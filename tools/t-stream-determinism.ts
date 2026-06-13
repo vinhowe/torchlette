@@ -8,7 +8,7 @@
  * to force a re-recording, capture again, diff.
  */
 import { GPT2, type GPT2Config } from "../examples/gpt2/model";
-import { initWebGPU } from "../src/backend/webgpu";
+import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
 import { diffStreams, canonicalizeStream } from "../src/executor/stream-diff";
 import { Torchlette } from "../src/frontend/torchlette";
 import { Adam } from "../src/optim";
@@ -76,6 +76,15 @@ async function main() {
   }
   console.log(allEqual ? "DETERMINISM: PASS" : "DETERMINISM: FAIL");
   void canonicalizeStream;
+  // Clean Dawn teardown before hard exit — a bare process.exit() leaves the
+  // Vulkan/Dawn device handle live and segfaults (code 139) when this tool
+  // is spawned from a vitest worker that already holds a WebGPU device
+  // (nested-device contention). The parity probe does the same.
+  try {
+    destroyWebGPU();
+  } catch {
+    /* ignore */
+  }
   process.exit(allEqual ? 0 : 1);
 }
 main().catch((e) => { console.error(e); process.exit(1); });

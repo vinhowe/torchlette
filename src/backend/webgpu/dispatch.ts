@@ -639,13 +639,12 @@ function prepareMatmulInputs(
  * is geometry-only (no live buffers) so it is safe to CACHE on the lowered
  * action and read at generation time. */
 export interface BareMatmulPlan {
-  pipeline: GPUComputePipeline;
-  paramsData: Uint32Array;
-  dispatchX: number;
-  dispatchY: number;
-  dispatchZ: number;
   outShape: number[];
   outputDtype: DType;
+  /** Standard single-dispatch plan, or the two-dispatch K-split plan. */
+  matmul:
+    | import("./matmul/dispatch").MatmulStandardPlan
+    | import("./matmul/dispatch").MatmulKSplitPlan;
 }
 
 export function planBareMatmul(
@@ -682,16 +681,7 @@ export function planBareMatmul(
     dtype: dtypeA,
     dtypeB: dtypeB !== dtypeA ? dtypeB : undefined,
   });
-  if (plan.kSplit) return "ksplit";
-  return {
-    pipeline: plan.pipeline,
-    paramsData: plan.paramsData,
-    dispatchX: plan.dispatchX,
-    dispatchY: plan.dispatchY,
-    dispatchZ: plan.dispatchZ,
-    outShape: prep.outShape,
-    outputDtype,
-  };
+  return { outShape: prep.outShape, outputDtype, matmul: plan };
 }
 
 export function dispatchMatmul(

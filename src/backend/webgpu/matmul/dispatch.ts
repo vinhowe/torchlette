@@ -636,6 +636,15 @@ function getKSplitTempBuffer(device: GPUDevice, byteSize: number): GPUBuffer {
   return buf;
 }
 
+/** Stage-4 stream generation: read-only lookup of the cached K-split temp
+ *  buffer (the generator binds it as a persistent slot — same buffer object
+ *  the recording's dispatch referenced). Null if not yet allocated; the
+ *  generator runs post-recording so a hit is guaranteed for any dispatched
+ *  K-split shape. Never allocates. */
+export function lookupKSplitTempBuffer(byteSize: number): GPUBuffer | null {
+  return kSplitTempBufferCache.get(byteSize) ?? null;
+}
+
 /** Pipeline cache for K-split reduction shaders. */
 const reductionPipelineCache = new Map<string, GPUComputePipeline>();
 
@@ -710,9 +719,27 @@ export interface MatmulStandardPlan {
   numEpilogueInputs: number;
 }
 
+/**
+ * K-split plan: two dispatches over a cached f32 partials temp buffer (keyed
+ * by byte size, persistent — NOT a recordAlloc'd buffer, so it's a
+ * persistent slot in the stream). (1) K-split matmul a,b → temp[P*M*N];
+ * (2) reduction temp → out with alpha. The generator looks the temp up by
+ * tempBytes (lookupKSplitTempBuffer) and binds it as a persistent slot.
+ */
+export interface MatmulKSplitPlan {
+  kSplit: true;
+  tempBytes: number;
+  ksplitPipeline: GPUComputePipeline;
+  ksplitParamsData: Uint32Array;
+  ksplitDispatch: [number, number, number];
+  reducePipeline: GPUComputePipeline;
+  reduceParamsData: Uint32Array;
+  reduceDispatch: [number, number, number];
+}
+
 export function planTiledMatmul(
   options: DispatchMatmulOptions,
-): MatmulStandardPlan | { kSplit: true } {
+): MatmulStandardPlan | MatmulKSplitPlan {
   const {
     device,
     m,
@@ -756,7 +783,55 @@ export function planTiledMatmul(
     batchSize,
     hasEpilogue,
   );
-  if (kSplitFactor >= 2) return { kSplit: true };
+  if (kSplitFactor >= 2) {
+    const outputDtype =
+      epilogue?.outputDtype ??
+      (dtype === "f32" || (dtypeB ?? dtype) === "f32" ? "f32" : dtype);
+    const totalElements = m * n;
+    const tempBytes = kSplitFactor * totalElements * F32_BYTES;
+    const ksplitPipeline = getOrCreatePipeline(device, {
+      config,
+      transposeMode,
+      dtype,
+      dtypeB,
+      batched: false,
+      inputCastA,
+      inputCastB,
+      kSplit: kSplitFactor,
+    });
+    const ksplitParamsData = packMatmulParams(
+      m,
+      n,
+      k,
+      lda,
+      ldb,
+      ldc,
+      1.0,
+      1,
+      batchStrideA,
+      batchStrideB,
+      batchStrideC,
+    );
+    const reducePipeline = getOrCreateReductionPipeline(
+      device,
+      kSplitFactor,
+      outputDtype as DType,
+    );
+    const reduceParamsBuf = new ArrayBuffer(8);
+    const reduceU32 = new Uint32Array(reduceParamsBuf);
+    new Float32Array(reduceParamsBuf)[1] = alpha;
+    reduceU32[0] = totalElements;
+    return {
+      kSplit: true,
+      tempBytes,
+      ksplitPipeline,
+      ksplitParamsData,
+      ksplitDispatch: [workgroupsX, workgroupsY, kSplitFactor],
+      reducePipeline,
+      reduceParamsData: reduceU32,
+      reduceDispatch: [Math.ceil(totalElements / 256), 1, 1],
+    };
+  }
 
   const swapGrid =
     batchSize === 1 && workgroupsX > workgroupsY * 4 ? true : undefined;
@@ -859,110 +934,58 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     hasEpilogue,
   );
 
-  if (kSplitFactor >= 2) {
-    // --- K-split path: two dispatches ---
-    const outputDtype =
-      epilogue?.outputDtype ??
-      (dtype === "f32" || (dtypeB ?? dtype) === "f32" ? "f32" : dtype);
+  void kSplitFactor;
+  // Decisions single-sourced in planTiledMatmul (the stream generator
+  // consumes the same plan — standard or K-split).
+  const plan = planTiledMatmul(options);
 
-    // 1. K-split matmul: partials[P * M * N] in f32
-    const totalElements = m * n;
-    const tempBytes = kSplitFactor * totalElements * F32_BYTES; // always f32
-    const tempBuffer = getKSplitTempBuffer(device, tempBytes);
+  if (plan.kSplit) {
+    // --- K-split path: two dispatches over the cached partials temp. ---
+    const opLabel = getCurrentOpLabel() ?? "matmul";
+    const tempBuffer = getKSplitTempBuffer(device, plan.tempBytes);
 
-    const kSplitCodegenOptions: CodegenOptions = {
-      config,
-      transposeMode,
-      dtype,
-      dtypeB,
-      batched: false,
-      inputCastA,
-      inputCastB,
-      kSplit: kSplitFactor,
-    };
-
-    const kSplitPipeline = getOrCreatePipeline(device, kSplitCodegenOptions);
-    const kSplitParamsData = packMatmulParams(
-      m,
-      n,
-      k,
-      lda,
-      ldb,
-      ldc,
-      1.0,
-      1,
-      batchStrideA,
-      batchStrideB,
-      batchStrideC,
-    );
     const kSplitParamsBuffer = sharedCreateParamsBuffer(
       device,
-      kSplitParamsData,
+      plan.ksplitParamsData,
     );
-
-    const kSplitBgBuffers = [a, b, tempBuffer, kSplitParamsBuffer];
-    const kSplitBindGroup = cachedCreateBindGroup(
-      device,
-      kSplitPipeline,
-      kSplitBgBuffers,
-    );
-
-    // Dispatch K-split matmul
-    const opLabel = getCurrentOpLabel() ?? "matmul";
+    const kSplitBindGroup = cachedCreateBindGroup(device, plan.ksplitPipeline, [
+      a,
+      b,
+      tempBuffer,
+      kSplitParamsBuffer,
+    ]);
     dispatchComputePass(
-      kSplitPipeline,
+      plan.ksplitPipeline,
       kSplitBindGroup,
-      workgroupsX,
-      workgroupsY,
-      kSplitFactor,
+      plan.ksplitDispatch[0],
+      plan.ksplitDispatch[1],
+      plan.ksplitDispatch[2],
       opLabel,
     );
-
     releaseParamsBuffer(kSplitParamsBuffer);
 
-    // 2. Reduction: sum P partials → final output with alpha
-    const reductionPipeline = getOrCreateReductionPipeline(
+    const reduceParamsBuffer = sharedCreateParamsBuffer(
       device,
-      kSplitFactor,
-      outputDtype as DType,
+      plan.reduceParamsData,
     );
-
-    // Pack reduction params: totalElements, alpha
-    const reduceParamsBuf = new ArrayBuffer(8);
-    const reduceU32 = new Uint32Array(reduceParamsBuf);
-    const reduceF32 = new Float32Array(reduceParamsBuf);
-    reduceU32[0] = totalElements;
-    reduceF32[1] = alpha;
-    const reduceParamsBuffer = sharedCreateParamsBuffer(device, reduceU32);
-
-    const reduceBgBuffers = [tempBuffer, out, reduceParamsBuffer];
-    const reduceBindGroup = cachedCreateBindGroup(
-      device,
-      reductionPipeline,
-      reduceBgBuffers,
-    );
-
-    const reduceWorkgroups = Math.ceil(totalElements / 256);
-
+    const reduceBindGroup = cachedCreateBindGroup(device, plan.reducePipeline, [
+      tempBuffer,
+      out,
+      reduceParamsBuffer,
+    ]);
     dispatchComputePass(
-      reductionPipeline,
+      plan.reducePipeline,
       reduceBindGroup,
-      reduceWorkgroups,
-      1,
-      1,
+      plan.reduceDispatch[0],
+      plan.reduceDispatch[1],
+      plan.reduceDispatch[2],
       opLabel + "_ksplit_reduce",
     );
-
     releaseParamsBuffer(reduceParamsBuffer);
     return;
   }
 
-  // --- Standard path (no K-split) — decisions single-sourced in
-  // planTiledMatmul (the stream generator consumes the same plan). ---
-  const std = planTiledMatmul(options);
-  if (std.kSplit) {
-    throw new Error("dispatchTiledMatmul: K-split reached the standard tail");
-  }
+  const std = plan;
   const paramsBuffer = sharedCreateParamsBuffer(device, std.paramsData);
   const bgBuffers = [a, b, out, paramsBuffer, ...epilogueInputs];
   const bindGroup = cachedCreateBindGroup(device, std.pipeline, bgBuffers);

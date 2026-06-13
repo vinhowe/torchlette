@@ -27,7 +27,10 @@ import {
 } from "../backend/webgpu/ops/views";
 import { planFullReductionDispatch } from "../backend/webgpu/ops/reductions";
 import { planFusedKernel } from "../backend/webgpu/fusion-dispatch";
-import { planTiledMatmul } from "../backend/webgpu/matmul/dispatch";
+import {
+  lookupKSplitTempBuffer,
+  planTiledMatmul,
+} from "../backend/webgpu/matmul/dispatch";
 import type { BareMatmulPlan } from "../backend/webgpu/dispatch";
 import { dtypeBytes } from "../backend/webgpu/shape-utils";
 import { planAdamStepDispatch } from "../backend/webgpu/adam-kernel";
@@ -227,6 +230,7 @@ export function generateStream(
                 node,
                 slots,
                 resolveRefSlot,
+                bufferSlot,
               )
             : generateSequential(node, slots, resolveRefSlot, bufferSlot);
         if (typeof gen === "string") {
@@ -816,6 +820,7 @@ function generateBareMatmul(
   node: LazyIRNode,
   slots: SlotSource[],
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
 ): { commands: GpuCommand[]; outSlot: Slot } | string {
   if (cached === undefined) return "no-cached-plan";
   if (typeof cached === "string") return cached; // bail reason from capture
@@ -829,8 +834,51 @@ function generateBareMatmul(
   const outBytes = sizeOf(cached.outShape) * dtypeBytes(cached.outputDtype);
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
+  const m = cached.matmul;
+
+  if (m.kSplit) {
+    // K-split: ALLOC(out) then two dispatches over the cached partials temp
+    // (a persistent-slot buffer — no ALLOC, looked up by byte size). The
+    // generator binds the SAME cached buffer object the recording used.
+    const temp = lookupKSplitTempBuffer(m.tempBytes);
+    if (!temp) return "ksplit-temp-missing";
+    const tempSlot = bufferSlot(temp as unknown, "persistent");
+    const ksplitParamsSlot = slots.length;
+    slots.push({ kind: "params", seqIndex: -1, data: m.ksplitParamsData });
+    const reduceParamsSlot = slots.length;
+    slots.push({ kind: "params", seqIndex: -1, data: m.reduceParamsData });
+    return {
+      commands: [
+        {
+          tag: TAG_ALLOC,
+          slot: outSlot,
+          bytes: outBytes,
+          allocKind: 0,
+          inputSlots: [aSlot, bSlot],
+        },
+        {
+          tag: TAG_DISPATCH,
+          pipeline: m.ksplitPipeline,
+          bindings: [aSlot, bSlot, tempSlot, ksplitParamsSlot],
+          gx: m.ksplitDispatch[0],
+          gy: m.ksplitDispatch[1],
+          gz: m.ksplitDispatch[2],
+        },
+        {
+          tag: TAG_DISPATCH,
+          pipeline: m.reducePipeline,
+          bindings: [tempSlot, outSlot, reduceParamsSlot],
+          gx: m.reduceDispatch[0],
+          gy: m.reduceDispatch[1],
+          gz: m.reduceDispatch[2],
+        },
+      ],
+      outSlot,
+    };
+  }
+
   const paramsSlot = slots.length;
-  slots.push({ kind: "params", seqIndex: -1, data: cached.paramsData });
+  slots.push({ kind: "params", seqIndex: -1, data: m.paramsData });
   return {
     commands: [
       {
@@ -842,11 +890,11 @@ function generateBareMatmul(
       },
       {
         tag: TAG_DISPATCH,
-        pipeline: cached.pipeline,
+        pipeline: m.pipeline,
         bindings: [aSlot, bSlot, outSlot, paramsSlot],
-        gx: cached.dispatchX,
-        gy: cached.dispatchY,
-        gz: cached.dispatchZ,
+        gx: m.dispatchX,
+        gy: m.dispatchY,
+        gz: m.dispatchZ,
       },
     ],
     outSlot,
