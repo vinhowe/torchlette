@@ -2121,14 +2121,29 @@ interface FusedActionShape {
 
 /**
  * Fused-segment generator. Covers the clean case — all external inputs
- * contiguous, no needed-intermediate re-execution — and emits the fused
- * kernel's ALLOC(s) + DISPATCH via planFusedKernel (shared with the
- * dispatcher, so binding order / workgroups can't drift). Donation is
- * detected POST-HOC: the recording already ran, so a donated out0 is the
- * input whose buffer the output node's result aliases (ownsBuffer=false) —
- * no liveness recomputation needed. Bails (uncovered) on contiguous-copy
- * prologues, needed intermediates, and oversized buffers, exactly the
- * branches executeFusedSegment routes away from the plain dispatch.
+ * contiguous — and emits the fused kernel's ALLOC(s) + DISPATCH via
+ * planFusedKernel (shared with the dispatcher, so binding order / workgroups
+ * can't drift). Donation is detected POST-HOC: the recording already ran, so
+ * a donated out0 is the input whose buffer the output node's result aliases
+ * (ownsBuffer=false) — no liveness recomputation needed.
+ *
+ * NEEDED INTERMEDIATES: group-internal elementwise nodes consumed OUTSIDE the
+ * group that couldn't be promoted to additional fused outputs (shape mismatch
+ * with the primary, or out of binding slots). The fused kernel computes them
+ * inline but doesn't write them out; the executor re-executes just those nodes
+ * sequentially (executeFusedSegment → executeSequentialSegment) so external
+ * consumers can read them. That re-execution stays under the SAME recording
+ * node index (action.outputNodeIndex — never reset by executeNode), so the
+ * recorder attributes those commands to THIS segment. We mirror it exactly:
+ * after the fused dispatch, generate each needed-intermediate's plain
+ * ALLOC+DISPATCH via generateSequential (the same elementwise path executeNode
+ * takes), resolving its inputs against this group's own outputs (assigned
+ * locally here, not yet in the outer nodeSlot) and earlier intermediates.
+ *
+ * Bails (uncovered) on contiguous-copy prologues and oversized buffers,
+ * exactly the branches executeFusedSegment routes away from the plain
+ * dispatch; a needed-intermediate that itself can't be generated bails the
+ * whole action (kept atomic — partial segments would break the diff).
  */
 function generateFused(
   action: FusedActionShape,
@@ -2138,7 +2153,6 @@ function generateFused(
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
   backend: import("../backend/types").Backend,
 ): { commands: GpuCommand[]; outputs: Array<{ nodeIndex: number; slot: Slot }> } | string {
-  if (action.neededIntermediateNodeIndices?.length) return "needed-intermediates";
   const device = (backend as { device?: GPUDevice }).device;
   if (!device) return "no-device";
   if (!action.cachedExternalInputPattern) return "no-input-pattern";
@@ -2280,6 +2294,45 @@ function generateFused(
       outputs.push({ nodeIndex: addl[i], slot: outputSlots[i + 1] });
     }
   }
+
+  // Needed-intermediate re-execution (see header). Resolve each one's inputs
+  // against this group's own outputs (primary + promoted additionals, whose
+  // slots are assigned right here and aren't in the outer nodeSlot yet) and
+  // against earlier intermediates in this same loop — falling back to the
+  // outer channel for true external inputs. Each is the plain elementwise
+  // dispatch executeNode would run, so generateSequential reproduces it.
+  const needed = action.neededIntermediateNodeIndices ?? [];
+  if (needed.length > 0) {
+    const localById = new Map<number, Slot>();
+    localById.set(planNodes[action.outputNodeIndex].id, outputSlots[0]);
+    for (let i = 0; i < addl.length; i++) {
+      if (outputSlots[i + 1] !== undefined) {
+        localById.set(planNodes[addl[i]].id, outputSlots[i + 1]);
+      }
+    }
+    const localResolve = (
+      ref: LazyIRNode["inputs"][number],
+    ): Slot | undefined => {
+      if (ref.kind !== "materialized" && ref.kind !== "scalar") {
+        if ((ref.outputIndex ?? 0) === 0) {
+          const s = localById.get(ref.node.id);
+          if (s !== undefined) return s;
+        }
+      }
+      return resolveRefSlot(ref);
+    };
+    for (const niIdx of needed) {
+      const niNode = planNodes[niIdx];
+      const g = generateSequential(niNode, slots, localResolve, bufferSlot);
+      if (typeof g === "string") {
+        return `needed-intermediate:${niNode.op}[${g || "?"}]`;
+      }
+      commands.push(...g.commands);
+      localById.set(niNode.id, g.outSlot);
+      outputs.push({ nodeIndex: niIdx, slot: g.outSlot });
+    }
+  }
+
   return { commands, outputs };
 }
 

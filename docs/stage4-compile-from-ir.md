@@ -214,9 +214,10 @@ adam-batch; fusedAttention FORWARD. Three capture mechanisms cover the
 "generator can't derive it post-hoc" cases: `cachedMatmulPlan` (geometry),
 `cachedInputShapes` (released multi-output input shapes), and read-only
 workspace/config lookups (`lookupKSplitTempBuffer`, `lookupPackedBuffers`,
-`lookupAttentionConfigBuffer`). Coverage: fwd 287/289, bwd 397/414,
+`lookupAttentionConfigBuffer`). Coverage: fwd 287/289, bwd 405/414,
 optimizer 100% (FULLY GENERATED) — FORWARD is now complete bar the two
-deliberately-excluded expand/broadcast producers. A latent bug fell out:
+deliberately-excluded expand/broadcast producers; BACKWARD is complete bar
+fusedAttentionBackward×8 (bijection blocker) + 1 excluded expand producer. A latent bug fell out:
 `getOrCreateConfigBuffer` never populated its cache (re-created the
 attention config uniform every dispatch) — fixed (perf + stable identity
 for the generator).
@@ -242,14 +243,31 @@ the output's aliasing candidates — the ALLOC's inputSlots must list only
 poolable operands (track `aliasInSlots` separately from the DISPATCH
 bindings).
 
-**Remaining uncovered (fwd 2, bwd 17), all out of easy reach:**
+**Remaining uncovered (fwd 2, bwd 9), all out of easy reach:**
 expand/broadcast producers (`contiguous[no-storage]×2` fwd,
 `mul[no-storage]×1` bwd) — strided-view layout not shape-derivable,
-correctly excluded; `fused[needed-intermediates]×8` — structural
-(post-dispatch intermediate re-exec), the hardest/last class;
-`fusedAttentionBackward×8` — the lifetime-split-slot bijection blocker
-below. Everything tractable without a major design effort (a new capture
-mechanism or the bijection redesign) is now covered.
+correctly excluded; `fusedAttentionBackward×8` — the lifetime-split-slot
+bijection blocker below (now bails earlier at `[contiguous-prologue]`,
+since its inputs took the asContiguous path; same root, still uncovered).
+The only remaining tractable-vs-structural line is the bijection redesign;
+everything else is covered.
+
+**Needed-intermediate re-execution (DONE — was "the hardest/last class,"
+turned out mechanical).** A fused group's internal elementwise nodes that
+are consumed OUTSIDE the group but couldn't be promoted to additional fused
+outputs (shape ≠ primary, or out of binding slots) are re-executed
+sequentially after the fused dispatch (`executeFusedSegment` →
+`executeSequentialSegment`). That re-execution never resets the recording
+node index (`executeNode` doesn't touch it), so its commands land in the
+SAME segment as the fused dispatch. `generateFused` now mirrors it: after
+the kernel dispatch, it generates each needed-intermediate's plain
+ALLOC+DISPATCH via `generateSequential` (the same elementwise path
+`executeNode` takes), resolving inputs against a LOCAL node.id→slot map
+seeded with this group's own primary + promoted-additional output slots
+(assigned inside `generateFused`, not yet in the outer `nodeSlot`) plus
+earlier intermediates, falling back to the outer channel for true external
+inputs. Kept atomic: a needed-intermediate that itself can't be generated
+bails the whole action. bwd 397→405/414; 0 diverged.
 
 Added since: **gather** (forward, single-sourced on `planGatherDirect`);
 **scatterAdd** (embedding backward ×2, single-sourced on
