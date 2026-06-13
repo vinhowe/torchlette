@@ -86,6 +86,11 @@ function getOrCreateConfigBuffer(
   u32View[6] = 0; // pad
   u32View[7] = 0; // pad
   device.queue.writeBuffer(buf, 0, new Uint8Array(data));
+  // Cache it (the "getOrCreate" contract — was missing, so every attention
+  // dispatch re-created + re-uploaded this 32-byte uniform; caching is a
+  // per-step perf win AND gives the stream generator a stable buffer
+  // identity to bind as a persistent slot via lookupAttentionConfigBuffer).
+  configCache.set(key, buf);
   return buf;
 }
 
@@ -548,6 +553,138 @@ function dispatchAttention(
   ]);
   for (const b of buffers) trackSharedEncoderWrite(b);
   dispatchComputePass(pipeline, bindGroup, grid[0], grid[1] ?? 1, grid[2] ?? 1);
+}
+
+// ============================================================================
+// Stage-4 stream generation: plan helpers (no GPU dispatch). Each attention
+// dispatch resolves its pipeline through the SAME getTileIRWGSL+getPipeline
+// caches the dispatcher uses, and binds the shared CACHED config buffer
+// (getOrCreateConfigBuffer — a persistent slot, looked up read-only here).
+// All four attention dispatches in a step share one config buffer (same
+// B/H/N/D/scale/causal). The ephemeral D-precompute is a normal recorded
+// allocateOutputBuffer (allocKind 1), not a persistent workspace.
+// ============================================================================
+
+export interface AttentionStepPlan {
+  pipeline: import("./gpu-types").GPUComputePipeline;
+  configBuffer: GPUBuffer | null;
+  grid: [number, number, number];
+}
+
+/** Read-only lookup of the cached attention config buffer (persistent slot
+ *  in the stream). Null if not yet created (guaranteed hit post-recording). */
+export function lookupAttentionConfigBuffer(
+  batchSize: number,
+  numHeads: number,
+  seqLen: number,
+  headDim: number,
+  scale: number,
+  isCausal: boolean,
+): GPUBuffer | null {
+  return (
+    configCache.get(
+      `${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${isCausal ? 1 : 0}`,
+    ) ?? null
+  );
+}
+
+function planAttentionStep(
+  wgslKey: string,
+  pipelinePrefix: string,
+  specFactory: () => TileKernelSpec,
+  headDim: number,
+  configBuffer: GPUBuffer | null,
+  grid: [number, number, number],
+): AttentionStepPlan {
+  const ctx = requireContext();
+  const wgsl = getTileIRWGSL(wgslKey, specFactory);
+  const pipeline = getPipeline(ctx, `${pipelinePrefix}:tile:${headDim}`, wgsl);
+  return { pipeline, configBuffer, grid };
+}
+
+export function planFlashAttentionForward(
+  batchSize: number,
+  numHeads: number,
+  seqLen: number,
+  headDim: number,
+  scale: number,
+  isCausal: boolean,
+): { plan: AttentionStepPlan; outBytes: number; lseBytes: number } {
+  const cfg = lookupAttentionConfigBuffer(
+    batchSize,
+    numHeads,
+    seqLen,
+    headDim,
+    scale,
+    isCausal,
+  );
+  return {
+    plan: planAttentionStep(
+      `fwd:${headDim}`,
+      "faFwd",
+      () => makeForwardAttentionSpec(headDim),
+      headDim,
+      cfg,
+      [Math.ceil(seqLen / BR), numHeads, batchSize],
+    ),
+    outBytes: batchSize * numHeads * seqLen * headDim * 4,
+    lseBytes: batchSize * numHeads * seqLen * 4,
+  };
+}
+
+export function planFlashAttentionBackward(
+  batchSize: number,
+  numHeads: number,
+  seqLen: number,
+  headDim: number,
+  scale: number,
+  isCausal: boolean,
+): {
+  dPlan: AttentionStepPlan;
+  dqPlan: AttentionStepPlan;
+  dkvPlan: AttentionStepPlan;
+  dBytes: number;
+  dqBytes: number;
+  dkvBytes: number;
+} {
+  const cfg = lookupAttentionConfigBuffer(
+    batchSize,
+    numHeads,
+    seqLen,
+    headDim,
+    scale,
+    isCausal,
+  );
+  const bhnd = batchSize * numHeads * seqLen * headDim * 4;
+  return {
+    dPlan: planAttentionStep(
+      `bwdD:${headDim}`,
+      "faBwdD",
+      () => makeDPrecomputeSpec(headDim),
+      headDim,
+      cfg,
+      [batchSize * numHeads * seqLen, 1, 1],
+    ),
+    dqPlan: planAttentionStep(
+      `bwdDQ:${headDim}`,
+      "faBwdDQ",
+      () => makeBackwardDQSpec(headDim),
+      headDim,
+      cfg,
+      [Math.ceil(seqLen / BR), numHeads, batchSize],
+    ),
+    dkvPlan: planAttentionStep(
+      `bwdDKV:${headDim}`,
+      "faBwdDKV",
+      () => makeBackwardDKVSpec(headDim),
+      headDim,
+      cfg,
+      [Math.ceil(seqLen / BC_BW), numHeads, batchSize],
+    ),
+    dBytes: batchSize * numHeads * seqLen * 4,
+    dqBytes: bhnd,
+    dkvBytes: bhnd,
+  };
 }
 
 /** Q,K,V: [B, H, N, D] → O: [B, H, N, D], L: [B, H, N] */

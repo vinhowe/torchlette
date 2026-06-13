@@ -85,6 +85,10 @@ interface LoweredNodeAction {
    *  generator can't derive them post-hoc (released multi-output inputs);
    *  e.g. narrowBackward's grad dim size. Template-invariant. */
   cachedInputShapes?: number[][];
+  /** Stage-4 phase-3: whether every input was contiguous at lowering
+   *  (attention ops asContiguous internally; a copy prologue isn't yet
+   *  generated, so the generator bails when false). Template-invariant. */
+  cachedAllInputsContig?: boolean;
 }
 
 /** A matmul + epilogue chain dispatch. */

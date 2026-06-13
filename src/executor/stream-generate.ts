@@ -37,6 +37,11 @@ import {
   lookupKSplitTempBuffer,
   planTiledMatmul,
 } from "../backend/webgpu/matmul/dispatch";
+import {
+  type AttentionStepPlan,
+  planFlashAttentionBackward,
+  planFlashAttentionForward,
+} from "../backend/webgpu/attention-kernel";
 import type { BareMatmulPlan } from "../backend/webgpu/dispatch";
 import { dtypeBytes } from "../backend/webgpu/shape-utils";
 import { planAdamStepDispatch } from "../backend/webgpu/adam-kernel";
@@ -150,16 +155,19 @@ export function generateStream(
   // its base share one slot; a separate logical slot per view node would
   // break the diff bijection).
   const nodeSlot = new Map<number, Slot>();
+  // Extra-output channel: `${nodeIndex}:${outputIndex}` → slot, for
+  // multi-output producers (attention dQ/dK/dV, logsumexp) whose non-primary
+  // outputs are released by plan-build and have no recoverable buffer.
+  const nodeSlotExtra = new Map<string, Slot>();
   const resolveRefSlot = (ref: LazyIRNode["inputs"][number]): Slot | undefined => {
     if (ref.kind === "scalar") return undefined;
     if (ref.kind !== "materialized") {
       const oi = ref.outputIndex ?? 0;
-      if (oi === 0) {
-        const idx = nodeIndexById.get(ref.node.id);
-        if (idx !== undefined) {
-          const s = nodeSlot.get(idx);
-          if (s !== undefined) return s;
-        }
+      const idx = nodeIndexById.get(ref.node.id);
+      if (idx !== undefined) {
+        const s =
+          oi === 0 ? nodeSlot.get(idx) : nodeSlotExtra.get(`${idx}:${oi}`);
+        if (s !== undefined) return s;
       }
       const storage =
         oi === 0 ? ref.node.result : ref.node.results?.[oi];
@@ -228,6 +236,41 @@ export function generateStream(
       }
       case "sequential": {
         const node = planNodes[action.nodeIndex];
+        // Multi-output attention (output+logsumexp; dQ/dK/dV) — dedicated
+        // generators that return per-output slot mappings.
+        if (
+          node.op === "fusedAttentionForward" ||
+          node.op === "fusedAttentionBackward"
+        ) {
+          // Bail if any input needed a contiguous-copy prologue (the op
+          // asContiguous'd it) — that extra ALLOC+dispatch isn't generated.
+          if (
+            (action as { cachedAllInputsContig?: boolean })
+              .cachedAllInputsContig === false
+          ) {
+            miss(`op:${node.op}[contiguous-prologue]`);
+            phantom(node, action.nodeIndex);
+            break;
+          }
+          const ag = generateAttention(node, slots, resolveRefSlot, bufferSlot);
+          if (typeof ag === "string") {
+            miss(`op:${node.op}[${ag}]`);
+            phantom(node, action.nodeIndex);
+            break;
+          }
+          commands.push(...ag.commands);
+          segments.push({ nodeIndex: action.nodeIndex, commands: ag.commands });
+          for (const o of ag.outputs) {
+            if (o.outputIndex === 0) {
+              mapNodeResult(node, o.slot, bufferToSlot);
+              nodeSlot.set(action.nodeIndex, o.slot);
+            } else {
+              nodeSlotExtra.set(`${action.nodeIndex}:${o.outputIndex}`, o.slot);
+            }
+          }
+          coveredActions++;
+          break;
+        }
         const gen =
           node.op === "matmul"
             ? generateBareMatmul(
@@ -776,6 +819,137 @@ function generateLayerNormGradX(
       },
     ],
     outSlot,
+  };
+}
+
+/**
+ * Flash-attention fwd/bwd generator (multi-output). dispatchAttention binds
+ * [...buffers, config] POSITIONALLY (not via the tile spec), so bindings are
+ * built positionally here. The shared config buffer is a cached persistent
+ * slot (lookup). Forward: ALLOC(output) + ALLOC(lse) + 1 dispatch
+ * [q,k,v,output,lse,config], outputs {0:output, 1:logsumexp}. Backward: D
+ * (ALLOC dBuf + dispatch [dO,o,dBuf,config]) → DQ (ALLOC dQ + dispatch
+ * [q,k,v,lse,dBuf,dO,dQ,config]) → DKV (ALLOC dK, ALLOC dV + dispatch
+ * [q,k,v,lse,dBuf,dO,dK,dV,config]); dBuf is an ephemeral recorded alloc,
+ * outputs {0:dQ, 1:dK, 2:dV}. Inputs q/k/v/output/logsumexp are saved (live);
+ * dO is a grad (logical slot if released).
+ */
+function generateAttention(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+):
+  | { commands: GpuCommand[]; outputs: Array<{ outputIndex: number; slot: Slot }> }
+  | string {
+  const cfg = node.payload as
+    | {
+        batchSize?: number;
+        numHeads?: number;
+        seqLen?: number;
+        headDim?: number;
+        scale?: number;
+        isCausal?: boolean;
+      }
+    | undefined;
+  if (
+    !cfg ||
+    cfg.batchSize == null ||
+    cfg.numHeads == null ||
+    cfg.seqLen == null ||
+    cfg.headDim == null ||
+    cfg.scale == null
+  ) {
+    return "payload";
+  }
+  const inSlots: Slot[] = [];
+  for (const ref of node.inputs) {
+    if (ref.kind === "scalar") return "scalar-operand";
+    const s = resolveRefSlot(ref);
+    if (s === undefined) return "untracked-input";
+    inSlots.push(s);
+  }
+  const newSlot = (): Slot => {
+    const s = slots.length;
+    slots.push({ kind: "arena" });
+    return s;
+  };
+  const causal = cfg.isCausal ?? false;
+
+  if (node.op === "fusedAttentionForward") {
+    if (inSlots.length !== 3) return "arity";
+    const p = planFlashAttentionForward(
+      cfg.batchSize,
+      cfg.numHeads,
+      cfg.seqLen,
+      cfg.headDim,
+      cfg.scale,
+      causal,
+    );
+    if (!p.plan.configBuffer) return "config-missing";
+    const cfgSlot = bufferSlot(p.plan.configBuffer as unknown, "persistent");
+    const outSlot = newSlot();
+    const lseSlot = newSlot();
+    return {
+      commands: [
+        { tag: TAG_ALLOC, slot: outSlot, bytes: p.outBytes, allocKind: 1, inputSlots: [] },
+        { tag: TAG_ALLOC, slot: lseSlot, bytes: p.lseBytes, allocKind: 1, inputSlots: [] },
+        {
+          tag: TAG_DISPATCH,
+          pipeline: p.plan.pipeline,
+          bindings: [inSlots[0], inSlots[1], inSlots[2], outSlot, lseSlot, cfgSlot],
+          gx: p.plan.grid[0],
+          gy: p.plan.grid[1],
+          gz: p.plan.grid[2],
+        },
+      ],
+      outputs: [
+        { outputIndex: 0, slot: outSlot },
+        { outputIndex: 1, slot: lseSlot },
+      ],
+    };
+  }
+
+  // fusedAttentionBackward — inputs [q, k, v, logsumexp, dO, output]
+  if (inSlots.length !== 6) return "arity";
+  const [qS, kS, vS, lseS, dOS, oS] = inSlots;
+  const p = planFlashAttentionBackward(
+    cfg.batchSize,
+    cfg.numHeads,
+    cfg.seqLen,
+    cfg.headDim,
+    cfg.scale,
+    causal,
+  );
+  if (!p.dPlan.configBuffer) return "config-missing";
+  const cfgSlot = bufferSlot(p.dPlan.configBuffer as unknown, "persistent");
+  const dBufSlot = newSlot();
+  const dQSlot = newSlot();
+  const dKSlot = newSlot();
+  const dVSlot = newSlot();
+  const dispatch = (plan: AttentionStepPlan, bindings: Slot[]): GpuCommand => ({
+    tag: TAG_DISPATCH,
+    pipeline: plan.pipeline,
+    bindings,
+    gx: plan.grid[0],
+    gy: plan.grid[1],
+    gz: plan.grid[2],
+  });
+  return {
+    commands: [
+      { tag: TAG_ALLOC, slot: dBufSlot, bytes: p.dBytes, allocKind: 1, inputSlots: [] },
+      dispatch(p.dPlan, [dOS, oS, dBufSlot, cfgSlot]),
+      { tag: TAG_ALLOC, slot: dQSlot, bytes: p.dqBytes, allocKind: 1, inputSlots: [] },
+      dispatch(p.dqPlan, [qS, kS, vS, lseS, dBufSlot, dOS, dQSlot, cfgSlot]),
+      { tag: TAG_ALLOC, slot: dKSlot, bytes: p.dkvBytes, allocKind: 1, inputSlots: [] },
+      { tag: TAG_ALLOC, slot: dVSlot, bytes: p.dkvBytes, allocKind: 1, inputSlots: [] },
+      dispatch(p.dkvPlan, [qS, kS, vS, lseS, dBufSlot, dOS, dKSlot, dVSlot, cfgSlot]),
+    ],
+    outputs: [
+      { outputIndex: 0, slot: dQSlot },
+      { outputIndex: 1, slot: dKSlot },
+      { outputIndex: 2, slot: dVSlot },
+    ],
   };
 }
 

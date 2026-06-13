@@ -1533,6 +1533,23 @@ export async function executeLoweredPlan(
               (t as { shape: number[] }).shape.slice(),
             );
           }
+
+          // Attention fwd/bwd asContiguous() their inputs inside the op — a
+          // non-contiguous input inserts a contiguous-copy prologue (extra
+          // ALLOC+dispatch) the generator doesn't yet emit. Capture whether
+          // every input is contiguous at lowering; the generator bails
+          // (uncovered) otherwise. Contiguity is template-invariant.
+          if (
+            action.kind === "sequential" &&
+            (node.op === "fusedAttentionForward" ||
+              node.op === "fusedAttentionBackward") &&
+            action.cachedAllInputsContig === undefined
+          ) {
+            action.cachedAllInputsContig = backendInputs.every((t) => {
+              const w = t as { isContiguous?: boolean; offset?: number };
+              return w.isContiguous !== false && (w.offset ?? 0) === 0;
+            });
+          }
           break;
         }
 
