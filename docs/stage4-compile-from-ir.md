@@ -363,10 +363,32 @@ re-confirmed against current code before being treated as a design fork; the
 cheap instrumented trace overturned a multi-session redesign plan in minutes.
 
 ### Phase 4 — Deletions and dividends
-- Delete: record* hooks (recorder kept only as the CI cross-check), the
-  per-position arena (+hints, pre-pinning, conflict paths), pinnedBufferSet,
-  params-sequence cache (params buffers become planner slots with declared
-  volatile fields).
+
+**Pre-cutover deletion audit (2026-06-13): there is NO safe deletion before
+the cutover.** Every item below was confirmed load-bearing in the CURRENT
+path, so the "deletions" are CONSEQUENCES of the cutover (the generator+planner
+becoming the sole build source), not independent dead code to clear first:
+- `pinnedBufferSet` — NOT the deleted pin mechanism (that's gone clean: 0 refs
+  to adoptBuffer/poolOrigin/allocBuffers/plannedBind). It is the CURRENT memory
+  planner's buffer-ownership mechanism (registry entries pinned to survive plan
+  teardown; consulted by every destroy/release/harvest path). Load-bearing.
+- params-sequence cache (`createParamsBuffer`/`paramsSequenceSet`) — allocates
+  every dispatch's params/uniform buffer; core to both the lowered first
+  execution and replay. Becomes planner slots only AFTER the cutover.
+- per-position arena (`allocateOutputBuffer`/`arenaAllocAt`) — the canonical
+  output allocation for every backend op, active in BOTH liveness (default) and
+  legacy modes. The pool-hint machinery (`outputSequenceHints`/
+  `pinnedOutputBuffers`/`conflictDetected`) is used by `resolveOutputBuffer` +
+  the shared encoder during the first (lowered) execution. Not dead.
+- legacy unbudgeted arena (`TORCHLETTE_ARENA_LIVENESS=0`) — a SUPPORTED opt-out
+  / planner-bug fallback, not vestigial. Dropping it is a product decision.
+
+**So the order is cutover-first.** The cutover: make `buildCompiledPlan`
+consume the GENERATED stream (proven byte-identical modulo slot bijection)
+instead of the recorded log — wiring nodeResults / slot sources / planner
+assignment from the generated segments — behind a flag, validated by the full
+parity ladder both directions. THEN the record* hooks demote to a gate-only
+cross-check and the above become deletable as the planner subsumes them.
 - Dividends: serializable compiled plans (a generated plan has no live GPU
   pointers → ~700ms cold start dies); single answer to "who owns this
   buffer"; the architecture-debt rules become enforced by construction.
