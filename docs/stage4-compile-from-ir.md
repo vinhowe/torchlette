@@ -203,6 +203,44 @@ plan-cores were kept (the dispatchers consume them; the splits are sound).
   same mechanism for the fused LN/attention/CE kernels (their plan() also
   declares the op-internal workspace temps).
 
+### Phase 3 progress (2026-06-13)
+Covered: all declarative tile ops; matmul (bare + epilogue + K-split, 100%
+both directions); LayerNorm fwd + gradX + gradWeightBias (100%, incl. the
+op-internal partial-sum WORKSPACE — cached workspace buffers bind as
+persistent slots via read-only lookup, the K-split-temp/packed-buffer
+mechanism); narrowBackward (grad shape captured at lowering via
+`cachedInputShapes` — its grad is a released multi-output extra);
+adam-batch; fusedAttention FORWARD. Three capture mechanisms cover the
+"generator can't derive it post-hoc" cases: `cachedMatmulPlan` (geometry),
+`cachedInputShapes` (released multi-output input shapes), and read-only
+workspace/config lookups (`lookupKSplitTempBuffer`, `lookupPackedBuffers`,
+`lookupAttentionConfigBuffer`). Coverage: fwd 282/289, bwd 388/414,
+optimizer 100%. A latent bug fell out: `getOrCreateConfigBuffer` never
+populated its cache (re-created the attention config uniform every
+dispatch) — fixed (perf + stable identity for the generator).
+
+**KNOWN BLOCKER — fusedAttentionBackward (the lifetime-split-slot limit).**
+Attempted and reverted (it broke narrowBackward). The attention-backward
+SEGMENT itself verifies; what fails is the consumer: narrowBackward reads
+attention's dV (a multi-output extra) and the recording assigns that ONE
+logical tensor TWO different slot numbers across segments — its value in
+the attention segment vs the slot narrowBackward reads (a recordAlloc
+lifetime split / intervening realloc, NOT a missing contiguous copy:
+narrowBackward emits only alloc+dispatch, no copy). The segment differ's
+GLOBAL gen↔rec bijection is 1:1 and so rejects one-gen-slot→two-rec-slots.
+This is a structural limit of bijection-based segment diffing against a
+recording that lifetime-splits buffers, surfaced only when BOTH the
+multi-output producer AND its downstream consumer are covered (while
+attention-bwd was uncovered its outputs were phantom slots, so
+narrowBackward verified). Candidate fixes, each non-trivial: (a) the
+generator models the recording's lifetime-split slot transitions for
+multi-output extras; (b) the differ tolerates gen→{rec aliases of one
+buffer} when it can prove they're lifetime-split (needs alias info it
+doesn't have today); (c) make recordAlloc NOT lifetime-split buffers that
+are still logically live across a consumer (changes the recording).
+Forward attention + the config-cache fix shipped (d00d1e7); backward
+attention stays cleanly bailed (`cachedAllInputsContig`).
+
 ### Phase 4 — Deletions and dividends
 - Delete: record* hooks (recorder kept only as the CI cross-check), the
   per-position arena (+hints, pre-pinning, conflict paths), pinnedBufferSet,
