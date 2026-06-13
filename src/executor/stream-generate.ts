@@ -24,6 +24,7 @@ import {
 import {
   planCastDirect,
   planContiguousDirect,
+  planNarrowBackward,
 } from "../backend/webgpu/ops/views";
 import { planFullReductionDispatch } from "../backend/webgpu/ops/reductions";
 import {
@@ -237,7 +238,13 @@ export function generateStream(
                 resolveRefSlot,
                 bufferSlot,
               )
-            : generateSequential(node, slots, resolveRefSlot, bufferSlot);
+            : generateSequential(
+                node,
+                slots,
+                resolveRefSlot,
+                bufferSlot,
+                (action as { cachedInputShapes?: number[][] }).cachedInputShapes,
+              );
         if (typeof gen === "string") {
           miss(`op:${node.op}${gen ? `[${gen}]` : ""}`);
           phantom(node, action.nodeIndex);
@@ -440,6 +447,7 @@ function generateSequential(
   slots: SlotSource[],
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+  cachedInputShapes?: number[][],
 ): { commands: GpuCommand[]; outSlot: Slot } | string {
   // Tile-kernel ops with bespoke command patterns.
   if (node.op === "sum") return generateSumFull(node, slots, resolveRefSlot, bufferSlot);
@@ -453,6 +461,8 @@ function generateSequential(
     return generateLayerNormGradX(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "fusedLayerNormBackwardGradWeightBias")
     return generateLayerNormGradWB(node, slots, resolveRefSlot, bufferSlot);
+  if (node.op === "narrowBackward")
+    return generateNarrowBackward(node, slots, resolveRefSlot, cachedInputShapes);
   const wgslOp = BINARY_OPS.get(node.op);
   const isUnary =
     UNARY_OPS.has(node.op) ||
@@ -878,6 +888,81 @@ function generateLayerNormGradWB(
       dispatch(p.reducePlan, reduceBindings),
     ],
     outSlot: gwSlot,
+  };
+}
+
+/** narrowBackward: ALLOC(out, kind 0, inputs=[grad]) + one dispatch
+ *  [grad, out, params]. Geometry from the grad input SHAPE + payload
+ *  {dim,start,originalLength} + node dtype (no live buffer). The grad shape
+ *  comes from the input ref's producer node (works post-release). */
+function generateNarrowBackward(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  cachedInputShapes?: number[][],
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 1) return "arity";
+  const cfg = node.payload as
+    | { dim?: number; start?: number; originalLength?: number }
+    | undefined;
+  if (!cfg || cfg.dim == null || cfg.start == null || cfg.originalLength == null) {
+    return "payload";
+  }
+  const ref = node.inputs[0];
+  if (ref.kind === "scalar") return "scalar-operand";
+  const gradSlot = resolveRefSlot(ref);
+  if (gradSlot === undefined) return "untracked-input";
+  // Grad shape: the lowering-captured shape (cachedInputShapes[0]) is
+  // authoritative — the grad is a released multi-output extra (attention
+  // dQ/dK/dV) at plan-build, with no recoverable per-output shape. Fall
+  // back to live storage / a non-view producer's node shape.
+  let gradShape: number[] | undefined = cachedInputShapes?.[0];
+  if (!gradShape) {
+    if (ref.kind === "materialized") {
+      gradShape = ref.storage.backendTensor.shape;
+    } else {
+      const oi = ref.outputIndex ?? 0;
+      const storage = oi === 0 ? ref.node.result : ref.node.results?.[oi];
+      gradShape = storage
+        ? storage.backendTensor.shape
+        : oi === 0 && !VIEW_OPS.has(ref.node.op)
+          ? ref.node.shape
+          : undefined;
+    }
+  }
+  if (!gradShape) return "no-grad-shape";
+  const dtype = (node.dtype ?? "f32") as DType;
+  const plan = planNarrowBackward(
+    gradShape,
+    cfg.dim,
+    cfg.start,
+    cfg.originalLength,
+    dtype,
+  );
+  const pipeline = getPipeline(requireContext(), plan.key, plan.shader);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const paramsSlot = slots.length;
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData });
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: plan.outputSizeBytes,
+        allocKind: 0,
+        inputSlots: [gradSlot],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline,
+        bindings: [gradSlot, outSlot, paramsSlot],
+        gx: plan.dispatchX,
+        gy: plan.dispatchY,
+        gz: 1,
+      },
+    ],
+    outSlot,
   };
 }
 

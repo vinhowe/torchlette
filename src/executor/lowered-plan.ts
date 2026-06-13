@@ -81,6 +81,10 @@ interface LoweredNodeAction {
    *  (contiguous-prologue / ksplit) — uncovered, keeps record/replay.
    *  Geometry is shape/dtype-pure → invariant within a template. */
   cachedMatmulPlan?: import("../backend/webgpu/dispatch").BareMatmulPlan | string;
+  /** Stage-4 phase-3: input shapes captured at lowering for ops whose
+   *  generator can't derive them post-hoc (released multi-output inputs);
+   *  e.g. narrowBackward's grad dim size. Template-invariant. */
+  cachedInputShapes?: number[][];
 }
 
 /** A matmul + epilogue chain dispatch. */

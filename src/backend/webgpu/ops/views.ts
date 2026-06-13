@@ -695,6 +695,49 @@ export function narrow(
  * Backward for narrow: pad gradient back to original shape.
  * Writes grad into [start, start+length) along dim, zeros elsewhere.
  */
+/**
+ * Stage-4 plan/encode for narrowBackward (pad a narrowed grad back to the
+ * original length). Geometry is fully derivable from the grad SHAPE +
+ * dim/start/originalLength + dtype — no live buffer needed, so the stream
+ * generator computes it from the node (input shape + payload) post-hoc.
+ * Output ALLOC is resolveOutputBuffer (allocKind 0) with the grad as the
+ * aliasing input; binding order [grad, out, params].
+ */
+export function planNarrowBackward(
+  gradShape: number[],
+  dim: number,
+  start: number,
+  originalLength: number,
+  dtype: DType,
+): ElementwiseDirectPlan & { outShape: number[] } {
+  const outShape = gradShape.slice();
+  outShape[dim] = originalLength;
+  const outSize = sizeOf(outShape);
+  const bytesPerElement = dtypeBytes(dtype);
+  const outerSize = sizeOf(outShape.slice(0, dim));
+  const innerSize = sizeOf(outShape.slice(dim + 1));
+  const gradDimSize = gradShape[dim]; // = length from narrow
+  const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
+  const dispatch = compute2DDispatch(totalWorkgroups);
+  const use2D = dispatch.y > 1;
+  const gridSizeX = dispatch.x * WORKGROUP_SIZE;
+  const shader = narrowBackwardTileIR(
+    originalLength,
+    outSize,
+    dtype as "f32" | "f16" | "i32" | "u32",
+  );
+  const key = `narrowBackward:${originalLength}:${gradDimSize}:${start}:${outSize}:${dtype}:${use2D ? `2d:${gridSizeX}` : "1d"}`;
+  return {
+    key,
+    shader,
+    outputSizeBytes: outSize * bytesPerElement,
+    paramsData: params(outerSize, innerSize, gradDimSize, start),
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y,
+    outShape,
+  };
+}
+
 export function narrowBackward(
   grad: BackendTensor,
   dim: number,
@@ -702,43 +745,28 @@ export function narrowBackward(
   originalLength: number,
 ): BackendTensor {
   const gradTensor = ensureContiguous(asGPUTensor(grad));
-
-  const outShape = gradTensor.shape.slice();
-  outShape[dim] = originalLength;
-  const outSize = sizeOf(outShape);
   const dtype = gradTensor.dtype;
-  const bytesPerElement = dtypeBytes(dtype);
-
-  const outerSize = sizeOf(outShape.slice(0, dim));
-  const innerSize = sizeOf(outShape.slice(dim + 1));
-  const gradDimSize = gradTensor.shape[dim]; // = length from narrow
-  const outDimSize = originalLength;
-
-  const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
-  const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
-  const gridSizeX = dispatch.x * WORKGROUP_SIZE;
-
-  const shaderCode = narrowBackwardTileIR(
-    outDimSize,
-    outSize,
-    dtype as "f32" | "f16" | "i32" | "u32",
+  const plan = planNarrowBackward(
+    gradTensor.shape,
+    dim,
+    start,
+    originalLength,
+    dtype,
   );
-  const key = `narrowBackward:${outDimSize}:${gradDimSize}:${start}:${outSize}:${dtype}:${use2D ? `2d:${gridSizeX}` : "1d"}`;
 
   const outBuffer = dispatchElementwise({
-    key,
-    shader: shaderCode,
+    key: plan.key,
+    shader: plan.shader,
     inputs: [gradTensor.buffer],
-    outputSizeBytes: outSize * bytesPerElement,
-    params: params(outerSize, innerSize, gradDimSize, start),
-    dispatchX: dispatch.x,
-    dispatchY: dispatch.y,
+    outputSizeBytes: plan.outputSizeBytes,
+    params: plan.paramsData,
+    dispatchX: plan.dispatchX,
+    dispatchY: plan.dispatchY,
   });
 
   if (gradTensor !== asGPUTensor(grad)) destroyCopy(gradTensor);
 
-  return createTensor(outShape, outBuffer, undefined, 0, dtype);
+  return createTensor(plan.outShape, outBuffer, undefined, 0, dtype);
 }
 
 /**

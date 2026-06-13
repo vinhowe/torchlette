@@ -1517,6 +1517,22 @@ export async function executeLoweredPlan(
               action.cachedMatmulPlan = "plan-throw";
             }
           }
+
+          // Stage-4 phase-3: cache input SHAPES at lowering (inputs live) for
+          // ops whose generator geometry can't be derived post-hoc — e.g.
+          // narrowBackward needs its grad's dim size, but that grad is a
+          // released multi-output extra (attention dQ/dK/dV) at plan-build,
+          // and nodes carry no per-output shape metadata. Cheap (small arrays,
+          // once per template); shapes are template-invariant.
+          if (
+            action.kind === "sequential" &&
+            node.op === "narrowBackward" &&
+            action.cachedInputShapes === undefined
+          ) {
+            action.cachedInputShapes = backendInputs.map((t) =>
+              (t as { shape: number[] }).shape.slice(),
+            );
+          }
           break;
         }
 
