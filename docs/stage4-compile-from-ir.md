@@ -436,16 +436,65 @@ the backward plan consumes) are wrong → backward gets garbage/zero grads → t
 from step 1 (step-1 loss is right because it's the forward OUTPUT; step-1's opt
 already no-ops, so step 2 reads ~initial weights).
 
-Next: buffer-level trace of the forward plan's SAVED-ACTIVATION result slots —
-genResults marks them (count matches recorded, so they're in resultSlots and
-nominally excluded from planner packing), but the suspicion is a slot-
-CORRESPONDENCE error: `gen.nodeSlot[activationNode]` may name a slot that ISN'T
-where the generated stream actually WRITES that activation (e.g. an aliased/
-view slot), so the harvest reads a buffer that was repacked/overwritten while
-the true activation buffer is the one that should have been protected. Compare,
-per saved-activation node, gen.nodeSlot vs the slot its producing command
-writes, and the harvested buffer CONTENTS (generated vs recorded) for one
-activation across a step.
+**ISOLATION (2026-06-13, extensive — every structural hypothesis FALSIFIED).**
+Ground truth via `PRINT_RAW_GRAD`/`DEBUG_READSLOTS`/`DEBUG_HARVEST`: the
+backward grads are normal at step 0/1 (max ~2-8) then EXPLODE at step 2 (max
+1.8e10, leading zeros) → clipped to tiny garbage updates → loss sticks. Refined
+timeline: step-1 forward is the LOWERED recording execution (genPlan is BUILT
+after it), so **the genPlan's FIRST replay is step 2 — and it's wrong** (loss
+10.82 vs recorded 10.47); the recorded plan's first replay (also step 2) is
+correct. So it's not cross-step drift — the genPlan is simply wrong on replay.
+The wrong forward LOSS (a forward output, computed before backward) means the
+forward genPlan itself computes wrong, OR its loss-node harvest reads the wrong
+buffer.
+
+Build-time comparison of genPlan vs the recorded plan shows EVERYTHING matches:
+commands (gate), flat TAG order, slot count, slot KIND per result node
+(cutover-kind: 0 mismatches), result coverage (259/259), external-ref SET
+(cutover-ext: 101/101, 0 diff — same (planNodeIndex,inputIndex) pairs), and the
+forward's weight external slots resolve to the SAME buffers with the SAME
+storage progression as recorded. Falsified by direct test: discarded-plan
+release (NO_RELEASE), the memory planner (freezes under ARENA_LIVENESS=0),
+checkpointing (freezes under CHECKPOINT=0), and harvest-skip staleness
+(dbgHarvestSkipped==0 — node.result IS re-assigned fresh each step).
+
+So a generated plan that is structurally IDENTICAL to the recorded plan by
+every available measure still computes wrong on its first replay. Remaining
+suspects. The decisive content tests then RAN and settled it:
+- The loss node's gen result-slot CONTENT at step-2 replay is itself 10.82
+  (wrong) — so it's NOT a harvest-binding issue; the genPlan COMPUTES the wrong
+  loss into the slot.
+- The forward's WEIGHT slot content is BYTE-IDENTICAL between generated and
+  recorded at step 2 (slot30 b1 = -7.3291e-2 [0.009829,-0.01468,...] in both).
+
+**ROOT CAUSE LOCALIZED — wrong PARAMS DATA (element count), a gate blind spot.**
+Comparing the params-DATA multisets of genPlan vs the recorded plan (the gate
+compares DISPATCH by pipeline + workgroups + binding SLOTS, but NEVER the
+params/uniform DATA bytes) shows ~80 dispatches in the generated plan carry a
+length-1 params slot = **[2048] (= BATCH×SEQ = 8×256)** where the recorded plan
+has the correct element counts ([262144]×76, [6438912]×1, [32768]×2,
+[102926336]×1). Concretely: `node32 cast shape=[50304,128]` (6.4M elems) binds
+`params=[2048]`. The output buffer IS sized correctly (genfused/genparams
+output-byte checks pass) — only the per-dispatch element-COUNT uniform is
+2048 — so the kernel processes 2048 of N elements and leaves the rest garbage
+→ wrong forward → exploded grads (1.8e10) → optimizer corrupts weights → freeze.
+The gate is blind because it never diffs params DATA bytes (a THIRD gate hole
+after orphan slots and flat-order; ALL THREE should be closed: params-data,
+external-RESOLUTION, and orphan-slot checks).
+
+Flagged dispatches are in cast/contiguous/add/gather segments, BUT
+generateSequential's own check (`paramsData[0] === sizeOf(node.shape)` for every
+binary/unary/cast/contiguous it emits) and generateFused's output-size check
+BOTH pass — i.e. the standard generators emit correct params. So the [2048]
+slots come from a path those self-checks don't cover, OR a dispatch binds a
+params slot OTHER than the one its generator created (a slot-index/binding
+error). NEXT: trace exactly how node32's cast dispatch acquires a [2048] params
+slot — instrument every params-slot creation (value + the generator + node id)
+and find which one emits [2048] for a 6.4M-element node, or whether node32's
+DISPATCH binding points at the wrong (someone else's [2048]) params slot. That
+single trace pins the generator rule. (Toolbelt left in place behind
+TORCHLETTE_DEBUG_COMPILED/TORCHLETTE_DEBUG_GENPARAMS: cutover-params,
+cutover-2048nodes, cutover-castdump, genparams/gencontig/genfused.)
 
 ## Risks and mitigations
 - **Imperative-op long tail** (phase 3): mitigated by per-op fallback — no

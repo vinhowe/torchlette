@@ -1978,6 +1978,144 @@ export async function executeLoweredPlan(
                     .join(", ")}`
                 : ""),
           );
+          // CORRESPONDENCE CHECK: for each result node, compare the slot KIND
+          // in the recorded plan vs the generated plan. A computed saved
+          // activation must be "arena" in BOTH; if gen has it as external/
+          // params/persistent (an alias/input) while rec has "arena", the
+          // harvest reads the wrong (uncomputed) buffer → the freeze bug.
+          const recSlotKindByKey = new Map<string, string>();
+          for (const r of nodeResults)
+            recSlotKindByKey.set(
+              `${r.nodeIndex}:${r.outputIndex}`,
+              compiled.slots[r.slot]?.kind ?? "?",
+            );
+          const kindMismatches: string[] = [];
+          for (const r of genResults) {
+            const key = `${r.nodeIndex}:${r.outputIndex}`;
+            const recKind = recSlotKindByKey.get(key);
+            const genKind = gen.slots[r.slot]?.kind ?? "?";
+            if (recKind !== undefined && recKind !== genKind) {
+              kindMismatches.push(
+                `${key}=${planNodes[r.nodeIndex]?.op} rec=${recKind} gen=${genKind}`,
+              );
+            }
+          }
+          console.log(
+            `[cutover-kind] mismatches=${kindMismatches.length}` +
+              (kindMismatches.length
+                ? `\n  ${kindMismatches.slice(0, 12).join("\n  ")}`
+                : ""),
+          );
+          // EXTERNAL-RESOLUTION check: the gate compares external slots only by
+          // slot NUMBER (bijection), never by (planNodeIndex,inputIndex) — so a
+          // generator that picks different external refs than the recording is
+          // INVISIBLE to the gate but reads wrong inputs at replay. Compare the
+          // SET of (planNodeIndex:inputIndex) pairs assigned external slots.
+          const extSet = (ss: typeof gen.slots) => {
+            const s = new Set<string>();
+            for (const x of ss)
+              if (x.kind === "external")
+                s.add(`${x.planNodeIndex}:${x.inputIndex}`);
+            return s;
+          };
+          const ge = extSet(gen.slots);
+          const re = extSet(compiled.slots);
+          const onlyGen = [...ge].filter((k) => !re.has(k));
+          const onlyRec = [...re].filter((k) => !ge.has(k));
+          console.log(
+            `[cutover-ext] genExt=${ge.size} recExt=${re.size} onlyGen=${onlyGen.length} onlyRec=${onlyRec.length}` +
+              (onlyGen.length || onlyRec.length
+                ? `\n  onlyGen(8): ${onlyGen.slice(0, 8).join(", ")}\n  onlyRec(8): ${onlyRec.slice(0, 8).join(", ")}`
+                : ""),
+          );
+          // PARAMS-DATA check: the gate compares DISPATCH by pipeline + wg +
+          // binding SLOTS, but NOT the params/uniform DATA bytes — a generated
+          // dispatch with a wrong config (synthesized-metadata error) passes
+          // the gate yet computes garbage. Compare the params-data multisets.
+          const paramsBag = (ss: typeof gen.slots) => {
+            const m = new Map<string, number>();
+            for (const x of ss)
+              if (x.kind === "params") {
+                const u = new Uint32Array(
+                  (x.data as Uint32Array).buffer,
+                  (x.data as Uint32Array).byteOffset,
+                  (x.data as Uint32Array).length,
+                );
+                const k = `${u.length}:${Array.from(u).join(",")}`;
+                m.set(k, (m.get(k) ?? 0) + 1);
+              }
+            return m;
+          };
+          const gp = paramsBag(gen.slots);
+          const rp = paramsBag(compiled.slots);
+          const allKeys = new Set([...gp.keys(), ...rp.keys()]);
+          const pdiffs: string[] = [];
+          for (const k of allKeys) {
+            const g = gp.get(k) ?? 0;
+            const r = rp.get(k) ?? 0;
+            if (g !== r) pdiffs.push(`${k.slice(0, 60)} gen×${g} rec×${r}`);
+          }
+          console.log(
+            `[cutover-params] gen=${[...gp.values()].reduce((a, b) => a + b, 0)} rec=${[...rp.values()].reduce((a, b) => a + b, 0)} distinctDiffs=${pdiffs.length}` +
+              (pdiffs.length ? `\n  ${pdiffs.slice(0, 10).join("\n  ")}` : ""),
+          );
+          // Trace [2048] params slots to their SEGMENT node (the op that emitted
+          // the wrong-size config).
+          const is2048 = (slot: number) => {
+            const s = gen.slots[slot];
+            return (
+              s?.kind === "params" &&
+              (s.data as Uint32Array).length === 1 &&
+              (s.data as Uint32Array)[0] === 2048
+            );
+          };
+          const badNodes: Record<string, number> = {};
+          for (const segx of gen.segments) {
+            for (const c of segx.commands) {
+              if (c.tag === 1 /* DISPATCH */) {
+                if ((c.bindings as number[]).some(is2048)) {
+                  const op = planNodes[segx.nodeIndex]?.op ?? "?";
+                  badNodes[op] = (badNodes[op] ?? 0) + 1;
+                }
+              }
+            }
+          }
+          console.log(`[cutover-2048nodes] ${JSON.stringify(badNodes)}`);
+          // Dump ONE flagged cast segment in full: node shape + each binding's
+          // slot kind/data, to see what the [2048] params actually is.
+          for (const segx of gen.segments) {
+            if (planNodes[segx.nodeIndex]?.op !== "cast") continue;
+            const d = segx.commands.find(
+              (c) => c.tag === 1 && (c.bindings as number[]).some(is2048),
+            );
+            if (!d) continue;
+            const bind = (d as { bindings: number[] }).bindings;
+            console.log(
+              `[cutover-castdump] node${segx.nodeIndex} cast shape=${JSON.stringify(planNodes[segx.nodeIndex]?.shape)} bindings=[${bind
+                .map((s) => {
+                  const ss = gen.slots[s];
+                  const dat =
+                    ss?.kind === "params"
+                      ? `=[${Array.from(ss.data as Uint32Array)}]`
+                      : "";
+                  return `${s}:${ss?.kind}${dat}`;
+                })
+                .join(", ")}]`,
+            );
+            break;
+          }
+          // Which result nodes have size 262144 (the size that got collapsed to
+          // 2048)? → identifies the op class with the wrong generated config.
+          for (const target of [262144, 2048]) {
+            const ops: Record<string, number> = {};
+            for (const r of genResults) {
+              if (r.shape.reduce((a, b) => a * b, 1) === target) {
+                const op = planNodes[r.nodeIndex]?.op ?? "?";
+                ops[op] = (ops[op] ?? 0) + 1;
+              }
+            }
+            console.log(`[cutover-size${target}] ${JSON.stringify(ops)}`);
+          }
         }
         if (genOk) {
           const genPlan = buildCompiledPlanFromGenerated({

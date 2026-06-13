@@ -17,6 +17,7 @@
  * each sharing its spec/codegen with the imperative dispatcher so pipeline
  * identity resolves through the same caches.
  */
+import { ENV } from "../core/env";
 import {
   planBinaryDirect,
   planUnaryDirect,
@@ -558,6 +559,11 @@ function planContigCopy(
   } as unknown as WebGPUTensor;
   const cp = planContiguousDirect(meta);
   if (!cp) return "contig-chunked";
+  if (ENV.TORCHLETTE_DEBUG_GENPARAMS === "1") {
+    console.log(
+      `[gencontig] info.shape=${JSON.stringify(info.shape)}(${sizeOf(info.shape)}) strides=${JSON.stringify(info.strides)} paramsData=[${Array.from(cp.paramsData as Uint32Array)}]`,
+    );
+  }
   const pipeline = getPipeline(requireContext(), cp.key, cp.shader);
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
@@ -781,6 +787,14 @@ function generateSequential(
     );
   } else {
     plan = planUnaryDirect(node.op, ins[0]);
+  }
+  if (ENV.TORCHLETTE_DEBUG_GENPARAMS === "1" && plan) {
+    const pd = Array.from(plan.paramsData as Uint32Array);
+    if (pd[0] !== sizeOf(node.shape)) {
+      console.log(
+        `[genparams] ${node.op} outShape=${JSON.stringify(node.shape)}(${sizeOf(node.shape)}) paramsData=[${pd}] ins=${ins.map((m) => JSON.stringify(m.shape)).join(",")}`,
+      );
+    }
   }
   if (!plan) return "non-direct-route";
   // Resolve the pipeline through the SAME cache the dispatcher used (at
@@ -2391,6 +2405,17 @@ function generateFused(
     });
   } catch {
     return "plan-throw";
+  }
+
+  if (ENV.TORCHLETTE_DEBUG_GENPARAMS === "1") {
+    const outNode = planNodes[action.outputNodeIndex];
+    const expect = sizeOf(outNode.shape);
+    const got = (plan.outputs[0] as { bytes?: number }).bytes;
+    if (got !== undefined && got / 4 !== expect && got / 2 !== expect) {
+      console.log(
+        `[genfused] out ${outNode.op} shape=${JSON.stringify(outNode.shape)}(${expect}) plan.out0.bytes=${got} dispatchInsShapes=${dispatchInputs.map((d) => JSON.stringify(d.shape)).join(",")}`,
+      );
+    }
   }
 
   // Output slots: the donated out0 reuses the donated input's slot; allocated
