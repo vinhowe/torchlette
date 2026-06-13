@@ -145,6 +145,44 @@ Keep recording for WHAT to dispatch; replace the buffer assignment:
   (validated against recording by the phase-0 differential in CI); else
   record/replay as today. Coverage is a counter, not a cliff.
 
+### Phase 2 status (2026-06-13): PROOF POINT REACHED
+`src/executor/stream-generate.ts` generates the GpuCommand stream from the
+lowered plan; the executor's `TORCHLETTE_STREAM_GENERATE=1` hook diffs it
+against the recording. Diffing is **segment-aligned** (per-action, modulo a
+consistent slot bijection — the stream is slot-renaming-invariant, so
+raw-slot `diffStreams` is right only for record-vs-record determinism); a
+fully-covered plan adds a flat command-count assertion. Generators landed:
+data-source (tensorFromArray/zeros), binary/unary/cast/contiguous/gelu,
+sum (full reduction), unscaleGrad (volatile TAG_UNIFORM), stridedScatterCopy
+(in-place DMA), fused recipes (`planFusedKernel`, post-hoc donation
+detection), adam-batch (`planAdamStepDispatch` + `lookupPackedBuffers` +
+`planPackedGroups`, f16 variant), matmul-epilogue (`planTiledMatmul`
+standard path, reads the action's `cachedDispatchConfig`).
+
+**Proof point: the optimizer plan is FULLY GENERATED** — 439/439 actions,
+437/437 segments verified, flat 1746/1746 commands, zero divergences. The
+differential paid for itself en route: it caught a latent stale-`zeros`
+replay hazard, a recording-attribution bug (fused/epilogue actions
+inheriting the prior node's index), and a grid-normalization mismatch —
+all at build time, never in a loss curve.
+
+Forward 256/289, cross-entropy plan 89/91, backward 255/414.
+
+**The phase-2/phase-3 boundary (the line, characterized):** everything
+DECLARATIVE or carrying a lowering-time config (matmul-epilogue's
+`cachedDispatchConfig`) generates. The remainder — bare `op:matmul` (67),
+fused LayerNorm/attention/cross-entropy, gather, narrowBackward — bails with
+`released-input`: their inputs are **liveness-released by plan-build time**,
+so geometry that depends on live input strides (matmul transpose detection)
+or op-internal workspaces cannot be reconstructed at generation. matmul-
+epilogue worked *because* its geometry was captured at lowering (when inputs
+were live) and cached. That is exactly phase 3's mandate, now concrete:
+capture each imperative op's resolved plan at lowering and cache it where the
+generator reads it. A bare-matmul generator was built, measured (100%
+`released-input`), and reverted as dead code — `planTiledMatmul`/
+`planBinaryDirect`/`planUnaryDirect`/`planCastDirect`/`planContiguousDirect`
+plan-cores were kept (the dispatchers consume them; the splits are sound).
+
 ### Phase 3 — Planning interfaces for imperative ops
 - matmul (tile config selection, K-split temps, epilogues), attention
   (workspaces, D-precompute), fused LN/CE (partials), adamStep/packed.
@@ -155,6 +193,15 @@ Keep recording for WHAT to dispatch; replace the buffer assignment:
 - adamStep's config payload becomes planner uniform data → the TAG_UNIFORM
   per-op registry dies; with foreach default (unblocked by phase 1), the
   mega-op itself can go.
+- **Concrete entry point (from the phase-2 boundary):** the unifying need is
+  capturing resolved geometry AT LOWERING TIME (inputs live) and caching it
+  where the generator reads it post-hoc. matmul-epilogue already does this
+  via `cachedDispatchConfig`; bare matmul has no per-action object (it's a
+  `sequential` action) → cache on the lazy node (node-keyed plan cache) from
+  the matmul op handler's first live execution. First increment: bare-matmul
+  node plan-cache (covers 67 matmuls, reuses `planTiledMatmul`); then the
+  same mechanism for the fused LN/attention/CE kernels (their plan() also
+  declares the op-internal workspace temps).
 
 ### Phase 4 — Deletions and dividends
 - Delete: record* hooks (recorder kept only as the CI cross-check), the
