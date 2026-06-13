@@ -215,6 +215,50 @@ export function gather(
 // ScatterAdd
 // ============================================================================
 
+/**
+ * Stage-4 plan/encode for the DIRECT scatterAdd path. Geometry from
+ * a.shape (=out) + src.shape + dim + index dtype. The op is ALLOC(out,
+ * allocKind 0, [a,index,src]) + COPY(a→out) + DISPATCH[index,src,out,params]
+ * (the copy seeds the accumulator — recorded, replayed). Null on chunked.
+ */
+export function planScatterAddDirect(
+  inputShape: number[],
+  srcShape: number[],
+  dim: number,
+  indexDtype: DType,
+): {
+  key: string;
+  shader: string;
+  paramsData: Uint32Array;
+  dispatchX: number;
+  dispatchY: number;
+  outShape: number[];
+  outputBytes: number;
+} | null {
+  const ctx = requireContext();
+  const outSize = sizeOf(inputShape);
+  if (outSize * F32_BYTES > (ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024)) {
+    return null; // chunked
+  }
+  if (indexDtype !== "f32" && indexDtype !== "i32" && indexDtype !== "u32") {
+    return null;
+  }
+  const srcSize = sizeOf(srcShape);
+  const dispatch = compute2DDispatch(Math.ceil(srcSize / WORKGROUP_SIZE));
+  const use2D = dispatch.y > 1;
+  const shader = scatterAddTileIR(inputShape, srcShape, dim, indexDtype);
+  const key = `scatterAdd:${inputShape.join(",")}:${srcShape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
+  return {
+    key,
+    shader,
+    paramsData: params(srcSize),
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y,
+    outShape: inputShape.slice(),
+    outputBytes: outSize * F32_BYTES,
+  };
+}
+
 export function scatterAdd(
   a: BackendTensor,
   index: BackendTensor,
@@ -263,38 +307,56 @@ export function scatterAdd(
     );
   }
 
-  // Generate shader via tile-IR (both direct and chunked paths)
-  const code = chunked
-    ? chunkedScatterAddTileIR(inputShape, tensorSrc.shape, dim, indexDtype)
-    : scatterAddTileIR(inputShape, tensorSrc.shape, dim, indexDtype);
-
-  const keyPrefix = chunked ? "scatterAddChunked" : "scatterAdd";
-  const pipelineKey = `${keyPrefix}:${inputShape.join(",")}:${tensorSrc.shape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
-  const pipeline = getPipeline(ctx, pipelineKey, code);
-
-  // Copy input to output (both paths need this)
-  const outBuffer = chunked
-    ? createTrackedBuffer(ctx.device, {
-        size: outSize * F32_BYTES,
-        usage:
-          GPUBufferUsage.STORAGE |
-          GPUBufferUsage.COPY_SRC |
-          GPUBufferUsage.COPY_DST,
-      })
-    : resolveOutputBuffer(ctx.device, outSize * F32_BYTES, [
-        tensorA.buffer,
-        tensorIndex.buffer,
-        tensorSrc.buffer,
-      ]);
-
-  {
+  // --- Direct path — single-sourced with the stream generator. ---
+  if (!chunked) {
+    const plan = planScatterAddDirect(inputShape, tensorSrc.shape, dim, indexDtype);
+    if (!plan) throw new Error("scatterAdd: direct path but planScatterAddDirect null");
+    const pipeline = getPipeline(ctx, plan.key, plan.shader);
+    const outBuffer = resolveOutputBuffer(ctx.device, plan.outputBytes, [
+      tensorA.buffer,
+      tensorIndex.buffer,
+      tensorSrc.buffer,
+    ]);
     // scatterAdd accumulates: out = copy(a); out[idx] += src. The kernel ADDS
     // onto the copied content, so this copy is INTRA-PLAN and MUST be replayed
     // by the compiled plan — otherwise `out` keeps the previous replay's result
-    // and the grad inflates +1x per step (embedding-grad accumulation bug). Use
-    // the recorded-copy helper. (Chunked path uses createTrackedBuffer for out,
-    // which is untracked → the executor invalidates the compiled plan → lowered
-    // path, so the standalone branch needs no recording.)
+    // and the grad inflates +1x per step (embedding-grad accumulation bug).
+    const enc = getSharedEncoderInstance();
+    if (enc) {
+      recordedCopyBufferToBuffer(enc, tensorA.buffer, 0, outBuffer, 0, plan.outputBytes);
+    } else {
+      const cmdEnc = ctx.device.createCommandEncoder();
+      cmdEnc.copyBufferToBuffer(tensorA.buffer, 0, outBuffer, 0, plan.outputBytes);
+      submitOrCollect(cmdEnc.finish());
+    }
+    const uniformBuf = createParamsBuffer(ctx.device, plan.paramsData);
+    const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
+      tensorIndex.buffer,
+      tensorSrc.buffer,
+      outBuffer,
+      uniformBuf,
+    ]);
+    dispatchComputePass(pipeline, bindGroup, plan.dispatchX, plan.dispatchY);
+    releaseParamsBuffer(uniformBuf);
+    return createTensor(plan.outShape, outBuffer);
+  }
+
+  // Generate shader for the chunked path.
+  const code = chunkedScatterAddTileIR(inputShape, tensorSrc.shape, dim, indexDtype);
+  const pipelineKey = `scatterAddChunked:${inputShape.join(",")}:${tensorSrc.shape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
+  const pipeline = getPipeline(ctx, pipelineKey, code);
+
+  // Chunked uses createTrackedBuffer for out (untracked → the executor
+  // invalidates the compiled plan → lowered path), so the seed copy below
+  // needs no recording.
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: outSize * F32_BYTES,
+    usage:
+      GPUBufferUsage.STORAGE |
+      GPUBufferUsage.COPY_SRC |
+      GPUBufferUsage.COPY_DST,
+  });
+  {
     const enc = getSharedEncoderInstance();
     if (enc) {
       recordedCopyBufferToBuffer(enc, tensorA.buffer, 0, outBuffer, 0, outSize * F32_BYTES);
@@ -303,20 +365,6 @@ export function scatterAdd(
       cmdEnc.copyBufferToBuffer(tensorA.buffer, 0, outBuffer, 0, outSize * F32_BYTES);
       submitOrCollect(cmdEnc.finish());
     }
-  }
-
-  // --- Direct path ---
-  if (!chunked) {
-    const uniformBuf = createParamsBuffer(ctx.device, params(srcSize));
-    const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
-      tensorIndex.buffer,
-      tensorSrc.buffer,
-      outBuffer,
-      uniformBuf,
-    ]);
-    dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
-    releaseParamsBuffer(uniformBuf);
-    return createTensor(outShape, outBuffer);
   }
 
   // --- Chunked path ---

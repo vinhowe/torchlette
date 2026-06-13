@@ -27,7 +27,10 @@ import {
   planNarrowBackward,
 } from "../backend/webgpu/ops/views";
 import { planFullReductionDispatch } from "../backend/webgpu/ops/reductions";
-import { planGatherDirect } from "../backend/webgpu/ops/gather-scatter";
+import {
+  planGatherDirect,
+  planScatterAddDirect,
+} from "../backend/webgpu/ops/gather-scatter";
 import {
   planLayerNormBackwardGradWeightBias,
   planLayerNormBackwardGradXDispatch,
@@ -503,6 +506,8 @@ function generateSequential(
     return generateLayerNormForward(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "gather")
     return generateGather(node, slots, resolveRefSlot);
+  if (node.op === "scatterAdd")
+    return generateScatterAdd(node, slots, resolveRefSlot);
   if (node.op === "fusedLayerNormBackwardGradX")
     return generateLayerNormGradX(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "fusedLayerNormBackwardGradWeightBias")
@@ -721,6 +726,88 @@ function refShapeDtype(
     return { shape: ref.node.shape, dtype: (ref.node.dtype ?? "f32") as DType };
   }
   return undefined;
+}
+
+/** Contiguous-view ops whose logical node.shape == physical layout: a flat
+ *  kernel binding the shared base buffer reads them correctly. Strided views
+ *  (narrow/transpose/slice/expand) are deliberately excluded. */
+const CONTIGUOUS_VIEW_OPS = new Set(["reshape", "view", "flatten", "squeeze", "unsqueeze"]);
+
+/** Logical shape/dtype for a released contiguous-view producer (oi 0). Returns
+ *  undefined for non-views, strided views, or multi-output extras. */
+function contiguousViewShapeDtype(
+  ref: LazyIRNode["inputs"][number],
+): { shape: number[]; dtype: DType } | undefined {
+  if (ref.kind === "scalar" || ref.kind === "materialized") return undefined;
+  if ((ref.outputIndex ?? 0) !== 0) return undefined;
+  if (!CONTIGUOUS_VIEW_OPS.has(ref.node.op)) return undefined;
+  return { shape: ref.node.shape, dtype: (ref.node.dtype ?? "f32") as DType };
+}
+
+/** scatterAdd (embedding backward): ALLOC(out,kind0,[a,index,src]) +
+ *  COPY(a→out) + DISPATCH[index,src,out,params]. The copy seeds the
+ *  accumulator (recorded, replayed — the +1x-grad bug class). Geometry from
+ *  a.shape(=out) + src.shape + payload{dim} + index dtype. Chunked bails;
+ *  if index/src needed a contiguous copy the recording diverges (caught). */
+function generateScatterAdd(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 3) return "arity";
+  const cfg = node.payload as { dim?: number } | undefined;
+  if (!cfg || cfg.dim == null) return "payload";
+  const aSlot = resolveRefSlot(node.inputs[0]);
+  const idxSlot = resolveRefSlot(node.inputs[1]);
+  const srcSlot = resolveRefSlot(node.inputs[2]);
+  if (aSlot === undefined || idxSlot === undefined || srcSlot === undefined) {
+    return "untracked-input";
+  }
+  const a = refShapeDtype(node.inputs[0]);
+  const idx = refShapeDtype(node.inputs[1]);
+  // src (the indexed grad) is typically a released `reshape` view of the
+  // upstream grad. A contiguous-view's logical node.shape/dtype ARE the
+  // geometry scatterAdd needs (the buffer binding comes from srcSlot, resolved
+  // above); refShapeDtype skips all VIEW_OPS, so derive it here for the
+  // contiguous-reshape class only — strided views (narrow/transpose) would
+  // mislead the flat-indexed kernel and must keep bailing.
+  const src = refShapeDtype(node.inputs[2]) ?? contiguousViewShapeDtype(node.inputs[2]);
+  if (!a || !idx || !src) return "no-shape";
+  const plan = planScatterAddDirect(a.shape, src.shape, cfg.dim, idx.dtype);
+  if (!plan) return "chunked";
+  const pipeline = getPipeline(requireContext(), plan.key, plan.shader);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const paramsSlot = slots.length;
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData });
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: plan.outputBytes,
+        allocKind: 0,
+        inputSlots: [aSlot, idxSlot, srcSlot],
+      },
+      {
+        tag: TAG_COPY,
+        src: aSlot,
+        srcOffset: 0,
+        dst: outSlot,
+        dstOffset: 0,
+        bytes: plan.outputBytes,
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline,
+        bindings: [idxSlot, srcSlot, outSlot, paramsSlot],
+        gx: plan.dispatchX,
+        gy: plan.dispatchY,
+        gz: 1,
+      },
+    ],
+    outSlot,
+  };
 }
 
 /** gather: ALLOC(out, kind 0, [a,index]) + DISPATCH [a,index,out,params].
