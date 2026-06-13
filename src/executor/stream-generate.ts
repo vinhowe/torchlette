@@ -29,6 +29,7 @@ import {
 import {
   planDimReductionDispatch,
   planFullReductionDispatch,
+  planMeanDivDispatch,
 } from "../backend/webgpu/ops/reductions";
 import {
   planGatherDirect,
@@ -554,6 +555,8 @@ function generateSequential(
     return generateCrossEntropyForward(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "fusedCrossEntropyBackward")
     return generateCrossEntropyBackward(node, slots, resolveRefSlot, bufferSlot);
+  if (node.op === "mean")
+    return generateMean(node, slots, resolveRefSlot, bufferSlot);
   const wgslOp = BINARY_OPS.get(node.op);
   const isUnary =
     UNARY_OPS.has(node.op) ||
@@ -846,6 +849,89 @@ function generateDimReduction(
         gy: plan.grid[1],
         gz: plan.grid[2],
       },
+    ],
+    outSlot,
+  };
+}
+
+/** mean = sum (full or dim) ÷ count, as backend.mean dispatches it: a sum
+ *  through the cached reduction dispatcher into an intermediate buffer, then a
+ *  meanDiv dispatch (cached "meanDiv", count in a UNIFORM not a buffer) → ONE
+ *  node, TWO ALLOC+dispatch pairs recorded under it. The user-epilogue mean
+ *  path (meanWithEpilogue, fresh invCount buffer) is a different op and not
+ *  reached here. Input must be contiguous (sum forces it otherwise). */
+function generateMean(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 1) return "arity";
+  const payload = node.payload as
+    | { dim?: number | number[] | null; keepdim?: boolean }
+    | undefined;
+  const ref = node.inputs[0];
+  if (ref.kind === "scalar") return "scalar-operand";
+  const inSlot = resolveRefSlot(ref);
+  if (inSlot === undefined) return "untracked-producer";
+  const storage =
+    ref.kind === "materialized"
+      ? ref.storage
+      : ((ref.outputIndex ?? 0) === 0
+          ? ref.node.result
+          : ref.node.results?.[ref.outputIndex ?? 0]);
+  let inShape: number[];
+  if (storage) {
+    const t = storage.backendTensor as WebGPUTensor;
+    if (!t.isContiguous) return "non-contiguous";
+    inShape = t.shape;
+  } else {
+    const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
+    if (!sd) return "no-shape";
+    inShape = sd.shape;
+  }
+  const outSize = sizeOf(node.shape);
+  const dims =
+    payload?.dim == null
+      ? null
+      : (Array.isArray(payload.dim) ? payload.dim : [payload.dim]).map((d) =>
+          d < 0 ? d + inShape.length : d,
+        );
+  const count =
+    dims == null ? sizeOf(inShape) : dims.reduce((acc, d) => acc * inShape[d], 1);
+
+  // --- sum part (cached full or dim reduction) ---
+  let sumPlan: TileKernelPlan;
+  let sumOutBytes: number;
+  if (dims == null) {
+    const inSize = sizeOf(inShape);
+    if (inSize * 4 > 128 * 1024 * 1024) return "chunked";
+    sumPlan = planFullReductionDispatch("sum", inSize);
+    sumOutBytes = 4;
+  } else {
+    const p = planDimReductionDispatch("sum", inShape, payload!.dim!, payload?.keepdim ?? false);
+    if (!p) return "all-dims-or-epilogue";
+    sumPlan = p;
+    sumOutBytes = outSize * 4;
+  }
+  const sumSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const sumBindings = tilePlanBindings(sumPlan, { input: inSlot, out: sumSlot }, bufferSlot);
+  if (!sumBindings) return "config-missing";
+
+  // --- meanDiv part (cached "meanDiv", size+count uniforms) ---
+  const divPlan = planMeanDivDispatch(outSize, count);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const divBindings = tilePlanBindings(divPlan, { input: sumSlot, out: outSlot }, bufferSlot);
+  if (!divBindings) return "config-missing";
+
+  return {
+    commands: [
+      { tag: TAG_ALLOC, slot: sumSlot, bytes: sumOutBytes, allocKind: 0, inputSlots: [inSlot] },
+      { tag: TAG_DISPATCH, pipeline: sumPlan.pipeline, bindings: sumBindings, gx: sumPlan.grid[0], gy: sumPlan.grid[1], gz: sumPlan.grid[2] },
+      { tag: TAG_ALLOC, slot: outSlot, bytes: outSize * 4, allocKind: 0, inputSlots: [sumSlot] },
+      { tag: TAG_DISPATCH, pipeline: divPlan.pipeline, bindings: divBindings, gx: divPlan.grid[0], gy: divPlan.grid[1], gz: divPlan.grid[2] },
     ],
     outSlot,
   };

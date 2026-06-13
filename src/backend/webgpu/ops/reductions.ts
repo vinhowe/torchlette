@@ -419,6 +419,16 @@ export function planFullReductionDispatch(
   ).plan({ size });
 }
 
+/** Stage-4 plan/encode: the meanDiv (sum→÷count) dispatch plan, from the SAME
+ *  cached dispatcher mean() uses. Both uniforms (size, count) are shape-derived
+ *  constants, so the config buffer is stable — no volatile repack needed. */
+export function planMeanDivDispatch(
+  size: number,
+  count: number,
+): import("../tile-dispatch").TileKernelPlan {
+  return getCachedDispatcher("meanDiv", makeMeanDivSpec).plan({ size, count });
+}
+
 // ============================================================================
 // Sum Full Reduction Chunked
 // ============================================================================
