@@ -207,6 +207,36 @@ export function dispatchCrossEntropyBackward(
 }
 
 /**
+ * Stage-4 plan/encode: forward CE dispatch plan, derived from the SAME
+ * module-level cached dispatcher dispatchCrossEntropyForward() uses (shared
+ * config cache → shared config-buffer identity for stream generation).
+ */
+export function planCrossEntropyForwardDispatch(
+  batchSize: number,
+  vocabSize: number,
+  ignoreIndex = -100,
+): import("./tile-dispatch").TileKernelPlan {
+  return ceFwdTileKernel.plan({
+    batch_size: batchSize,
+    vocab_size: vocabSize,
+    ignore_index: ignoreIndex,
+  });
+}
+
+/** Stage-4 plan/encode: backward CE dispatch plan (same cached dispatcher). */
+export function planCrossEntropyBackwardDispatch(
+  batchSize: number,
+  vocabSize: number,
+  ignoreIndex = -100,
+): import("./tile-dispatch").TileKernelPlan {
+  return ceBwdTileKernel.plan({
+    batch_size: batchSize,
+    vocab_size: vocabSize,
+    ignore_index: ignoreIndex,
+  });
+}
+
+/**
  * Reset all module-local mutable state (pipeline cache, config buffer cache).
  */
 export function resetCrossEntropyKernelState(): void {

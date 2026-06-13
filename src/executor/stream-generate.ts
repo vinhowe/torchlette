@@ -39,6 +39,10 @@ import {
   planLayerNormBackwardGradXDispatch,
   planLayerNormForwardDispatch,
 } from "../backend/webgpu/layernorm-kernel";
+import {
+  planCrossEntropyBackwardDispatch,
+  planCrossEntropyForwardDispatch,
+} from "../backend/webgpu/cross-entropy-kernel";
 import { planFusedKernel } from "../backend/webgpu/fusion-dispatch";
 import {
   lookupKSplitTempBuffer,
@@ -545,6 +549,10 @@ function generateSequential(
     return generateLayerNormGradWB(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "narrowBackward")
     return generateNarrowBackward(node, slots, resolveRefSlot, cachedInputShapes);
+  if (node.op === "fusedCrossEntropyForward")
+    return generateCrossEntropyForward(node, slots, resolveRefSlot, bufferSlot);
+  if (node.op === "fusedCrossEntropyBackward")
+    return generateCrossEntropyBackward(node, slots, resolveRefSlot, bufferSlot);
   const wgslOp = BINARY_OPS.get(node.op);
   const isUnary =
     UNARY_OPS.has(node.op) ||
@@ -1046,6 +1054,122 @@ function generateGather(
         gy: plan.dispatchY,
         gz: 1,
       },
+    ],
+    outSlot,
+  };
+}
+
+/** Resolve an input that the kernel reads as a CONTIGUOUS buffer. Bails when
+ *  the input is live-but-non-contiguous (the op would insert an uncaptured
+ *  asContiguous copy) or a released non-derivable view; a released non-view /
+ *  contiguous-view producer is contiguous by construction. Returns the slot. */
+function resolveContiguousInputSlot(
+  ref: LazyIRNode["inputs"][number],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+): Slot | string {
+  if (ref.kind === "scalar") return "scalar-operand";
+  const slot = resolveRefSlot(ref);
+  if (slot === undefined) return "untracked-input";
+  const storage =
+    ref.kind === "materialized"
+      ? ref.storage
+      : ((ref.outputIndex ?? 0) === 0
+          ? ref.node.result
+          : ref.node.results?.[ref.outputIndex ?? 0]);
+  if (storage) {
+    if (!(storage.backendTensor as WebGPUTensor).isContiguous) return "non-contiguous";
+  } else if (!(refShapeDtype(ref) ?? contiguousViewShapeDtype(ref))) {
+    return "no-storage";
+  }
+  return slot;
+}
+
+/** fusedCrossEntropyForward: ALLOC(loss [B], kind 0) + one tile dispatch
+ *  [logits, targets, loss, config] via the module-level cached ceFwd dispatcher
+ *  (planCrossEntropyForwardDispatch). Geometry is the payload config
+ *  {batchSize, vocabSize, ignoreIndex} — no shape derivation. Targets must be
+ *  i32/u32 (else ensureI32Targets inserts an uncaptured cast) and logits
+ *  contiguous (else asContiguous inserts an uncaptured copy). */
+function generateCrossEntropyForward(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 2) return "arity";
+  const cfg = node.payload as
+    | { batchSize?: number; vocabSize?: number; ignoreIndex?: number }
+    | undefined;
+  if (!cfg || cfg.batchSize == null || cfg.vocabSize == null) return "payload";
+  const logitsSlot = resolveContiguousInputSlot(node.inputs[0], resolveRefSlot);
+  if (typeof logitsSlot === "string") return logitsSlot;
+  const targetsSlot = resolveRefSlot(node.inputs[1]);
+  if (targetsSlot === undefined) return "untracked-input";
+  const tgt = refShapeDtype(node.inputs[1]);
+  if (!tgt) return "no-shape";
+  if (tgt.dtype !== "i32" && tgt.dtype !== "u32") return "targets-not-i32";
+  const plan = planCrossEntropyForwardDispatch(
+    cfg.batchSize,
+    cfg.vocabSize,
+    cfg.ignoreIndex ?? -100,
+  );
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const bindings = tilePlanBindings(
+    plan,
+    { logits: logitsSlot, targets: targetsSlot, loss: outSlot },
+    bufferSlot,
+  );
+  if (!bindings) return "config-missing";
+  return {
+    commands: [
+      { tag: TAG_ALLOC, slot: outSlot, bytes: cfg.batchSize * 4, allocKind: 1, inputSlots: [] },
+      { tag: TAG_DISPATCH, pipeline: plan.pipeline, bindings, gx: plan.grid[0], gy: plan.grid[1], gz: plan.grid[2] },
+    ],
+    outSlot,
+  };
+}
+
+/** fusedCrossEntropyBackward: ALLOC(grad_logits [B,V], kind 0) + one tile
+ *  dispatch [logits, targets, grad_output, grad_logits, config] via the cached
+ *  ceBwd dispatcher. Same guards as forward, plus grad_output contiguous. */
+function generateCrossEntropyBackward(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 3) return "arity";
+  const cfg = node.payload as
+    | { batchSize?: number; vocabSize?: number; ignoreIndex?: number }
+    | undefined;
+  if (!cfg || cfg.batchSize == null || cfg.vocabSize == null) return "payload";
+  const logitsSlot = resolveContiguousInputSlot(node.inputs[0], resolveRefSlot);
+  if (typeof logitsSlot === "string") return logitsSlot;
+  const targetsSlot = resolveRefSlot(node.inputs[1]);
+  if (targetsSlot === undefined) return "untracked-input";
+  const tgt = refShapeDtype(node.inputs[1]);
+  if (!tgt) return "no-shape";
+  if (tgt.dtype !== "i32" && tgt.dtype !== "u32") return "targets-not-i32";
+  const gradSlot = resolveContiguousInputSlot(node.inputs[2], resolveRefSlot);
+  if (typeof gradSlot === "string") return gradSlot;
+  const plan = planCrossEntropyBackwardDispatch(
+    cfg.batchSize,
+    cfg.vocabSize,
+    cfg.ignoreIndex ?? -100,
+  );
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const bindings = tilePlanBindings(
+    plan,
+    { logits: logitsSlot, targets: targetsSlot, grad_output: gradSlot, grad_logits: outSlot },
+    bufferSlot,
+  );
+  if (!bindings) return "config-missing";
+  return {
+    commands: [
+      { tag: TAG_ALLOC, slot: outSlot, bytes: cfg.batchSize * cfg.vocabSize * 4, allocKind: 1, inputSlots: [] },
+      { tag: TAG_DISPATCH, pipeline: plan.pipeline, bindings, gx: plan.grid[0], gy: plan.grid[1], gz: plan.grid[2] },
     ],
     outSlot,
   };
