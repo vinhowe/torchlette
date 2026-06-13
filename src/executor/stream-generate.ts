@@ -61,6 +61,7 @@ import {
   planPackedGroups,
 } from "../optim/packed-dispatch";
 import { getInputStorage } from "./op-dispatch";
+import { lookupScalarStorage } from "./scalar-table";
 import { planUnscaleGradDispatch } from "../backend/webgpu/unscale-kernel";
 import type { TileKernelPlan } from "../backend/webgpu/tile-dispatch";
 import { requireContext } from "../backend/webgpu/gpu-context";
@@ -564,8 +565,25 @@ function generateSequential(
   if (isUnary && node.inputs.length !== 1) return "arity";
   const ins: WebGPUTensor[] = [];
   const inSlots: Slot[] = [];
+  // Aliasing candidates for the output ALLOC: only POOLABLE operands. Scalar-
+  // table buffers are persistent and resolveOutputBuffer excludes them, so
+  // they must NOT appear in the recorded ALLOC's inputSlots (caught by diff).
+  const aliasInSlots: Slot[] = [];
   for (const ref of node.inputs) {
-    if (ref.kind === "scalar") return "scalar-operand";
+    if (ref.kind === "scalar") {
+      // Scalar operand: resolves through the plan's scalar table to a
+      // PERSISTENT buffer (stable identity; the executor refreshes its value
+      // from the current step before execution — so it binds as a persistent
+      // slot, not a stream write). The legacy CPU/non-f32 fallback path
+      // (lookupScalarStorage miss) materializes a fresh full([],v) and isn't
+      // generatable — bail.
+      const sh = lookupScalarStorage(ref);
+      if (!sh) return "scalar-no-table";
+      const t = sh.backendTensor as WebGPUTensor;
+      ins.push(t);
+      inSlots.push(bufferSlot(gpuBuffer(t), "persistent"));
+      continue;
+    }
     // Tensor METADATA (shape/strides/offset/dtype) comes from the storage
     // when it still exists. Liveness may have RELEASED an intermediate's
     // result before plan-build: for NON-VIEW producers the output layout is
@@ -615,6 +633,7 @@ function generateSequential(
     if (slot === undefined) return "untracked-producer";
     ins.push(meta);
     inSlots.push(slot);
+    aliasInSlots.push(slot);
   }
   let plan;
   if (wgslOp) {
@@ -659,7 +678,9 @@ function generateSequential(
         slot: outSlot,
         bytes: plan.outputSizeBytes,
         allocKind: 0,
-        inputSlots: inSlots,
+        // Only poolable operands are aliasing candidates; scalar-table buffers
+        // are persistent and excluded by resolveOutputBuffer.
+        inputSlots: aliasInSlots,
       },
       {
         tag: TAG_DISPATCH,
