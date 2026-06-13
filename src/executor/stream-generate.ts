@@ -27,6 +27,7 @@ import {
   planNarrowBackward,
 } from "../backend/webgpu/ops/views";
 import { planFullReductionDispatch } from "../backend/webgpu/ops/reductions";
+import { planGatherDirect } from "../backend/webgpu/ops/gather-scatter";
 import {
   planLayerNormBackwardGradWeightBias,
   planLayerNormBackwardGradXDispatch,
@@ -500,6 +501,8 @@ function generateSequential(
     return generateScatterCopyDMA(node, resolveRefSlot);
   if (node.op === "fusedLayerNormForward")
     return generateLayerNormForward(node, slots, resolveRefSlot, bufferSlot);
+  if (node.op === "gather")
+    return generateGather(node, slots, resolveRefSlot);
   if (node.op === "fusedLayerNormBackwardGradX")
     return generateLayerNormGradX(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "fusedLayerNormBackwardGradWeightBias")
@@ -692,6 +695,76 @@ function generateSumFull(
         gx: plan.grid[0],
         gy: plan.grid[1],
         gz: plan.grid[2],
+      },
+    ],
+    outSlot,
+  };
+}
+
+/** Resolve a ref's [shape, dtype] from live storage, else the producer
+ *  node (non-view) — for ops whose geometry needs an input's shape/dtype. */
+function refShapeDtype(
+  ref: LazyIRNode["inputs"][number],
+): { shape: number[]; dtype: DType } | undefined {
+  if (ref.kind === "scalar") return undefined;
+  if (ref.kind === "materialized") {
+    const t = ref.storage.backendTensor as WebGPUTensor;
+    return { shape: t.shape, dtype: (t.dtype as DType) ?? "f32" };
+  }
+  const oi = ref.outputIndex ?? 0;
+  const storage = oi === 0 ? ref.node.result : ref.node.results?.[oi];
+  if (storage) {
+    const t = storage.backendTensor as WebGPUTensor;
+    return { shape: t.shape, dtype: (t.dtype as DType) ?? "f32" };
+  }
+  if (oi === 0 && !VIEW_OPS.has(ref.node.op)) {
+    return { shape: ref.node.shape, dtype: (ref.node.dtype ?? "f32") as DType };
+  }
+  return undefined;
+}
+
+/** gather: ALLOC(out, kind 0, [a,index]) + DISPATCH [a,index,out,params].
+ *  Geometry from a.shape + index.shape/dtype + payload {dim}. Single output,
+ *  no copy. Chunked (table > maxBindingSize) bails. */
+function generateGather(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 2) return "arity";
+  const cfg = node.payload as { dim?: number } | undefined;
+  if (!cfg || cfg.dim == null) return "payload";
+  const aRef = node.inputs[0];
+  const idxRef = node.inputs[1];
+  const aSlot = resolveRefSlot(aRef);
+  const idxSlot = resolveRefSlot(idxRef);
+  if (aSlot === undefined || idxSlot === undefined) return "untracked-input";
+  const a = refShapeDtype(aRef);
+  const idx = refShapeDtype(idxRef);
+  if (!a || !idx) return "no-shape";
+  const plan = planGatherDirect(a.shape, idx.shape, cfg.dim, idx.dtype);
+  if (!plan) return "chunked";
+  const pipeline = getPipeline(requireContext(), plan.key, plan.shader);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const paramsSlot = slots.length;
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData });
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: plan.outputBytes,
+        allocKind: 0,
+        inputSlots: [aSlot, idxSlot],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline,
+        bindings: [aSlot, idxSlot, outSlot, paramsSlot],
+        gx: plan.dispatchX,
+        gy: plan.dispatchY,
+        gz: 1,
       },
     ],
     outSlot,

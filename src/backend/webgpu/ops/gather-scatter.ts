@@ -41,6 +41,53 @@ import {
 // Gather
 // ============================================================================
 
+/**
+ * Stage-4 plan/encode for the DIRECT gather path (no chunking). Geometry is
+ * derivable from a.shape + index.shape + dim + index dtype — the stream
+ * generator computes it from the node post-hoc (a = embedding table, index =
+ * token ids; both live at lowering, contiguous). Returns null on the chunked
+ * route (table > maxBindingSize). Binding order [a, index, out, params];
+ * output is resolveOutputBuffer (allocKind 0, inputs [a, index]).
+ */
+export function planGatherDirect(
+  inputShape: number[],
+  indexShape: number[],
+  dim: number,
+  indexDtype: DType,
+): {
+  key: string;
+  shader: string;
+  paramsData: Uint32Array;
+  dispatchX: number;
+  dispatchY: number;
+  outShape: number[];
+  outputBytes: number;
+} | null {
+  const ctx = requireContext();
+  const inputSizeBytes = sizeOf(inputShape) * F32_BYTES;
+  const maxBindingSize =
+    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  if (inputSizeBytes > maxBindingSize) return null; // chunked
+  if (indexDtype !== "f32" && indexDtype !== "i32" && indexDtype !== "u32") {
+    return null;
+  }
+  const outShape = indexShape.slice();
+  const outSize = sizeOf(outShape);
+  const dispatch = compute2DDispatch(Math.ceil(outSize / WORKGROUP_SIZE));
+  const use2D = dispatch.y > 1;
+  const shader = gatherTileIR(inputShape, indexShape, dim, indexDtype);
+  const key = `gather:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
+  return {
+    key,
+    shader,
+    paramsData: params(outSize),
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y,
+    outShape,
+    outputBytes: outSize * F32_BYTES,
+  };
+}
+
 export function gather(
   a: BackendTensor,
   index: BackendTensor,
@@ -86,32 +133,31 @@ export function gather(
     );
   }
 
-  // Generate shader via tile-IR (both direct and chunked paths)
-  const code = chunked
-    ? chunkedGatherTileIR(inputShape, indexShape, dim, indexDtype)
-    : gatherTileIR(inputShape, indexShape, dim, indexDtype);
-
-  const keyPrefix = chunked ? "gatherChunked" : "gather";
-  const pipelineKey = `${keyPrefix}:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
-  const pipeline = getPipeline(ctx, pipelineKey, code);
-
-  // --- Direct path ---
+  // --- Direct path — single-sourced with the stream generator. ---
   if (!chunked) {
-    const outBuffer = resolveOutputBuffer(ctx.device, outSize * F32_BYTES, [
+    const plan = planGatherDirect(inputShape, indexShape, dim, indexDtype);
+    if (!plan) throw new Error("gather: direct path but planGatherDirect null");
+    const pipeline = getPipeline(ctx, plan.key, plan.shader);
+    const outBuffer = resolveOutputBuffer(ctx.device, plan.outputBytes, [
       tensorA.buffer,
       tensorIndex.buffer,
     ]);
-    const uniformBuf = createParamsBuffer(ctx.device, params(outSize));
+    const uniformBuf = createParamsBuffer(ctx.device, plan.paramsData);
     const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
       tensorA.buffer,
       tensorIndex.buffer,
       outBuffer,
       uniformBuf,
     ]);
-    dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
+    dispatchComputePass(pipeline, bindGroup, plan.dispatchX, plan.dispatchY);
     releaseParamsBuffer(uniformBuf);
-    return createTensor(outShape, outBuffer);
+    return createTensor(plan.outShape, outBuffer);
   }
+
+  // Generate shader for the chunked path.
+  const code = chunkedGatherTileIR(inputShape, indexShape, dim, indexDtype);
+  const pipelineKey = `gatherChunked:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
+  const pipeline = getPipeline(ctx, pipelineKey, code);
 
   // --- Chunked path ---
   const dimSize = inputShape[dim];
