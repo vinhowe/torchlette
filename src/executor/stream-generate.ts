@@ -17,7 +17,6 @@
  * each sharing its spec/codegen with the imperative dispatcher so pipeline
  * identity resolves through the same caches.
  */
-import { ENV } from "../core/env";
 import {
   planBinaryDirect,
   planUnaryDirect,
@@ -559,16 +558,11 @@ function planContigCopy(
   } as unknown as WebGPUTensor;
   const cp = planContiguousDirect(meta);
   if (!cp) return "contig-chunked";
-  if (ENV.TORCHLETTE_DEBUG_GENPARAMS === "1") {
-    console.log(
-      `[gencontig] info.shape=${JSON.stringify(info.shape)}(${sizeOf(info.shape)}) strides=${JSON.stringify(info.strides)} paramsData=[${Array.from(cp.paramsData as Uint32Array)}]`,
-    );
-  }
   const pipeline = getPipeline(requireContext(), cp.key, cp.shader);
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
   const paramsSlot = slots.length;
-  slots.push({ kind: "params", seqIndex: -1, data: cp.paramsData });
+  slots.push({ kind: "params", seqIndex: -1, data: cp.paramsData.slice() });
   return {
     commands: [
       {
@@ -788,14 +782,6 @@ function generateSequential(
   } else {
     plan = planUnaryDirect(node.op, ins[0]);
   }
-  if (ENV.TORCHLETTE_DEBUG_GENPARAMS === "1" && plan) {
-    const pd = Array.from(plan.paramsData as Uint32Array);
-    if (pd[0] !== sizeOf(node.shape)) {
-      console.log(
-        `[genparams] ${node.op} outShape=${JSON.stringify(node.shape)}(${sizeOf(node.shape)}) paramsData=[${pd}] ins=${ins.map((m) => JSON.stringify(m.shape)).join(",")}`,
-      );
-    }
-  }
   if (!plan) return "non-direct-route";
   // Resolve the pipeline through the SAME cache the dispatcher used (at
   // build time it is warm — this just interns the identity for the diff).
@@ -806,7 +792,7 @@ function generateSequential(
   slots.push({
     kind: "params",
     seqIndex: -1,
-    data: plan.paramsData,
+    data: plan.paramsData.slice(),
   });
   return {
     commands: [
@@ -1221,7 +1207,7 @@ function generateScatterAdd(
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
   const paramsSlot = slots.length;
-  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData });
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData.slice() });
   return {
     commands: [
       {
@@ -1277,7 +1263,7 @@ function generateGather(
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
   const paramsSlot = slots.length;
-  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData });
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData.slice() });
   return {
     commands: [
       {
@@ -1864,7 +1850,7 @@ function generateNarrowBackward(
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
   const paramsSlot = slots.length;
-  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData });
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData.slice() });
   return {
     commands: [
       {
@@ -2097,9 +2083,9 @@ function generateBareMatmul(
     if (!temp) return "ksplit-temp-missing";
     const tempSlot = bufferSlot(temp as unknown, "persistent");
     const ksplitParamsSlot = slots.length;
-    slots.push({ kind: "params", seqIndex: -1, data: m.ksplitParamsData });
+    slots.push({ kind: "params", seqIndex: -1, data: m.ksplitParamsData.slice() });
     const reduceParamsSlot = slots.length;
-    slots.push({ kind: "params", seqIndex: -1, data: m.reduceParamsData });
+    slots.push({ kind: "params", seqIndex: -1, data: m.reduceParamsData.slice() });
     return {
       commands: [
         {
@@ -2131,7 +2117,7 @@ function generateBareMatmul(
   }
 
   const paramsSlot = slots.length;
-  slots.push({ kind: "params", seqIndex: -1, data: m.paramsData });
+  slots.push({ kind: "params", seqIndex: -1, data: m.paramsData.slice() });
   return {
     commands: [
       {
@@ -2248,7 +2234,7 @@ function generateMatmulEpilogue(
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
   const paramsSlot = slots.length;
-  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData });
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData.slice() });
   return {
     commands: [
       {
@@ -2407,17 +2393,6 @@ function generateFused(
     return "plan-throw";
   }
 
-  if (ENV.TORCHLETTE_DEBUG_GENPARAMS === "1") {
-    const outNode = planNodes[action.outputNodeIndex];
-    const expect = sizeOf(outNode.shape);
-    const got = (plan.outputs[0] as { bytes?: number }).bytes;
-    if (got !== undefined && got / 4 !== expect && got / 2 !== expect) {
-      console.log(
-        `[genfused] out ${outNode.op} shape=${JSON.stringify(outNode.shape)}(${expect}) plan.out0.bytes=${got} dispatchInsShapes=${dispatchInputs.map((d) => JSON.stringify(d.shape)).join(",")}`,
-      );
-    }
-  }
-
   // Output slots: the donated out0 reuses the donated input's slot; allocated
   // outputs get fresh slots. Maps recipe output index -> stream slot.
   const outputSlots: Slot[] = [];
@@ -2442,7 +2417,7 @@ function generateFused(
   }
 
   const paramsSlot = slots.length;
-  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData });
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData.slice() });
 
   const bindings: Slot[] = plan.bindings.map((b) => {
     if (b.kind === "input") return inputSlots[b.pos];

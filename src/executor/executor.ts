@@ -1895,8 +1895,36 @@ export async function executeLoweredPlan(
               `[stream-gen] DIVERGE flat command count: generated ${gen.commands.length} vs recorded ${compiled.commands.length}`,
             );
           }
+          // Params/uniform DATA multiset must agree. diffSegmentsAligned
+          // compares DISPATCH by pipeline + workgroups + binding SLOTS but
+          // NOT the params bytes — a wrong config (e.g. a shared paramsData
+          // array stored by reference and later mutated) is otherwise
+          // invisible yet computes garbage. This guard closes that hole.
+          const paramsBag = (ss: typeof gen.slots) => {
+            const m = new Map<string, number>();
+            for (const s of ss)
+              if (s.kind === "params") {
+                const k = Array.from(s.data).join(",");
+                m.set(k, (m.get(k) ?? 0) + 1);
+              }
+            return m;
+          };
+          const gpar = paramsBag(gen.slots);
+          const rpar = paramsBag(compiled.slots);
+          let paramsMatch = gpar.size === rpar.size;
+          if (paramsMatch)
+            for (const [k, v] of gpar)
+              if (rpar.get(k) !== v) {
+                paramsMatch = false;
+                break;
+              }
+          if (!paramsMatch) {
+            console.warn(
+              `[stream-gen] DIVERGE params-data multiset (generated vs recorded uniform bytes differ)`,
+            );
+          }
           console.log(
-            `[stream-gen] FULLY GENERATED ${gen.actionCount} actions: ${seg.verifiedActions}/${gen.segments.length} segments verified, ${seg.divergences.length} diverged, flat ${gen.commands.length}/${compiled.commands.length} cmds${countMatch ? " ✓" : " ✗"}`,
+            `[stream-gen] FULLY GENERATED ${gen.actionCount} actions: ${seg.verifiedActions}/${gen.segments.length} segments verified, ${seg.divergences.length} diverged, flat ${gen.commands.length}/${compiled.commands.length} cmds${countMatch && paramsMatch ? " ✓" : " ✗"}`,
           );
         } else {
           console.log(
@@ -1916,16 +1944,6 @@ export async function executeLoweredPlan(
       // slot per result node (gen.nodeSlot / gen.nodeSlotExtra); metadata
       // comes from the live node result (same as the recorded harvest).
       if (wantCutover && gen?.fullyCovered && compiled.valid) {
-        if (ENV.TORCHLETTE_DEBUG_COMPILED) {
-          const hist = (ss: typeof gen.slots) => {
-            const h: Record<string, number> = {};
-            for (const s of ss) h[s.kind] = (h[s.kind] ?? 0) + 1;
-            return JSON.stringify(h);
-          };
-          console.log(
-            `[cutover-slots] gen=${gen.slots.length} ${hist(gen.slots)} | rec=${compiled.slots.length} ${hist(compiled.slots)}`,
-          );
-        }
         const genResults: NodeResult[] = [];
         let genOk = true;
         const emit = (i: number, oi: number, sh: { backendTensor: unknown }) => {
@@ -1957,166 +1975,6 @@ export async function executeLoweredPlan(
             emit(i, 0, node.result);
           }
         }
-        if (ENV.TORCHLETTE_DEBUG_COMPILED) {
-          const recKeys = new Set(
-            nodeResults.map((r) => `${r.nodeIndex}:${r.outputIndex}`),
-          );
-          const genKeys = new Set(
-            genResults.map((r) => `${r.nodeIndex}:${r.outputIndex}`),
-          );
-          const missingInGen = [...recKeys].filter((k) => !genKeys.has(k));
-          const extraInGen = [...genKeys].filter((k) => !recKeys.has(k));
-          console.log(
-            `[cutover-results] genOk=${genOk} recResults=${nodeResults.length} genResults=${genResults.length} missingInGen=${missingInGen.length} extraInGen=${extraInGen.length}` +
-              (missingInGen.length
-                ? `\n  missing(first 8): ${missingInGen
-                    .slice(0, 8)
-                    .map((k) => {
-                      const ni = Number(k.split(":")[0]);
-                      return `${k}=${planNodes[ni]?.op}`;
-                    })
-                    .join(", ")}`
-                : ""),
-          );
-          // CORRESPONDENCE CHECK: for each result node, compare the slot KIND
-          // in the recorded plan vs the generated plan. A computed saved
-          // activation must be "arena" in BOTH; if gen has it as external/
-          // params/persistent (an alias/input) while rec has "arena", the
-          // harvest reads the wrong (uncomputed) buffer → the freeze bug.
-          const recSlotKindByKey = new Map<string, string>();
-          for (const r of nodeResults)
-            recSlotKindByKey.set(
-              `${r.nodeIndex}:${r.outputIndex}`,
-              compiled.slots[r.slot]?.kind ?? "?",
-            );
-          const kindMismatches: string[] = [];
-          for (const r of genResults) {
-            const key = `${r.nodeIndex}:${r.outputIndex}`;
-            const recKind = recSlotKindByKey.get(key);
-            const genKind = gen.slots[r.slot]?.kind ?? "?";
-            if (recKind !== undefined && recKind !== genKind) {
-              kindMismatches.push(
-                `${key}=${planNodes[r.nodeIndex]?.op} rec=${recKind} gen=${genKind}`,
-              );
-            }
-          }
-          console.log(
-            `[cutover-kind] mismatches=${kindMismatches.length}` +
-              (kindMismatches.length
-                ? `\n  ${kindMismatches.slice(0, 12).join("\n  ")}`
-                : ""),
-          );
-          // EXTERNAL-RESOLUTION check: the gate compares external slots only by
-          // slot NUMBER (bijection), never by (planNodeIndex,inputIndex) — so a
-          // generator that picks different external refs than the recording is
-          // INVISIBLE to the gate but reads wrong inputs at replay. Compare the
-          // SET of (planNodeIndex:inputIndex) pairs assigned external slots.
-          const extSet = (ss: typeof gen.slots) => {
-            const s = new Set<string>();
-            for (const x of ss)
-              if (x.kind === "external")
-                s.add(`${x.planNodeIndex}:${x.inputIndex}`);
-            return s;
-          };
-          const ge = extSet(gen.slots);
-          const re = extSet(compiled.slots);
-          const onlyGen = [...ge].filter((k) => !re.has(k));
-          const onlyRec = [...re].filter((k) => !ge.has(k));
-          console.log(
-            `[cutover-ext] genExt=${ge.size} recExt=${re.size} onlyGen=${onlyGen.length} onlyRec=${onlyRec.length}` +
-              (onlyGen.length || onlyRec.length
-                ? `\n  onlyGen(8): ${onlyGen.slice(0, 8).join(", ")}\n  onlyRec(8): ${onlyRec.slice(0, 8).join(", ")}`
-                : ""),
-          );
-          // PARAMS-DATA check: the gate compares DISPATCH by pipeline + wg +
-          // binding SLOTS, but NOT the params/uniform DATA bytes — a generated
-          // dispatch with a wrong config (synthesized-metadata error) passes
-          // the gate yet computes garbage. Compare the params-data multisets.
-          const paramsBag = (ss: typeof gen.slots) => {
-            const m = new Map<string, number>();
-            for (const x of ss)
-              if (x.kind === "params") {
-                const u = new Uint32Array(
-                  (x.data as Uint32Array).buffer,
-                  (x.data as Uint32Array).byteOffset,
-                  (x.data as Uint32Array).length,
-                );
-                const k = `${u.length}:${Array.from(u).join(",")}`;
-                m.set(k, (m.get(k) ?? 0) + 1);
-              }
-            return m;
-          };
-          const gp = paramsBag(gen.slots);
-          const rp = paramsBag(compiled.slots);
-          const allKeys = new Set([...gp.keys(), ...rp.keys()]);
-          const pdiffs: string[] = [];
-          for (const k of allKeys) {
-            const g = gp.get(k) ?? 0;
-            const r = rp.get(k) ?? 0;
-            if (g !== r) pdiffs.push(`${k.slice(0, 60)} gen×${g} rec×${r}`);
-          }
-          console.log(
-            `[cutover-params] gen=${[...gp.values()].reduce((a, b) => a + b, 0)} rec=${[...rp.values()].reduce((a, b) => a + b, 0)} distinctDiffs=${pdiffs.length}` +
-              (pdiffs.length ? `\n  ${pdiffs.slice(0, 10).join("\n  ")}` : ""),
-          );
-          // Trace [2048] params slots to their SEGMENT node (the op that emitted
-          // the wrong-size config).
-          const is2048 = (slot: number) => {
-            const s = gen.slots[slot];
-            return (
-              s?.kind === "params" &&
-              (s.data as Uint32Array).length === 1 &&
-              (s.data as Uint32Array)[0] === 2048
-            );
-          };
-          const badNodes: Record<string, number> = {};
-          for (const segx of gen.segments) {
-            for (const c of segx.commands) {
-              if (c.tag === 1 /* DISPATCH */) {
-                if ((c.bindings as number[]).some(is2048)) {
-                  const op = planNodes[segx.nodeIndex]?.op ?? "?";
-                  badNodes[op] = (badNodes[op] ?? 0) + 1;
-                }
-              }
-            }
-          }
-          console.log(`[cutover-2048nodes] ${JSON.stringify(badNodes)}`);
-          // Dump ONE flagged cast segment in full: node shape + each binding's
-          // slot kind/data, to see what the [2048] params actually is.
-          for (const segx of gen.segments) {
-            if (planNodes[segx.nodeIndex]?.op !== "cast") continue;
-            const d = segx.commands.find(
-              (c) => c.tag === 1 && (c.bindings as number[]).some(is2048),
-            );
-            if (!d) continue;
-            const bind = (d as { bindings: number[] }).bindings;
-            console.log(
-              `[cutover-castdump] node${segx.nodeIndex} cast shape=${JSON.stringify(planNodes[segx.nodeIndex]?.shape)} bindings=[${bind
-                .map((s) => {
-                  const ss = gen.slots[s];
-                  const dat =
-                    ss?.kind === "params"
-                      ? `=[${Array.from(ss.data as Uint32Array)}]`
-                      : "";
-                  return `${s}:${ss?.kind}${dat}`;
-                })
-                .join(", ")}]`,
-            );
-            break;
-          }
-          // Which result nodes have size 262144 (the size that got collapsed to
-          // 2048)? → identifies the op class with the wrong generated config.
-          for (const target of [262144, 2048]) {
-            const ops: Record<string, number> = {};
-            for (const r of genResults) {
-              if (r.shape.reduce((a, b) => a * b, 1) === target) {
-                const op = planNodes[r.nodeIndex]?.op ?? "?";
-                ops[op] = (ops[op] ?? 0) + 1;
-              }
-            }
-            console.log(`[cutover-size${target}] ${JSON.stringify(ops)}`);
-          }
-        }
         if (genOk) {
           const genPlan = buildCompiledPlanFromGenerated({
             commands: gen.commands,
@@ -2132,13 +1990,8 @@ export async function executeLoweredPlan(
             genPlan.endCounters = getDispatchSequenceCounters();
             loweredPlan.compiledPlan = genPlan;
             if (ENV.TORCHLETTE_DEBUG_COMPILED) {
-              const opc: Record<string, number> = {};
-              for (const n of planNodes) opc[n.op] = (opc[n.op] ?? 0) + 1;
-              const sig = ["adamStep", "matmul", "fusedAttentionForward", "fusedAttentionBackward", "fusedCrossEntropyForward", "tensorFromArray"]
-                .map((o) => `${o}=${opc[o] ?? 0}`)
-                .join(" ");
               console.log(
-                `[compiled] phase-4 cutover: GENERATED plan execution source (${gen.commands.length} cmds, ${genResults.length} results) ops[${sig}]`,
+                `[compiled] phase-4 cutover: GENERATED plan is the execution source (${gen.commands.length} cmds, ${genResults.length} results)`,
               );
             }
           }

@@ -399,7 +399,7 @@ shared planner+assembly tail, extracted from `buildCompiledPlan`),
 `buildCompiledPlanFromGenerated` (feeds the generated commands/slots + gen-slot
 nodeResults through `finalize`), `generateStream` now exports `nodeSlot`/
 `nodeSlotExtra`, and the executor builds the generated plan + swaps it in when
-`gen.fullyCovered` and every result node has a gen slot. Two bugs found+fixed
+`gen.fullyCovered` and every result node has a gen slot. Three bugs found+fixed
 en route:
 1. **Spurious external slots (FIXED).** The generator's external pre-assignment
    mirrored the executor's, but the executor runs PRE-execution (in-plan nodes
@@ -414,87 +414,42 @@ en route:
    genOk=false and that plan stays recorded — SAFE, but means the cutover is
    per-plan (forward cuts over; backward+optimizer stays recorded for now).
 
-**OPEN — cross-step freeze (the blocker), now precisely localized.** With the
-flag on, the FORWARD plan cuts over (backward+optimizer stays recorded — genOk
-=false there, see #2). **Step-0/1 losses match the recorded baseline to fp
-noise**, then the loss FREEZES from step 2 at ≈ the INITIAL-param loss.
+3. **paramsData stored BY REFERENCE — the freeze, FIXED.** With the flag on the
+   forward cut over, step-0/1 losses matched the recorded baseline exactly, then
+   the loss FROZE from step 2. After an extensive isolation that FALSIFIED every
+   structural hypothesis (commands, flat-tag order, slot count+KIND per result
+   node, result coverage 259/259, external-ref SET 101/101, weight-buffer
+   resolution byte-identical, the memory planner — froze under
+   `ARENA_LIVENESS=0` too —, checkpointing, harvest-skips), the decisive test
+   was the **params-DATA multiset**: the generated plan had ~80 dispatches with
+   a length-1 params slot = **[2048] (=BATCH×SEQ)** where the recorded plan had
+   the real element counts ([262144]×76, [6438912]×1, ...). e.g. `node32` cast
+   [50304,128] (6.4M elems) bound `params=[2048]` → its kernel processed 2048 of
+   N elements → garbage forward → grads explode (1.8e10) → optimizer corrupts
+   weights → frozen loss.
+   ROOT CAUSE: the generator stored `plan.paramsData` **by reference** in the
+   params SlotSource, but those uniform arrays are SHARED/reused across plan
+   calls and later MUTATED — so every params slot ended up reading the
+   last-written value. The recorded path was immune because `createParamsBuffer`
+   stores `data.slice()` (a copy). FIX: `.slice()` at all 10 generator
+   params-slot storage sites (generateSequential, planContigCopy, the layernorm/
+   matmul/fused generators). After the fix the cutover trajectory matches the
+   recorded baseline to fp noise over 20 steps (8.836388 vs 8.836389 @ step 19).
+   GATE HOLE CLOSED: `diffSegmentsAligned` compared DISPATCH by pipeline +
+   workgroups + binding SLOTS but never the params/uniform DATA bytes — a third
+   hole (after orphan slots and flat-order). Added a params-data multiset guard
+   to the FULLY-GENERATED gate (executor.ts) so this class is caught in future.
 
-Ruled out by direct comparison against the recorded plan (all IDENTICAL):
-generated commands (gate), flat command TAG order, slot-kind histograms, result
-coverage (259/259, 0 missing), data-source re-execution (inputs ARE fresh each
-step via TAG_WRITE), and — decisively — the forward's WEIGHT external slots
-resolve to the SAME buffers with the SAME storage progression as recorded
-(slot30: storage 4945→6542, both on buffer b1, in-place mutated). Also
-falsified: discarded-recorded-plan entry release (NO_RELEASE freezes too) and
-the memory planner (freezes identically under `ARENA_LIVENESS=0`).
-
-So the forward reads IDENTICAL weights+inputs as recorded yet the optimizer
-stops updating weights (they stay ~initial). The chain: **the generated forward
-plan computes the LOSS correctly but its SAVED ACTIVATIONS (the intermediates
-the backward plan consumes) are wrong → backward gets garbage/zero grads → the
-(recorded) optimizer no-ops → weights frozen → loss frozen.** This is present
-from step 1 (step-1 loss is right because it's the forward OUTPUT; step-1's opt
-already no-ops, so step 2 reads ~initial weights).
-
-**ISOLATION (2026-06-13, extensive — every structural hypothesis FALSIFIED).**
-Ground truth via `PRINT_RAW_GRAD`/`DEBUG_READSLOTS`/`DEBUG_HARVEST`: the
-backward grads are normal at step 0/1 (max ~2-8) then EXPLODE at step 2 (max
-1.8e10, leading zeros) → clipped to tiny garbage updates → loss sticks. Refined
-timeline: step-1 forward is the LOWERED recording execution (genPlan is BUILT
-after it), so **the genPlan's FIRST replay is step 2 — and it's wrong** (loss
-10.82 vs recorded 10.47); the recorded plan's first replay (also step 2) is
-correct. So it's not cross-step drift — the genPlan is simply wrong on replay.
-The wrong forward LOSS (a forward output, computed before backward) means the
-forward genPlan itself computes wrong, OR its loss-node harvest reads the wrong
-buffer.
-
-Build-time comparison of genPlan vs the recorded plan shows EVERYTHING matches:
-commands (gate), flat TAG order, slot count, slot KIND per result node
-(cutover-kind: 0 mismatches), result coverage (259/259), external-ref SET
-(cutover-ext: 101/101, 0 diff — same (planNodeIndex,inputIndex) pairs), and the
-forward's weight external slots resolve to the SAME buffers with the SAME
-storage progression as recorded. Falsified by direct test: discarded-plan
-release (NO_RELEASE), the memory planner (freezes under ARENA_LIVENESS=0),
-checkpointing (freezes under CHECKPOINT=0), and harvest-skip staleness
-(dbgHarvestSkipped==0 — node.result IS re-assigned fresh each step).
-
-So a generated plan that is structurally IDENTICAL to the recorded plan by
-every available measure still computes wrong on its first replay. Remaining
-suspects. The decisive content tests then RAN and settled it:
-- The loss node's gen result-slot CONTENT at step-2 replay is itself 10.82
-  (wrong) — so it's NOT a harvest-binding issue; the genPlan COMPUTES the wrong
-  loss into the slot.
-- The forward's WEIGHT slot content is BYTE-IDENTICAL between generated and
-  recorded at step 2 (slot30 b1 = -7.3291e-2 [0.009829,-0.01468,...] in both).
-
-**ROOT CAUSE LOCALIZED — wrong PARAMS DATA (element count), a gate blind spot.**
-Comparing the params-DATA multisets of genPlan vs the recorded plan (the gate
-compares DISPATCH by pipeline + workgroups + binding SLOTS, but NEVER the
-params/uniform DATA bytes) shows ~80 dispatches in the generated plan carry a
-length-1 params slot = **[2048] (= BATCH×SEQ = 8×256)** where the recorded plan
-has the correct element counts ([262144]×76, [6438912]×1, [32768]×2,
-[102926336]×1). Concretely: `node32 cast shape=[50304,128]` (6.4M elems) binds
-`params=[2048]`. The output buffer IS sized correctly (genfused/genparams
-output-byte checks pass) — only the per-dispatch element-COUNT uniform is
-2048 — so the kernel processes 2048 of N elements and leaves the rest garbage
-→ wrong forward → exploded grads (1.8e10) → optimizer corrupts weights → freeze.
-The gate is blind because it never diffs params DATA bytes (a THIRD gate hole
-after orphan slots and flat-order; ALL THREE should be closed: params-data,
-external-RESOLUTION, and orphan-slot checks).
-
-Flagged dispatches are in cast/contiguous/add/gather segments, BUT
-generateSequential's own check (`paramsData[0] === sizeOf(node.shape)` for every
-binary/unary/cast/contiguous it emits) and generateFused's output-size check
-BOTH pass — i.e. the standard generators emit correct params. So the [2048]
-slots come from a path those self-checks don't cover, OR a dispatch binds a
-params slot OTHER than the one its generator created (a slot-index/binding
-error). NEXT: trace exactly how node32's cast dispatch acquires a [2048] params
-slot — instrument every params-slot creation (value + the generator + node id)
-and find which one emits [2048] for a 6.4M-element node, or whether node32's
-DISPATCH binding points at the wrong (someone else's [2048]) params slot. That
-single trace pins the generator rule. (Toolbelt left in place behind
-TORCHLETTE_DEBUG_COMPILED/TORCHLETTE_DEBUG_GENPARAMS: cutover-params,
-cutover-2048nodes, cutover-castdump, genparams/gencontig/genfused.)
+**Cutover STATUS: working under the flag.** Forward cuts over and trains
+correctly; backward+optimizer stays recorded (genOk=false — see #2). Remaining
+before flipping the default: (a) cover the result nodes without `nodeSlot`
+entries so backward+optimizer also cut over (the #2 limit); (b) the full parity
+ladder (fullstack 30-step + regression + A100 A/B) with the flag on; (c) close
+the other two gate holes (external-resolution, orphan-slot) for durability; then
+the phase-4 deletions (recorder → cross-check only). Lesson worth keeping: the
+generator must treat every recorded structure it reproduces as needing the SAME
+copy/ownership discipline the recorder uses — storing a shared mutable array by
+reference is the same class as the params-sequence cache's `data.slice()`.
 
 ## Risks and mitigations
 - **Imperative-op long tail** (phase 3): mitigated by per-op fallback — no
