@@ -497,7 +497,8 @@ function generateSequential(
   cachedInputShapes?: number[][],
 ): { commands: GpuCommand[]; outSlot: Slot } | string {
   // Tile-kernel ops with bespoke command patterns.
-  if (node.op === "sum") return generateSumFull(node, slots, resolveRefSlot, bufferSlot);
+  if (node.op === "sum")
+    return generateFullReduction(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "unscaleGrad")
     return generateUnscaleGrad(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "stridedScatterCopy")
@@ -658,13 +659,19 @@ function tilePlanBindings(
 }
 
 /** sum with no dim (FULL reduction): ALLOC(4 bytes, kind 0) + tile dispatch
- *  [input, out, config]. Dim reductions / preamble chains stay uncovered. */
-function generateSumFull(
+ *  [input, out, config], using the SAME cached dispatcher (→ shared config
+ *  buffer) fullReduction() uses. Dim reductions / preamble chains stay
+ *  uncovered. `mean` is NOT covered here: it lowers to sum + an invCount
+ *  epilogue (mul by 1/count) dispatched through a FRESH uncached dispatcher
+ *  with a per-call invCount buffer — neither the config nor that buffer is
+ *  shape-derivable, so it belongs to the captured-state class, not this one. */
+function generateFullReduction(
   node: LazyIRNode,
   slots: SlotSource[],
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
 ): { commands: GpuCommand[]; outSlot: Slot } | string {
+  const reduceOp = "sum";
   const payload = node.payload as { dim?: number | number[] | null } | undefined;
   if (payload?.dim != null) return "dim-reduction";
   if (node.inputs.length !== 1) return "arity";
@@ -689,7 +696,7 @@ function generateSumFull(
     return "no-storage";
   }
   if (size * 4 > 128 * 1024 * 1024) return "chunked";
-  const plan = planFullReductionDispatch("sum", size);
+  const plan = planFullReductionDispatch(reduceOp, size);
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
   const bindings = tilePlanBindings(

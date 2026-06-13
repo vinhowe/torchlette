@@ -214,10 +214,35 @@ adam-batch; fusedAttention FORWARD. Three capture mechanisms cover the
 "generator can't derive it post-hoc" cases: `cachedMatmulPlan` (geometry),
 `cachedInputShapes` (released multi-output input shapes), and read-only
 workspace/config lookups (`lookupKSplitTempBuffer`, `lookupPackedBuffers`,
-`lookupAttentionConfigBuffer`). Coverage: fwd 282/289, bwd 388/414,
-optimizer 100%. A latent bug fell out: `getOrCreateConfigBuffer` never
-populated its cache (re-created the attention config uniform every
-dispatch) — fixed (perf + stable identity for the generator).
+`lookupAttentionConfigBuffer`). Coverage: fwd 285/289, bwd 391/414,
+optimizer 100% (FULLY GENERATED). A latent bug fell out:
+`getOrCreateConfigBuffer` never populated its cache (re-created the
+attention config uniform every dispatch) — fixed (perf + stable identity
+for the generator).
+
+Added since: **gather** (forward, single-sourced on `planGatherDirect`);
+**scatterAdd** (embedding backward ×2, single-sourced on
+`planScatterAddDirect`; its src grad is a released contiguous `reshape`
+view — covered by `contiguousViewShapeDtype`, which derives logical
+shape/dtype for the reshape/view/flatten/squeeze/unsqueeze class since
+their layout is contiguous-offset-0); **released contiguous-view inputs to
+elementwise ops** (the synthesized-metadata fallback now also covers the
+contiguous-view class, clearing `cast[no-storage]` fwd+bwd). Strided views
+(expand/broadcast) stay bailed — layout not shape-derivable, contiguous
+metadata would mislead the kernel; the remaining `contiguous[no-storage]×2`
+/ `mul[no-storage]×1` are all `expand` producers, correctly excluded.
+
+**`mean` is NOT an easy tile op** (investigated, left uncovered): the
+backend `ReduceOp` is only sum/max/min — `mean` lowers to a `sum` FULL
+reduction with an invCount epilogue (mul by 1/count). That epilogue path
+dispatches through a FRESH uncached `createTileKernelDispatcher` with a
+per-call `invCount` buffer (createTrackedBuffer + writeBuffer 1/count).
+Neither the dispatcher's config buffer nor the invCount buffer is cached
+or shape-derivable, so `mean` belongs to the captured-state class, not the
+shared-cached-dispatcher class `generateFullReduction` covers for `sum`. A
+real fix would route the epilogue full-reduction through a cached
+dispatcher + count-keyed invCount buffer cache (a framework cleanup worth
+doing on its own), after which the generator could share the identity.
 
 **KNOWN BLOCKER — fusedAttentionBackward (the lifetime-split-slot limit).**
 Attempted and reverted (it broke narrowBackward). The attention-backward
