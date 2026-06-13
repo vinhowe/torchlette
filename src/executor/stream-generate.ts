@@ -26,6 +26,7 @@ import {
   planContiguousDirect,
 } from "../backend/webgpu/ops/views";
 import { planFullReductionDispatch } from "../backend/webgpu/ops/reductions";
+import { planLayerNormForwardDispatch } from "../backend/webgpu/layernorm-kernel";
 import { planFusedKernel } from "../backend/webgpu/fusion-dispatch";
 import {
   lookupKSplitTempBuffer,
@@ -442,6 +443,8 @@ function generateSequential(
     return generateUnscaleGrad(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "stridedScatterCopy")
     return generateScatterCopyDMA(node, resolveRefSlot);
+  if (node.op === "fusedLayerNormForward")
+    return generateLayerNormForward(node, slots, resolveRefSlot, bufferSlot);
   const wgslOp = BINARY_OPS.get(node.op);
   const isUnary =
     UNARY_OPS.has(node.op) ||
@@ -628,6 +631,67 @@ function generateSumFull(
         gx: plan.grid[0],
         gy: plan.grid[1],
         gz: plan.grid[2],
+      },
+    ],
+    outSlot,
+  };
+}
+
+/** fusedLayerNormForward: ALLOC(output, kind 1) + one tile dispatch
+ *  [x, weight, bias, output, config]. Single output, no workspace temp.
+ *  payload = FusedLayerNormConfig {numRows, featureDim, eps}. Inputs are
+ *  contiguous in practice (x = residual stream, weight/bias = params); a
+ *  non-contiguous input would add a recorded contiguous-copy prologue →
+ *  command-count mismatch caught by the segment diff. */
+function generateLayerNormForward(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 3) return "arity";
+  const cfg = node.payload as
+    | { numRows?: number; featureDim?: number; eps?: number }
+    | undefined;
+  if (!cfg || cfg.numRows == null || cfg.featureDim == null || cfg.eps == null) {
+    return "payload";
+  }
+  const inSlots: Slot[] = [];
+  for (const ref of node.inputs) {
+    if (ref.kind === "scalar") return "scalar-operand";
+    const s = resolveRefSlot(ref);
+    if (s === undefined) return "untracked-input";
+    inSlots.push(s);
+  }
+  const planned = planLayerNormForwardDispatch(
+    cfg.numRows,
+    cfg.featureDim,
+    cfg.eps,
+  );
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const bindings = tilePlanBindings(
+    planned.plan,
+    { x: inSlots[0], weight: inSlots[1], bias: inSlots[2], output: outSlot },
+    bufferSlot,
+  );
+  if (!bindings) return "config-missing";
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: planned.outputBytes,
+        allocKind: 1,
+        inputSlots: [],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: planned.plan.pipeline,
+        bindings,
+        gx: planned.plan.grid[0],
+        gy: planned.plan.grid[1],
+        gz: planned.plan.grid[2],
       },
     ],
     outSlot,

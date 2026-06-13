@@ -389,6 +389,28 @@ export function dispatchLayerNormForward(
 }
 
 /**
+ * Stage-4 stream generation: the LayerNorm-forward dispatch plan, from the
+ * SAME fwdTileKernel instance the dispatcher uses (shared config cache →
+ * shared config buffer identity). Single output, no workspace temp — the
+ * op is ALLOC(output, allocKind 1) + this one tile dispatch over bindings
+ * [x, weight, bias, output, config]. outputBytes is numRows*featureDim*4.
+ */
+export function planLayerNormForwardDispatch(
+  numRows: number,
+  featureDim: number,
+  eps: number,
+): { plan: import("./tile-dispatch").TileKernelPlan; outputBytes: number } {
+  return {
+    plan: fwdTileKernel.plan({
+      num_rows: numRows,
+      feature_dim: featureDim,
+      eps,
+    }),
+    outputBytes: numRows * featureDim * 4,
+  };
+}
+
+/**
  * Dispatch fused LayerNorm backward gradX kernel.
  * grad_output [N, D] + x [N, D] + weight [D] → grad_x [N, D]
  */
