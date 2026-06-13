@@ -32,14 +32,23 @@ async function main() {
   });
   const out = stdout + "\n" + stderr;
   const lines = out.split("\n").filter((l) => l.includes("[stream-gen]"));
+  // A plan is a hook-fire if it VERIFIED a covered prefix OR is FULLY
+  // GENERATED (every action covered, command counts agree). As coverage
+  // completed, plans graduated from "VERIFIED N/M" to "FULLY GENERATED".
   const matches = lines.filter(
-    (l) => l.includes("MATCH") || l.includes("VERIFIED"),
+    (l) =>
+      l.includes("MATCH") ||
+      l.includes("VERIFIED") ||
+      l.includes("FULLY GENERATED"),
   ).length;
   const diverges = lines.filter((l) => l.includes("DIVERGE")).length;
   let verifiedCmds = 0;
   for (const l of lines) {
     const m = l.match(/VERIFIED \d+\/\d+ segments \((\d+) cmds/);
     if (m) verifiedCmds += parseInt(m[1], 10);
+    // FULLY GENERATED lines report "flat X/Y cmds" — count X.
+    const f = l.match(/FULLY GENERATED .* flat (\d+)\/\d+ cmds/);
+    if (f) verifiedCmds += parseInt(f[1], 10);
   }
   for (const l of lines) console.log(l.trim());
   console.log(

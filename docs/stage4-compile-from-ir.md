@@ -214,11 +214,10 @@ adam-batch; fusedAttention FORWARD. Three capture mechanisms cover the
 "generator can't derive it post-hoc" cases: `cachedMatmulPlan` (geometry),
 `cachedInputShapes` (released multi-output input shapes), and read-only
 workspace/config lookups (`lookupKSplitTempBuffer`, `lookupPackedBuffers`,
-`lookupAttentionConfigBuffer`). Coverage: fwd 287/289, bwd 413/414,
-optimizer 100% (FULLY GENERATED) — FORWARD and BACKWARD are both now
-complete bar the deliberately-excluded expand/broadcast producers
-(`contiguous[no-storage]×2` fwd, `mul[no-storage]×1` bwd). A latent bug fell
-out: `getOrCreateConfigBuffer` never populated its cache (re-created the
+`lookupAttentionConfigBuffer`). **Coverage: 100% — every plan in the
+canonical trainer (forward, backward, optimizer) is FULLY GENERATED, 0
+diverged, command counts equal.** A latent bug fell out:
+`getOrCreateConfigBuffer` never populated its cache (re-created the
 attention config uniform every dispatch) — fixed (perf + stable identity
 for the generator).
 
@@ -243,12 +242,18 @@ the output's aliasing candidates — the ALLOC's inputSlots must list only
 poolable operands (track `aliasInSlots` separately from the DISPATCH
 bindings).
 
-**Remaining uncovered (fwd 2, bwd 1), all deliberately excluded:**
-expand/broadcast producers (`contiguous[no-storage]×2` fwd,
-`mul[no-storage]×1` bwd) — strided-view layout not shape-derivable, so
-synthesizing contiguous metadata would mislead the kernel. Nothing else is
-uncovered: forward, backward, and the optimizer are all complete. **The
-recorder is now ready to become a pure cross-check (phase 4).**
+**Nothing uncovered — the expand/broadcast producers are now covered too.**
+The previously-"correctly-excluded" `contiguous(expand)×2` (fwd) and
+`mul(a, expand(b))×1` (bwd) were excluded because a released strided view's
+stride-bearing layout (broadcast stride-0) "isn't shape-derivable." That is
+exactly what capture-don't-synthesize solves: `cachedStridedInputs` captures
+each strided-view input's live layout at lowering (expand/transpose/permute/
+narrow producers of a sequential elementwise op), and generateSequential
+synthesizes the real strided metadata so planBinaryDirect/planUnaryDirect
+emit the matching broadcast/gather kernel (the cache key includes strides, so
+pipeline identity matches the recording). Generalizes the per-op capture from
+attention/reshape into one mechanism for any released strided-view input.
+**The recorder is now ready to become a pure cross-check (phase 4).**
 
 **fusedAttentionBackward (DONE — and the "bijection blocker" was stale).**
 The 2026-06-13 doc claimed a lifetime-split-slot bijection blocker: dV read

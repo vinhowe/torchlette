@@ -329,6 +329,8 @@ export function generateStream(
                 resolveRefSlot,
                 bufferSlot,
                 (action as { cachedInputShapes?: number[][] }).cachedInputShapes,
+                (action as { cachedStridedInputs?: (AttnInputContig | null)[] })
+                  .cachedStridedInputs,
               );
         if (typeof gen === "string") {
           miss(`op:${node.op}${gen ? `[${gen}]` : ""}`);
@@ -612,6 +614,7 @@ function generateSequential(
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
   cachedInputShapes?: number[][],
+  cachedStridedInputs?: (AttnInputContig | null)[],
 ): { commands: GpuCommand[]; outSlot: Slot } | string {
   // Tile-kernel ops with bespoke command patterns.
   if (node.op === "sum")
@@ -653,7 +656,8 @@ function generateSequential(
   // table buffers are persistent and resolveOutputBuffer excludes them, so
   // they must NOT appear in the recorded ALLOC's inputSlots (caught by diff).
   const aliasInSlots: Slot[] = [];
-  for (const ref of node.inputs) {
+  for (let inputIdx = 0; inputIdx < node.inputs.length; inputIdx++) {
+    const ref = node.inputs[inputIdx];
     if (ref.kind === "scalar") {
       // Scalar operand: resolves through the plan's scalar table to a
       // PERSISTENT buffer (stable identity; the executor refreshes its value
@@ -707,10 +711,27 @@ function generateSequential(
         // Only .size is consulted by planner guards.
         buffer: { size: alignBufferSize(size * 4) },
       } as unknown as WebGPUTensor;
+    } else if (cachedStridedInputs?.[inputIdx]) {
+      // Released STRIDED-view producer (expand/transpose/permute/narrow): its
+      // stride-bearing layout (incl. broadcast stride-0) was captured live at
+      // lowering, so synthesize the real strided metadata — planBinaryDirect/
+      // planUnaryDirect then emit the matching strided/broadcast kernel (the
+      // cache key includes strides, so the pipeline identity matches the
+      // recording). The binding's buffer comes from the resolved slot (the
+      // view aliases its base).
+      const cap = cachedStridedInputs[inputIdx];
+      meta = {
+        shape: cap.shape,
+        strides: cap.strides,
+        offset: cap.offset,
+        dtype: cap.dtype as WebGPUTensor["dtype"],
+        size: sizeOf(cap.shape),
+        isContiguous: false,
+        buffer: { size: cap.bufferSize },
+      } as unknown as WebGPUTensor;
     } else {
-      // Remaining no-storage producers are strided views (expand/broadcast):
-      // their layout isn't shape-derivable and synthesizing contiguous
-      // metadata would be wrong, so they stay bailed.
+      // Remaining no-storage producers are strided views with no captured
+      // layout — not shape-derivable, stay bailed.
       return "no-storage";
     }
     const slot = resolveRefSlot(ref);

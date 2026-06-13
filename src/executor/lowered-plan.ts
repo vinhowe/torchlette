@@ -95,6 +95,14 @@ interface LoweredNodeAction {
    *  materializes a contiguous copy when its input is non-contiguous (the
    *  generator replays planContiguousDirect). Template-invariant. */
   cachedViewInput?: AttnInputContig;
+  /** Stage-4 phase-3: per-input layouts for sequential elementwise ops whose
+   *  producer is a STRIDED view (expand/transpose/permute/narrow) — those
+   *  views are released by plan-build and their stride-bearing layout isn't
+   *  shape-derivable, so the generator would bail. Captured live so it can
+   *  synthesize the real strided metadata (broadcast stride-0 etc.) and let
+   *  planBinaryDirect/planUnaryDirect generate the matching kernel. Only the
+   *  strided-view input positions are non-null. Template-invariant. */
+  cachedStridedInputs?: (AttnInputContig | null)[];
 }
 
 /** Per-input layout for an attention op's contiguous-copy prologue (stage-4

@@ -1604,6 +1604,47 @@ export async function executeLoweredPlan(
               bufferSize: w.buffer.size,
             };
           }
+
+          // Sequential elementwise op consuming a STRIDED view (expand /
+          // transpose / permute / narrow): that producer is released by
+          // plan-build and its stride-bearing layout isn't shape-derivable, so
+          // the generator bails "no-storage". Capture each such input's live
+          // layout (incl. broadcast stride-0) so the generator can synthesize
+          // the real metadata and planBinaryDirect/planUnaryDirect emits the
+          // matching strided kernel. Empty array marks "checked, none" so this
+          // runs once per template. (reshape is a contiguous view, handled
+          // above; it's excluded here.)
+          if (action.kind === "sequential" && action.cachedStridedInputs === undefined) {
+            let caps: (import("./lowered-plan").AttnInputContig | null)[] | undefined;
+            for (let i = 0; i < node.inputs.length; i++) {
+              const ref = node.inputs[i];
+              if (
+                ref.kind !== "pending" ||
+                (ref.node.op !== "expand" &&
+                  ref.node.op !== "transpose" &&
+                  ref.node.op !== "permute" &&
+                  ref.node.op !== "narrow")
+              ) {
+                continue;
+              }
+              const w = backendInputs[i] as {
+                shape: number[];
+                strides: number[];
+                offset?: number;
+                dtype: import("../backend/types").DType;
+                buffer: { size: number };
+              };
+              (caps ??= new Array(node.inputs.length).fill(null))[i] = {
+                contiguous: false,
+                shape: w.shape.slice(),
+                strides: w.strides.slice(),
+                offset: w.offset ?? 0,
+                dtype: w.dtype,
+                bufferSize: w.buffer.size,
+              };
+            }
+            action.cachedStridedInputs = caps ?? [];
+          }
           break;
         }
 
