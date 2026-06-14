@@ -198,6 +198,10 @@ export interface CompiledPlan {
    *  registry was reset (engine-instance boundary) — indices are stale, all
    *  allocs fall back dynamically and the plan invalidates for re-record. */
   plannerGen?: number;
+  /** Storage ids the harvest rcRetained as VIEW bases on the LAST replay.
+   *  Released at the start of the next harvest so view-base retains don't
+   *  accumulate per replay (the clip+optimizer storage-handle leak). */
+  _viewBaseRetains?: number[];
 }
 
 // ============================================================================
@@ -598,6 +602,15 @@ export function dbgIsDestroyed(buf: GPUBuffer): boolean {
  * is invalidated or its template evicted.
  */
 export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
+  // Release the last replay's view-base retains (normally released at the next
+  // harvest, which won't happen once the plan is gone). Safe no-op if the base
+  // storages were already freed (monotonic ids, rcRelease returns -1).
+  if (compiled._viewBaseRetains) {
+    for (const baseId of compiled._viewBaseRetains) {
+      rcRelease(baseId, "view.reharvest.teardown");
+    }
+    compiled._viewBaseRetains = undefined;
+  }
   // Release co-owned registry entries (cross-plan packing). An entry's
   // buffer dies with its LAST owner; the entry record itself stays and is
   // re-listed for future plans (the buffer rematerializes on demand).
@@ -1001,7 +1014,7 @@ import {
   trackSharedEncoderWrite,
 } from "../backend/webgpu/webgpu-state";
 import { createStorageHandle } from "../graph/node-factory";
-import { rcRetain } from "../graph/refcount";
+import { rcRelease, rcRetain } from "../graph/refcount";
 import { executeOpSync } from "./op-dispatch";
 
 /**
@@ -1365,6 +1378,15 @@ export async function executeCompiledPlan(
     //  - Otherwise (default-arena buffers, dynamic fallback allocs): owning,
     //    as before (arena buffers are shielded by arenaBufferSet anyway).
     let dbgHarvestSkipped = 0;
+    // Release the PRIOR replay's view-base retains before creating this
+    // replay's (see the rationale where they're pushed below). First replay:
+    // the field is undefined → nothing to release.
+    if (compiled._viewBaseRetains) {
+      for (const baseId of compiled._viewBaseRetains) {
+        rcRelease(baseId, "view.reharvest");
+      }
+    }
+    const viewBaseRetains: number[] = [];
     const resolveInputStorage = (
       node: LazyIRNode,
       j: number,
@@ -1437,6 +1459,19 @@ export async function executeCompiledPlan(
       if (base) {
         sh.baseStorageId = base.id;
         rcRetain(base.id, "view.baseStorageId");
+        // The harvest re-creates VIEW result handles every replay and rcRetains
+        // their base each time. The lowered path balances this retain via the
+        // view storage's destruction ("view.destroyed"), driven by the
+        // RuntimeTensor wrapper transitioning off the old storage; the compiled
+        // harvest has no wrapper transition and the prior handle is dropped
+        // (node.result/results reassigned or cleared by liveness between
+        // replays), so the prior base-retain is never released → +1 storage
+        // handle/step per re-harvested view. Invisible in GPU bytes (bases alias
+        // pooled buffers), so it slipped past the profiler (which never clips)
+        // and the regression check (which measures bytes). The PLAN owns the
+        // retains it creates and releases the PRIOR replay's set at harvest
+        // start (below) — robust regardless of how the prior handle was dropped.
+        viewBaseRetains.push(base.id);
       }
       if (assignsPrimary) {
         node.result = sh;
@@ -1449,6 +1484,10 @@ export async function executeCompiledPlan(
         node.results[r.outputIndex] = sh;
       }
     }
+    // Commit this replay's view-base retains; the prior set was released at
+    // harvest start. Storage ids are monotonic (never reused), so releasing a
+    // since-freed base id next replay is a safe no-op (rcRelease returns -1).
+    compiled._viewBaseRetains = viewBaseRetains;
     if (ENV.TORCHLETTE_DEBUG_HARVEST && dbgHarvestSkipped > 0) {
       console.log(
         `[harvest-skip] ${dbgHarvestSkipped}/${compiled.results.length} results NOT assigned (node.result already set); planNodes[0].id=${planNodes[0]?.id} planNodes[last].id=${planNodes[planNodes.length - 1]?.id}`,

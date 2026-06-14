@@ -166,25 +166,22 @@ describe("browser LoRA trainer — training trajectory", () => {
         `loss did not descend: early=${early.toFixed(4)} late=${late.toFixed(4)} | ${losses.map((l) => l.toFixed(2)).join(",")}`,
       ).toBeLessThan(early);
 
-      // 2. STORAGE. Per-step growth in reachable storages. KNOWN LEAK (task
-      //    #47): the example LoRATrainer leaks ~24 storages/step under the
-      //    current default — bisected to the clipGradNorm_ + Adam interaction on
-      //    the LoRA layers' RAW (api.randn/zeros) params; reproduces in Node too,
-      //    so it is NOT browser-specific. The validated WebGPUGPT2Trainer (nn
-      //    params) profiles flat. Baseline B historically recorded "GPU storage
-      //    flat at 292" — this regressed since (the arena flip / implied-step-
-      //    boundaries postdate it). This bound GUARDS AGAINST WORSENING while the
-      //    leak stands; TIGHTEN to ~2 once task #47 is fixed.
-      const KNOWN_LEAK_PER_STEP = 30; // measured ~24/step; margin for noise
+      // 2. STORAGE FLAT. Reachable-storage count must not grow step-over-step.
+      //    Previously this leaked ~24/step — root-caused (task #47) to the
+      //    COMPILED replay harvest re-creating VIEW result handles every replay
+      //    and rcRetaining their base each time WITHOUT releasing the prior
+      //    replay's retain (the lowered path balances it via the wrapper's
+      //    view.destroyed; the compiled harvest had no equivalent). It was a
+      //    handle leak (bases alias pooled buffers → GPU bytes flat), which is
+      //    why it slipped past the profiler (never clips) and the regression
+      //    check (measures bytes). FIXED: the compiled plan now owns its
+      //    harvest view-base retains and releases the prior replay's set.
       const lateReach = reachable.slice(-11);
-      let maxStepGrowth = 0;
-      for (let i = 1; i < lateReach.length; i++) {
-        maxStepGrowth = Math.max(maxStepGrowth, lateReach[i] - lateReach[i - 1]);
-      }
+      const reachGrowth = Math.max(...lateReach) - Math.min(...lateReach);
       expect(
-        maxStepGrowth,
-        `per-step storage growth EXCEEDED the known-leak bound (${KNOWN_LEAK_PER_STEP}/step) — leak worsened: ${reachable.join(",")}`,
-      ).toBeLessThanOrEqual(KNOWN_LEAK_PER_STEP);
+        reachGrowth,
+        `reachable storage grew over the last 10 steps (leak regressed): ${reachable.join(",")}`,
+      ).toBeLessThanOrEqual(2);
 
       // Re-baseline metrics (printed; not asserted — hardware-dependent).
       const steady = stepMs.slice(5);
