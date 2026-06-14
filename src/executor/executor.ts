@@ -28,7 +28,7 @@ import {
 } from "../backend/webgpu";
 import { getDispatchSequenceCounters } from "../backend/webgpu/bind-group-cache";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
-import { VIEW_META_OPS, viewResultMeta } from "../backend/webgpu/ops/view-meta";
+import { reshapeMeta, VIEW_META_OPS, viewResultMeta } from "../backend/webgpu/ops/view-meta";
 import {
   asGPUTensor,
   type GPUBuffer,
@@ -1611,11 +1611,28 @@ export async function executeLoweredPlan(
               dtype: import("../backend/types").DType;
               buffer: { size: number };
             };
+            // Materialization is DERIVED from the input layout via the shared
+            // reshapeMeta (inc 2/4: build-without-execution has no result buffer
+            // to observe). Cross-check against the live observation while we
+            // still execute, so any divergence is loud (TORCHLETTE_DEBUG_COMPILED).
+            const derivedMaterialized = reshapeMeta(
+              { shape: w.shape, strides: w.strides, offset: w.offset ?? 0 },
+              node.shape,
+            ).materialized;
             const resultBuf = (
               node.result?.backendTensor as { buffer?: object } | undefined
             )?.buffer;
-            const materialized =
+            const observedMaterialized =
               resultBuf !== undefined && resultBuf !== w.buffer;
+            if (
+              ENV.TORCHLETTE_DEBUG_COMPILED &&
+              derivedMaterialized !== observedMaterialized
+            ) {
+              console.warn(
+                `[reshape-mat] node[${nodeIdx}] derived=${derivedMaterialized} observed=${observedMaterialized} shape ${w.shape.join("x")}→${node.shape.join("x")} strides=${w.strides.join(",")}`,
+              );
+            }
+            const materialized = derivedMaterialized;
             action.cachedViewInput = {
               contiguous: !materialized,
               shape: w.shape.slice(),

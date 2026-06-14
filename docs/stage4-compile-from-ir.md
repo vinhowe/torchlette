@@ -635,12 +635,29 @@ cutover alone. The deletions decompose into gated sub-phases:
     Validated: gates 4/4, regression baseline-exact + mem flat, full suite green
     (cpu 1100 + webgpu 711). The harvest still READS live bt (no behavior change);
     flipping it to deriveResultMeta happens in inc 4 (when there's no live result).
-  - **REMAINING for 4.4:** (inc 3) move the layout captures from the exec loop
-    (executor.ts:1519+) to LOWERING time (inputs live there too) so the generated
-    stream builds with no execution; (inc 4) build the plan on first call with no
-    lowered exec — switch the harvest to deriveResultMeta + the input-meta
-    recursion across the NodeResult chain — behind a flag, A/B'd via the parity
-    ladder. Delete the lowered first-exec last.
+  - **INC 3 RE-SCOPED (2026-06-14).** "Move the layout captures to lowering
+    (inputs live there too)" is WRONG: most capture inputs are INTERMEDIATE nodes
+    not materialized at lowering (the captures run during execution precisely
+    because that's the only time intermediate inputs are live). And the capture
+    fns need live tensors — e.g. planBareMatmul puts `effectiveA.buffer` into the
+    plan. So the real remaining work is to feed IR-DERIVED input metadata
+    (deriveResultMeta, recursed to inputs) into the capture/plan fns via metadata
+    STUBS, and confirm those fns use only geometry (shape/strides/dtype), not live
+    buffer contents (replay rebinds buffers via slots anyway). That MERGES inc 3
+    into inc 4 — one integrated build-without-execution push, not a separate step.
+    - **Bounded inc-3 win DONE:** the reshape capture's materialization flag was
+      OBSERVED (`result.buffer !== input.buffer` — needs a live result); now
+      DERIVED via the shared `reshapeMeta(...).materialized` (inc 2), removing its
+      last live-result dependency. Verified: derived == observed on every reshape
+      across fullstack (no `[reshape-mat]` divergence), stream gate 4/4 0-diverged,
+      gates 4/4, regression baseline-exact + flat.
+  - **REMAINING for 4.4 (inc 3+4 merged):** build the plan on first call with NO
+    lowered exec — (a) feed deriveResultMeta-derived input metadata (recursed
+    across the NodeResult chain, bottoming at leaf/external inputs) into the
+    capture/plan fns via metadata stubs; (b) switch the harvest to
+    deriveResultMeta; (c) confirm the plan/capture fns need only geometry, not
+    live buffers. Behind a flag, A/B'd via the parity ladder. Delete the lowered
+    first-exec last.
 - **4.5 Retire the now-dead lowered-path machinery** (MEDIUM, gated on 4.4).
   Once 4.4 removes the lowered first execution, audit + delete what it alone
   used: the per-position arena hints/pre-pinning/conflict paths, the params-
