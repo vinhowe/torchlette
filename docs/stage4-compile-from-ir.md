@@ -458,19 +458,35 @@ en route:
    the cutover (BOTH forward and backward+optimizer generated) matches the
    recorded baseline to ~1e-5 over **30 steps** (7.902291 vs 7.902299 @ step 29).
 
-**Cutover STATUS: forward + backward + optimizer all cut over correctly under
-the flag (30-step parity to fp noise).** Remaining before flipping the default:
+5. **External pre-assignment over-skipped LEAF inputs (the untracked-input /
+   untracked-producer misses, FIXED → ALL plans cut over).** The earlier fix #1
+   skipped external slots for any pending ref to an IN-PLAN node. But planNodes
+   also holds LEAF inputs (the i32 input tokens, prior-plan results threaded in)
+   that are in-plan yet have NO producing action — those are true externals and
+   need an external slot. Skipping them left them (and, cascading, every view /
+   cast / matmul-epilogue that consumed them) untracked, so two plans stayed
+   recorded (matmul-epilogue/scatterAdd/cast `untracked-input`). Fix: build the
+   set of nodes PRODUCED within the plan (every index any action emits/covers)
+   and skip the external slot only for those — matching the recording's
+   "storage exists pre-execution" exactly (a leaf input's storage DID exist
+   pre-execution → external; a computed node's didn't → internal). All four
+   canonical plans now FULLY GENERATED; the full cutover (forward + backward +
+   optimizer) matches the recorded baseline to ~1e-6 over 30 steps (7.902296
+   vs 7.902297 @ step 29).
+
+**Cutover STATUS: ALL plans cut over correctly under the flag (4/4 FULLY
+GENERATED, 30-step parity to fp noise).** Remaining before flipping the default:
 (b) the rest of the parity ladder (regression + A100 A/B) with the flag on; (c)
-close the other two gate holes (external-resolution, orphan-slot) for durability
-— and note the gate still reports a few `untracked-input`/`untracked-producer`
-misses on some plans (matmul-epilogue / scatterAdd / cast with released inputs)
-that keep THOSE plans recorded; the cut-over plans are correct, but full
-coverage needs those closed too; then the phase-4 deletions (recorder →
-cross-check only). Lesson worth keeping: the generator must treat every recorded
-structure it reproduces as needing the SAME copy/ownership AND volatile-repack
-discipline the recorder uses — a shared mutable array stored by reference, and a
-no-op volatile pack, are the same class of bug (params-sequence `data.slice()`,
-frozen-step_size volatile uniform).
+close the two remaining gate holes (external-resolution, orphan-slot) for
+durability — the params-data hole is already closed; then the phase-4 deletions
+(recorder → CI cross-check only, per-position arena / pinnedBufferSet /
+params-sequence cache subsumed by the planner). Lesson worth keeping: the
+generator must treat every recorded structure it reproduces as needing the SAME
+copy/ownership, volatile-repack, AND produced-vs-external discipline the
+recorder uses — a shared mutable array stored by reference, a no-op volatile
+pack, and a leaf input mistaken for an internal producer are all the same class
+of bug (the recorder's `data.slice()`, volatile uniform, and pre-execution
+external pre-assignment, respectively).
 
 ## Risks and mitigations
 - **Imperative-op long tail** (phase 3): mitigated by per-op fallback — no

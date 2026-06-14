@@ -132,6 +132,39 @@ export function generateStream(
     nodeIndexById.set(planNodes[i].id, i);
   }
 
+  // Nodes PRODUCED within this plan (executed by some action — every index an
+  // action emits/covers). The recording's external pre-assignment runs
+  // PRE-execution and assigns external slots only to refs whose storage already
+  // exists, i.e. NOT produced by this plan. The generator runs POST-execution
+  // (all nodes have results), so it can't use "result exists"; instead it skips
+  // exactly the produced-within nodes. Using "in planNodes" as the proxy was
+  // WRONG — planNodes also holds LEAF inputs (e.g. the i32 input tokens) that
+  // are in-plan yet have NO producing action; those are true externals and must
+  // get an external slot, or their (and their consumers') slots go untracked.
+  const producedNodes = new Set<number>();
+  const addProduced = (...idxs: (number | undefined)[]) => {
+    for (const x of idxs) if (x !== undefined) producedNodes.add(x);
+  };
+  for (const a of loweredPlan.actions) {
+    const aa = a as {
+      nodeIndex?: number;
+      nodeIndices?: number[];
+      outputNodeIndex?: number;
+      matmulNodeIndex?: number;
+      coveredNodeIndices?: number[];
+      additionalOutputNodeIndices?: number[];
+      neededIntermediateNodeIndices?: number[];
+    };
+    addProduced(aa.nodeIndex, aa.outputNodeIndex, aa.matmulNodeIndex);
+    for (const arr of [
+      aa.nodeIndices,
+      aa.coveredNodeIndices,
+      aa.additionalOutputNodeIndices,
+      aa.neededIntermediateNodeIndices,
+    ])
+      if (arr) for (const x of arr) producedNodes.add(x);
+  }
+
   // 1. External pre-assignment, mirroring executor.ts (recording mode).
   for (let i = 0; i < planNodes.length; i++) {
     const node = planNodes[i];
@@ -143,16 +176,14 @@ export function generateStream(
       } else if (ref.kind === "scalar") {
         continue;
       } else {
-        // CRITICAL: the recording's pre-assignment (executor.ts) runs
-        // PRE-execution, when in-plan nodes have NO result — so only TRUE
-        // externals (materialized refs, prior-plan results) get external
-        // slots; in-plan producers (data sources, intermediates) get their
-        // slot from their own action later. The generator runs POST-execution,
-        // when EVERY node has a result, so it must exclude in-plan producers
-        // explicitly — otherwise a data-source buffer gets a spurious external
-        // slot whose Phase-1 replay resolution (planNodes[..].inputs[..] →
-        // getInputStorage) fails once the node's result is cleared (step 2+).
-        if (nodeIndexById.has(ref.node.id)) continue;
+        // Skip refs PRODUCED within this plan (they get their slot from their
+        // own action). A ref whose producer is NOT produced-within is a true
+        // external (matched to the recording's "storage exists pre-execution":
+        // leaf inputs + prior-plan results), and gets an external slot. Using
+        // produced-within (not merely in-plan) is essential — in-plan LEAF
+        // inputs (the i32 tokens) have no action and ARE external.
+        const pidx = nodeIndexById.get(ref.node.id);
+        if (pidx !== undefined && producedNodes.has(pidx)) continue;
         const idx = ref.outputIndex ?? 0;
         storage = idx === 0 ? ref.node.result : ref.node.results?.[idx];
       }
