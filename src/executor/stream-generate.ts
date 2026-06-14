@@ -397,6 +397,17 @@ export function generateStream(
         }
         mapNodeResult(node, gen.outSlot, bufferToSlot);
         nodeSlot.set(action.nodeIndex, gen.outSlot);
+        // Multi-output sequential ops (e.g. layernorm-bwd grad_weight/grad_bias)
+        // expose their non-primary outputs so the harvest carries them — else
+        // the cutover drops those results and downstream consumers replay stale
+        // (the optimizer reading grad_bias). Extras go to nodeSlotExtra only —
+        // same convention as the adam-batch / attention multi-output paths;
+        // resolveRefSlot checks nodeSlotExtra first for outputIndex != 0.
+        if (gen.extraOutputs) {
+          for (const eo of gen.extraOutputs) {
+            nodeSlotExtra.set(`${action.nodeIndex}:${eo.outputIndex}`, eo.slot);
+          }
+        }
         coveredActions++;
         break;
       }
@@ -666,6 +677,18 @@ const UNARY_OPS = new Set([
  * params]); the params buffer takes the slot AFTER the output (assigned at
  * createParamsBuffer during encoding).
  */
+/** A sequential generator's result. `outSlot` is the primary (outputIndex 0)
+ *  result slot; `extraOutputs` carries non-primary outputs for multi-output
+ *  sequential ops (e.g. fusedLayerNormBackwardGradWeightBias's grad_bias at
+ *  outputIndex 1) so the walker can map them into nodeSlotExtra — without this
+ *  the cutover harvest drops those results and downstream consumers (the
+ *  optimizer reading grad_bias) silently replay stale values. */
+interface SequentialGen {
+  commands: GpuCommand[];
+  outSlot: Slot;
+  extraOutputs?: Array<{ outputIndex: number; slot: Slot }>;
+}
+
 function generateSequential(
   node: LazyIRNode,
   slots: SlotSource[],
@@ -673,7 +696,7 @@ function generateSequential(
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
   cachedInputShapes?: number[][],
   cachedStridedInputs?: (AttnInputContig | null)[],
-): { commands: GpuCommand[]; outSlot: Slot } | string {
+): SequentialGen | string {
   // Tile-kernel ops with bespoke command patterns.
   if (node.op === "sum")
     return generateFullReduction(node, slots, resolveRefSlot, bufferSlot);
@@ -1820,7 +1843,7 @@ function generateLayerNormGradWB(
   slots: SlotSource[],
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
-): { commands: GpuCommand[]; outSlot: Slot } | string {
+): SequentialGen | string {
   if (node.inputs.length !== 2) return "arity";
   const cfg = node.payload as
     | { numRows?: number; featureDim?: number; eps?: number }
@@ -1916,6 +1939,10 @@ function generateLayerNormGradWB(
       dispatch(p.reducePlan, reduceBindings),
     ],
     outSlot: gwSlot,
+    // grad_bias is outputIndex 1 — expose it so the harvest maps it into
+    // nodeSlotExtra (the optimizer consumes it; dropping it replays stale bias
+    // gradients → slow trajectory divergence).
+    extraOutputs: [{ outputIndex: 1, slot: gbSlot }],
   };
 }
 

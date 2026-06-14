@@ -457,24 +457,46 @@ cutover alone. The deletions decompose into gated sub-phases:
     "every recurring plan cuts over" (4.2) was true only for the produced-only
     (backward/optimizer) plans; the input-bearing forward/loss plans always used
     the recording.
-  - **Their generated replay is buggy.** Skipping the external nodes in the
-    harvest (so they DO cut over) made the trajectory diverge ~3e-2 over 30 steps
-    — even though the command-level diff was byte-clean (0 diverged). Classic
-    frozen-uniform signature: step-0 loss matches exactly, divergence grows. The
-    generated forward/loss plan freezes some per-step-varying value the RECORDED
-    plan repacks (a missing TAG_UNIFORM volatile repack, or the GradScaler
-    loss-scale / CE-backward seed). The recorded replay of the SAME plan is
-    correct (matches `=0`).
-  - A partial 4.3 (skip recording only for produced-only plans, fall back to
-    recording for input-bearing ones via a `streamGenFailed` retry) was built and
-    is numerically SAFE (parity 9e-6) — but it (a) only half-removes the recorder
-    and (b) measured **+57 MB** vs the recorded path (3135 vs 3078 MB on the 124M
-    regression), violating no-regression. Reverted.
-  - **Real next step:** fix the input-bearing-plan generated replay (find the
-    per-step value the generated forward/loss plan freezes; cross-check via a
-    forced-cutover trajectory diff, NOT the command diff — the command diff is
-    blind to it). Once input-bearing plans cut over correctly, 4.3 (and 4.4)
-    unblock: every plan builds from generated, recording becomes CI-only.
+  - **DIVERGENCE ROOT-CAUSED + FIXED (2026-06-14).** The "buggy generated replay"
+    was NOT a frozen uniform — it was the harvest DROPPING multi-output result
+    slots the generator never exposed. Bisection (force-cutover one plan at a
+    time): the FORWARD plan cuts over bit-exact (4.8e-6 — its ~198 dropped
+    primary-output activations are recomputed under checkpointing / not consumed
+    cross-plan, so skipping is safe). The BACKWARD plan diverged (1.3e-2): it
+    dropped `fusedLayerNormBackwardGradWeightBias` **output[1]** (grad_bias) of
+    every layer — the optimizer consumed it, so a frozen/stale grad_bias drifted
+    the bias params. `generateLayerNormGradWB` allocated the grad_bias buffer
+    in-stream but returned only the primary (grad_weight) slot; the walker had no
+    channel for a sequential op's non-primary outputs. **Fix (general):
+    `SequentialGen.extraOutputs` — a multi-output sequential op returns its
+    non-primary slots, the walker maps them into `nodeSlotExtra`** (same
+    convention as the adam-batch / attention multi-output paths). With grad_bias
+    exposed, backward-cutover + all-input-cutover match the recorded trajectory
+    to fp noise (5.7e-6), checkpoint ON and OFF. **This generator fix is landed.**
+  - **Harvest hardening (designed, not yet landed):** distinguish a PRIMARY
+    (oi 0) miss — external input/leaf or recomputed intermediate, safe to SKIP —
+    from a NON-PRIMARY (oi>0) miss — a real generator gap that must BAIL the
+    cutover to recording, never silently replay stale. This makes the cutover
+    safe-by-construction: it caught a second instance (attention `logsumexp`
+    oi=1 unexposed in the checkpoint-recompute path) and fell back to recording
+    instead of diverging.
+  - **REMAINING 4.3 BLOCKER — memory, not correctness.** Once input-bearing plans
+    cut over (the goal), the FORWARD plan's GENERATED compiled plan measures
+    **+57 MB** vs its recorded equivalent (regression 3135 vs 3078 MB), present
+    even with all plans cutting over (so it's NOT the streamGenFailed two-pass —
+    it's inherent to the generated forward plan's buffer assignment). The command
+    streams diff byte-clean, so this is a memory-PLANNER inefficiency on the
+    activation-heavy forward plan (its generated buffer assignment packs worse
+    than the recorded one). 4.3 cannot ship until this is closed (violates
+    no-regression). Open sub-question: a record-vs-no-record forward-plan node
+    count difference (289 vs 364) was observed across runs at DIFFERENT `STEPS`
+    — likely a warmup/STEPS artifact, to confirm it's not a structural
+    record-dependence (which would mean the gate validates a different plan than
+    production runs).
+  - **Net:** the divergence (correctness) is FIXED and general (grad_bias
+    multi-output exposure + the bail rule); 4.3's recorder demotion stays BLOCKED
+    on the +57 MB forward-plan memory-planner regression. 4.4 shares the same
+    memory dependency.
 - **4.4 Build-without-execution → serializable plans** (LARGE, the headline
   dividend). Build the CompiledPlan from the lowered IR at COMPILE time, with NO
   first lowered execution. Requires the generator to derive ALL metadata from
@@ -483,9 +505,10 @@ cutover alone. The deletions decompose into gated sub-phases:
   synthesize discipline phase 3 already established). This kills the ~700 ms cold
   start AND makes plans serializable (no live GPU pointers) — the actual payoff.
   GATED ON the 4.3 blocker: build-without-execution forces EVERY plan onto the
-  generated replay, including the input-bearing forward/loss plans whose
-  generated replay currently diverges (see 4.3). That divergence must be fixed
-  before either phase can proceed.
+  generated replay, including the input-bearing forward/loss plans. Their
+  generated replay is now CORRECT (the grad_bias multi-output fix), but the
+  forward plan's generated compiled plan costs +57 MB vs recorded — that
+  memory-planner regression must be closed before either phase proceeds.
 - **4.5 Retire the now-dead lowered-path machinery** (MEDIUM, gated on 4.4).
   Once 4.4 removes the lowered first execution, audit + delete what it alone
   used: the per-position arena hints/pre-pinning/conflict paths, the params-
@@ -498,11 +521,12 @@ Dividends (realized progressively, fully at 4.4): serializable compiled plans
 (generated plans have no live GPU pointers → ~700 ms cold start dies); single
 answer to "who owns this buffer"; the architecture-debt rules enforced by
 construction. Net: 4.1 DONE (cutover default-on) + 4.2 DONE (chunked
-full-reduction sum covered → every PRODUCED-ONLY recurring plan cuts over). 4.3
-attempt EXPOSED that input-bearing forward/loss plans never cut over (they ride
-the recorded replay) and their generated replay diverges — fixing that is the
-real next step and the shared prerequisite for both 4.3 (demote recorder) and
-4.4 (build-without-execution).
+full-reduction sum covered). 4.3 attempt FIXED the input-bearing-plan
+divergence (grad_bias multi-output exposure — LANDED — + the harvest bail rule)
+so those plans now cut over correctly; but recorder demotion stays BLOCKED on a
++57 MB memory-planner regression in the generated FORWARD plan. That memory
+issue is the shared prerequisite for 4.3 (demote recorder) and 4.4
+(build-without-execution).
 
 **Cutover WIP (2026-06-13, flag-gated `TORCHLETTE_GENERATED_PLAN=1`, DEFAULT
 OFF — default path + gate fully green).** Wired: `finalizeCompiledPlan` (the
