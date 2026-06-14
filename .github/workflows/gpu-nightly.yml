@@ -9,6 +9,12 @@ name: gpu-nightly
 #
 # REQUIRES a self-hosted runner labelled [self-hosted, gpu] with WebGPU/Dawn
 # available (the dw-2-1 / sivri boxes). Register one, or trigger manually.
+# The runner also needs `xvfb` + a Playwright Chromium (the box ships both) for
+# the browser project: vitest browser mode launches a HEADED Chromium, so it
+# runs under xvfb-run. The browser project is the ONLY in-browser training
+# validation (test/browser/lora-training-trajectory.spec.ts) and is what guards
+# the compiled-harvest view-base storage-handle leak class (commit 867f6c1).
+# It's excluded from `npm test` (needs a display) so it executes ONLY here.
 
 on:
   schedule:
@@ -38,3 +44,9 @@ jobs:
       # true, so the webgpu project — and the compiled-plan-parity gates
       # (compiled==lowered, stream-gen no-divergence, determinism) — execute.
       - run: pnpm test:full
+      # Browser project (real Chromium WebGPU via Playwright): the in-browser
+      # LoRA training-trajectory test (loss descends + GPU storage flat — the
+      # compiled-harvest leak guard). Ensure Chromium is present, then run the
+      # headed browser under a virtual display.
+      - run: pnpm exec playwright install chromium
+      - run: xvfb-run -a pnpm test:browser
