@@ -895,10 +895,21 @@ interface DerivedMeta {
 /** Output shape of a node's output `oi` (mirrors the harvest's extra-output map). */
 function derivedOutputShape(node: LazyIRNode, oi: number): number[] | null {
   if (oi === 0) return node.shape;
-  // Multi-output extras present in real plans:
-  //  - adamStep oi 1,2 (m, v): same shape as the param (= node.shape).
-  //  - fusedAttentionForward oi 1 (logsumexp): [batch, heads, seq] from payload.
-  if (node.op === "adamStep") return node.shape;
+  // Multi-output extras present in real plans whose every output has the SAME
+  // shape as the primary (= node.shape):
+  //  - adamStep oi 1,2 (m, v) — same shape as the param.
+  //  - fusedAttentionBackward oi 1,2 (dK, dV) — dQ/dK/dV are all
+  //    [batch, heads, seq, headDim] by construction.
+  //  - fusedLayerNormBackwardGradWeightBias oi 1 (grad_bias) — grad_weight and
+  //    grad_bias are both [featureDim].
+  if (
+    node.op === "adamStep" ||
+    node.op === "fusedAttentionBackward" ||
+    node.op === "fusedLayerNormBackwardGradWeightBias"
+  ) {
+    return node.shape;
+  }
+  // fusedAttentionForward oi 1 (logsumexp): [batch, heads, seq] from payload.
   if (node.op === "fusedAttentionForward" && oi === 1) {
     const p = node.payload as {
       batchSize: number;
@@ -1342,6 +1353,16 @@ function actionOutputHarvestPairs(
   }
   return pairs;
 }
+
+// NOTE: build-without-execution must harvest the FULL action-output set
+// (actionOutputHarvestPairs), NOT just the live-result survivors. A "survivor"
+// prune (protected-OR-no-in-plan-consumer) is UNSAFE: plans are built/executed
+// incrementally, so at one plan's build time a cross-plan consumer living in a
+// LATER plan is not yet a live pending tensor and the liveness walk can't see
+// it — pruning then drops a result a future plan needs ("Input not ready").
+// The lowered/cutover path avoids this only because it materializes every result
+// and prunes later by ACTUAL refcount at markStep, which build-from-IR has no
+// equivalent of. So the over-harvest (and its memory cost) is inherent here.
 
 /**
  * @param plan - The original execution plan

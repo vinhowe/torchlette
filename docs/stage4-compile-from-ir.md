@@ -719,16 +719,34 @@ cutover alone. The deletions decompose into gated sub-phases:
     blocked otherwise-buildable plans. With the precise set one more plan builds
     from IR, peak drops 2899→2893 MB, loss baseline-exact, fullstack vs default
     still 6.7e-6/30 steps, chunked-sum (>128MB) path |Δ|=0 vs CPU under the flag.
-  - **REMAINING for 4.4:** (1) a newly-buildable small plan with a per-step-varying
-    `mul` scalar trips the volatile-params guard (`[compiled] FAIL params bytes
-    changed`) and falls back once to lowered+record — correct (guard catches it,
-    no drift) but build-from-IR should route per-step scalars through the volatile/
-    scalar-table mechanism so it builds cleanly; (2) forward plan still falls
-    through — its result set genuinely mismatches any structural set (planNodes
-    carries uncovered-but-live-result nodes + multi-output fusion exposure gaps),
-    so it needs the generator to slot cross-plan outputs (same blocker as its
-    no-cutover today); (3) flip the default + delete the lowered first-exec once
-    coverage is broad enough.
+  - **DERIVER COMPLETED + COVERAGE = ALL PLANS (2026-06-14).** `derivedOutputShape`
+    now handles every multi-output extra real plans hit: adamStep oi 1,2 (m,v),
+    fusedAttentionBackward oi 1,2 (dK,dV — all [B,H,N,D] = node.shape),
+    fusedLayerNormBackwardGradWeightBias oi 1 (grad_bias = [featureDim] =
+    node.shape), fusedAttentionForward oi 1 (logsumexp). With the deriver complete
+    AND the precise action-output set, EVERY recurring plan (forward, backward,
+    optimizer) builds from IR — zero lowered execution. Loss baseline-exact,
+    fullstack vs default 5.7e-6/30 steps, chunked-sum |Δ|=0.
+  - **THE OVER-HARVEST IS INHERENT (key finding).** build-from-IR must harvest the
+    FULL action-output set, not just the live-result survivors. A survivor prune
+    (protected-OR-no-in-plan-consumer) is UNSAFE: plans are built/executed
+    INCREMENTALLY, so at one plan's build a cross-plan consumer in a LATER plan
+    is not yet a live pending tensor — `computeLivenessOutputIds` can't see it, and
+    pruning drops a result a future plan needs (deterministic "Input not ready" on
+    a narrow). The lowered/cutover path avoids this only because it materializes
+    every result and prunes later by ACTUAL refcount at markStep — which has no
+    build-time equivalent. So full coverage costs memory: 124M regression peak
+    2754→3686 MB (+34%, flat, zero leak). build-from-IR therefore trades MEMORY for
+    cold-start elimination + serializability; it is a viable OPT-IN, not a free
+    default replacement. Closing the gap needs whole-graph-ahead liveness (defeats
+    incremental execution) or a different result-lifetime model — out of scope.
+  - **REMAINING for 4.4:** (1) a small plan with a per-step-varying `mul` scalar
+    trips the volatile-params guard and falls back once (correct, no drift) —
+    route per-step scalars through the volatile/scalar-table mechanism so it
+    builds cleanly; (2) decide the default: given the +34% memory, keep
+    build-from-IR opt-in (cold-start/serializable plans) rather than flipping the
+    default + deleting the lowered first-exec (the 4.5 plan) — or first solve the
+    over-harvest memory.
 - **4.5 Retire the now-dead lowered-path machinery** (MEDIUM, gated on 4.4).
   Once 4.4 removes the lowered first execution, audit + delete what it alone
   used: the per-position arena hints/pre-pinning/conflict paths, the params-
