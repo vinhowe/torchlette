@@ -13,6 +13,7 @@ export {
   getWebGPUInitError,
   initWebGPU,
   KernelContext,
+  setProfilePhase,
   syncWebGPU,
   type TileKernelInstance,
   type TileKernelSpec,

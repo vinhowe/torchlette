@@ -1,6 +1,17 @@
+import * as path from "node:path";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      // Browser-side example code (examples/*) imports torchlette by package
+      // name; resolve it to the BROWSER source entry so those imports load the
+      // same source the tests do (the package `browser` field points at built
+      // dist, which we don't want to test here). Keeps example + tests on one
+      // build of the source.
+      torchlette: path.resolve(__dirname, "src/browser.ts"),
+    },
+  },
   test: {
     include: ["test/browser/**/*.spec.ts"],
     browser: {

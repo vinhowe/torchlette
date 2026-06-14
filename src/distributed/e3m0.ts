@@ -12,7 +12,16 @@
  * Compression: f32 (32 bits) → 4 bits + ~1 bit scale amortized ≈ 6.4x.
  * With block size 128+, scale overhead is negligible → ~8x.
  *
- * Used by Streaming DiLoCo for pseudo-gradient communication.
+ * STATUS: EXPERIMENTAL — NOT on any production wire (2026-06-14). The validated
+ * pseudo-grad wire codec is f16 (`wire-codec.ts`), which round-trips at ~1e-3 rel
+ * error and preserves the DiLoCo trajectory to noise. E3M0's 4-bit (no-mantissa)
+ * format injects up to ~50% per-element RMSE (see e3m0.spec) and MEASURABLY
+ * degrades convergence: a 2-peer real-trainer trajectory (tools/t-codec-convergence.ts)
+ * reached loss 4.91 at round 9 under E3M0 vs 4.64 under f16/none (+0.27 nats, lagging
+ * at every checkpoint). Kept in-tree as a reference implementation for any future
+ * sub-byte codec work (which would need error-feedback to be viable) — do NOT put it
+ * on a real wire without re-gating through tools/t-codec-convergence.ts. The browser
+ * LoRA trainer was switched off E3M0 onto the f16 wire-codec as part of task #46.
  */
 
 /**
