@@ -1858,7 +1858,15 @@ export async function executeLoweredPlan(
       // Stage-4: generate the command stream from the lowered plan, once, if
       // either consumer wants it — the cross-check gate or the phase-4 cutover.
       const wantStreamGen = ENV.TORCHLETTE_STREAM_GENERATE === "1";
-      const wantCutover = ENV.TORCHLETTE_GENERATED_PLAN === "1";
+      // Phase-4.1 (2026-06-14): the cutover is DEFAULT-ON. The generated
+      // stream is the replay source for every fully-covered plan; only plans
+      // the generator cannot fully cover (transient warmup plans that never
+      // recur, chunked ops >128MB that bail) stay on the recorded replay —
+      // per-plan, coverage-gated. TORCHLETTE_GENERATED_PLAN=0 opts back into
+      // the recorded replay everywhere (the legacy path). The first execution
+      // of any plan ALWAYS runs lowered + records regardless; this flag only
+      // swaps the REPLAY source on 2nd+ executions.
+      const wantCutover = ENV.TORCHLETTE_GENERATED_PLAN !== "0";
       const gen =
         (wantStreamGen || wantCutover) && compiled.valid
           ? generateStream(loweredPlan, planNodes, backend)
@@ -1933,8 +1941,9 @@ export async function executeLoweredPlan(
         }
       }
 
-      // Stage-4 phase-4 CUTOVER (TORCHLETTE_GENERATED_PLAN=1): when the
-      // generated stream fully covers the plan, build the compiled plan FROM
+      // Stage-4 phase-4 CUTOVER (default-on; TORCHLETTE_GENERATED_PLAN=0 to
+      // opt out): when the generated stream fully covers the plan, build the
+      // compiled plan FROM
       // IT and use it as the execution source — the recording stays only as
       // the gate's reference (the recorded plan we just built is discarded,
       // its planner entries released so the registry doesn't leak). The

@@ -397,11 +397,21 @@ because of two facts the cutover work surfaced:
 Therefore the recorder + the arena/params machinery CANNOT be deleted by the
 cutover alone. The deletions decompose into gated sub-phases:
 
-- **4.1 Flip the cutover to default-on** (decision + validation, LOW risk). Make
-  `TORCHLETTE_GENERATED_PLAN` the default. No deletions — just makes the
-  generated plan the replay source for covered plans by default. Recorder still
-  runs (gate + fallback). Gate: full ladder + suites, default-on. This is the
-  go/no-go that unblocks everything below.
+- **4.1 Flip the cutover to default-on** — ✅ **DONE 2026-06-14**. The cutover is
+  the default; `wantCutover = ENV.TORCHLETTE_GENERATED_PLAN !== "0"` (opt-out
+  form, matching `ARENA_LIVENESS`/`MEMORY_PLANNER`). The generated plan is the
+  replay source for every fully-covered plan; `=0` opts back into the recorded
+  replay everywhere. No deletions — the recorder still runs (the first execution
+  is always lowered + records; this only swaps the 2nd+-execution replay source)
+  and is the gate/fallback. Validation ladder, default-on, all green:
+    - Gates (`test:gates`, cutover now the default "compiled" path): 3/3.
+    - Fullstack parity generated-default vs `=0` recorded: max |Δ| = 5.7e-6 over
+      30 steps (fp32 noise floor — byte-identical modulo slot bijection, as the
+      gate proves).
+    - Production regression (real WebGPUGPT2Trainer, 10×20): baseline-EXACT
+      (9.81/5.92/5.15/4.64), flat 3081 MB, zero leak.
+    - Full suite: 140 file-runs green (cpu 85 + webgpu 55, 710 webgpu tests).
+  This was the go/no-go; it unblocks everything below.
 - **4.2 Cover the chunked ops** (MEDIUM). chunked contiguous / chunked adam /
   the >128 MB `where`/embedding paths currently bail (`return "chunked"`), so
   large-model plans don't fully cover → stay recorded. Cover them so EVERY
@@ -432,8 +442,9 @@ cutover alone. The deletions decompose into gated sub-phases:
 Dividends (realized progressively, fully at 4.4): serializable compiled plans
 (generated plans have no live GPU pointers → ~700 ms cold start dies); single
 answer to "who owns this buffer"; the architecture-debt rules enforced by
-construction. Net: 4.1 is the next concrete step (a validated flag-flip);
-4.2-4.3 retire the recorder from production; 4.4 is the big structural win.
+construction. Net: 4.1 is DONE (cutover default-on); 4.2 (cover chunked ops so
+every recurring plan cuts over) is the next step; 4.2-4.3 retire the recorder
+from production; 4.4 is the big structural win.
 
 **Cutover WIP (2026-06-13, flag-gated `TORCHLETTE_GENERATED_PLAN=1`, DEFAULT
 OFF — default path + gate fully green).** Wired: `finalizeCompiledPlan` (the
