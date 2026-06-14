@@ -440,16 +440,37 @@ en route:
    hole (after orphan slots and flat-order). Added a params-data multiset guard
    to the FULLY-GENERATED gate (executor.ts) so this class is caught in future.
 
-**Cutover STATUS: working under the flag.** Forward cuts over and trains
-correctly; backward+optimizer stays recorded (genOk=false — see #2). Remaining
-before flipping the default: (a) cover the result nodes without `nodeSlot`
-entries so backward+optimizer also cut over (the #2 limit); (b) the full parity
-ladder (fullstack 30-step + regression + A100 A/B) with the flag on; (c) close
-the other two gate holes (external-resolution, orphan-slot) for durability; then
-the phase-4 deletions (recorder → cross-check only). Lesson worth keeping: the
-generator must treat every recorded structure it reproduces as needing the SAME
-copy/ownership discipline the recorder uses — storing a shared mutable array by
-reference is the same class as the params-sequence cache's `data.slice()`.
+4. **adamStep multi-output + frozen-step_size (the #2 limit, FIXED → backward+
+   optimizer now cuts over).** The backward+optimizer plan stayed recorded
+   because its `adamStep` result nodes' m_new (oi 1) / v_new (oi 2) outputs had
+   no `nodeSlot` entry (generateAdamBatch mapped only the primary param) →
+   genOk=false. Fixed: emit all three outputs (param→bufSlots[1], m→bufSlots[2],
+   v→bufSlots[3], all updated in place); the walker maps the primary to
+   nodeSlot and the m/v extras to nodeSlotExtra. That made it cut over but the
+   trajectory then DRIFTED gradually (onset at the step the optimizer plan first
+   replays) — the generated `adamStep` TAG_UNIFORM used a no-op pack
+   (`() => new Uint32Array(0)`), freezing the bias-corrected step_size at
+   recording time (the frozen-step_size class AGAIN, now in the generator). Fix:
+   thread a real volatile packer — `TileKernelInstance.volatilePack(repack)`
+   builds the exact `node => packUniforms(spec, repack(node)).data` the recorded
+   path uses; `planAdamStepDispatch` returns it (re-deriving the Adam config from
+   the node payload, keeping the static num_elements/grid fields). After the fix
+   the cutover (BOTH forward and backward+optimizer generated) matches the
+   recorded baseline to ~1e-5 over **30 steps** (7.902291 vs 7.902299 @ step 29).
+
+**Cutover STATUS: forward + backward + optimizer all cut over correctly under
+the flag (30-step parity to fp noise).** Remaining before flipping the default:
+(b) the rest of the parity ladder (regression + A100 A/B) with the flag on; (c)
+close the other two gate holes (external-resolution, orphan-slot) for durability
+— and note the gate still reports a few `untracked-input`/`untracked-producer`
+misses on some plans (matmul-epilogue / scatterAdd / cast with released inputs)
+that keep THOSE plans recorded; the cut-over plans are correct, but full
+coverage needs those closed too; then the phase-4 deletions (recorder →
+cross-check only). Lesson worth keeping: the generator must treat every recorded
+structure it reproduces as needing the SAME copy/ownership AND volatile-repack
+discipline the recorder uses — a shared mutable array stored by reference, and a
+no-op volatile pack, are the same class of bug (params-sequence `data.slice()`,
+frozen-step_size volatile uniform).
 
 ## Risks and mitigations
 - **Imperative-op long tail** (phase 3): mitigated by per-op fallback — no

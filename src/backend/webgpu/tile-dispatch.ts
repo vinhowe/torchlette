@@ -179,6 +179,18 @@ export interface TileKernelInstance {
   /** Get the compiled WGSL source (for debugging/testing). */
   getWGSL(): string;
 
+  /**
+   * Stage-4 stream generation: build the volatile-uniform PACK function the
+   * recorded path uses (getConfigBuffer → recordVolatileUniform with
+   * `node => packUniforms(spec, volatileRepack(node)).data`). A generated
+   * TAG_UNIFORM for a kernel with per-step-varying config (Adam's bias-
+   * corrected step_size) MUST carry this packer, not a no-op — else the config
+   * freezes at the recording-time value (the frozen-step_size class).
+   */
+  volatilePack(volatileRepack: VolatileUniformRepack): (
+    node: LazyIRNode,
+  ) => ArrayBufferView;
+
   /** Reset cached pipelines and config buffers. */
   reset(): void;
 }
@@ -477,6 +489,14 @@ export function createTileKernelDispatcher(
     },
 
     getWGSL,
+
+    volatilePack(volatileRepack: VolatileUniformRepack) {
+      // Identical to the pack recorded in getConfigBuffer (line ~257), so a
+      // generated TAG_UNIFORM replays byte-for-byte what the recorded path
+      // would write each step.
+      return (node: LazyIRNode): ArrayBufferView =>
+        packUniforms(spec, volatileRepack(node)).data;
+    },
 
     reset(): void {
       configCache.clear();

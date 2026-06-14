@@ -477,6 +477,9 @@ export function planAdamStepDispatch(
    *  binding the caller must allocate (numElements*2 bytes, allocKind 1). */
   doF16: boolean;
   f16Bytes: number;
+  /** Volatile-uniform packer for the generated TAG_UNIFORM — re-derives the
+   *  per-step Adam config (bias-corrected step_size) from the node payload. */
+  volatilePack: (node: LazyIRNode) => ArrayBufferView;
 } | null {
   if (numElements * 4 > getMaxStorageBufferBindingSize()) return null; // chunked
   const doF16 = emitF16 && isF16Supported();
@@ -499,11 +502,30 @@ export function planAdamStepDispatch(
     uniforms._pad2 = 0;
     uniforms._pad3 = 0;
   }
+  const dispatcher = getAdamDispatcher(useVec4, doF16, doUnscale);
+  // Volatile repack for the generated stream's TAG_UNIFORM: re-derive the
+  // config-driven uniform fields (the per-step bias-corrected step_size etc.)
+  // from the CURRENT step's adamStep node payload, keeping the static fields
+  // (num_elements, grid_stride, pads) captured here. Identical to the recorded
+  // path's volatileRepack (dispatchAdamStep) — without it the generated plan
+  // freezes the step_size at recording time (the frozen-step_size class).
+  const baseUniforms = { ...uniforms };
+  const volatileRepack = (node: LazyIRNode): Record<string, number> => {
+    if (node.op !== "adamStep" || !node.payload) {
+      throw new Error(
+        `[adam-kernel] volatile repack expected an adamStep node, got '${node.op}'`,
+      );
+    }
+    const u = { ...baseUniforms };
+    setAdamConfigUniforms(u, node.payload as AdamStepConfig, doUnscale);
+    return u;
+  };
   return {
-    plan: getAdamDispatcher(useVec4, doF16, doUnscale).plan(uniforms),
+    plan: dispatcher.plan(uniforms),
     doUnscale,
     doF16,
     f16Bytes: numElements * 2,
+    volatilePack: dispatcher.volatilePack(volatileRepack),
   };
 }
 

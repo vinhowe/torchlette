@@ -429,8 +429,15 @@ export function generateStream(
         commands.push(...gen.commands);
         segments.push({ nodeIndex: gen.firstNodeIndex, commands: gen.commands });
         for (const o of gen.outputs) {
-          mapNodeResult(planNodes[o.nodeIndex], o.slot, bufferToSlot);
-          nodeSlot.set(o.nodeIndex, o.slot);
+          // adamStep is multi-output (param oi0, m oi1, v oi2). Primary → the
+          // node→slot + buffer→slot channels; m/v extras → the extra channel so
+          // the harvest can carry persistent optimizer state across steps.
+          if (o.outputIndex === 0) {
+            mapNodeResult(planNodes[o.nodeIndex], o.slot, bufferToSlot);
+            nodeSlot.set(o.nodeIndex, o.slot);
+          } else {
+            nodeSlotExtra.set(`${o.nodeIndex}:${o.outputIndex}`, o.slot);
+          }
         }
         coveredActions++;
         break;
@@ -2505,7 +2512,7 @@ function generateAdamBatch(
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
   backend: import("../backend/types").Backend,
 ):
-  | { commands: GpuCommand[]; outputs: Array<{ nodeIndex: number; slot: Slot }>; firstNodeIndex: number }
+  | { commands: GpuCommand[]; outputs: Array<{ nodeIndex: number; outputIndex: number; slot: Slot }>; firstNodeIndex: number }
   | string {
   const device = (backend as { device?: GPUDevice }).device;
   if (!device) return "no-device";
@@ -2552,11 +2559,17 @@ function generateAdamBatch(
   if (itemList.length === 0) return "no-items";
 
   const commands: GpuCommand[] = [];
-  const outputs: Array<{ nodeIndex: number; slot: Slot }> = [];
-  // param/m/v are updated in place — the node's result reuses the param/m/v
-  // input slot. Primary (param) = bufSlots[1].
+  const outputs: Array<{ nodeIndex: number; outputIndex: number; slot: Slot }> =
+    [];
+  // adamStep is multi-output: param (oi 0), m (oi 1), v (oi 2). All three are
+  // updated IN PLACE — the node's result reuses the param/m/v INPUT slot
+  // (bufSlots = [grad, param, m, v]). The harvest needs slots for ALL three or
+  // the persistent m/v optimizer state can't be carried across steps (the
+  // genOk bail that kept backward+optimizer plans on the recorded path).
   for (const it of itemList) {
-    outputs.push({ nodeIndex: it.nodeIndex, slot: it.bufSlots[1] });
+    outputs.push({ nodeIndex: it.nodeIndex, outputIndex: 0, slot: it.bufSlots[1] });
+    outputs.push({ nodeIndex: it.nodeIndex, outputIndex: 1, slot: it.bufSlots[2] });
+    outputs.push({ nodeIndex: it.nodeIndex, outputIndex: 2, slot: it.bufSlots[3] });
   }
 
   // PACKED groups (planPackedGroups mirrors dispatchPackedOptimizer's
@@ -2635,7 +2648,7 @@ function generateAdamBatch(
       tag: TAG_UNIFORM,
       slot: configSlot,
       nodeIndex: -1,
-      pack: () => new Uint32Array(0),
+      pack: planned.volatilePack,
     });
     commands.push({
       tag: TAG_DISPATCH,
@@ -2704,7 +2717,7 @@ function generateAdamBatch(
       tag: TAG_UNIFORM,
       slot: configSlot,
       nodeIndex: -1,
-      pack: () => new Uint32Array(0),
+      pack: planned.volatilePack,
     });
     commands.push({
       tag: TAG_DISPATCH,
