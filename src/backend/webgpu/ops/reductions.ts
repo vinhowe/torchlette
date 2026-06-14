@@ -18,15 +18,18 @@ import {
 import {
   cachedCreateBindGroup,
   createParamsBuffer,
-  params,
   profiledCreateBindGroup,
   releaseParamsBuffer,
 } from "../bind-group-cache";
-import { resolveOutputBuffer } from "../buffer-arena";
-import { bufferPool } from "../buffer-pool";
+import { allocateOutputBuffer, resolveOutputBuffer } from "../buffer-arena";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { requireContext } from "../gpu-context";
-import type { GPUBuffer, WebGPUContext, WebGPUTensor } from "../gpu-types";
+import type {
+  GPUBuffer,
+  GPUComputePipeline,
+  WebGPUContext,
+  WebGPUTensor,
+} from "../gpu-types";
 import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
 import {
   dimInfo,
@@ -385,14 +388,13 @@ function fullReduction(
   // Only sum needs the chunked path for tensors exceeding maxStorageBufferBindingSize
   if (op === "sum") {
     const bytesPerElement = dtypeBytes(tensor.dtype);
-    const limits = ctx.device.limits;
     const maxBindingSize =
-      limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+      ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
     if (
       tensor.buffer.size > maxBindingSize ||
-      tensor.size * bytesPerElement > maxBindingSize
+      fullReductionNeedsChunking(tensor.size, bytesPerElement, ctx)
     ) {
-      return sumFullReductionChunked(ctx, tensor, maxBindingSize);
+      return sumFullReductionChunked(ctx, tensor);
     }
   }
 
@@ -434,104 +436,155 @@ export function planMeanDivDispatch(
 // ============================================================================
 
 /**
- * Chunked full reduction sum for tensors exceeding maxStorageBufferBindingSize.
- * Computes partial sums per chunk, then sums the partials.
- *
- * Uses tile-IR generated WGSL but dispatches manually (per-chunk bind groups
- * need buffer offset/size entries which tile-dispatch doesn't support directly).
+ * Per-chunk geometry for the chunked full-reduction sum, derived purely from
+ * the element count + device limits — no live tensor needed. Stage-4: this is
+ * the SINGLE SOURCE for both the execution path (sumFullReductionChunked) and
+ * the stream generator (generateChunkedFullReduction), so the recorded and
+ * generated command streams cannot drift apart. Pipelines come from the shared
+ * getPipeline cache, so identity matches the diff by construction.
  */
-function sumFullReductionChunked(
-  ctx: WebGPUContext,
-  tensor: WebGPUTensor,
-  maxBindingSize: number,
-): WebGPUTensor {
-  const bytesPerElement = dtypeBytes(tensor.dtype);
+export interface ChunkedFullReductionPlan {
+  /** Per-chunk partial-sum pipeline (sumChunk). */
+  pipeline: GPUComputePipeline;
+  /** Final partials-sum pipeline; null when numChunks === 1 (partials IS out). */
+  finalPipeline: GPUComputePipeline | null;
+  numChunks: number;
+  /** Byte size of the partials buffer (one f32 per chunk, aligned). */
+  partialsBytes: number;
+  /** Per-chunk subrange + uniform params ([chunkSize, chunkIdx]). */
+  chunks: Array<{
+    byteOffset: number;
+    byteSize: number;
+    paramsData: Uint32Array;
+  }>;
+  /** Final-dispatch uniforms ([numChunks,0,0,0]); null when numChunks === 1. */
+  finalParamsData: Uint32Array | null;
+}
+
+/** True iff a full sum over `totalElements` of `bytesPerElement`-byte elements
+ *  exceeds the device's max storage-buffer binding size and must be chunked.
+ *  Single predicate shared by execution (fullReduction) and the generator. */
+export function fullReductionNeedsChunking(
+  totalElements: number,
+  bytesPerElement: number,
+  ctx: WebGPUContext = requireContext(),
+): boolean {
+  const maxBindingSize =
+    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  return totalElements * bytesPerElement > maxBindingSize;
+}
+
+export function planChunkedFullReduction(
+  totalElements: number,
+  bytesPerElement: number,
+  ctx: WebGPUContext = requireContext(),
+): ChunkedFullReductionPlan {
   const limits = ctx.device.limits;
+  const maxBindingSize =
+    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
   const elementsPerAlignment = minAlignment / bytesPerElement;
   const maxElementsPerChunk = Math.floor(maxBindingSize / bytesPerElement);
   const elementsPerChunk =
     Math.floor(maxElementsPerChunk / elementsPerAlignment) *
     elementsPerAlignment;
-
-  const totalElements = tensor.size;
   const numChunks = Math.ceil(totalElements / elementsPerChunk);
 
-  // Create buffer for partial sums (one f32 per chunk)
-  const partialsBuffer = createTrackedBuffer(ctx.device, {
-    size: alignBufferSize(numChunks * 4),
-    usage:
-      GPUBufferUsage.STORAGE |
-      GPUBufferUsage.COPY_SRC |
-      GPUBufferUsage.COPY_DST,
-  });
-
-  // Per-chunk kernel: tile-IR generated WGSL, manual bind groups for offset/size
   const chunkWGSL = getChunkedSumWGSL();
   const pipeline = getPipeline(ctx, chunkWGSL, chunkWGSL);
 
+  const chunks: ChunkedFullReductionPlan["chunks"] = [];
   for (let chunk = 0; chunk < numChunks; chunk++) {
     const chunkStart = chunk * elementsPerChunk;
     const chunkEnd = Math.min(chunkStart + elementsPerChunk, totalElements);
     const chunkSize = chunkEnd - chunkStart;
-    const chunkByteOffset = chunkStart * bytesPerElement;
-    const chunkByteSize = chunkSize * bytesPerElement;
+    chunks.push({
+      byteOffset: chunkStart * bytesPerElement,
+      byteSize: chunkSize * bytesPerElement,
+      // params(chunkSize, chunk) — but a FRESH array (params() pools/reuses).
+      paramsData: Uint32Array.of(chunkSize, chunk),
+    });
+  }
 
-    const paramsBuffer = createParamsBuffer(
-      ctx.device,
-      params(chunkSize, chunk),
-    );
+  let finalPipeline: GPUComputePipeline | null = null;
+  let finalParamsData: Uint32Array | null = null;
+  if (numChunks > 1) {
+    const finalWGSL = getFinalSumWGSL();
+    finalPipeline = getPipeline(ctx, finalWGSL, finalWGSL);
+    finalParamsData = new Uint32Array([numChunks, 0, 0, 0]); // 16-byte aligned
+  }
 
+  return {
+    pipeline,
+    finalPipeline,
+    numChunks,
+    partialsBytes: alignBufferSize(numChunks * 4),
+    chunks,
+    finalParamsData,
+  };
+}
+
+/**
+ * Chunked full reduction sum for tensors exceeding maxStorageBufferBindingSize.
+ * Computes partial sums per chunk, then sums the partials.
+ *
+ * Uses tile-IR generated WGSL but dispatches manually (per-chunk bind groups
+ * need buffer offset/size entries which tile-dispatch doesn't support directly).
+ *
+ * The partials + output buffers go through the ARENA allocators (not raw
+ * createTrackedBuffer) so they are recordAlloc'd into real plan slots — the
+ * stream generator can then reproduce them as ALLOC commands. Raw
+ * createTrackedBuffer buffers become record-time persistentSlots, which the
+ * generator (building from IR, no live buffers) fundamentally cannot emit; that
+ * was the lone thing keeping embedding-sized plans on the recorded replay.
+ */
+function sumFullReductionChunked(
+  ctx: WebGPUContext,
+  tensor: WebGPUTensor,
+): WebGPUTensor {
+  const bytesPerElement = dtypeBytes(tensor.dtype);
+  const plan = planChunkedFullReduction(tensor.size, bytesPerElement, ctx);
+
+  // Partial sums (one f32 per chunk). Fresh arena alloc (kind 1).
+  const partialsBuffer = allocateOutputBuffer(plan.partialsBytes);
+
+  for (let chunk = 0; chunk < plan.numChunks; chunk++) {
+    const c = plan.chunks[chunk];
+    const paramsBuffer = createParamsBuffer(ctx.device, c.paramsData);
     const bindGroup = profiledCreateBindGroup(ctx.device, {
-      layout: pipeline.getBindGroupLayout(0),
+      layout: plan.pipeline.getBindGroupLayout(0),
       entries: [
         {
           binding: 0,
           resource: {
             buffer: tensor.buffer,
-            offset: chunkByteOffset,
-            size: chunkByteSize,
+            offset: c.byteOffset,
+            size: c.byteSize,
           },
         },
         { binding: 1, resource: { buffer: partialsBuffer } },
         { binding: 2, resource: { buffer: paramsBuffer } },
       ],
     });
-
-    dispatchComputePass(pipeline, bindGroup, 1);
+    dispatchComputePass(plan.pipeline, bindGroup, 1);
     releaseParamsBuffer(paramsBuffer);
   }
 
   // Sum the partials
-  if (numChunks === 1) {
+  if (plan.numChunks === 1) {
     return createTensor([], partialsBuffer);
   }
 
-  // Final reduction of partials: tile-IR generated WGSL
-  const outBuffer = createTrackedBuffer(ctx.device, {
-    size: 4,
-    usage:
-      GPUBufferUsage.STORAGE |
-      GPUBufferUsage.COPY_SRC |
-      GPUBufferUsage.COPY_DST,
-  });
-
-  const finalWGSL = getFinalSumWGSL();
-  const finalPipeline = getPipeline(ctx, finalWGSL, finalWGSL);
-  const finalParamsData = new Uint32Array([numChunks, 0, 0, 0]); // 16-byte aligned
-  const finalParamsBuffer = createParamsBuffer(ctx.device, finalParamsData);
-
-  const finalBindGroup = cachedCreateBindGroup(ctx.device, finalPipeline, [
+  // Final reduction of partials → scalar. Fresh arena alloc (kind 1).
+  const outBuffer = allocateOutputBuffer(4);
+  const finalParamsBuffer = createParamsBuffer(ctx.device, plan.finalParamsData!);
+  const finalBindGroup = cachedCreateBindGroup(ctx.device, plan.finalPipeline!, [
     partialsBuffer,
     outBuffer,
     finalParamsBuffer,
   ]);
-
-  dispatchComputePass(finalPipeline, finalBindGroup, 1);
+  dispatchComputePass(plan.finalPipeline!, finalBindGroup, 1);
   releaseParamsBuffer(finalParamsBuffer);
-
-  // Destroy the intermediate partials buffer
-  bufferPool.deferredDestroy(partialsBuffer, alignBufferSize(numChunks * 4));
 
   return createTensor([], outBuffer);
 }

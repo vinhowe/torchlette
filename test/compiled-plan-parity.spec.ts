@@ -29,6 +29,7 @@ const execFileP = promisify(execFile);
 const TOOLS = path.join(__dirname, "..", "tools");
 const PARITY_PROBE = path.join(TOOLS, "t-compiled-parity-probe.ts");
 const DETERMINISM = path.join(TOOLS, "t-stream-determinism.ts");
+const CHUNKED_SUM = path.join(TOOLS, "t-chunked-sum-probe.ts");
 const TIMEOUT = 300_000;
 
 /** Spawn a tsx tool with retry/backoff (Dawn child spawn is flaky under
@@ -124,6 +125,31 @@ describe("compiled-plan correctness gates", () => {
       const { stdout, code } = await runTool(DETERMINISM, {});
       expect(stdout, stdout.slice(-400)).toContain("DETERMINISM: PASS");
       expect(code).toBe(0);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "chunked full-reduction sum: correct + fully generated (>128MB input)",
+    async () => {
+      if (!webgpu) return;
+      // The chunked sum (input > maxStorageBufferBindingSize) is the lone
+      // chunked op the 124M plan hits; it cuts over to the generated stream
+      // only because its partials/out buffers are arena-allocated (recordable).
+      // Small-model gates never allocate >128MB, so this path needs its own
+      // gate: correctness (Δ=0 vs CPU) AND generated == recorded (0 diverged).
+      const { stdout, stderr, code } = await runTool(CHUNKED_SUM, {
+        TORCHLETTE_STREAM_GENERATE: "1",
+      });
+      const out = `${stdout}\n${stderr}`;
+      expect(out, out.slice(-400)).toContain("CHUNKED-SUM: OK");
+      expect(code).toBe(0);
+      const sg = out.split("\n").filter((l) => l.includes("[stream-gen]"));
+      expect(sg.filter((l) => l.includes("DIVERGE")), out.slice(-600)).toHaveLength(0);
+      expect(
+        sg.filter((l) => l.includes("FULLY GENERATED")).length,
+        `expected the chunked-sum plan to FULLY GENERATE:\n${sg.join("\n")}`,
+      ).toBeGreaterThan(0);
     },
     TIMEOUT,
   );

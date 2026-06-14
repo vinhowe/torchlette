@@ -27,6 +27,8 @@ import {
   planNarrowBackward,
 } from "../backend/webgpu/ops/views";
 import {
+  fullReductionNeedsChunking,
+  planChunkedFullReduction,
   planDimReductionDispatch,
   planFullReductionDispatch,
   planMeanDivDispatch,
@@ -907,16 +909,23 @@ function generateFullReduction(
   const inSlot = resolveRefSlot(ref);
   if (inSlot === undefined) return "untracked-producer";
   let size: number;
+  let bytesPerElement = 4;
   if (storage) {
     const t = storage.backendTensor as WebGPUTensor;
     if (!t.isContiguous) return "non-contiguous";
     size = t.size;
+    bytesPerElement = dtypeBytes(t.dtype);
   } else if (ref.kind !== "materialized" && !VIEW_OPS.has(ref.node.op)) {
     size = sizeOf(ref.node.shape);
+    const sd = refShapeDtype(ref);
+    if (sd) bytesPerElement = dtypeBytes(sd.dtype);
   } else {
     return "no-storage";
   }
-  if (size * 4 > 128 * 1024 * 1024) return "chunked";
+  // Input exceeds maxStorageBufferBindingSize → chunked partials path (the
+  // generated commands mirror sumFullReductionChunked, sharing its plan).
+  if (fullReductionNeedsChunking(size, bytesPerElement))
+    return generateChunkedFullReduction(size, bytesPerElement, inSlot, slots);
   const plan = planFullReductionDispatch(reduceOp, size);
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
@@ -940,6 +949,80 @@ function generateFullReduction(
     ],
     outSlot,
   };
+}
+
+/**
+ * Chunked full-reduction sum (input > maxStorageBufferBindingSize). Mirrors
+ * sumFullReductionChunked command-for-command, deriving identical geometry +
+ * pipelines from the shared planChunkedFullReduction (single source). Both temp
+ * buffers (partials, out) are FRESH arena allocs (kind 1) — the execution path
+ * routes them through allocateOutputBuffer for exactly this reason, so they
+ * record as real ALLOC commands the generator can reproduce here. Per-chunk
+ * dispatches bind the input at a subrange (bindingRanges[0]); the partials
+ * buffer and uniform params bind whole (null). When numChunks === 1 the
+ * partials buffer IS the scalar output (no final reduction).
+ */
+function generateChunkedFullReduction(
+  size: number,
+  bytesPerElement: number,
+  inSlot: Slot,
+  slots: SlotSource[],
+): { commands: GpuCommand[]; outSlot: Slot } {
+  const plan = planChunkedFullReduction(size, bytesPerElement, requireContext());
+  const commands: GpuCommand[] = [];
+
+  const partialsSlot = slots.length;
+  slots.push({ kind: "arena" });
+  commands.push({
+    tag: TAG_ALLOC,
+    slot: partialsSlot,
+    bytes: plan.partialsBytes,
+    allocKind: 1,
+    inputSlots: [],
+  });
+
+  for (const c of plan.chunks) {
+    const pSlot = slots.length;
+    slots.push({ kind: "params", seqIndex: -1, data: c.paramsData.slice() });
+    commands.push({
+      tag: TAG_DISPATCH,
+      pipeline: plan.pipeline,
+      bindings: [inSlot, partialsSlot, pSlot],
+      bindingRanges: [{ offset: c.byteOffset, size: c.byteSize }, null, null],
+      gx: 1,
+      gy: 1,
+      gz: 1,
+    });
+  }
+
+  if (plan.numChunks === 1) {
+    return { commands, outSlot: partialsSlot };
+  }
+
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  commands.push({
+    tag: TAG_ALLOC,
+    slot: outSlot,
+    bytes: 4,
+    allocKind: 1,
+    inputSlots: [],
+  });
+  const fpSlot = slots.length;
+  slots.push({
+    kind: "params",
+    seqIndex: -1,
+    data: plan.finalParamsData!.slice(),
+  });
+  commands.push({
+    tag: TAG_DISPATCH,
+    pipeline: plan.finalPipeline!,
+    bindings: [partialsSlot, outSlot, fpSlot],
+    gx: 1,
+    gy: 1,
+    gz: 1,
+  });
+  return { commands, outSlot };
 }
 
 /** sum over dim(s) — NON-epilogue (e.g. a bias gradient): ALLOC(outSize*4,

@@ -412,12 +412,36 @@ cutover alone. The deletions decompose into gated sub-phases:
       (9.81/5.92/5.15/4.64), flat 3081 MB, zero leak.
     - Full suite: 140 file-runs green (cpu 85 + webgpu 55, 710 webgpu tests).
   This was the go/no-go; it unblocks everything below.
-- **4.2 Cover the chunked ops** (MEDIUM). chunked contiguous / chunked adam /
-  the >128 MB `where`/embedding paths currently bail (`return "chunked"`), so
-  large-model plans don't fully cover → stay recorded. Cover them so EVERY
-  recurring plan cuts over. (Transient plans still won't compile — they don't
-  recur; that's fine, they run lowered once.) After 4.2 the recorded BUILD is
-  the source for NO recurring plan.
+- **4.2 Cover the chunked ops** — ✅ **DONE 2026-06-14**. Empirically, the lone
+  chunked op the production 124M plan hits is the **full-reduction sum** over a
+  >maxStorageBufferBindingSize input (the clip/scaler reductions over the 154 MB
+  embedding grad). A census at production batch×seq=1024 (where CE logits are
+  206 MB) confirmed it: all 4 recurring plans now FULLY GENERATE, **zero**
+  uncovered — CE's custom kernel doesn't introduce a generic >128 MB binding,
+  and chunked contiguous/adam/`where` simply never appear at vocab×embed sizes.
+  - **Root cause it was uncovered:** `sumFullReductionChunked` allocated its
+    `partials`/`out` temps via raw `createTrackedBuffer`, which bypasses
+    `recordAlloc` → they became record-time **persistentSlots** (live GPU
+    pointers). The generator builds from IR with no live buffers, so it
+    fundamentally cannot reproduce a persistentSlot — that, not the dispatch
+    shape, was the blocker. (It was also fragile in the recorded path.)
+  - **Fix:** extracted `planChunkedFullReduction(elements, bytesPerElement, ctx)`
+    — pure geometry (chunk subranges, per-chunk `[chunkSize, idx]` params,
+    partials bytes, final params, shared pipelines) — as the SINGLE SOURCE for
+    both `sumFullReductionChunked` (execution) and `generateChunkedFullReduction`
+    (generator). The temps now go through `allocateOutputBuffer` (arena, kind-1
+    ALLOC), so they record as real planner-managed slots the generator emits.
+    Chunk dispatches carry `bindingRanges: [{offset,size}, null, null]`.
+  - **Validated:** chunked sum generated == recorded (0 diverged, params multiset
+    matches) + Δ=0 vs CPU across replays; 124M generated-cutover vs `=0` recorded
+    identical loss + memory; gates 4/4 (new in-suite gate: `t-chunked-sum-probe`
+    in `compiled-plan-parity.spec.ts` — small-model gates never allocate >128 MB);
+    full suite green; production regression baseline-exact, flat 3081 MB.
+  - After 4.2 the recorded BUILD is the source for NO recurring plan. (Transient
+    warmup plans still never compile — they don't recur; that's fine, they run
+    lowered once. Any future config that surfaces a genuinely new chunked op
+    shows up as a loud `uncovered` census entry → that plan safely stays recorded
+    until covered.)
 - **4.3 Demote the recorder to CI-only** (MEDIUM, the first real deletion). With
   4.2, skip recording in production entirely — build the compiled plan from the
   generated stream directly (the genResults harvest already gives the slots).
@@ -442,9 +466,9 @@ cutover alone. The deletions decompose into gated sub-phases:
 Dividends (realized progressively, fully at 4.4): serializable compiled plans
 (generated plans have no live GPU pointers → ~700 ms cold start dies); single
 answer to "who owns this buffer"; the architecture-debt rules enforced by
-construction. Net: 4.1 is DONE (cutover default-on); 4.2 (cover chunked ops so
-every recurring plan cuts over) is the next step; 4.2-4.3 retire the recorder
-from production; 4.4 is the big structural win.
+construction. Net: 4.1 DONE (cutover default-on) + 4.2 DONE (chunked
+full-reduction sum covered → every recurring plan cuts over). 4.3 (demote the
+recorder to CI-only) is the next step; 4.4 is the big structural win.
 
 **Cutover WIP (2026-06-13, flag-gated `TORCHLETTE_GENERATED_PLAN=1`, DEFAULT
 OFF — default path + gate fully green).** Wired: `finalizeCompiledPlan` (the
