@@ -502,8 +502,23 @@ whose result clears mid-replay). Closing the remaining holes "properly" would
 need resolved-BUFFER comparison (not ref-pair identity), which the trajectory
 parity already subsumes — not worth the false-positive surface.
 
-Remaining before flipping the default: (b) the rest of the parity ladder
-(regression + A100 A/B) with the flag on; then the phase-4 deletions (recorder →
+**Parity ladder with the flag ON (b) — VALIDATED.** (1) fullstack 30-step:
+generated == recorded to ~1e-6. (2) PRODUCTION regression
+(`diloco-regression-check.ts`, the real WebGPUGPT2Trainer, 10 rounds × 20 inner
+steps) with `TORCHLETTE_GENERATED_PLAN=1`: loss trajectory matches the baseline
+EXACTLY (9.81 / 5.92 / 5.15 / 4.64 — the baseline was recorded flag-OFF, so this
+IS the A/B), and peak memory is FLAT at 3081 MB, 0 MB growth over rounds (no
+leak). Because the generated stream is byte-identical to the recording (the
+gate proves it), the cutover is memory/speed-NEUTRAL by construction — the
+production regression's flat-memory check confirms it on the real path. SCALE
+SAFETY: larger models keep working because the cutover is PER-PLAN and gated on
+full coverage — a plan with a chunked op (chunked contiguous/adam, >128 MB
+buffers) isn't fully covered, so it never cuts over and stays on the recorded
+path. No correctness risk at scale; just less of the plan set cuts over.
+(`profile-training.ts` at gpt2@512 hangs at init independent of the flag — a
+profiler/scale issue, not a cutover regression; not pursued.)
+
+Remaining before flipping the default: the phase-4 deletions (recorder →
 CI cross-check only; per-position arena / pinnedBufferSet / params-sequence
 cache subsumed by the planner). Lesson worth keeping: the generator must treat
 every recorded structure it reproduces as needing the SAME copy/ownership,
