@@ -1293,23 +1293,33 @@ function actionOutputHarvestPairs(
   planNodes: LazyIRNode[],
   gen: GeneratedStream,
 ): Array<{ i: number; oi: number }> {
-  // Nodes absorbed inside a group (covered but not the group's output) get no
-  // node.result in the lowered path.
-  const absorbed = new Set<number>();
+  // The PRIMARY (oi 0) result nodes are exactly the action OUTPUT nodes — what
+  // the lowered path calls assignNodeResult for. Nodes absorbed inside a group
+  // (covered but not the output) get no result; nodes in planNodes but in NO
+  // action (CSE'd / bypassed / externally materialized) are not produced by
+  // this plan and must not be harvested.
+  const isOutput = new Set<number>();
   for (const action of loweredPlan.actions) {
-    if (action.kind === "fused") {
-      const outs = new Set<number>([
-        action.outputNodeIndex,
-        ...action.additionalOutputNodeIndices,
-      ]);
-      for (const ni of action.coveredNodeIndices)
-        if (!outs.has(ni)) absorbed.add(ni);
-    } else if (action.kind === "matmul-epilogue") {
-      for (const ni of action.coveredNodeIndices)
-        if (ni !== action.outputNodeIndex) absorbed.add(ni);
-    } else if (action.kind === "row-program") {
-      for (const ni of action.coveredNodeIndices)
-        if (ni !== action.outputNodeIndex) absorbed.add(ni);
+    switch (action.kind) {
+      case "sequential":
+      case "view":
+      case "data-source":
+        isOutput.add(action.nodeIndex);
+        break;
+      case "fused":
+        isOutput.add(action.outputNodeIndex);
+        for (const ni of action.additionalOutputNodeIndices) isOutput.add(ni);
+        break;
+      case "matmul-epilogue":
+      case "row-program":
+        isOutput.add(action.outputNodeIndex);
+        break;
+      case "adam-batch":
+      case "batched-reduction":
+        for (const ni of action.nodeIndices) isOutput.add(ni);
+        break;
+      case "reclaim":
+        break;
     }
   }
   const extrasByNode = new Map<number, number[]>();
@@ -1323,7 +1333,7 @@ function actionOutputHarvestPairs(
   }
   const pairs: Array<{ i: number; oi: number }> = [];
   for (let i = 0; i < planNodes.length; i++) {
-    if (!absorbed.has(i)) pairs.push({ i, oi: 0 });
+    if (isOutput.has(i)) pairs.push({ i, oi: 0 });
     const extras = extrasByNode.get(i);
     if (extras) {
       extras.sort((a, b) => a - b);

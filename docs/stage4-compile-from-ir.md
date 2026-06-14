@@ -709,13 +709,26 @@ cutover alone. The deletions decompose into gated sub-phases:
       `harvestGenResults` + `liveResultHarvestPairs` (cutover) /
       `actionOutputHarvestPairs` (build-from-IR), and `computeLivenessOutputIds`
       (shared by liveness release + reused logic).
-  - **REMAINING for 4.4:** (1) tighten the harvest set toward the exact survivors
-    (close the +145 MB) — needs a structural model of cross-plan refcount holds, or
-    recording the survivor set once; (2) extend coverage to the forward plan (its
-    cross-plan-consumed activations aren't slotted by the generator — same blocker
-    that stops it cutting over today); (3) flip the default + delete the lowered
-    first-exec once coverage is broad enough. Multi-output extras whose derivation
-    isn't wired (e.g. logsumexp oi=1) still hit the harvest's live fallback.
+  - **HARVEST SET REFINED (2026-06-14):** `actionOutputHarvestPairs` now
+    enumerates the PRECISE action-output set (sequential/view/data-source →
+    nodeIndex; fused → output + additional; epilogue/row-program → output;
+    adam-batch/batched-reduction → all nodeIndices) instead of "all plan nodes
+    minus fused-internal." The old form wrongly included nodes that are in
+    planNodes but covered by NO action (CSE'd / bypassed / externally
+    materialized) — they have no generated slot, so they forced genOk=false and
+    blocked otherwise-buildable plans. With the precise set one more plan builds
+    from IR, peak drops 2899→2893 MB, loss baseline-exact, fullstack vs default
+    still 6.7e-6/30 steps, chunked-sum (>128MB) path |Δ|=0 vs CPU under the flag.
+  - **REMAINING for 4.4:** (1) a newly-buildable small plan with a per-step-varying
+    `mul` scalar trips the volatile-params guard (`[compiled] FAIL params bytes
+    changed`) and falls back once to lowered+record — correct (guard catches it,
+    no drift) but build-from-IR should route per-step scalars through the volatile/
+    scalar-table mechanism so it builds cleanly; (2) forward plan still falls
+    through — its result set genuinely mismatches any structural set (planNodes
+    carries uncovered-but-live-result nodes + multi-output fusion exposure gaps),
+    so it needs the generator to slot cross-plan outputs (same blocker as its
+    no-cutover today); (3) flip the default + delete the lowered first-exec once
+    coverage is broad enough.
 - **4.5 Retire the now-dead lowered-path machinery** (MEDIUM, gated on 4.4).
   Once 4.4 removes the lowered first execution, audit + delete what it alone
   used: the per-position arena hints/pre-pinning/conflict paths, the params-
