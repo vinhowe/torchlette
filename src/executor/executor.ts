@@ -1,7 +1,7 @@
 import { ENV } from "../core/env";
 import { getBackend } from "../backend/registry";
 import { diffSegmentsAligned, diffStreams } from "./stream-diff";
-import { generateStream } from "./stream-generate";
+import { type GeneratedStream, generateStream } from "./stream-generate";
 import type {
   AdamStepConfig,
   Backend,
@@ -29,6 +29,8 @@ import {
 import { getDispatchSequenceCounters } from "../backend/webgpu/bind-group-cache";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
 import { reshapeMeta, VIEW_META_OPS, viewResultMeta } from "../backend/webgpu/ops/view-meta";
+import { detectSimpleTranspose } from "../backend/webgpu/ops/views";
+import { dtypeBytes } from "../backend/webgpu/shape-utils";
 import {
   asGPUTensor,
   type GPUBuffer,
@@ -51,7 +53,7 @@ import {
   _detectTransposeView,
   executeMatmulWithEpilogue,
 } from "../compiler/matmul-epilogue";
-import { contiguousStrides, shapesEqual } from "../core/shape";
+import { checkContiguous, contiguousStrides, shapesEqual, sizeOf } from "../core/shape";
 import {
   _webgpuMatmulGeomImports,
   _webgpuMatmulImports,
@@ -92,6 +94,7 @@ import {
   assignSlot,
   buildCompiledPlan,
   buildCompiledPlanFromGenerated,
+  type CompiledPlan,
   destroyCompiledPlanBuffers,
   resetPlannerRegistry,
   executeCompiledPlan,
@@ -696,6 +699,641 @@ async function buildAndCacheDispatchConfig(
  * all of those decisions were recorded during the first execution and are
  * replayed here.
  *
+/**
+ * Capture the layout metadata the stream generator needs but can't derive
+ * post-hoc (liveness frees the inputs before plan-build). SINGLE SOURCE for
+ * the five action-cache captures: the lowered main loop calls this with the
+ * LIVE backend input tensors; build-without-execution (phase 4.4) calls it
+ * with IR-DERIVED metadata stubs (same `{shape,strides,offset,dtype,
+ * buffer.size}` surface). Each capture is shape/dtype-pure → template-
+ * invariant, so it runs once per template (the `=== undefined` guards).
+ *
+ * `backendInputs[i]` must expose `.shape/.strides/.offset?/.dtype/.buffer.size`
+ * (and `.isContiguous?`); the matmul capture additionally needs whatever
+ * planBareMatmul reads, which the IR stub mirrors. `observeResult` enables the
+ * reshape-materialization cross-check against the live result (off under
+ * build-without-execution — there is no live result to observe).
+ */
+function captureActionLayouts(
+  action: LoweredAction,
+  node: LazyIRNode,
+  nodeIdx: number,
+  backendInputs: unknown[],
+  backendName: string,
+  observeResult: boolean,
+): void {
+  // Stage-4 phase-3: capture bare-matmul geometry (transpose detection needs
+  // live strides). Geometry is shape/dtype-pure → valid for every step.
+  if (
+    action.kind === "sequential" &&
+    node.op === "matmul" &&
+    action.cachedMatmulPlan === undefined &&
+    backendName === "webgpu" &&
+    backendInputs.length === 2
+  ) {
+    try {
+      action.cachedMatmulPlan = _webgpuMatmulImports!.planBareMatmul(
+        asGPUTensor(backendInputs[0]),
+        asGPUTensor(backendInputs[1]),
+      );
+    } catch {
+      action.cachedMatmulPlan = "plan-throw";
+    }
+  }
+
+  // narrowBackward needs its grad's dim size, but that grad is a released
+  // multi-output extra at plan-build and nodes carry no per-output shape
+  // metadata — cache the input shapes (template-invariant).
+  if (
+    action.kind === "sequential" &&
+    node.op === "narrowBackward" &&
+    action.cachedInputShapes === undefined
+  ) {
+    action.cachedInputShapes = backendInputs.map((t) =>
+      (t as { shape: number[] }).shape.slice(),
+    );
+  }
+
+  // Attention fwd/bwd asContiguous() their inputs inside the op — a non-
+  // contiguous input inserts a contiguous-copy prologue. Capture each input's
+  // layout (`contiguous` mirrors ensureContiguous EXACTLY) so the generator
+  // replays planContiguousDirect for the non-contiguous ones.
+  if (
+    action.kind === "sequential" &&
+    (node.op === "fusedAttentionForward" ||
+      node.op === "fusedAttentionBackward") &&
+    action.cachedInputContig === undefined
+  ) {
+    action.cachedInputContig = backendInputs.map((t) => {
+      const w = t as {
+        isContiguous?: boolean;
+        shape: number[];
+        strides: number[];
+        offset?: number;
+        dtype: import("../backend/types").DType;
+        buffer: { size: number };
+      };
+      return {
+        contiguous: w.isContiguous !== false,
+        shape: w.shape.slice(),
+        strides: w.strides.slice(),
+        offset: w.offset ?? 0,
+        dtype: w.dtype,
+        bufferSize: w.buffer.size,
+      };
+    });
+  }
+
+  // reshape MATERIALIZES a contiguous copy iff its input is non-contiguous AND
+  // the new shape is incompatible with the input strides — DERIVED via the
+  // shared reshapeMeta (single source with views.ts). When a live result is
+  // present, cross-check the derivation against the observed buffer aliasing.
+  if (
+    action.kind === "view" &&
+    node.op === "reshape" &&
+    action.cachedViewInput === undefined &&
+    backendInputs.length >= 1
+  ) {
+    const w = backendInputs[0] as {
+      shape: number[];
+      strides: number[];
+      offset?: number;
+      dtype: import("../backend/types").DType;
+      buffer: { size: number };
+    };
+    const derivedMaterialized = reshapeMeta(
+      { shape: w.shape, strides: w.strides, offset: w.offset ?? 0 },
+      node.shape,
+    ).materialized;
+    if (observeResult && ENV.TORCHLETTE_DEBUG_COMPILED) {
+      const resultBuf = (
+        node.result?.backendTensor as { buffer?: object } | undefined
+      )?.buffer;
+      const observedMaterialized =
+        resultBuf !== undefined && resultBuf !== w.buffer;
+      if (derivedMaterialized !== observedMaterialized) {
+        console.warn(
+          `[reshape-mat] node[${nodeIdx}] derived=${derivedMaterialized} observed=${observedMaterialized} shape ${w.shape.join("x")}→${node.shape.join("x")} strides=${w.strides.join(",")}`,
+        );
+      }
+    }
+    action.cachedViewInput = {
+      contiguous: !derivedMaterialized,
+      shape: w.shape.slice(),
+      strides: w.strides.slice(),
+      offset: w.offset ?? 0,
+      dtype: w.dtype,
+      bufferSize: w.buffer.size,
+    };
+  }
+
+  // Sequential elementwise op consuming a STRIDED view (expand / transpose /
+  // permute / narrow): that producer is released by plan-build and its
+  // stride-bearing layout isn't shape-derivable, so capture each such input's
+  // layout (incl. broadcast stride-0). Empty array marks "checked, none".
+  if (action.kind === "sequential" && action.cachedStridedInputs === undefined) {
+    let caps:
+      | (import("./lowered-plan").AttnInputContig | null)[]
+      | undefined;
+    for (let i = 0; i < node.inputs.length; i++) {
+      const ref = node.inputs[i];
+      if (
+        ref.kind !== "pending" ||
+        (ref.node.op !== "expand" &&
+          ref.node.op !== "transpose" &&
+          ref.node.op !== "permute" &&
+          ref.node.op !== "narrow")
+      ) {
+        continue;
+      }
+      const w = backendInputs[i] as {
+        shape: number[];
+        strides: number[];
+        offset?: number;
+        dtype: import("../backend/types").DType;
+        buffer: { size: number };
+      };
+      (caps ??= new Array(node.inputs.length).fill(null))[i] = {
+        contiguous: false,
+        shape: w.shape.slice(),
+        strides: w.strides.slice(),
+        offset: w.offset ?? 0,
+        dtype: w.dtype,
+        bufferSize: w.buffer.size,
+      };
+    }
+    action.cachedStridedInputs = caps ?? [];
+  }
+}
+
+// ============================================================================
+// Build-without-execution: IR-derived metadata (stage-4 phase 4.4)
+// ============================================================================
+//
+// To build the compiled plan on the FIRST call (no lowered execution), the two
+// things that previously needed live tensors — the layout captures and the
+// result-metadata harvest — must be derived from the IR. Both bottom out at
+// the same recursive metadata derivation here: a node's output {shape, strides,
+// offset, dtype, base-buffer-size} is a pure function of its op + its inputs'
+// derived metadata, recursing until a leaf/external input whose live storage IS
+// available at build time (model params, prior-plan results). Views use the
+// shared view-meta transforms (single source with the backend ops); compute ops
+// produce contiguous outputs. The base-buffer size feeds only the generator's
+// >maxBindingSize guard (planContiguousDirectCore) — it is the one field that
+// needn't be byte-exact; the stream-generation differential is the seam check
+// that catches any divergence (→ not fully covered → lowered fallback).
+
+interface DerivedMeta {
+  shape: number[];
+  strides: number[];
+  offset: number;
+  dtype: DType;
+  /** Base storage buffer size in bytes (the >maxBindingSize guard input). */
+  bufferSize: number;
+}
+
+/** Output shape of a node's output `oi` (mirrors the harvest's extra-output map). */
+function derivedOutputShape(node: LazyIRNode, oi: number): number[] | null {
+  if (oi === 0) return node.shape;
+  // Multi-output extras present in real plans:
+  //  - adamStep oi 1,2 (m, v): same shape as the param (= node.shape).
+  //  - fusedAttentionForward oi 1 (logsumexp): [batch, heads, seq] from payload.
+  if (node.op === "adamStep") return node.shape;
+  if (node.op === "fusedAttentionForward" && oi === 1) {
+    const p = node.payload as {
+      batchSize: number;
+      numHeads: number;
+      seqLen: number;
+    };
+    return [p.batchSize, p.numHeads, p.seqLen];
+  }
+  return null;
+}
+
+/**
+ * Recursive IR metadata deriver with memoization. `deriveRefMeta` resolves an
+ * input ref's metadata — reading the LIVE storage when it exists (a leaf/
+ * external/already-executed base case) and recursing through the producer node
+ * otherwise (an intra-plan intermediate not yet materialized under build-
+ * without-execution). At the cutover this bottoms out immediately (every intra-
+ * plan node is live); under build-without-execution it recurses to the leaves.
+ */
+function makeMetaDeriver(): {
+  deriveRefMeta: (ref: LazyRef) => DerivedMeta | null;
+  deriveNodeMeta: (node: LazyIRNode, oi: number) => DerivedMeta | null;
+} {
+  const memo = new Map<string, DerivedMeta | null>();
+
+  const liveMeta = (st: StorageHandle | undefined): DerivedMeta | null => {
+    if (!st) return null;
+    const bt = asGPUTensor(st.backendTensor);
+    return {
+      shape: bt.shape.slice(),
+      strides: bt.strides.slice(),
+      offset: bt.offset ?? 0,
+      dtype: bt.dtype,
+      bufferSize: bt.buffer.size,
+    };
+  };
+
+  const deriveRefMeta = (ref: LazyRef): DerivedMeta | null => {
+    if (!ref || ref.kind === "scalar") return null;
+    if (ref.kind === "materialized") return liveMeta(ref.storage);
+    const oi = ref.outputIndex ?? 0;
+    const st = oi === 0 ? ref.node.result : ref.node.results?.[oi];
+    if (st) return liveMeta(st); // live base case (external / already executed)
+    return deriveNodeMeta(ref.node, oi); // recurse: intra-plan intermediate
+  };
+
+  const deriveNodeMeta = (
+    node: LazyIRNode,
+    oi: number,
+  ): DerivedMeta | null => {
+    const key = `${node.id}:${oi}`;
+    const cached = memo.get(key);
+    if (cached !== undefined) return cached;
+    memo.set(key, null); // cycle guard (DAG → never actually hit)
+
+    let m: DerivedMeta | null = null;
+    if (oi === 0 && VIEW_META_OPS.has(node.op)) {
+      const inp = deriveRefMeta(node.inputs[0]);
+      if (inp) {
+        const inpVM = {
+          shape: inp.shape,
+          strides: inp.strides,
+          offset: inp.offset,
+        };
+        if (node.op === "reshape" || node.op === "view") {
+          // reshape may MATERIALIZE (incompatible non-contiguous → fresh
+          // contiguous buffer) or stay a free view (shares the base buffer).
+          const r = reshapeMeta(inpVM, node.shape);
+          m = {
+            shape: r.shape,
+            strides: r.strides,
+            offset: r.offset,
+            dtype: node.dtype,
+            bufferSize: r.materialized
+              ? sizeOf(node.shape) * dtypeBytes(node.dtype)
+              : inp.bufferSize,
+          };
+        } else {
+          const vm = viewResultMeta(node.op, inpVM, node.shape, node.payload);
+          if (vm) {
+            m = {
+              shape: vm.shape,
+              strides: vm.strides,
+              offset: vm.offset,
+              dtype: node.dtype,
+              bufferSize: inp.bufferSize, // metadata-only view → same base buffer
+            };
+          }
+        }
+      }
+    }
+    if (!m) {
+      // Compute op (oi 0) or a known multi-output extra: contiguous, offset 0,
+      // fresh buffer sized from the output shape.
+      const shape = derivedOutputShape(node, oi);
+      if (shape) {
+        m = {
+          shape: shape.slice(),
+          strides: contiguousStrides(shape),
+          offset: 0,
+          dtype: node.dtype,
+          bufferSize: sizeOf(shape) * dtypeBytes(node.dtype),
+        };
+      }
+    }
+    memo.set(key, m);
+    return m;
+  };
+
+  return { deriveRefMeta, deriveNodeMeta };
+}
+
+/**
+ * A WebGPUTensor-shaped metadata stub fed to captureActionLayouts (and through
+ * it planBareMatmul) when there is no live tensor. Exposes exactly the surface
+ * the captures read: shape/strides/offset/dtype, isContiguous (matching the
+ * backend's offset-agnostic definition — see tensor.ts), and a buffer.size for
+ * the binding-size guard. planTiledMatmul never touches the buffer at plan time.
+ */
+function stubTensor(m: DerivedMeta): {
+  shape: number[];
+  strides: number[];
+  offset: number;
+  dtype: DType;
+  isContiguous: boolean;
+  buffer: { size: number };
+} {
+  return {
+    shape: m.shape,
+    strides: m.strides,
+    offset: m.offset,
+    dtype: m.dtype,
+    isContiguous: checkContiguous(m.shape, m.strides),
+    buffer: { size: m.bufferSize },
+  };
+}
+
+/**
+ * Populate the action layout caches from IR-derived metadata (build-without-
+ * execution). Drives the SAME captureActionLayouts the lowered loop uses, fed
+ * metadata stubs instead of live tensors. Returns the deriver (reused by the
+ * harvest) and a `reset` thunk that restores every cache this populated to
+ * `undefined` — so a fall-through to the lowered path re-captures from live
+ * tensors with no residue. Matmul inputs that would force a contiguous copy
+ * (non-contiguous AND not a simple transpose — never produced by real plans,
+ * but a stub copy would dispatch on a fake buffer) bail to a sentinel, so the
+ * generator simply leaves that matmul uncovered (→ lowered fallback).
+ */
+function populateCapturesFromIR(
+  loweredPlan: LoweredPlan,
+  planNodes: LazyIRNode[],
+  backendName: string,
+): {
+  deriver: ReturnType<typeof makeMetaDeriver>;
+  reset: () => void;
+} {
+  const deriver = makeMetaDeriver();
+  const CACHE_FIELDS = [
+    "cachedMatmulPlan",
+    "cachedInputShapes",
+    "cachedInputContig",
+    "cachedViewInput",
+    "cachedStridedInputs",
+  ] as const;
+  const resets: Array<() => void> = [];
+
+  for (const action of loweredPlan.actions) {
+    if (action.kind !== "sequential" && action.kind !== "view") continue;
+    const nodeIdx = action.nodeIndex;
+    const node = planNodes[nodeIdx];
+    const stubs = node.inputs.map((ref) => {
+      const dm = deriver.deriveRefMeta(ref);
+      return dm ? stubTensor(dm) : null;
+    });
+
+    // Snapshot which caches are unset, so fall-through can restore them.
+    const wasUnset: Record<string, boolean> = {};
+    for (const f of CACHE_FIELDS)
+      wasUnset[f] = (action as Record<string, unknown>)[f] === undefined;
+
+    // Matmul dispatch guard: skip planBareMatmul if a stub input would copy.
+    if (
+      action.kind === "sequential" &&
+      node.op === "matmul" &&
+      action.cachedMatmulPlan === undefined
+    ) {
+      const a = stubs[0];
+      const b = stubs[1];
+      const unsafe =
+        stubs.length < 2 ||
+        !a ||
+        !b ||
+        (!a.isContiguous && detectSimpleTranspose(a as never) === null) ||
+        (!b.isContiguous && detectSimpleTranspose(b as never) === null);
+      if (unsafe) action.cachedMatmulPlan = "ir-noncontig-matmul";
+    }
+
+    captureActionLayouts(action, node, nodeIdx, stubs, backendName, false);
+
+    for (const f of CACHE_FIELDS) {
+      if (wasUnset[f] && (action as Record<string, unknown>)[f] !== undefined) {
+        resets.push(() => {
+          (action as Record<string, unknown>)[f] = undefined;
+        });
+      }
+    }
+  }
+
+  return { deriver, reset: () => resets.forEach((r) => r()) };
+}
+
+/**
+ * Harvest the NodeResult metadata for the generated stream. The metadata is
+ * IR-DERIVED (the build-without-execution source of truth); when a live result
+ * is present (the cutover runs post-execution) it's a cross-check that asserts
+ * agreement and falls back loudly on a mismatch. The result SET — which
+ * (nodeIndex, outputIndex) pairs survive past the plan — is supplied by the
+ * caller (`harvestPairs`, in plan order): the cutover passes the live-result
+ * survivors, build-without-execution passes the liveness-output set. The slot
+ * for each pair comes from the generator's own nodeSlot / nodeSlotExtra map;
+ * `genOk` is false iff a pair has no generated slot, or its metadata is neither
+ * derivable nor live (→ lowered fallback).
+ */
+function harvestGenResults(
+  planNodes: LazyIRNode[],
+  gen: GeneratedStream,
+  deriver: ReturnType<typeof makeMetaDeriver>,
+  harvestPairs: Array<{ i: number; oi: number }>,
+): { genResults: NodeResult[]; genOk: boolean } {
+  const genResults: NodeResult[] = [];
+  let genOk = true;
+  let diverged = 0;
+
+  for (const { i, oi } of harvestPairs) {
+    if (!genOk) break;
+    const slot =
+      oi === 0 ? gen.nodeSlot.get(i) : gen.nodeSlotExtra.get(`${i}:${oi}`);
+    if (slot === undefined) {
+      genOk = false;
+      break;
+    }
+    const node = planNodes[i];
+    const d = deriver.deriveNodeMeta(node, oi);
+    const liveSt = oi === 0 ? node.result : node.results?.[oi];
+    const bt = liveSt ? asGPUTensor(liveSt.backendTensor) : null;
+
+    let meta = d;
+    if (d && bt) {
+      const mismatch =
+        d.shape.join(",") !== bt.shape.join(",") ||
+        d.strides.join(",") !== bt.strides.join(",") ||
+        d.offset !== bt.offset ||
+        d.dtype !== bt.dtype;
+      if (mismatch) {
+        diverged++;
+        console.warn(
+          `[ir-derive] DIVERGE ${node.op} oi=${oi}: derived ${JSON.stringify({ shape: d.shape, strides: d.strides, offset: d.offset, dtype: d.dtype })} != live {shape:[${bt.shape}],strides:[${bt.strides}],offset:${bt.offset},dtype:${bt.dtype}} — using live`,
+        );
+        meta = null; // fall back to live below
+      }
+    }
+    if (!meta) {
+      if (!bt) {
+        genOk = false; // neither derivable nor live → can't build w/o execution
+        break;
+      }
+      meta = {
+        shape: bt.shape.slice(),
+        strides: bt.strides.slice(),
+        offset: bt.offset ?? 0,
+        dtype: bt.dtype,
+        bufferSize: bt.buffer.size,
+      };
+    }
+    genResults.push({
+      nodeIndex: i,
+      outputIndex: oi,
+      slot,
+      shape: meta.shape.slice(),
+      strides: meta.strides.slice(),
+      dtype: meta.dtype,
+      offset: meta.offset,
+    });
+  }
+
+  if (ENV.TORCHLETTE_DEBUG_COMPILED) {
+    console.log(
+      `[ir-derive] harvested ${genResults.length}/${harvestPairs.length} results, ${diverged} diverged, genOk=${genOk}`,
+    );
+  }
+  return { genResults, genOk };
+}
+
+/**
+ * The set of node ids whose results must survive past this plan — plan
+ * terminal + plan.outputIndices + already-materialized + live pending roots +
+ * cross-plan consumers reached from external live roots. Pure function of the
+ * plan + the engine's live-pending state (no execution): single source for the
+ * liveness-release protection set AND the build-without-execution harvest set.
+ */
+function computeLivenessOutputIds(
+  plan: ExecutionPlan,
+  planNodes: LazyIRNode[],
+): Set<number> {
+  const nodeIdSet = new Set(planNodes.map((n) => n.id));
+  const outputIds = new Set<number>();
+  outputIds.add(planNodes[planNodes.length - 1].id);
+  // Trust plan.outputIndices first — the explicit "caller needs these" contract
+  // (without it, multi-output ops like adamStep can have node.result cleared
+  // mid-plan even though the param-tied node still needs it for materialization).
+  if (plan.outputIndices) {
+    for (const idx of plan.outputIndices) {
+      outputIds.add(plan.nodes[idx].id);
+    }
+  }
+  // Legacy fallback for callers that don't set outputIndices.
+  const livePendingIds = getLivePendingNodeIds();
+  for (const node of planNodes) {
+    if (node.result) outputIds.add(node.id);
+    if (livePendingIds.has(node.id)) outputIds.add(node.id);
+  }
+  // CROSS-PLAN CONSUMERS: a step's pending graph can split across several plans
+  // (e.g. the foreach optimizer's update graph). A node in THIS plan that an
+  // external live root's closure references will be read by a LATER plan — walk
+  // the pending graph from every live root NOT in this plan and protect any
+  // plan node encountered.
+  const visited = new Set<number>();
+  const stack: LazyIRNode[] = [];
+  for (const rootObj of getLivePendingRootNodes()) {
+    const root = rootObj as LazyIRNode;
+    if (nodeIdSet.has(root.id)) continue; // this plan's own output
+    if (!visited.has(root.id)) {
+      visited.add(root.id);
+      stack.push(root);
+    }
+  }
+  while (stack.length > 0) {
+    const n = stack.pop()!;
+    if (nodeIdSet.has(n.id)) {
+      outputIds.add(n.id); // reached into the plan from outside: protect
+      continue;
+    }
+    if (n.result) continue; // materialized boundary — replays from storage
+    for (const ref of n.inputs) {
+      if (ref.kind !== "pending") continue;
+      const child = ref.node as LazyIRNode;
+      if (visited.has(child.id)) continue;
+      visited.add(child.id);
+      stack.push(child);
+    }
+  }
+  return outputIds;
+}
+
+/** Build the live-result harvest pairs (cutover): every materialized result, in plan order. */
+function liveResultHarvestPairs(
+  planNodes: LazyIRNode[],
+): Array<{ i: number; oi: number }> {
+  const pairs: Array<{ i: number; oi: number }> = [];
+  for (let i = 0; i < planNodes.length; i++) {
+    const node = planNodes[i];
+    if (node.results && node.results.length > 0) {
+      for (let oi = 0; oi < node.results.length; oi++) {
+        if (node.results[oi]) pairs.push({ i, oi });
+      }
+    } else if (node.result) {
+      pairs.push({ i, oi: 0 });
+    }
+  }
+  return pairs;
+}
+
+/**
+ * Build the harvest pairs for build-without-execution: the ACTION-OUTPUT set —
+ * the structural superset of the cutover's live-result survivors.
+ *
+ * The lowered path calls assignNodeResult for every action's OUTPUT node(s);
+ * only nodes ABSORBED inside a fused / epilogue / row-program group (covered
+ * but not the group output) never get a node.result. So the action-output set
+ * = all plan nodes minus those fused-internal absorbed nodes. The live-result
+ * survivors the cutover harvests are a SUBSET of this (some action outputs get
+ * released when no live refcount holds them — an execution-/rc-dependent fact
+ * we deliberately do NOT model here). Harvesting the full action-output set is
+ * therefore conservative: if the generator slotted every one of them the
+ * resulting plan is complete (harvestGenResults proceeds); if any lacks a
+ * generated slot, genOk is false and we fall through to the lowered path —
+ * exactly as the cutover declines when the stream doesn't cover a live result.
+ * Multi-output extras (oi>0) come from the generator's nodeSlotExtra.
+ */
+function actionOutputHarvestPairs(
+  loweredPlan: LoweredPlan,
+  planNodes: LazyIRNode[],
+  gen: GeneratedStream,
+): Array<{ i: number; oi: number }> {
+  // Nodes absorbed inside a group (covered but not the group's output) get no
+  // node.result in the lowered path.
+  const absorbed = new Set<number>();
+  for (const action of loweredPlan.actions) {
+    if (action.kind === "fused") {
+      const outs = new Set<number>([
+        action.outputNodeIndex,
+        ...action.additionalOutputNodeIndices,
+      ]);
+      for (const ni of action.coveredNodeIndices)
+        if (!outs.has(ni)) absorbed.add(ni);
+    } else if (action.kind === "matmul-epilogue") {
+      for (const ni of action.coveredNodeIndices)
+        if (ni !== action.outputNodeIndex) absorbed.add(ni);
+    } else if (action.kind === "row-program") {
+      for (const ni of action.coveredNodeIndices)
+        if (ni !== action.outputNodeIndex) absorbed.add(ni);
+    }
+  }
+  const extrasByNode = new Map<number, number[]>();
+  for (const k of gen.nodeSlotExtra.keys()) {
+    const colon = k.indexOf(":");
+    const i = Number(k.slice(0, colon));
+    const oi = Number(k.slice(colon + 1));
+    let list = extrasByNode.get(i);
+    if (!list) extrasByNode.set(i, (list = []));
+    list.push(oi);
+  }
+  const pairs: Array<{ i: number; oi: number }> = [];
+  for (let i = 0; i < planNodes.length; i++) {
+    if (!absorbed.has(i)) pairs.push({ i, oi: 0 });
+    const extras = extrasByNode.get(i);
+    if (extras) {
+      extras.sort((a, b) => a - b);
+      for (const oi of extras) pairs.push({ i, oi });
+    }
+  }
+  return pairs;
+}
+
+/**
  * @param plan - The original execution plan
  * @param planNodes - Reordered plan nodes (from template.finalPerm)
  * @param loweredPlan - The cached lowered plan from the template
@@ -821,6 +1459,84 @@ export async function executeLoweredPlan(
   }
 
   // =========================================================================
+  // BUILD-WITHOUT-EXECUTION (stage-4 phase 4.4)
+  // =========================================================================
+  // Build the compiled plan from the lowered IR on the FIRST call — NO lowered
+  // execution, NO recording. Populate the layout captures from IR-derived
+  // metadata stubs, generate the stream, harvest the result metadata from the
+  // IR (the liveness-output set), build the planner-backed plan, and replay it.
+  // Opt-in via TORCHLETTE_BUILD_FROM_IR=1 (default off; A/B'd against the
+  // record-then-cutover path via the parity ladder). Any failure (uncovered
+  // stream, underivable result, invalid plan) resets the captures and falls
+  // through to the lowered path with zero residue — so flag-off behaviour and
+  // the fallback are byte-identical to the unmodified normal path.
+  if (
+    ENV.TORCHLETTE_BUILD_FROM_IR === "1" &&
+    backend.name === "webgpu" &&
+    useTopLevelSharedEncoder &&
+    options.bufferArena &&
+    !loweredPlan.compiledPlan &&
+    ENV.TORCHLETTE_COMPILED_PLAN !== "0" &&
+    ENV.TORCHLETTE_GENERATED_PLAN !== "0" &&
+    (!arenaLivenessEnabled() || compiledPlannedEnabled())
+  ) {
+    await ensureFusionImports();
+    const { reset } = populateCapturesFromIR(loweredPlan, planNodes, backend.name);
+    let genPlan: CompiledPlan | undefined;
+    const gen = generateStream(loweredPlan, planNodes, backend);
+    if (gen?.fullyCovered) {
+      const { genResults, genOk } = harvestGenResults(
+        planNodes,
+        gen,
+        makeMetaDeriver(),
+        actionOutputHarvestPairs(loweredPlan, planNodes, gen),
+      );
+      if (genOk) {
+        const built = buildCompiledPlanFromGenerated({
+          commands: gen.commands,
+          slots: gen.slots,
+          nodeResults: genResults,
+        });
+        if (built.valid) {
+          loweredPlan.compiledPlan = genPlan = built;
+          if (ENV.TORCHLETTE_DEBUG_COMPILED) {
+            console.log(
+              `[compiled] phase-4.4 BUILD-FROM-IR: ${gen.commands.length} cmds, ${genResults.length} results — no lowered execution`,
+            );
+          }
+        }
+      }
+    }
+    if (genPlan) {
+      const externalInputBuffers = collectExternalInputBuffers(planNodes);
+      try {
+        // First replay: endCounters is undefined, so executeCompiledPlan lets
+        // the dispatch sequence advance naturally (no reset). Capture it AFTER
+        // for subsequent FAST-PATH replays (they reset to this absolute value
+        // so later plans in the step don't collide on params/output indices).
+        await executeCompiledPlan(
+          genPlan,
+          planNodes,
+          options.bufferArena,
+          backend,
+          externalInputBuffers,
+        );
+        genPlan.endCounters = getDispatchSequenceCounters();
+      } finally {
+        clearActiveScalarTable();
+      }
+      loweredPlan.cachedStats = stats;
+      return {
+        result: planNodes[planNodes.length - 1].result!,
+        stats,
+      };
+    }
+    // Fall through to the lowered path: restore the caches we populated so the
+    // normal loop re-captures them from live tensors with no residue.
+    reset();
+  }
+
+  // =========================================================================
   // NORMAL PATH (with optional compilation recording for compiled plan)
   // =========================================================================
 
@@ -936,66 +1652,10 @@ export async function executeLoweredPlan(
   if (enableLivenessRelease) {
     const nodeIdSet = new Set(planNodes.map((n) => n.id));
 
-    // Protected nodes: plan terminals + already-materialized + live RuntimeTensors.
-    // Materialized nodes (node.result) MUST stay protected — their buffers may be
-    // read by subsequent plan actions even after the liveness analysis thinks they're
-    // dead (the analysis only sees plan-internal references, not external ones like
-    // compiled plan cache slots or arena bindings).
-    livenessOutputIds = new Set<number>();
-    livenessOutputIds.add(planNodes[planNodes.length - 1].id);
-    // Trust plan.outputIndices first — this is the explicit contract from the
-    // engine ("the caller needs these results"). Without this, multi-output ops
-    // like adamStep can have node.result cleared mid-plan even though the new
-    // adamStep node tied to a model parameter still needs it for materialization.
-    if (plan.outputIndices) {
-      for (const idx of plan.outputIndices) {
-        livenessOutputIds.add(plan.nodes[idx].id);
-      }
-    }
-    // Legacy fallback for callers that don't set outputIndices.
-    const livePendingIds = getLivePendingNodeIds();
-    for (const node of planNodes) {
-      if (node.result) livenessOutputIds.add(node.id);
-      if (livePendingIds.has(node.id)) livenessOutputIds.add(node.id);
-    }
-
-    // CROSS-PLAN CONSUMERS: a step's pending graph can split across several
-    // plans (e.g. the foreach optimizer's update graph). A node in THIS plan
-    // that an external live root's closure references will be read by a
-    // LATER plan — it must be protected from liveness release and from
-    // buffer donation. Walk the pending graph from every live root that is
-    // NOT itself in this plan and protect any plan node encountered.
-    {
-      const visited = new Set<number>();
-      const stack: LazyIRNode[] = [];
-      for (const rootObj of getLivePendingRootNodes()) {
-        const root = rootObj as LazyIRNode;
-        if (nodeIdSet.has(root.id)) continue; // this plan's own output
-        if (!visited.has(root.id)) {
-          visited.add(root.id);
-          stack.push(root);
-        }
-      }
-      while (stack.length > 0) {
-        const n = stack.pop()!;
-        if (nodeIdSet.has(n.id)) {
-          // Reached INTO the plan from outside: protect, don't descend —
-          // the node's own inputs are protected transitively only if some
-          // external path reads them; in-plan reads are already covered by
-          // livenessLastAction.
-          livenessOutputIds.add(n.id);
-          continue;
-        }
-        if (n.result) continue; // materialized boundary — replays from storage
-        for (const ref of n.inputs) {
-          if (ref.kind !== "pending") continue;
-          const child = ref.node as LazyIRNode;
-          if (visited.has(child.id)) continue;
-          visited.add(child.id);
-          stack.push(child);
-        }
-      }
-    }
+    // Protected nodes: plan terminals + already-materialized + live RuntimeTensors
+    // + cross-plan consumers (see computeLivenessOutputIds — single source with
+    // the build-without-execution harvest set).
+    livenessOutputIds = computeLivenessOutputIds(plan, planNodes);
 
     // Map nodeId → plan index for O(1) lookup
     livenessNodeIdToIndex = new Map();
@@ -1517,172 +2177,20 @@ export async function executeLoweredPlan(
             recordWrite(gpuBuffer(node.result!.backendTensor), nodeIdx);
           }
 
-          // Stage-4 phase-3: capture bare-matmul geometry NOW (inputs live).
-          // The stream generator runs at plan-build, after liveness has freed
-          // these inputs — so the geometry (transpose detection needs live
-          // strides) must be captured here and cached on the action. Geometry
-          // is shape/dtype-pure → valid for every step of this template.
-          if (
-            action.kind === "sequential" &&
-            node.op === "matmul" &&
-            action.cachedMatmulPlan === undefined &&
-            backend.name === "webgpu" &&
-            backendInputs.length === 2
-          ) {
-            try {
-              action.cachedMatmulPlan = _webgpuMatmulImports!.planBareMatmul(
-                asGPUTensor(backendInputs[0]),
-                asGPUTensor(backendInputs[1]),
-              );
-            } catch {
-              action.cachedMatmulPlan = "plan-throw";
-            }
-          }
-
-          // Stage-4 phase-3: cache input SHAPES at lowering (inputs live) for
-          // ops whose generator geometry can't be derived post-hoc — e.g.
-          // narrowBackward needs its grad's dim size, but that grad is a
-          // released multi-output extra (attention dQ/dK/dV) at plan-build,
-          // and nodes carry no per-output shape metadata. Cheap (small arrays,
-          // once per template); shapes are template-invariant.
-          if (
-            action.kind === "sequential" &&
-            node.op === "narrowBackward" &&
-            action.cachedInputShapes === undefined
-          ) {
-            action.cachedInputShapes = backendInputs.map((t) =>
-              (t as { shape: number[] }).shape.slice(),
-            );
-          }
-
-          // Attention fwd/bwd asContiguous() their inputs inside the op — a
-          // non-contiguous input inserts a contiguous-copy prologue (one
-          // ALLOC + one copy dispatch, mirroring ensureContiguous). Capture
-          // each input's layout at lowering (inputs are live here; released
-          // by plan-build) so the generator can replay planContiguousDirect
-          // for the non-contiguous ones. `contiguous` mirrors ensureContiguous
-          // EXACTLY (copy iff isContiguous === false) so the generated command
-          // count matches the recording. Template-invariant.
-          if (
-            action.kind === "sequential" &&
-            (node.op === "fusedAttentionForward" ||
-              node.op === "fusedAttentionBackward") &&
-            action.cachedInputContig === undefined
-          ) {
-            action.cachedInputContig = backendInputs.map((t) => {
-              const w = t as {
-                isContiguous?: boolean;
-                shape: number[];
-                strides: number[];
-                offset?: number;
-                dtype: import("../backend/types").DType;
-                buffer: { size: number };
-              };
-              return {
-                contiguous: w.isContiguous !== false,
-                shape: w.shape.slice(),
-                strides: w.strides.slice(),
-                offset: w.offset ?? 0,
-                dtype: w.dtype,
-                bufferSize: w.buffer.size,
-              };
-            });
-          }
-
-          // reshape MATERIALIZES a contiguous copy ONLY when its input is
-          // non-contiguous AND the new shape is incompatible with the input
-          // strides (inferReshapeStrides === null); a non-contiguous input
-          // with compatible strides is still a free view (reshape in views.ts).
-          // So we don't re-derive that decision — we OBSERVE it: the copy
-          // produced a fresh buffer, so result.buffer !== input.buffer iff it
-          // materialized. `contiguous: !materialized` → the generator emits the
-          // copy (false) or a free alias (true). Capture the input layout for
-          // planContiguousDirect. e.g. reshape-of-permute in attention grads.
-          if (
-            action.kind === "view" &&
-            node.op === "reshape" &&
-            action.cachedViewInput === undefined &&
-            backendInputs.length >= 1
-          ) {
-            const w = backendInputs[0] as {
-              shape: number[];
-              strides: number[];
-              offset?: number;
-              dtype: import("../backend/types").DType;
-              buffer: { size: number };
-            };
-            // Materialization is DERIVED from the input layout via the shared
-            // reshapeMeta (inc 2/4: build-without-execution has no result buffer
-            // to observe). Cross-check against the live observation while we
-            // still execute, so any divergence is loud (TORCHLETTE_DEBUG_COMPILED).
-            const derivedMaterialized = reshapeMeta(
-              { shape: w.shape, strides: w.strides, offset: w.offset ?? 0 },
-              node.shape,
-            ).materialized;
-            const resultBuf = (
-              node.result?.backendTensor as { buffer?: object } | undefined
-            )?.buffer;
-            const observedMaterialized =
-              resultBuf !== undefined && resultBuf !== w.buffer;
-            if (
-              ENV.TORCHLETTE_DEBUG_COMPILED &&
-              derivedMaterialized !== observedMaterialized
-            ) {
-              console.warn(
-                `[reshape-mat] node[${nodeIdx}] derived=${derivedMaterialized} observed=${observedMaterialized} shape ${w.shape.join("x")}→${node.shape.join("x")} strides=${w.strides.join(",")}`,
-              );
-            }
-            const materialized = derivedMaterialized;
-            action.cachedViewInput = {
-              contiguous: !materialized,
-              shape: w.shape.slice(),
-              strides: w.strides.slice(),
-              offset: w.offset ?? 0,
-              dtype: w.dtype,
-              bufferSize: w.buffer.size,
-            };
-          }
-
-          // Sequential elementwise op consuming a STRIDED view (expand /
-          // transpose / permute / narrow): that producer is released by
-          // plan-build and its stride-bearing layout isn't shape-derivable, so
-          // the generator bails "no-storage". Capture each such input's live
-          // layout (incl. broadcast stride-0) so the generator can synthesize
-          // the real metadata and planBinaryDirect/planUnaryDirect emits the
-          // matching strided kernel. Empty array marks "checked, none" so this
-          // runs once per template. (reshape is a contiguous view, handled
-          // above; it's excluded here.)
-          if (action.kind === "sequential" && action.cachedStridedInputs === undefined) {
-            let caps: (import("./lowered-plan").AttnInputContig | null)[] | undefined;
-            for (let i = 0; i < node.inputs.length; i++) {
-              const ref = node.inputs[i];
-              if (
-                ref.kind !== "pending" ||
-                (ref.node.op !== "expand" &&
-                  ref.node.op !== "transpose" &&
-                  ref.node.op !== "permute" &&
-                  ref.node.op !== "narrow")
-              ) {
-                continue;
-              }
-              const w = backendInputs[i] as {
-                shape: number[];
-                strides: number[];
-                offset?: number;
-                dtype: import("../backend/types").DType;
-                buffer: { size: number };
-              };
-              (caps ??= new Array(node.inputs.length).fill(null))[i] = {
-                contiguous: false,
-                shape: w.shape.slice(),
-                strides: w.strides.slice(),
-                offset: w.offset ?? 0,
-                dtype: w.dtype,
-                bufferSize: w.buffer.size,
-              };
-            }
-            action.cachedStridedInputs = caps ?? [];
-          }
+          // Stage-4 phase-3/4.4: capture the layout metadata the stream
+          // generator needs (matmul geometry, attention/reshape/strided-view
+          // input layouts) — inputs are live here; plan-build frees them.
+          // Single source with the build-without-execution path (see
+          // captureActionLayouts). observeResult=true: cross-check reshape
+          // materialization against the live result.
+          captureActionLayouts(
+            action,
+            node,
+            nodeIdx,
+            backendInputs,
+            backend.name,
+            true,
+          );
           break;
         }
 
@@ -1980,185 +2488,21 @@ export async function executeLoweredPlan(
 
       // Stage-4 phase-4 CUTOVER (default-on; TORCHLETTE_GENERATED_PLAN=0 to
       // opt out): when the generated stream fully covers the plan, build the
-      // compiled plan FROM
-      // IT and use it as the execution source — the recording stays only as
-      // the gate's reference (the recorded plan we just built is discarded,
-      // its planner entries released so the registry doesn't leak). The
-      // streams are proven byte-identical (modulo slot bijection) by the gate,
-      // so the generated plan is equivalent; flag-gated for A/B against the
-      // recorded build via the parity ladder. nodeResults carry the GENERATED
-      // slot per result node (gen.nodeSlot / gen.nodeSlotExtra); metadata
-      // comes from the live node result (same as the recorded harvest).
+      // compiled plan FROM IT and use it as the execution source — the
+      // recording stays only as the gate's reference (the recorded plan we
+      // just built is discarded, its planner entries released so the registry
+      // doesn't leak). The streams are proven byte-identical (modulo slot
+      // bijection) by the gate, so the generated plan is equivalent. The
+      // harvest (harvestGenResults — SINGLE SOURCE with build-without-
+      // execution) derives the NodeResult metadata from the IR and asserts it
+      // against the live result here (post-execution).
       if (wantCutover && gen?.fullyCovered && compiled.valid) {
-        const genResults: NodeResult[] = [];
-        let genOk = true;
-        // Stage-4 phase-4.4 differential (build-without-execution): the harvest
-        // reads result metadata from the LIVE node.result. For
-        // build-without-execution there is no live result, so the metadata must
-        // be DERIVED from the IR (node.shape/dtype + contiguous strides + offset
-        // 0). This counts where IR-derived would DIFFER from the live result —
-        // proving (when zero) that requirement #2 is sound, and surfacing the
-        // cases that need a capture (multi-output extra shapes). Diagnostic
-        // only; removes/changes nothing. Reported under TORCHLETTE_DEBUG_COMPILED.
-        const irDiff = { shape: 0, strides: 0, dtype: 0, offset: 0, extra: 0 };
-        // Per-op breakdown of each diff category → names exactly which ops'
-        // metadata the harvest must learn to derive (inc 2 implements those).
-        const irDiffOps = {
-          shape: new Map<string, number>(),
-          strides: new Map<string, number>(),
-          offset: new Map<string, number>(),
-          extra: new Map<string, number>(),
-        };
-        const contigStrides = (shape: number[]): number[] => {
-          const s = new Array(shape.length);
-          let acc = 1;
-          for (let d = shape.length - 1; d >= 0; d--) {
-            s[d] = acc;
-            acc *= shape[d];
-          }
-          return s;
-        };
-        // Live metadata of a node's input 0 (the base for a view derivation).
-        // Available here because the harvest runs post-execution; for true
-        // build-without-execution this comes from the input's own derived meta
-        // (the recursive NodeResult chain — inc 4). Validating the view
-        // TRANSFORM against the live input isolates transform correctness.
-        type Meta = { shape: number[]; strides: number[]; offset: number };
-        const liveInputMeta = (node: LazyIRNode): Meta | null => {
-          const ref = node.inputs[0];
-          if (!ref || ref.kind === "scalar") return null;
-          const st =
-            ref.kind === "materialized"
-              ? ref.storage
-              : (ref.outputIndex ?? 0) === 0
-                ? ref.node.result
-                : ref.node.results?.[ref.outputIndex ?? 0];
-          if (!st) return null;
-          const ib = asGPUTensor(st.backendTensor);
-          return { shape: ib.shape, strides: ib.strides, offset: ib.offset };
-        };
-        // Result metadata DERIVED from the IR (no live result) — the build-
-        // without-execution path. Views use the shared view-meta transforms
-        // (single source with the backend ops); compute ops are contiguous;
-        // multi-output extras use the op's defined output shape.
-        const deriveResultMeta = (i: number, oi: number): Meta | null => {
-          const node = planNodes[i];
-          if (oi === 0) {
-            if (VIEW_META_OPS.has(node.op)) {
-              const inp = liveInputMeta(node);
-              if (inp) {
-                const m = viewResultMeta(node.op, inp, node.shape, node.payload);
-                if (m) return m;
-              }
-            }
-            return { shape: node.shape, strides: contigStrides(node.shape), offset: 0 };
-          }
-          // Multi-output extras (the ops with extra outputs in real plans):
-          //  - adamStep oi 1,2 (m, v): same shape as the param (= node.shape).
-          //  - fusedAttentionForward oi 1 (logsumexp): [B,H,N] from payload.
-          if (node.op === "adamStep") {
-            return { shape: node.shape, strides: contigStrides(node.shape), offset: 0 };
-          }
-          if (node.op === "fusedAttentionForward" && oi === 1) {
-            const p = node.payload as {
-              batchSize: number;
-              numHeads: number;
-              seqLen: number;
-            };
-            const lse = [p.batchSize, p.numHeads, p.seqLen];
-            return { shape: lse, strides: contigStrides(lse), offset: 0 };
-          }
-          return null;
-        };
-        const bump = (
-          cat: keyof typeof irDiff,
-          ops: Map<string, number>,
-          op: string,
-        ) => {
-          irDiff[cat]++;
-          ops.set(op, (ops.get(op) ?? 0) + 1);
-        };
-        const emit = (i: number, oi: number, sh: { backendTensor: unknown }) => {
-          const bt = asGPUTensor(sh.backendTensor as never);
-          const slot =
-            oi === 0 ? gen.nodeSlot.get(i) : gen.nodeSlotExtra.get(`${i}:${oi}`);
-          if (slot === undefined) {
-            genOk = false;
-            return;
-          }
-          // Phase-4.4 (build-without-execution): the IR-DERIVED metadata is the
-          // source of truth for the harvested NodeResult. The live result is
-          // still present here (the cutover runs post-execution), so we ASSERT
-          // the derived value agrees with it at the seam — and fall back to the
-          // live read (loudly) if an op's metadata isn't derivable yet, so a
-          // gap can never silently produce wrong metadata. The no-execution
-          // flip just removes this live cross-check (there is no live result);
-          // any op still hitting the fallback is what that flip must learn to
-          // derive first (the multi-output extras the differential surfaces).
-          const op = planNodes[i].op;
-          const d = deriveResultMeta(i, oi);
-          let useDerived = d !== null;
-          if (!d) {
-            bump("extra", irDiffOps.extra, op);
-          } else {
-            if (d.shape.join(",") !== bt.shape.join(",")) {
-              bump("shape", irDiffOps.shape, op);
-              useDerived = false;
-            } else if (d.strides.join(",") !== bt.strides.join(",")) {
-              bump("strides", irDiffOps.strides, op);
-              useDerived = false;
-            } else if (d.offset !== bt.offset) {
-              bump("offset", irDiffOps.offset, op);
-              useDerived = false;
-            }
-          }
-          if (planNodes[i].dtype !== bt.dtype) {
-            irDiff.dtype++;
-            useDerived = false;
-          }
-          if (!useDerived && d !== null) {
-            // Derived metadata exists but disagrees with the live result — a
-            // real derivation bug (the differential has been 0 across every
-            // production + fullstack plan). Surface it; use the live value so
-            // execution stays correct while the derivation is fixed.
-            console.warn(
-              `[ir-derive] DIVERGE ${op} oi=${oi}: derived ${JSON.stringify(d)} != live {shape:[${bt.shape}],strides:[${bt.strides}],offset:${bt.offset}} — falling back to live`,
-            );
-          }
-          genResults.push({
-            nodeIndex: i,
-            outputIndex: oi,
-            slot,
-            shape: useDerived ? d!.shape.slice() : bt.shape.slice(),
-            strides: useDerived ? d!.strides.slice() : bt.strides.slice(),
-            dtype: useDerived ? planNodes[i].dtype : bt.dtype,
-            offset: useDerived ? d!.offset : bt.offset,
-          });
-        };
-        for (let i = 0; i < planNodes.length && genOk; i++) {
-          const node = planNodes[i];
-          if (node.results && node.results.length > 0) {
-            for (let oi = 0; oi < node.results.length; oi++) {
-              const sh = node.results[oi];
-              if (sh) emit(i, oi, sh);
-            }
-          } else if (node.result) {
-            emit(i, 0, node.result);
-          }
-        }
-        if (ENV.TORCHLETTE_DEBUG_COMPILED && genOk) {
-          const fmt = (m: Map<string, number>) =>
-            [...m.entries()].map(([k, v]) => `${k}:${v}`).join(",") || "-";
-          const total =
-            irDiff.shape + irDiff.strides + irDiff.dtype + irDiff.offset + irDiff.extra;
-          console.log(
-            `[ir-derive] nodes=${planNodes.length} results=${genResults.length} IR-vs-live diffs=${total}: ` +
-              `shape=${irDiff.shape} strides=${irDiff.strides} dtype=${irDiff.dtype} offset=${irDiff.offset} multiOutExtra=${irDiff.extra}` +
-              (total
-                ? `\n  strides-ops=[${fmt(irDiffOps.strides)}] offset-ops=[${fmt(irDiffOps.offset)}] extra-ops=[${fmt(irDiffOps.extra)}]`
-                : ""),
-          );
-        }
+        const { genResults, genOk } = harvestGenResults(
+          planNodes,
+          gen,
+          makeMetaDeriver(),
+          liveResultHarvestPairs(planNodes),
+        );
         if (genOk) {
           const genPlan = buildCompiledPlanFromGenerated({
             commands: gen.commands,

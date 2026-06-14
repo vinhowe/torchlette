@@ -235,7 +235,7 @@ interface LoweredRowProgramAction {
 }
 
 /** Union of all lowered action types. */
-type LoweredAction =
+export type LoweredAction =
   | LoweredFusedAction
   | LoweredNodeAction
   | LoweredMatmulEpilogueAction

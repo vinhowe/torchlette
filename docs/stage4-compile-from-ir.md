@@ -662,22 +662,60 @@ cutover alone. The deletions decompose into gated sub-phases:
     full regression run + fullstack; gates 4/4; regression baseline-exact
     (`{0:9.81,3:5.92,6:5.15,9:4.64}`, peak 2754.6 flat); fullstack derived-cutover
     vs lowered max |Δloss| = 5.7e-6 / 30 steps.
-  - **REMAINING for 4.4 (inc 4a + 4c):** build the plan on first call with NO
-    lowered exec — (a) feed deriveResultMeta-derived input metadata (recursed
-    across the NodeResult chain, bottoming at leaf/external materialized inputs)
-    into the capture/plan fns via metadata stubs — confirmed feasible:
-    `generateBareMatmul` consumes only `cachedMatmulPlan`'s GEOMETRY (outShape,
-    dtype, kSplit, pipeline, dispatch dims, transpose flags), never its buffer,
-    and `planContiguousDirectCore` uses the input `buffer.size` only as a
-    >maxBindingSize guard (not geometry) — so metadata stubs (shape/strides/
-    dtype + base-buffer size for the guard) drive every capture; (c) the no-exec
-    build path: on first call build lowered ACTIONS (pure structure, no exec) →
-    populate captures from IR stubs → generateStream → harvest via
-    deriveResultMeta (4b, drop the live cross-check; the only remaining live read
-    is the leaf/external base case) → buildCompiledPlanFromGenerated → replay.
-    Behind a flag, A/B'd via the parity ladder. Delete the lowered first-exec
-    last. Ops still hitting the 4b fallback (multi-output extras whose derivation
-    isn't wired — e.g. logsumexp oi=1) are exactly what 4c must derive first.
+  - **INC 4a + 4c DONE (2026-06-14) — build-without-execution (TORCHLETTE_BUILD_FROM_IR=1).**
+    On the first call the compiled plan is now built from the lowered IR with NO
+    lowered execution and NO recording: a new early path in `executeLoweredPlan`
+    (gated by the flag, default off) populates the layout captures from IR-derived
+    metadata STUBS (`populateCapturesFromIR` → the extracted single-source
+    `captureActionLayouts`, fed `makeMetaDeriver` stubs instead of live tensors),
+    runs `generateStream`, harvests the result metadata from the IR
+    (`harvestGenResults`, the SAME function the cutover uses), builds the
+    planner-backed plan, and replays it via `executeCompiledPlan`.
+    - **Metadata deriver (`makeMetaDeriver`):** recursive — a node's output
+      {shape,strides,offset,dtype,bufferSize} from its op + its inputs' derived
+      metadata, bottoming at leaf/external inputs whose live storage IS available
+      at build (params, prior-plan results). Views use the shared `view-meta`
+      transforms; compute ops are contiguous. bufferSize feeds only the
+      >maxBindingSize guard (the one non-byte-exact field; the stream differential
+      is the seam check).
+    - **Matmul stubs:** `planBareMatmul`/`planTiledMatmul` never touch the buffer
+      at plan time (out=undefined; only m/n/k/dtype/strides matter), and
+      `ensureContiguous` no-ops when `isContiguous` (which ignores offset, matching
+      tensor.ts). A guard skips planBareMatmul for the never-in-practice
+      non-contiguous-non-transpose case (would dispatch a copy on a fake buffer).
+    - **Harvest SET = action-output nodes** (`actionOutputHarvestPairs`): the
+      structural superset of the cutover's live-result survivors (= all plan nodes
+      minus fused/epilogue/row-program absorbed-internal nodes). The exact survivor
+      set is partly RUNTIME-RC-DEPENDENT (a node is kept past the plan when an
+      external/cross-plan refcount holds it — e.g. backward holding forward
+      activations — which `canSafelyRelease` checks at release time and which can't
+      be modelled structurally), so we harvest the conservative superset: if the
+      generator slotted every action output → complete plan; if any lacks a slot →
+      `genOk` false → fall through to the lowered path, exactly as the cutover
+      declines. Verified the superset invariant (every live survivor ∈ action-output
+      set) holds for all build-able plans.
+    - **Result:** MIXED mode — the fully-coverable plans (backward / optimizer)
+      build from IR with zero lowered execution; the forward plan and others fall
+      through to lowered+record (the forward plan's cross-plan survivors aren't all
+      slotted, so it doesn't cut over today either). Loss baseline-exact
+      (`{0:9.81,3:5.92,6:5.15,9:4.64}`), peak flat at 2899.6 MB (+145 vs the 2754.6
+      default — the conservative-superset harvest marks more slots as exclusive
+      result entries, and build-from-IR skips the warmup-arena reclaim path).
+      Fullstack build-from-IR vs default max |Δloss| = 6.7e-6 / 30 steps. Default
+      path (flag off) byte-identical: gates 4/4, regression 2754.6 exact, full suite
+      green. `endCounters` captured AFTER the first replay (no prior dispatches).
+    - **Refactors (all single-source, behavior-preserving):** extracted
+      `captureActionLayouts` (shared by the lowered loop + IR population),
+      `harvestGenResults` + `liveResultHarvestPairs` (cutover) /
+      `actionOutputHarvestPairs` (build-from-IR), and `computeLivenessOutputIds`
+      (shared by liveness release + reused logic).
+  - **REMAINING for 4.4:** (1) tighten the harvest set toward the exact survivors
+    (close the +145 MB) — needs a structural model of cross-plan refcount holds, or
+    recording the survivor set once; (2) extend coverage to the forward plan (its
+    cross-plan-consumed activations aren't slotted by the generator — same blocker
+    that stops it cutting over today); (3) flip the default + delete the lowered
+    first-exec once coverage is broad enough. Multi-output extras whose derivation
+    isn't wired (e.g. logsumexp oi=1) still hit the harvest's live fallback.
 - **4.5 Retire the now-dead lowered-path machinery** (MEDIUM, gated on 4.4).
   Once 4.4 removes the lowered first execution, audit + delete what it alone
   used: the per-position arena hints/pre-pinning/conflict paths, the params-
