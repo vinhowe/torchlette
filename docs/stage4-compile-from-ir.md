@@ -599,12 +599,27 @@ cutover alone. The deletions decompose into gated sub-phases:
     cachedViewInput); the harvest just needs to consult those. multiOutExtra
     (8 + 200) is the genuine remaining capture gap: extra-output shapes (attention
     dQ/dK/dV, layernorm grad_weight/bias, Adam m/v) aren't in node.shape.
-  - **REMAINING for 4.4:** (inc 2) route the existing view captures + an
-    extra-output-shape capture into the harvest so result metadata needs no live
-    node.result; (inc 3) move the layout captures from the exec loop
-    (executor.ts:1519+) to LOWERING time (inputs are live there too); (inc 4)
-    build the plan on first call with no lowered exec, behind a flag, A/B'd via
-    the parity ladder. Delete the lowered first-exec last.
+  - **INC 1b DONE: per-op breakdown** ([ir-derive] now prints which ops cause each
+    diff). Exact spec for the derivation (`deriveResultMeta(node, oi)`):
+      - **dtype** = node.dtype (0 diffs — done).
+      - **primary shape** = node.shape (0 diffs — done).
+      - **multiOutExtra shapes** — adamStep oi=1,2 (m,v) = node.shape (the param
+        shape; 200 of the diffs, TRIVIAL); fusedAttentionForward oi=1 (logsumexp)
+        = from payload (batch,heads,seq; 8 diffs).
+      - **view strides+offset** — narrow / reshape / permute (measured: strides
+        narrow26/reshape24/permute32, offset narrow16/reshape16/permute16). Derive
+        by applying each view op's metadata transform to the INPUT's meta:
+        narrow → offset += start*inStrides[dim], shape[dim]=length, strides
+        unchanged; permute/transpose → permute/swap inStrides; expand → stride 0
+        on broadcast dims; reshape → contiguous(newShape) (materialize-vs-view
+        branch already captured via cachedViewInput.contiguous). The differential
+        is the oracle: implement, iterate to 0 diffs.
+  - **REMAINING for 4.4:** (inc 2) implement `deriveResultMeta` per the spec above
+    + switch the harvest to it (diff→0 proves equivalence); (inc 3) move the
+    layout captures from the exec loop (executor.ts:1519+) to LOWERING time
+    (inputs live there too); (inc 4) build the plan on first call with no lowered
+    exec, behind a flag, A/B'd via the parity ladder. Delete the lowered
+    first-exec last.
 - **4.5 Retire the now-dead lowered-path machinery** (MEDIUM, gated on 4.4).
   Once 4.4 removes the lowered first execution, audit + delete what it alone
   used: the per-position arena hints/pre-pinning/conflict paths, the params-

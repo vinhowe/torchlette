@@ -1983,6 +1983,14 @@ export async function executeLoweredPlan(
         // cases that need a capture (multi-output extra shapes). Diagnostic
         // only; removes/changes nothing. Reported under TORCHLETTE_DEBUG_COMPILED.
         const irDiff = { shape: 0, strides: 0, dtype: 0, offset: 0, extra: 0 };
+        // Per-op breakdown of each diff category → names exactly which ops'
+        // metadata the harvest must learn to derive (inc 2 implements those).
+        const irDiffOps = {
+          shape: new Map<string, number>(),
+          strides: new Map<string, number>(),
+          offset: new Map<string, number>(),
+          extra: new Map<string, number>(),
+        };
         const contigStrides = (shape: number[]): number[] => {
           const s = new Array(shape.length);
           let acc = 1;
@@ -2006,12 +2014,21 @@ export async function executeLoweredPlan(
           if (oi === 0) {
             const irShape = planNodes[i].shape;
             const irStrides = contigStrides(irShape);
-            if (irShape.join(",") !== bt.shape.join(",")) irDiff.shape++;
-            else if (irStrides.join(",") !== bt.strides.join(",")) irDiff.strides++;
+            if (irShape.join(",") !== bt.shape.join(",")) {
+              irDiff.shape++;
+              irDiffOps.shape.set(planNodes[i].op, (irDiffOps.shape.get(planNodes[i].op) ?? 0) + 1);
+            } else if (irStrides.join(",") !== bt.strides.join(",")) {
+              irDiff.strides++;
+              irDiffOps.strides.set(planNodes[i].op, (irDiffOps.strides.get(planNodes[i].op) ?? 0) + 1);
+            }
             if (planNodes[i].dtype !== bt.dtype) irDiff.dtype++;
-            if (bt.offset !== 0) irDiff.offset++;
+            if (bt.offset !== 0) {
+              irDiff.offset++;
+              irDiffOps.offset.set(planNodes[i].op, (irDiffOps.offset.get(planNodes[i].op) ?? 0) + 1);
+            }
           } else {
             irDiff.extra++;
+            irDiffOps.extra.set(planNodes[i].op, (irDiffOps.extra.get(planNodes[i].op) ?? 0) + 1);
           }
           genResults.push({
             nodeIndex: i,
@@ -2039,9 +2056,12 @@ export async function executeLoweredPlan(
           genOk &&
           (irDiff.shape || irDiff.strides || irDiff.dtype || irDiff.offset || irDiff.extra)
         ) {
+          const fmt = (m: Map<string, number>) =>
+            [...m.entries()].map(([k, v]) => `${k}:${v}`).join(",") || "-";
           console.log(
             `[ir-derive] nodes=${planNodes.length} results=${genResults.length} IR-vs-live diffs: ` +
-              `shape=${irDiff.shape} strides=${irDiff.strides} dtype=${irDiff.dtype} offset=${irDiff.offset} multiOutExtra=${irDiff.extra}`,
+              `shape=${irDiff.shape} strides=${irDiff.strides} dtype=${irDiff.dtype} offset=${irDiff.offset} multiOutExtra=${irDiff.extra}\n` +
+              `  strides-ops=[${fmt(irDiffOps.strides)}] offset-ops=[${fmt(irDiffOps.offset)}] extra-ops=[${fmt(irDiffOps.extra)}]`,
           );
         }
         if (genOk) {
