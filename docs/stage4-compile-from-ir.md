@@ -557,10 +557,24 @@ cutover alone. The deletions decompose into gated sub-phases:
     residue — not worth it. So the no-record path + `producedNodes` were REVERTED;
     the committed state is arena-reclaim (−323 MB) + cutover for the
     memory-neutral plans. Recorder demoted to the forward/loss plan + gate.
-  - Optional future win (BOTH modes, like arena-reclaim): evict the idle
-    warmup-spilled POOL buffers once a plan cuts over to planner replay (they're
-    never reused — replay binds planner entries). Low value (reusable/within
-    budget) and pool-shared, so deferred.
+  - **Spill-pool eviction ATTEMPTED → NOT VIABLE (2026-06-14, reverted).** Tried a
+    demand-driven pool trim: at beginStep (post-fence), evict idle pool buffers in
+    size classes demand-dead for N consecutive steps (hysteresis to avoid churn),
+    reasoning the warmup-spill classes go dead once plans cut over to planner
+    replay (which binds `device.createBuffer`, never pool-`acquire`s). It CHURNS:
+    the trim fired and freed up to ~2 GB/step, but steady-state `cur` was
+    byte-IDENTICAL with the trim on vs off (2721.1 MB) — i.e. it destroyed buffers
+    that were immediately re-allocated. Root cause: "0 reservation demand" ≠
+    "dead". The reservation window doesn't capture all pool acquires (markStep
+    cleanup / autograd intermediates acquire OUTSIDE the window), so working-set
+    classes look demand-dead, get trimmed, then re-acquired. Unlike the
+    per-position arena (per-plan-owned, provably dead, `canRecycle`-gated), the
+    spill residue is fungibly entangled with the shared pool's reusable working
+    set — there is no safe demand signal to separate them. The +33.5 MB stays
+    (idle, reusable, within the pool budget — not a leak). Do NOT re-attempt the
+    demand-trim. A real fix would need per-plan spill-buffer ownership tracking
+    (like the arena), which the spill path (resolveOutputBuffer → shared pool)
+    doesn't have.
 - **4.4 Build-without-execution → serializable plans** (LARGE, the headline
   dividend). Build the CompiledPlan from the lowered IR at COMPILE time, with NO
   first lowered execution. Requires the generator to derive ALL metadata from
