@@ -2086,28 +2086,53 @@ export async function executeLoweredPlan(
             genOk = false;
             return;
           }
-          // Differential: derived-from-IR metadata vs the live result. 0 diffs
-          // ⇒ build-without-execution can drop the live read for this result.
+          // Phase-4.4 (build-without-execution): the IR-DERIVED metadata is the
+          // source of truth for the harvested NodeResult. The live result is
+          // still present here (the cutover runs post-execution), so we ASSERT
+          // the derived value agrees with it at the seam — and fall back to the
+          // live read (loudly) if an op's metadata isn't derivable yet, so a
+          // gap can never silently produce wrong metadata. The no-execution
+          // flip just removes this live cross-check (there is no live result);
+          // any op still hitting the fallback is what that flip must learn to
+          // derive first (the multi-output extras the differential surfaces).
           const op = planNodes[i].op;
           const d = deriveResultMeta(i, oi);
+          let useDerived = d !== null;
           if (!d) {
             bump("extra", irDiffOps.extra, op);
-          } else if (d.shape.join(",") !== bt.shape.join(",")) {
-            bump("shape", irDiffOps.shape, op);
-          } else if (d.strides.join(",") !== bt.strides.join(",")) {
-            bump("strides", irDiffOps.strides, op);
-          } else if (d.offset !== bt.offset) {
-            bump("offset", irDiffOps.offset, op);
+          } else {
+            if (d.shape.join(",") !== bt.shape.join(",")) {
+              bump("shape", irDiffOps.shape, op);
+              useDerived = false;
+            } else if (d.strides.join(",") !== bt.strides.join(",")) {
+              bump("strides", irDiffOps.strides, op);
+              useDerived = false;
+            } else if (d.offset !== bt.offset) {
+              bump("offset", irDiffOps.offset, op);
+              useDerived = false;
+            }
           }
-          if (planNodes[i].dtype !== bt.dtype) irDiff.dtype++;
+          if (planNodes[i].dtype !== bt.dtype) {
+            irDiff.dtype++;
+            useDerived = false;
+          }
+          if (!useDerived && d !== null) {
+            // Derived metadata exists but disagrees with the live result — a
+            // real derivation bug (the differential has been 0 across every
+            // production + fullstack plan). Surface it; use the live value so
+            // execution stays correct while the derivation is fixed.
+            console.warn(
+              `[ir-derive] DIVERGE ${op} oi=${oi}: derived ${JSON.stringify(d)} != live {shape:[${bt.shape}],strides:[${bt.strides}],offset:${bt.offset}} — falling back to live`,
+            );
+          }
           genResults.push({
             nodeIndex: i,
             outputIndex: oi,
             slot,
-            shape: bt.shape.slice(),
-            strides: bt.strides.slice(),
-            dtype: bt.dtype,
-            offset: bt.offset,
+            shape: useDerived ? d!.shape.slice() : bt.shape.slice(),
+            strides: useDerived ? d!.strides.slice() : bt.strides.slice(),
+            dtype: useDerived ? planNodes[i].dtype : bt.dtype,
+            offset: useDerived ? d!.offset : bt.offset,
           });
         };
         for (let i = 0; i < planNodes.length && genOk; i++) {

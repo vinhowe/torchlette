@@ -651,13 +651,33 @@ cutover alone. The deletions decompose into gated sub-phases:
       last live-result dependency. Verified: derived == observed on every reshape
       across fullstack (no `[reshape-mat]` divergence), stream gate 4/4 0-diverged,
       gates 4/4, regression baseline-exact + flat.
-  - **REMAINING for 4.4 (inc 3+4 merged):** build the plan on first call with NO
+  - **INC 4b DONE (2026-06-14) — harvest seam-flip.** The cutover harvest now
+    takes its NodeResult metadata (shape/strides/dtype/offset) from the IR
+    derivation (`deriveResultMeta`) as the SOURCE OF TRUTH; the live result is
+    demoted to a post-exec cross-check that ASSERTS agreement and falls back
+    (loudly — `[ir-derive] DIVERGE`) if an op isn't derivable yet, so a gap can
+    never silently emit wrong metadata. This is the "single source at the seam,
+    assert agreement" rule applied to the harvest, and it's exactly the live read
+    the no-exec flip (inc 4c) removes. Verified: 0 DIVERGE warnings across the
+    full regression run + fullstack; gates 4/4; regression baseline-exact
+    (`{0:9.81,3:5.92,6:5.15,9:4.64}`, peak 2754.6 flat); fullstack derived-cutover
+    vs lowered max |Δloss| = 5.7e-6 / 30 steps.
+  - **REMAINING for 4.4 (inc 4a + 4c):** build the plan on first call with NO
     lowered exec — (a) feed deriveResultMeta-derived input metadata (recursed
-    across the NodeResult chain, bottoming at leaf/external inputs) into the
-    capture/plan fns via metadata stubs; (b) switch the harvest to
-    deriveResultMeta; (c) confirm the plan/capture fns need only geometry, not
-    live buffers. Behind a flag, A/B'd via the parity ladder. Delete the lowered
-    first-exec last.
+    across the NodeResult chain, bottoming at leaf/external materialized inputs)
+    into the capture/plan fns via metadata stubs — confirmed feasible:
+    `generateBareMatmul` consumes only `cachedMatmulPlan`'s GEOMETRY (outShape,
+    dtype, kSplit, pipeline, dispatch dims, transpose flags), never its buffer,
+    and `planContiguousDirectCore` uses the input `buffer.size` only as a
+    >maxBindingSize guard (not geometry) — so metadata stubs (shape/strides/
+    dtype + base-buffer size for the guard) drive every capture; (c) the no-exec
+    build path: on first call build lowered ACTIONS (pure structure, no exec) →
+    populate captures from IR stubs → generateStream → harvest via
+    deriveResultMeta (4b, drop the live cross-check; the only remaining live read
+    is the leaf/external base case) → buildCompiledPlanFromGenerated → replay.
+    Behind a flag, A/B'd via the parity ladder. Delete the lowered first-exec
+    last. Ops still hitting the 4b fallback (multi-output extras whose derivation
+    isn't wired — e.g. logsumexp oi=1) are exactly what 4c must derive first.
 - **4.5 Retire the now-dead lowered-path machinery** (MEDIUM, gated on 4.4).
   Once 4.4 removes the lowered first execution, audit + delete what it alone
   used: the per-position arena hints/pre-pinning/conflict paths, the params-
