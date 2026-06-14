@@ -1354,15 +1354,27 @@ function actionOutputHarvestPairs(
   return pairs;
 }
 
-// NOTE: build-without-execution must harvest the FULL action-output set
-// (actionOutputHarvestPairs), NOT just the live-result survivors. A "survivor"
-// prune (protected-OR-no-in-plan-consumer) is UNSAFE: plans are built/executed
-// incrementally, so at one plan's build time a cross-plan consumer living in a
-// LATER plan is not yet a live pending tensor and the liveness walk can't see
-// it — pruning then drops a result a future plan needs ("Input not ready").
-// The lowered/cutover path avoids this only because it materializes every result
-// and prunes later by ACTUAL refcount at markStep, which build-from-IR has no
-// equivalent of. So the over-harvest (and its memory cost) is inherent here.
+// build-without-execution MUST harvest the full action-output set, NOT just the
+// results that outlive the plan. Pruning to "survivors" is FUNDAMENTALLY unsafe
+// here, not merely hard — proven, not assumed:
+//
+// Plans are forced INCREMENTALLY. Two sibling plans can share a node (the DiLoCo
+// trainer's 388- and 364-node plans share node 2675, a narrow). The first plan
+// to be forced builds + replays; at that instant a COMPLETE walk of the entire
+// live pending graph (the maximum information available at build time) reports
+// the shared node as NOT cross-plan-consumed and NOT tensor-held — because the
+// sibling plan's graph has not been constructed yet. So NO build-time analysis,
+// however thorough, can know the node must be harvested. The second plan is
+// forced later, reads the node, and finds it gone ("Input not ready").
+//
+// The lowered/cutover path escapes this only because it materializes every
+// result and prunes later by ACTUAL refcount at markStep (it harvests live
+// results — node.result is set post-execution). build-from-IR has no such
+// after-the-fact signal, so it harvests every action output. The resulting
+// over-harvest (every intermediate becomes an exclusive planner entry) is the
+// inherent memory cost of building without execution (≈+34% on the 124M plan).
+// This was empirically verified with a per-node cross-plan-visibility trace; a
+// "survivor" prune deterministically crashes on the shared node.
 
 /**
  * @param plan - The original execution plan

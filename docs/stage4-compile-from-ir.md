@@ -727,19 +727,30 @@ cutover alone. The deletions decompose into gated sub-phases:
     AND the precise action-output set, EVERY recurring plan (forward, backward,
     optimizer) builds from IR — zero lowered execution. Loss baseline-exact,
     fullstack vs default 5.7e-6/30 steps, chunked-sum |Δ|=0.
-  - **THE OVER-HARVEST IS INHERENT (key finding).** build-from-IR must harvest the
-    FULL action-output set, not just the live-result survivors. A survivor prune
-    (protected-OR-no-in-plan-consumer) is UNSAFE: plans are built/executed
-    INCREMENTALLY, so at one plan's build a cross-plan consumer in a LATER plan
-    is not yet a live pending tensor — `computeLivenessOutputIds` can't see it, and
-    pruning drops a result a future plan needs (deterministic "Input not ready" on
-    a narrow). The lowered/cutover path avoids this only because it materializes
-    every result and prunes later by ACTUAL refcount at markStep — which has no
-    build-time equivalent. So full coverage costs memory: 124M regression peak
-    2754→3686 MB (+34%, flat, zero leak). build-from-IR therefore trades MEMORY for
-    cold-start elimination + serializability; it is a viable OPT-IN, not a free
-    default replacement. Closing the gap needs whole-graph-ahead liveness (defeats
-    incremental execution) or a different result-lifetime model — out of scope.
+  - **THE OVER-HARVEST IS FUNDAMENTAL (proven, not assumed).** build-from-IR must
+    harvest the FULL action-output set, not just the results that outlive the plan.
+    A survivor prune was tried TWICE — once via `computeLivenessOutputIds`, once via
+    a COMPLETE walk of the entire live pending graph (the maximum information
+    available at build time) — and BOTH deterministically crash on a shared node.
+    Proof (per-node cross-plan-visibility trace, node 2675, a narrow shared by the
+    DiLoCo trainer's 388- and 364-node sibling plans):
+    ```
+    [trace 2675] plan nodes=388 inThisPlan=true crossPlanOut=false reachableFromPendingRoots=true
+    [trace 2675] plan nodes=364 inThisPlan=true crossPlanOut=false reachableFromPendingRoots=true
+    → FATAL: Input not ready: node 2675
+    ```
+    Plans are forced INCREMENTALLY. When the 388 plan builds + replays, the 364
+    plan's graph does not exist yet, so the complete walk reports node 2675 as
+    NOT cross-plan-consumed and NOT tensor-held — no build-time analysis, however
+    thorough, can know it must be harvested. The 364 plan is forced afterward,
+    reads 2675, finds it gone. The lowered/cutover path escapes this ONLY because
+    it materializes every result and harvests live `node.result` post-execution
+    (then prunes by actual refcount at markStep) — build-from-IR has no
+    after-the-fact signal. So the over-harvest is intrinsic: closing it needs
+    whole-graph-ahead forcing (defeats incremental execution) or a different
+    result-lifetime model. Cost: 124M regression peak 2754→3686 MB (+34%, flat,
+    zero leak). build-from-IR therefore trades MEMORY for cold-start elimination +
+    serializability — a viable OPT-IN, not a free default replacement.
   - **REMAINING for 4.4:** (1) a small plan with a per-step-varying `mul` scalar
     trips the volatile-params guard and falls back once (correct, no drift) —
     route per-step scalars through the volatile/scalar-table mechanism so it
