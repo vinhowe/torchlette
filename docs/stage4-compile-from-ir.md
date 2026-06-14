@@ -383,15 +383,57 @@ becoming the sole build source), not independent dead code to clear first:
 - legacy unbudgeted arena (`TORCHLETTE_ARENA_LIVENESS=0`) — a SUPPORTED opt-out
   / planner-bug fallback, not vestigial. Dropping it is a product decision.
 
-**So the order is cutover-first.** The cutover: make `buildCompiledPlan`
-consume the GENERATED stream (proven byte-identical modulo slot bijection)
-instead of the recorded log — wiring nodeResults / slot sources / planner
-assignment from the generated segments — behind a flag, validated by the full
-parity ladder both directions. THEN the record* hooks demote to a gate-only
-cross-check and the above become deletable as the planner subsumes them.
-- Dividends: serializable compiled plans (a generated plan has no live GPU
-  pointers → ~700ms cold start dies); single answer to "who owns this
-  buffer"; the architecture-debt rules become enforced by construction.
+**DELETION SCOPING (2026-06-14, after the cutover landed & was validated).**
+The cutover works but the deletions are MORE gated than originally framed,
+because of two facts the cutover work surfaced:
+- The cutover is PER-PLAN and coverage-gated. Only the 2 steady-state plans cut
+  over; transient warmup plans (never recur → never compile) and any plan with
+  a chunked op (>128 MB buffers — chunked contiguous/adam) stay on the RECORDED
+  path. So the recorder is still the build source for those.
+- The FIRST execution of every template ALWAYS runs the LOWERED path (for real
+  results) + recording; the cutover only swaps the REPLAY source. So the per-
+  position arena, `createParamsBuffer`, and the record* hooks are all exercised
+  by that first lowered execution regardless of the cutover.
+Therefore the recorder + the arena/params machinery CANNOT be deleted by the
+cutover alone. The deletions decompose into gated sub-phases:
+
+- **4.1 Flip the cutover to default-on** (decision + validation, LOW risk). Make
+  `TORCHLETTE_GENERATED_PLAN` the default. No deletions — just makes the
+  generated plan the replay source for covered plans by default. Recorder still
+  runs (gate + fallback). Gate: full ladder + suites, default-on. This is the
+  go/no-go that unblocks everything below.
+- **4.2 Cover the chunked ops** (MEDIUM). chunked contiguous / chunked adam /
+  the >128 MB `where`/embedding paths currently bail (`return "chunked"`), so
+  large-model plans don't fully cover → stay recorded. Cover them so EVERY
+  recurring plan cuts over. (Transient plans still won't compile — they don't
+  recur; that's fine, they run lowered once.) After 4.2 the recorded BUILD is
+  the source for NO recurring plan.
+- **4.3 Demote the recorder to CI-only** (MEDIUM, the first real deletion). With
+  4.2, skip recording in production entirely — build the compiled plan from the
+  generated stream directly (the genResults harvest already gives the slots).
+  The record* hooks stay but fire ONLY under `TORCHLETTE_STREAM_GENERATE` (the
+  gate cross-check). Removes recording overhead from the first execution. The
+  recorder is now exactly what the doc always wanted: a CI cross-check.
+- **4.4 Build-without-execution → serializable plans** (LARGE, the headline
+  dividend). Build the CompiledPlan from the lowered IR at COMPILE time, with NO
+  first lowered execution. Requires the generator to derive ALL metadata from
+  the IR (today the harvest reads `node.result` for result shapes/strides — must
+  come from `node.shape`/`dtype` + the captured layouts, the same capture-don't-
+  synthesize discipline phase 3 already established). This kills the ~700 ms cold
+  start AND makes plans serializable (no live GPU pointers) — the actual payoff.
+- **4.5 Retire the now-dead lowered-path machinery** (MEDIUM, gated on 4.4).
+  Once 4.4 removes the lowered first execution, audit + delete what it alone
+  used: the per-position arena hints/pre-pinning/conflict paths, the params-
+  sequence cache. NOTE the doc's original "delete pinnedBufferSet" is WRONG —
+  it's the memory PLANNER's buffer-ownership mechanism (consulted by every
+  replay alloc), it STAYS. The legacy unbudgeted arena (`ARENA_LIVENESS=0`) is a
+  separate product decision (drop the opt-out or keep it).
+
+Dividends (realized progressively, fully at 4.4): serializable compiled plans
+(generated plans have no live GPU pointers → ~700 ms cold start dies); single
+answer to "who owns this buffer"; the architecture-debt rules enforced by
+construction. Net: 4.1 is the next concrete step (a validated flag-flip);
+4.2-4.3 retire the recorder from production; 4.4 is the big structural win.
 
 **Cutover WIP (2026-06-13, flag-gated `TORCHLETTE_GENERATED_PLAN=1`, DEFAULT
 OFF — default path + gate fully green).** Wired: `finalizeCompiledPlan` (the
