@@ -474,19 +474,44 @@ en route:
    optimizer) matches the recorded baseline to ~1e-6 over 30 steps (7.902296
    vs 7.902297 @ step 29).
 
-**Cutover STATUS: ALL plans cut over correctly under the flag (4/4 FULLY
-GENERATED, 30-step parity to fp noise).** Remaining before flipping the default:
-(b) the rest of the parity ladder (regression + A100 A/B) with the flag on; (c)
-close the two remaining gate holes (external-resolution, orphan-slot) for
-durability — the params-data hole is already closed; then the phase-4 deletions
-(recorder → CI cross-check only, per-position arena / pinnedBufferSet /
-params-sequence cache subsumed by the planner). Lesson worth keeping: the
-generator must treat every recorded structure it reproduces as needing the SAME
-copy/ownership, volatile-repack, AND produced-vs-external discipline the
-recorder uses — a shared mutable array stored by reference, a no-op volatile
-pack, and a leaf input mistaken for an internal producer are all the same class
-of bug (the recorder's `data.slice()`, volatile uniform, and pre-execution
-external pre-assignment, respectively).
+**Cutover STATUS: the steady-state plans cut over correctly (30-step parity to
+fp noise); coverage is 4/4 FULLY GENERATED.** Nuance: of the 4 canonical
+templates, the 2 STEADY-STATE plans (forward 357 cmds, backward+optimizer 1746
+cmds) recur every step → compile on the 2nd execution → cut over and execute via
+the generated path. The other 2 are TRANSIENT warmup/first-step templates: the
+generator FULLY covers them (the gate verifies their streams) but they never
+recur, so they never compile and stay on the lowered path — expected, transient
+plans gain nothing from compilation. The 30-step trajectory matches recorded to
+~1e-6 with the steady-state plans generated and the transient ones lowered.
+
+**Gate-hardening (params-data hole CLOSED; the other two are not cleanly
+closeable, by design).** The params-data multiset guard (executor fully-covered
+branch) is in — it caught the actual freeze and is value-level (affects
+execution). The external-RESOLUTION and ORPHAN-slot "holes" can NOT be closed
+with structural-identity checks: the segment-aligned differential is
+deliberately slot-renaming- AND benign-structural-difference-tolerant, so
+guards requiring the gen and recorded slot structures to be IDENTICAL
+false-positive (the transient plans carry harmless orphan external slots — a
+leaf-input buffer that a covered consumer resolves via another slot — and pick
+different external-ref representatives under dedup; both are benign and never
+executed). Correctness is instead pinned by: the segment diff + the params-data
+guard + the 30-step trajectory parity, and — for the spurious-external CRASH
+class specifically — the produced-set fix STRUCTURALLY prevents it (external
+slots are assigned only to non-produced refs, never to a produced-within node
+whose result clears mid-replay). Closing the remaining holes "properly" would
+need resolved-BUFFER comparison (not ref-pair identity), which the trajectory
+parity already subsumes — not worth the false-positive surface.
+
+Remaining before flipping the default: (b) the rest of the parity ladder
+(regression + A100 A/B) with the flag on; then the phase-4 deletions (recorder →
+CI cross-check only; per-position arena / pinnedBufferSet / params-sequence
+cache subsumed by the planner). Lesson worth keeping: the generator must treat
+every recorded structure it reproduces as needing the SAME copy/ownership,
+volatile-repack, AND produced-vs-external discipline the recorder uses — a
+shared mutable array stored by reference, a no-op volatile pack, and a leaf
+input mistaken for an internal producer are all the same class of bug (the
+recorder's `data.slice()`, volatile uniform, and pre-execution external
+pre-assignment, respectively).
 
 ## Risks and mitigations
 - **Imperative-op long tail** (phase 3): mitigated by per-op fallback — no
