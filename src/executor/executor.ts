@@ -28,6 +28,7 @@ import {
 } from "../backend/webgpu";
 import { getDispatchSequenceCounters } from "../backend/webgpu/bind-group-cache";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
+import { VIEW_META_OPS, viewResultMeta } from "../backend/webgpu/ops/view-meta";
 import {
   asGPUTensor,
   type GPUBuffer,
@@ -2000,6 +2001,66 @@ export async function executeLoweredPlan(
           }
           return s;
         };
+        // Live metadata of a node's input 0 (the base for a view derivation).
+        // Available here because the harvest runs post-execution; for true
+        // build-without-execution this comes from the input's own derived meta
+        // (the recursive NodeResult chain — inc 4). Validating the view
+        // TRANSFORM against the live input isolates transform correctness.
+        type Meta = { shape: number[]; strides: number[]; offset: number };
+        const liveInputMeta = (node: LazyIRNode): Meta | null => {
+          const ref = node.inputs[0];
+          if (!ref || ref.kind === "scalar") return null;
+          const st =
+            ref.kind === "materialized"
+              ? ref.storage
+              : (ref.outputIndex ?? 0) === 0
+                ? ref.node.result
+                : ref.node.results?.[ref.outputIndex ?? 0];
+          if (!st) return null;
+          const ib = asGPUTensor(st.backendTensor);
+          return { shape: ib.shape, strides: ib.strides, offset: ib.offset };
+        };
+        // Result metadata DERIVED from the IR (no live result) — the build-
+        // without-execution path. Views use the shared view-meta transforms
+        // (single source with the backend ops); compute ops are contiguous;
+        // multi-output extras use the op's defined output shape.
+        const deriveResultMeta = (i: number, oi: number): Meta | null => {
+          const node = planNodes[i];
+          if (oi === 0) {
+            if (VIEW_META_OPS.has(node.op)) {
+              const inp = liveInputMeta(node);
+              if (inp) {
+                const m = viewResultMeta(node.op, inp, node.shape, node.payload);
+                if (m) return m;
+              }
+            }
+            return { shape: node.shape, strides: contigStrides(node.shape), offset: 0 };
+          }
+          // Multi-output extras (the ops with extra outputs in real plans):
+          //  - adamStep oi 1,2 (m, v): same shape as the param (= node.shape).
+          //  - fusedAttentionForward oi 1 (logsumexp): [B,H,N] from payload.
+          if (node.op === "adamStep") {
+            return { shape: node.shape, strides: contigStrides(node.shape), offset: 0 };
+          }
+          if (node.op === "fusedAttentionForward" && oi === 1) {
+            const p = node.payload as {
+              batchSize: number;
+              numHeads: number;
+              seqLen: number;
+            };
+            const lse = [p.batchSize, p.numHeads, p.seqLen];
+            return { shape: lse, strides: contigStrides(lse), offset: 0 };
+          }
+          return null;
+        };
+        const bump = (
+          cat: keyof typeof irDiff,
+          ops: Map<string, number>,
+          op: string,
+        ) => {
+          irDiff[cat]++;
+          ops.set(op, (ops.get(op) ?? 0) + 1);
+        };
         const emit = (i: number, oi: number, sh: { backendTensor: unknown }) => {
           const bt = asGPUTensor(sh.backendTensor as never);
           const slot =
@@ -2008,28 +2069,20 @@ export async function executeLoweredPlan(
             genOk = false;
             return;
           }
-          // IR-derived metadata (what build-without-execution would have).
-          // Primary output: node.shape/dtype. Extra outputs (oi>0) have no IR
-          // shape today → counted as `extra` (the known capture gap).
-          if (oi === 0) {
-            const irShape = planNodes[i].shape;
-            const irStrides = contigStrides(irShape);
-            if (irShape.join(",") !== bt.shape.join(",")) {
-              irDiff.shape++;
-              irDiffOps.shape.set(planNodes[i].op, (irDiffOps.shape.get(planNodes[i].op) ?? 0) + 1);
-            } else if (irStrides.join(",") !== bt.strides.join(",")) {
-              irDiff.strides++;
-              irDiffOps.strides.set(planNodes[i].op, (irDiffOps.strides.get(planNodes[i].op) ?? 0) + 1);
-            }
-            if (planNodes[i].dtype !== bt.dtype) irDiff.dtype++;
-            if (bt.offset !== 0) {
-              irDiff.offset++;
-              irDiffOps.offset.set(planNodes[i].op, (irDiffOps.offset.get(planNodes[i].op) ?? 0) + 1);
-            }
-          } else {
-            irDiff.extra++;
-            irDiffOps.extra.set(planNodes[i].op, (irDiffOps.extra.get(planNodes[i].op) ?? 0) + 1);
+          // Differential: derived-from-IR metadata vs the live result. 0 diffs
+          // ⇒ build-without-execution can drop the live read for this result.
+          const op = planNodes[i].op;
+          const d = deriveResultMeta(i, oi);
+          if (!d) {
+            bump("extra", irDiffOps.extra, op);
+          } else if (d.shape.join(",") !== bt.shape.join(",")) {
+            bump("shape", irDiffOps.shape, op);
+          } else if (d.strides.join(",") !== bt.strides.join(",")) {
+            bump("strides", irDiffOps.strides, op);
+          } else if (d.offset !== bt.offset) {
+            bump("offset", irDiffOps.offset, op);
           }
+          if (planNodes[i].dtype !== bt.dtype) irDiff.dtype++;
           genResults.push({
             nodeIndex: i,
             outputIndex: oi,
@@ -2051,17 +2104,17 @@ export async function executeLoweredPlan(
             emit(i, 0, node.result);
           }
         }
-        if (
-          ENV.TORCHLETTE_DEBUG_COMPILED &&
-          genOk &&
-          (irDiff.shape || irDiff.strides || irDiff.dtype || irDiff.offset || irDiff.extra)
-        ) {
+        if (ENV.TORCHLETTE_DEBUG_COMPILED && genOk) {
           const fmt = (m: Map<string, number>) =>
             [...m.entries()].map(([k, v]) => `${k}:${v}`).join(",") || "-";
+          const total =
+            irDiff.shape + irDiff.strides + irDiff.dtype + irDiff.offset + irDiff.extra;
           console.log(
-            `[ir-derive] nodes=${planNodes.length} results=${genResults.length} IR-vs-live diffs: ` +
-              `shape=${irDiff.shape} strides=${irDiff.strides} dtype=${irDiff.dtype} offset=${irDiff.offset} multiOutExtra=${irDiff.extra}\n` +
-              `  strides-ops=[${fmt(irDiffOps.strides)}] offset-ops=[${fmt(irDiffOps.offset)}] extra-ops=[${fmt(irDiffOps.extra)}]`,
+            `[ir-derive] nodes=${planNodes.length} results=${genResults.length} IR-vs-live diffs=${total}: ` +
+              `shape=${irDiff.shape} strides=${irDiff.strides} dtype=${irDiff.dtype} offset=${irDiff.offset} multiOutExtra=${irDiff.extra}` +
+              (total
+                ? `\n  strides-ops=[${fmt(irDiffOps.strides)}] offset-ops=[${fmt(irDiffOps.offset)}] extra-ops=[${fmt(irDiffOps.extra)}]`
+                : ""),
           );
         }
         if (genOk) {

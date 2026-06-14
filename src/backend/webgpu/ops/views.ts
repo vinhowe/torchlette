@@ -3,6 +3,7 @@
  * detectSimpleTranspose, ensureContiguous.
  */
 import { inferReshapeStrides } from "../../../core/shape";
+import { expandMeta, narrowMeta, permuteMeta } from "./view-meta";
 import type { BackendTensor, DType, TransposeOptions } from "../../types";
 import {
   cachedCreateBindGroup,
@@ -296,44 +297,32 @@ export function expand(a: BackendTensor, shape: number[]): BackendTensor {
     );
   }
 
-  // Compute output strides with broadcasting
-  // For broadcast dims (input dim = 1, output dim > 1), stride = 0
-  // For leading dims (not in input), stride = 0
-  // For matching dims, use input stride
-  const outStrides: number[] = [];
+  // Validate broadcast compatibility, then use the shared single-source meta.
+  // (expandMeta assumes already-validated shapes; keep the explicit check here
+  // so the error message is preserved for callers.)
   const padded = shape.length - inputShape.length;
-
-  for (let i = 0; i < shape.length; i++) {
-    if (i < padded) {
-      // Leading dimension not in input - broadcast with stride 0
-      outStrides.push(0);
-    } else {
-      const inputIdx = i - padded;
-      const inputDim = inputShape[inputIdx];
-      const outputDim = shape[i];
-
-      if (inputDim === 1 && outputDim > 1) {
-        // Broadcast: stride = 0 (repeat same element)
-        outStrides.push(0);
-      } else if (inputDim === outputDim) {
-        // Same size: use existing stride
-        outStrides.push(inputStrides[inputIdx]);
-      } else {
-        throw new Error(
-          `expand: incompatible shapes at dimension ${i} (input ${inputDim} vs output ${outputDim})`,
-        );
-      }
+  for (let i = padded; i < shape.length; i++) {
+    const inputDim = inputShape[i - padded];
+    const outputDim = shape[i];
+    if (inputDim !== 1 && inputDim !== outputDim) {
+      throw new Error(
+        `expand: incompatible shapes at dimension ${i} (input ${inputDim} vs output ${outputDim})`,
+      );
     }
   }
+  const m = expandMeta(
+    { shape: inputShape, strides: inputStrides, offset: tensor.offset },
+    shape,
+  );
 
   // Return a view sharing the same buffer
   // Note: expand views are never contiguous (they have stride=0 somewhere)
   // View - does not own the buffer
   return createTensor(
-    shape,
+    m.shape,
     tensor.buffer,
-    outStrides,
-    tensor.offset,
+    m.strides,
+    m.offset,
     tensor.dtype,
     false,
   );
@@ -678,14 +667,17 @@ export function narrow(
       `narrow: range [${start}, ${start + length}) out of bounds for dim size ${tensor.shape[dim]}`,
     );
   }
-  const newShape = tensor.shape.slice();
-  newShape[dim] = length;
-  const newOffset = tensor.offset + start * tensor.strides[dim];
+  const m = narrowMeta(
+    { shape: tensor.shape, strides: tensor.strides, offset: tensor.offset },
+    dim,
+    start,
+    length,
+  );
   return createTensor(
-    newShape,
+    m.shape,
     tensor.buffer,
-    tensor.strides.slice(),
-    newOffset,
+    m.strides,
+    m.offset,
     tensor.dtype,
     false,
   );
@@ -816,17 +808,19 @@ export function permute(a: BackendTensor, dims: number[]): BackendTensor {
     seen.add(d);
   }
 
-  // Reorder shape and strides according to dims
-  const outShape = dims.map((d) => inputShape[d]);
-  const outStrides = dims.map((d) => tensor.strides[d]);
+  // Reorder shape and strides according to dims (shared single-source meta).
+  const m = permuteMeta(
+    { shape: inputShape, strides: tensor.strides, offset: tensor.offset },
+    dims,
+  );
 
   // Return a view sharing the same buffer
   // View - does not own the buffer
   return createTensor(
-    outShape,
+    m.shape,
     tensor.buffer,
-    outStrides,
-    tensor.offset,
+    m.strides,
+    m.offset,
     tensor.dtype,
     false,
   );

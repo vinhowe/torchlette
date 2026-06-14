@@ -614,12 +614,33 @@ cutover alone. The deletions decompose into gated sub-phases:
         on broadcast dims; reshape → contiguous(newShape) (materialize-vs-view
         branch already captured via cachedViewInput.contiguous). The differential
         is the oracle: implement, iterate to 0 diffs.
-  - **REMAINING for 4.4:** (inc 2) implement `deriveResultMeta` per the spec above
-    + switch the harvest to it (diff→0 proves equivalence); (inc 3) move the
-    layout captures from the exec loop (executor.ts:1519+) to LOWERING time
-    (inputs live there too); (inc 4) build the plan on first call with no lowered
-    exec, behind a flag, A/B'd via the parity ladder. Delete the lowered
-    first-exec last.
+  - **INC 2 DONE (2026-06-14): result metadata fully IR-derivable, single-source.**
+    NOT by re-deriving view-stride math in the executor (that would be a SECOND
+    source of truth that drifts — the hack we avoided). Instead:
+      - Extracted the view-metadata transforms into `backend/webgpu/ops/view-meta.ts`
+        (narrow/permute/transpose/expand + reshape) as the SINGLE SOURCE. The
+        backend view ops (narrow/permute/expand; transpose = permute) now compute
+        their output {shape,strides,offset} via it — one implementation, two
+        callers. reshape kept its buffer-branching but its meta is pinned by the
+        differential (and reshapeMeta carries a `materialized` flag).
+      - `deriveResultMeta(node, oi)` (executor.ts): views → view-meta transform on
+        the input meta; compute ops → node.shape + contiguous + offset 0;
+        multi-output extras → adamStep m/v = node.shape, attention logsumexp =
+        [B,H,N] from payload.
+      - The [ir-derive] differential now compares deriveResultMeta vs the live
+        result for EVERY result: **0 diffs across the production trainer
+        (388/703-node plans) AND fullstack (attention multi-output + all views).**
+        So the harvest can drop the live read entirely — requirement #2 proven.
+      - In-suite guard: test/view-meta.spec.ts (transforms vs hand-computed).
+    Validated: gates 4/4, regression baseline-exact + mem flat, full suite green
+    (cpu 1100 + webgpu 711). The harvest still READS live bt (no behavior change);
+    flipping it to deriveResultMeta happens in inc 4 (when there's no live result).
+  - **REMAINING for 4.4:** (inc 3) move the layout captures from the exec loop
+    (executor.ts:1519+) to LOWERING time (inputs live there too) so the generated
+    stream builds with no execution; (inc 4) build the plan on first call with no
+    lowered exec — switch the harvest to deriveResultMeta + the input-meta
+    recursion across the NodeResult chain — behind a flag, A/B'd via the parity
+    ladder. Delete the lowered first-exec last.
 - **4.5 Retire the now-dead lowered-path machinery** (MEDIUM, gated on 4.4).
   Once 4.4 removes the lowered first execution, audit + delete what it alone
   used: the per-position arena hints/pre-pinning/conflict paths, the params-
