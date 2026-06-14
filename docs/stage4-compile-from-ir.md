@@ -525,12 +525,31 @@ cutover alone. The deletions decompose into gated sub-phases:
     once reclaimed; arrays re-grow on a lowered fallback). **A DEFAULT-PATH win,
     independent of stage-4:** production regression peak **3078 → 2754 MB
     (−323 MB)**, 124M mem-probe 3.20 → 3.12 GB, loss baseline-exact, zero growth;
-    gates 4/4, full suite green, fullstack parity 7e-6. Because BOTH recorded and
-    generated replay take the compiled path, both reclaim their warmup arena → the
-    +57 MB no-record delta is erased (4.3 no longer blocked on the memory axis).
-  - Remaining for full no-record 4.3: the logsumexp multi-output gap (attention
-    oi=1 in the checkpoint-recompute path) — same one-line pattern as grad_bias —
-    so the forward plan cuts over without the bail-rule recording fallback.
+    gates 4/4, full suite green, fullstack parity 7e-6.
+  - **No-record path validated, then the residual isolated (2026-06-14).** Built
+    the full no-record path (`TORCHLETTE_NO_RECORD=1`) + a `producedNodes`-gated
+    harvest refinement (distinguishes a genuine produced multi-output gap → bail,
+    from a CSE-bypassed alias whose result is another slotted node's buffer →
+    safe skip). With it, the no-record run is bail-free (0 recordings, loss
+    baseline-exact) — the "logsumexp" bail was node[60], a CSE-bypassed alias
+    attention, correctly skipped. BUT measuring isolated the true residual:
+    **cutting the FORWARD plan over to generated replay costs +36 MB** (forward
+    on recorded 2752/2754 MB ≈ `=0`; forward cut over 2788 MB — stable). The
+    generated forward plan's steady-state replay is ~36 MB heavier than its
+    recorded replay (the activation-heavy plan packs worse on the generated side;
+    arena-reclaim does NOT cover this — it's a planner/replay difference, not
+    warmup arena). Backward/optimizer plans cut over memory-NEUTRALLY.
+  - **DECISION:** the memory-optimal config **keeps the forward plan on recorded
+    replay** (the bail rule routes it there at no cost) and cuts over everything
+    else. Full recorder demotion (forward too) would cost +36 MB — not worth it
+    until the generated-forward replay packs as tightly as recorded. So the
+    no-record path + `producedNodes` were REVERTED (they force the forward
+    cutover → +36 MB default regression); the committed state is arena-reclaim
+    (−323 MB) + the cutover for the memory-neutral plans. The recorder is demoted
+    to: the forward/loss plan + the gate cross-check.
+  - Open follow-up: WHY the generated forward plan packs +36 MB worse than
+    recorded (same planner, both arena-reclaimed) — the last thing between us and
+    a zero-cost full recorder demotion / 4.4.
 - **4.4 Build-without-execution → serializable plans** (LARGE, the headline
   dividend). Build the CompiledPlan from the lowered IR at COMPILE time, with NO
   first lowered execution. Requires the generator to derive ALL metadata from
