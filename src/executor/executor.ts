@@ -1974,6 +1974,24 @@ export async function executeLoweredPlan(
       if (wantCutover && gen?.fullyCovered && compiled.valid) {
         const genResults: NodeResult[] = [];
         let genOk = true;
+        // Stage-4 phase-4.4 differential (build-without-execution): the harvest
+        // reads result metadata from the LIVE node.result. For
+        // build-without-execution there is no live result, so the metadata must
+        // be DERIVED from the IR (node.shape/dtype + contiguous strides + offset
+        // 0). This counts where IR-derived would DIFFER from the live result —
+        // proving (when zero) that requirement #2 is sound, and surfacing the
+        // cases that need a capture (multi-output extra shapes). Diagnostic
+        // only; removes/changes nothing. Reported under TORCHLETTE_DEBUG_COMPILED.
+        const irDiff = { shape: 0, strides: 0, dtype: 0, offset: 0, extra: 0 };
+        const contigStrides = (shape: number[]): number[] => {
+          const s = new Array(shape.length);
+          let acc = 1;
+          for (let d = shape.length - 1; d >= 0; d--) {
+            s[d] = acc;
+            acc *= shape[d];
+          }
+          return s;
+        };
         const emit = (i: number, oi: number, sh: { backendTensor: unknown }) => {
           const bt = asGPUTensor(sh.backendTensor as never);
           const slot =
@@ -1981,6 +1999,19 @@ export async function executeLoweredPlan(
           if (slot === undefined) {
             genOk = false;
             return;
+          }
+          // IR-derived metadata (what build-without-execution would have).
+          // Primary output: node.shape/dtype. Extra outputs (oi>0) have no IR
+          // shape today → counted as `extra` (the known capture gap).
+          if (oi === 0) {
+            const irShape = planNodes[i].shape;
+            const irStrides = contigStrides(irShape);
+            if (irShape.join(",") !== bt.shape.join(",")) irDiff.shape++;
+            else if (irStrides.join(",") !== bt.strides.join(",")) irDiff.strides++;
+            if (planNodes[i].dtype !== bt.dtype) irDiff.dtype++;
+            if (bt.offset !== 0) irDiff.offset++;
+          } else {
+            irDiff.extra++;
           }
           genResults.push({
             nodeIndex: i,
@@ -2002,6 +2033,16 @@ export async function executeLoweredPlan(
           } else if (node.result) {
             emit(i, 0, node.result);
           }
+        }
+        if (
+          ENV.TORCHLETTE_DEBUG_COMPILED &&
+          genOk &&
+          (irDiff.shape || irDiff.strides || irDiff.dtype || irDiff.offset || irDiff.extra)
+        ) {
+          console.log(
+            `[ir-derive] nodes=${planNodes.length} results=${genResults.length} IR-vs-live diffs: ` +
+              `shape=${irDiff.shape} strides=${irDiff.strides} dtype=${irDiff.dtype} offset=${irDiff.offset} multiOutExtra=${irDiff.extra}`,
+          );
         }
         if (genOk) {
           const genPlan = buildCompiledPlanFromGenerated({

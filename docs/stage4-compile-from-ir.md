@@ -582,9 +582,29 @@ cutover alone. The deletions decompose into gated sub-phases:
   come from `node.shape`/`dtype` + the captured layouts, the same capture-don't-
   synthesize discipline phase 3 already established). This kills the ~700 ms cold
   start AND makes plans serializable (no live GPU pointers) — the actual payoff.
-  Shares the 4.3 residual: the generated replay of every plan is now CORRECT
-  (grad_bias fix + bail rule), the planner packs identically, and the remaining
-  +57 MB is a peripheral pool/size-class artifact (not architectural — see 4.3).
+  ALSO subsumes the 4.3 +36 MB residual: that residue is warmup-spill pool
+  buffers from the LOWERED first execution; build-without-execution removes that
+  execution → the spill never happens. (A standalone spill-pool reclaim churns —
+  fungible pool, no clean dead-signal — so it's not worth doing separately.)
+  - **INCREMENT 1 DONE (2026-06-14): IR-derive differential** (executor.ts cutover
+    harvest, `[ir-derive]` under TORCHLETTE_DEBUG_COMPILED — diagnostic, removes
+    nothing). Counts where IR-derived result metadata (node.shape/dtype +
+    contiguous strides + offset 0) would DIFFER from the live node.result. On the
+    production trainer:
+      - forward(388): shape 0, dtype 0, strides 82, offset 48, multiOutExtra 8
+      - backward(703): shape 0, dtype 0, strides 0, offset 0, multiOutExtra 200
+    → **primary-output shape + dtype are 100% IR-derivable** (the majority).
+    Strides/offset diffs are all VIEW results (narrow/transpose/permute) — NOT
+    contiguous, but the generator ALREADY captures them (cachedStridedInputs /
+    cachedViewInput); the harvest just needs to consult those. multiOutExtra
+    (8 + 200) is the genuine remaining capture gap: extra-output shapes (attention
+    dQ/dK/dV, layernorm grad_weight/bias, Adam m/v) aren't in node.shape.
+  - **REMAINING for 4.4:** (inc 2) route the existing view captures + an
+    extra-output-shape capture into the harvest so result metadata needs no live
+    node.result; (inc 3) move the layout captures from the exec loop
+    (executor.ts:1519+) to LOWERING time (inputs are live there too); (inc 4)
+    build the plan on first call with no lowered exec, behind a flag, A/B'd via
+    the parity ladder. Delete the lowered first-exec last.
 - **4.5 Retire the now-dead lowered-path machinery** (MEDIUM, gated on 4.4).
   Once 4.4 removes the lowered first execution, audit + delete what it alone
   used: the per-position arena hints/pre-pinning/conflict paths, the params-
