@@ -762,10 +762,18 @@ cutover alone. The deletions decompose into gated sub-phases:
     | embed768 L12 | 124M | 8536.9 MB | 10084.9 MB| +1548 MB | +18.1% |
     | embed1024 L24| 354M | 17971.3 MB| 19845.6 MB| +1874 MB | +10.4% |
     Δ% halves roughly per ~3× params, so gpt2-xl-scale (1.5B) would be single-digit
-    %. The fraction RISES with batch×seq (more activations vs fixed params) — the
-    original "+34%" figure was the embed128/L8 model at batch 8. (Sweep via the
-    REG_EMBED/REG_LAYERS/REG_HEADS/REG_BATCH/REG_SEQ/REG_ROUNDS knobs on
-    diloco-regression-check.ts; defaults preserve the baseline config.)
+    %. The fraction also FALLS along the batch axis and plateaus — fixed 8M model,
+    seq 256: b1 +42.5% (+350MB), b8 +33.8% (+932MB), b16 +33.9% (+1696MB), b64
+    +21.4% (+4320MB). Fitting Δ ≈ 287 + 63·batch MB vs base ≈ 517 + 307·batch MB
+    shows a batch-independent component (weight-grad / optimizer over-harvest,
+    ∝params) plus a per-batch component (activation workspace); the ratio plateaus
+    at ~63/307 ≈ 20% at high batch. So the % is WORST at small-model/small-batch
+    (~40%) and improves on BOTH axes — BUT the ABSOLUTE overhead grows to GBs
+    (+4.3 GB at b64 even for the 8M model), because it is transient-activation-
+    workspace memory. (Sweep via REG_EMBED/REG_LAYERS/REG_HEADS/REG_BATCH/REG_SEQ/
+    REG_ROUNDS on diloco-regression-check.ts; defaults preserve the baseline
+    config. Numbers from the 32GB sivri box — the benign "out of memory" pool-
+    budget log spam is not fatal; peaks are flat across rounds.)
   - **REMAINING for 4.4:** (1) a small plan with a per-step-varying `mul` scalar
     trips the volatile-params guard and falls back once (correct, no drift) —
     route per-step scalars through the volatile/scalar-table mechanism so it
