@@ -782,6 +782,25 @@ export async function executeLoweredPlan(
         `[exec] COMPILED nodes=${planNodes.length} cmds=${loweredPlan.compiledPlan.commands.length}`,
       );
     }
+    // Stage-4: reclaim the per-position arena's WARMUP buffers. The arena is
+    // populated only during the lowered first executions; a planner-backed
+    // compiled replay binds registry-materialized buffers (compiled-plan.ts
+    // device.createBuffer) and NEVER calls resolveOutputBuffer, so once a plan
+    // reaches this path its arena buffers are dead weight (measured ~209MB at
+    // steady state, retained forever). destroyArena is canRecycle-gated — a
+    // buffer still live (e.g. an external input to a not-yet-compiled consumer)
+    // is removed from arena ownership but routed through the pool-release chain
+    // (never destroyed-while-live) via fence-gated deferredDestroy; freeable
+    // buffers are reclaimed. The arrays re-grow if the plan ever falls back to
+    // lowered. Guarded on plannerEntries (the planner path that bypasses the
+    // arena) and on non-empty arrays (no-op once reclaimed).
+    if (
+      loweredPlan.compiledPlan.plannerEntries &&
+      (options.bufferArena.resolve.length > 0 ||
+        options.bufferArena.alloc.length > 0)
+    ) {
+      destroyArena(options.bufferArena);
+    }
     const externalInputBuffers = collectExternalInputBuffers(planNodes);
     try {
       await executeCompiledPlan(
