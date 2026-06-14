@@ -120,9 +120,31 @@ GPU memory is managed deterministically via two-tier reachability — no GC depe
 
 **Use `bufferPool.canRecycle(buf)` for any "is it safe to reuse?" decision in a buffer cache.** It checks both ownership (`bufferLiveCount`) AND in-flight encoder claims (`sharedEncoderWriteSet`). The pool's own `acquire()` doesn't need to call it — bucket residents are guaranteed safe by construction (only populated post-fence/flush). But any cache outside the pool — the buffer arena, hint maps, or future caches — must consult it before recycling, or it can hand out a buffer whose queued reader hasn't dispatched yet. That's the bug class behind the "later step's data leaks into earlier step's results" symptom (see `test/lifetime-natural-usage.spec.ts`).
 
-## Performance Baselines (2026-03-25)
+## Performance Baselines
 
-### Baseline A: DistilGPT-2, 512 tokens, Node/Dawn (V100)
+### CURRENT — authoritative (A100 dw-2-1, 2026-06-14)
+Default config (arena-liveness + memory planner + generated cutover + arena-reclaim).
+Node/Dawn, batch 1, seq 512, steady-state (late-step, pool reuse settled):
+- **DistilGPT-2 @512: ~50 ms/step, 4.67 GB peak (4.15 GB cur), 9 submits/step, zero leak.**
+- **GPT-2 Medium @512: ~190 ms/step, 13.47 GB peak (11.96 GB cur), 18 submits/step, zero leak.**
+
+arena-reclaim (commit 78c6f73) frees the dead per-position warmup arena buffers once a
+plan reaches compiled/planner replay. vs the 2026-06-12 planner-default A100 line below
+(5.07 GB / 15.0 GB), this is **distil −0.40 GB, medium −1.53 GB at unchanged speed**. 124M
+DiLoCo regression (V100, with arena-reclaim): peak 3078→2754 MB, loss baselines
+{0:9.81, 3:5.92, 6:5.15, 9:4.64}. Re-measure: `TORCHLETTE_PROFILE=1 TORCHLETTE_MODEL=…
+TORCHLETTE_SEQ_LEN=512 NUM_STEPS=18 npx tsx tools/profile-training.ts` on dw-2-1 (host
+node v18; the container node is too old). Read the LATE steps — the steady-state avg is
+warmup-inflated; pool reuse must settle (~step 10+).
+
+### HISTORICAL — NOT comparable to CURRENT
+**⚠ Memory is NOT comparable across hardware (V100-32GB vs A100-80GB) or arena eras.**
+The V100 lines below predate A100 + arena-reclaim. Trap to avoid: Medium 14.7 GB
+(Baseline C, V100) and 13.8 GB (2026-06-11, V100) sit BELOW the A100 numbers — that is
+V100-vs-A100 + different arena mechanisms, NOT a planner/arena regression. Compare only
+within one hardware+era row.
+
+### Baseline A: DistilGPT-2, 512 tokens, Node/Dawn (V100, HISTORICAL 2026-03-25)
 Steady-state ~213ms/step wall clock. Memory: 1645MB steady, zero leak. Pool reuse 68%. 525 dispatches/step. Top GPU: matmul 40ms (61%), fusedAttentionBwd 5.7ms, adamStep 3.2ms (8 dispatches, packed). Fusion: 15.7% forward, 7.3% backward (limited by V100's 10 storage buffer limit).
 
 ### Baseline B: DistilGPT-2, 128 tokens, Browser/Chrome (V100)
@@ -132,10 +154,10 @@ Steady-state ~213ms/step wall clock. Memory: 1645MB steady, zero leak. Pool reus
 
 **Progressive slowdown:** Reduced from 50%/200 steps to 20%/1000 steps by eliminating RuntimeTensor wrappers for in-place op intermediates (mul_, zero_, fill_). Remaining ~0.8 RT/step from autograd-escaped forward tensors — GC-eligible but V8 collects slowly. GPU storage flat at 292.
 
-### Baseline C: GPT-2 Medium, 512 tokens, Node/Dawn (V100)
+### Baseline C: GPT-2 Medium, 512 tokens, Node/Dawn (V100, HISTORICAL)
 Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reuse 58%. 741/4449 nodes fused (16.7%). Top GPU: bare matmul 125ms (bwd), epilogue matmul ~49ms (fwd) + ~47ms (bwd), fusedAttentionBwd 22.5ms, adamStep 14.3ms (14 dispatches, packed). GPU is 81% matmul.
 
-### Re-measured 2026-06-10 (V100 sivri, arena/compiled-plan era)
+### Re-measured 2026-06-10 → 06-12 (arena/compiled-plan era, HISTORICAL — superseded by CURRENT)
 - **DistilGPT-2 512 (GradScaler+AdamW)**: ~56ms/step steady wall (98ms incl. warmup-skewed avg), 8 submits/step, adamStep 8 packed dispatches. Memory: **10.2GB** steady (unbudgeted arena — up from 1.6GB pre-arena; flat, zero leak). GPU ~68ms/step total, matmul family 66%.
 - **DEFAULT MODE FLIPPED 2026-06-11**: the bounded (liveness) arena + planned compiled buffers is now THE DEFAULT (`TORCHLETTE_ARENA_LIVENESS=0` opts back into the legacy unbudgeted arena). New-default V100 (sivri) baselines: DistilGPT-2@512 **5.0GB peak at ~60ms/step**; GPT-2 Medium@512 **13.8GB peak at ~204ms/step** (legacy arena: 9.1GB→28.6GB respectively — Medium barely fit the 32GB V100); 124M DiLoCo regression at 2.85GB, baselines {0:9.81, 3:5.92, 6:5.15, 9:4.64}. Validated: full suite green in BOTH directions, browser suite green under the new default, fullstack canonical both directions, 4-peer DiLoCo soak (loss 5.088 @ 25 rounds, better than lowered control and the May baseline). History: planned compiled buffers landed 2026-06-10 (replays pin and rebind the recorded pool-buffer assignment; the liveness-lowered interim ran ~525ms/step).
 - **MEMORY PLANNER DEFAULT 2026-06-12 (stage-4 phase 1.5)**: compiled-replay buffer assignment is now DERIVED by the graph-liveness memory planner with cross-plan temp packing (step-scoped shared `PlannerRegistry`), replacing the pin-the-recorded-buffers mechanism (deleted: adoption refcounts, pool-origin tracking, allocBuffers, planned-bind fallbacks, `bufferPool.adoptBuffer`). `TORCHLETTE_MEMORY_PLANNER=0` disables compiled replay wholesale (lowered path) — dynamic-alloc replay would leak ownerless temps. A100 (dw-2-1, same-machine A/B vs pin): DistilGPT-2@512 **5.07GB** (pin 5.88), Medium@512 **15.0GB** (pin 17.5), speed parity (~51ms / ~180ms per step, identical submits); the V100 numbers above predate this and are historical. See `docs/stage4-compile-from-ir.md` phase 1.5.
@@ -156,14 +178,14 @@ Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reus
 
 4. **Per-shape matmul autotuning** — Infrastructure exists (`TORCHLETTE_AUTOTUNE=1`). Pre-seed cache for Medium shapes. ~5-10ms potential from sub-optimal tile configs on 1024-embed shapes.
 
-5. **Backward elementwise fusion** — 7.3% fusion rate on V100 (limited by 10 storage buffer limit). Apple Metal (96 buffers) would get much better fusion. Not actionable on V100.
+5. **Backward elementwise fusion** — 7.3% fusion rate on V100 was limited by V100's 10 storage-buffer limit. On A100 (CURRENT default hardware) that limit is gone, yet the 2026-06-14 profile still shows many unfused ops (bwd top: reshape:87, matmul:56, transpose:31, permute:24, sum:24, narrowBackward:19, add:19). So on A100 the limiter is the **consecutive-only fusion detector**, not the buffer count — re-investigate the detector (graph-aware grouping already exists; the gap is non-adjacent fusible runs broken by views/bypassed nodes). The old "not actionable on V100" verdict no longer applies on A100.
 
 ### Framework completeness targets
 
-6. **LR Schedulers** — StepLR, CosineAnnealingLR, etc. ~300 lines, pure math, zero risk.
-7. **Weight initialization** — kaiming_normal_, xavier_uniform_. ~200 lines.
+6. ~~**LR Schedulers**~~ — DONE. `src/optim/lr-scheduler.ts`: StepLR, ExponentialLR, CosineAnnealingLR, PolynomialLR (exported from optim/index).
+7. **Weight initialization** — kaiming_normal_, xavier_uniform_. ~200 lines. (nn.Linear already uses PyTorch kaiming_uniform default init; this is the standalone init API.)
 8. ~~**Gradient clipping**~~ — Implemented. Fully GPU (no CPU readback).
-9. **Parameter groups** — per-layer LR in Adam/SGD. ~150 lines.
+9. ~~**Parameter groups**~~ — DONE. `AdamParamGroup` / `SGDParamGroup` (per-group LR/weightDecay) in adam.ts / sgd.ts.
 
 ### Architecture targets (long-term)
 
