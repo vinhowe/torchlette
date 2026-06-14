@@ -488,26 +488,43 @@ cutover alone. The deletions decompose into gated sub-phases:
         resultHolders — the same in recorded and clean no-record (single-build).
         So generated plans pack the bulk (activations + results) IDENTICALLY;
         they are NOT inherently bloated.
-      - **Live buffer COUNT identical** (409) in both modes; `cur` differs +57 MB.
-        So it's not extra buffers — it's a buffer **size-class / pool-rounding**
-        delta (the same logical buffers materialized at a slightly larger pool
-        size class under the generated replay's allocation order; likely an
-        `allocKind` resolveOutputBuffer-vs-allocateOutputBuffer aliasing
-        difference that changes pool reuse without changing the planner entry).
-      - The fullstack parity model shows NO registry difference at all — the
-        +57 MB is specific to the production trainer's plan shapes.
-      - The earlier "+57 MB even no-double-build" + the 289-vs-364 node count
-        were red herrings from comparing different `STEPS` / the always-record
-        double-build; the clean single-build no-record registry == `=0`.
-  - **Net:** the divergence (correctness) is FIXED and general (grad_bias
-    multi-output exposure + the bail rule). 4.3 is NOT blocked by an
-    architectural memory regression — generated plans pack identically. The
-    residual is a **peripheral +57 MB pool/size-class artifact** (1.8%) in the
-    production trainer: either tune it (chase the `allocKind`/pool size-class
-    delta) or accept it as a bounded cost. The logsumexp multi-output gap (the
-    attention oi=1 in the checkpoint-recompute path) still needs exposing — same
-    one-line pattern as grad_bias — for the forward plan to cut over without the
-    bail-rule recording fallback.
+      - **ROOT-CAUSED to the per-position buffer ARENA** (alloc-stack histogram,
+        2026-06-14). The +57 MB is entirely in `resolveOutputBuffer` →
+        `buffer-arena.ts:486` (the per-(resolveIndex)-position arena): `=0` retains
+        ~671 such buffers / **209 MB**, no-record ~690 / **269 MB** (+59 MB). The
+        planner-materialized compiled-replay buffers (`compiled-plan.ts:1134`,
+        ~2333 MB) are byte-identical between modes.
+      - These arena buffers are **WARMUP-ONLY DEAD WEIGHT.** Compiled replay with
+        the memory planner (default) materializes registry-entry buffers directly
+        via `device.createBuffer` (1134) and never calls `resolveOutputBuffer`,
+        so the per-position arena is touched ONLY during the lowered warmup
+        executions (exec 1 + 2 per template) — then retained, unused, forever
+        (the regression's zero round-2→9 growth confirms it doesn't grow). It is
+        dead weight in BOTH modes (~209 MB even at `=0`).
+      - The +57 MB DELTA: the no-record warmup runs with backend op caches LIVE
+        (recording's cache-bypass is off), so its `resolveOutputBuffer` call
+        order/sizing populates the per-position arena to larger max sizes than the
+        recorded warmup. A secondary effect, not a generated-plan property.
+      - The fullstack parity model shows no registry diff; the earlier
+        "+57 MB even no-double-build" + the 289-vs-364 node count were red herrings
+        (different `STEPS` / always-record double-build). Clean single-build
+        no-record registry == `=0`.
+  - **Net / is-it-a-bug:** YES, but a **pre-existing one, not a generated-plan
+    bug.** The divergence (correctness) is FIXED and general (grad_bias exposure +
+    bail rule); generated plans pack IDENTICALLY (planner registry byte-for-byte).
+    The +57 MB is the per-position arena **failing to reclaim its warmup buffers
+    after a plan cuts over to compiled/planner replay** — a latent ~209 MB
+    inefficiency already present at `=0`, which the no-record warmup widens by
+    57 MB. **THE FIX (separate, benefits both modes ~209 MB):** free a
+    `loweredPlan`'s `bufferArena.resolve`/`alloc` buffers once it has a valid
+    planner-backed compiledPlan (the arena is provably never re-touched — replay
+    binds planner entries). Risk: those warmup buffers can be external inputs to
+    other not-yet-compiled plans, so reclaim must be gated on the buffer no longer
+    being live/referenced (consult `bufferPool.canRecycle` + `arenaBufferSet`
+    ownership) and routed through `deferredDestroy` (never immediate, mid-step).
+  - The logsumexp multi-output gap (attention oi=1 in the checkpoint-recompute
+    path) still needs exposing — same one-line pattern as grad_bias — for the
+    forward plan to cut over without the bail-rule recording fallback.
 - **4.4 Build-without-execution → serializable plans** (LARGE, the headline
   dividend). Build the CompiledPlan from the lowered IR at COMPILE time, with NO
   first lowered execution. Requires the generator to derive ALL metadata from
