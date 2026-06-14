@@ -748,9 +748,24 @@ cutover alone. The deletions decompose into gated sub-phases:
     (then prunes by actual refcount at markStep) — build-from-IR has no
     after-the-fact signal. So the over-harvest is intrinsic: closing it needs
     whole-graph-ahead forcing (defeats incremental execution) or a different
-    result-lifetime model. Cost: 124M regression peak 2754→3686 MB (+34%, flat,
-    zero leak). build-from-IR therefore trades MEMORY for cold-start elimination +
-    serializability — a viable OPT-IN, not a free default replacement.
+    result-lifetime model. build-from-IR therefore trades MEMORY for cold-start
+    elimination + serializability — a viable OPT-IN, not a free default
+    replacement.
+  - **OVER-HARVEST MEMORY SCALING (measured, batch 1 / seq 256, sivri 32GB).** The
+    overhead is activation/intermediate-bound, so as a FRACTION of peak it SHRINKS
+    with model size (params + optimizer state — harvested identically both ways —
+    grow ~quadratically in width and come to dominate). Not constant-MB, not a
+    constant %:
+    | model | params | default | build-from-IR | Δ | Δ% |
+    |-------|-------:|--------:|--------------:|--:|---:|
+    | embed128 L8  | 8M   | 824.7 MB  | 1175.2 MB | +350 MB  | +42.5% |
+    | embed768 L12 | 124M | 8536.9 MB | 10084.9 MB| +1548 MB | +18.1% |
+    | embed1024 L24| 354M | 17971.3 MB| 19845.6 MB| +1874 MB | +10.4% |
+    Δ% halves roughly per ~3× params, so gpt2-xl-scale (1.5B) would be single-digit
+    %. The fraction RISES with batch×seq (more activations vs fixed params) — the
+    original "+34%" figure was the embed128/L8 model at batch 8. (Sweep via the
+    REG_EMBED/REG_LAYERS/REG_HEADS/REG_BATCH/REG_SEQ/REG_ROUNDS knobs on
+    diloco-regression-check.ts; defaults preserve the baseline config.)
   - **REMAINING for 4.4:** (1) a small plan with a per-step-varying `mul` scalar
     trips the volatile-params guard and falls back once (correct, no drift) —
     route per-step scalars through the volatile/scalar-table mechanism so it

@@ -22,7 +22,7 @@ import {
 } from "../src/distributed/protocol/webgpu-gpt2-trainer";
 
 const SEED = 42;
-const ROUNDS = 10;
+const ROUNDS = parseInt(process.env.REG_ROUNDS ?? "10", 10);
 const TOKENS_PATH =
   process.env.LOCAL_TOKENS ??
   "/mnt/pccfs2/backed_up/vin/dev/torchlette/ckpts/tinystories-tokens.bin";
@@ -99,9 +99,9 @@ async function main() {
     modelConfig: {
       vocabSize: 50257,
       blockSize: 1024,
-      numLayers: 8,
-      numHeads: 4,
-      embedDim: 128,
+      numLayers: parseInt(process.env.REG_LAYERS ?? "8", 10),
+      numHeads: parseInt(process.env.REG_HEADS ?? "4", 10),
+      embedDim: parseInt(process.env.REG_EMBED ?? "128", 10),
       dropoutRate: 0,
     },
     tokenSource,
@@ -109,8 +109,8 @@ async function main() {
     outerLr: 1.0,
     outerMu: 0.0,
     innerSteps: 20,
-    batchSize: 8,
-    seqLen: 256,
+    batchSize: parseInt(process.env.REG_BATCH ?? "8", 10),
+    seqLen: parseInt(process.env.REG_SEQ ?? "256", 10),
     accumSteps: 1,
     weightDecay: 0.01,
     // Feature toggles (default on) — used to localize compiled-vs-lowered diffs.
