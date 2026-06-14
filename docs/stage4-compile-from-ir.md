@@ -442,12 +442,39 @@ cutover alone. The deletions decompose into gated sub-phases:
     lowered once. Any future config that surfaces a genuinely new chunked op
     shows up as a loud `uncovered` census entry → that plan safely stays recorded
     until covered.)
-- **4.3 Demote the recorder to CI-only** (MEDIUM, the first real deletion). With
-  4.2, skip recording in production entirely — build the compiled plan from the
-  generated stream directly (the genResults harvest already gives the slots).
-  The record* hooks stay but fire ONLY under `TORCHLETTE_STREAM_GENERATE` (the
-  gate cross-check). Removes recording overhead from the first execution. The
-  recorder is now exactly what the doc always wanted: a CI cross-check.
+- **4.3 Demote the recorder to CI-only** — ⛔ **BLOCKED (attempted 2026-06-14,
+  reverted).** Plan: skip recording in production, build the compiled plan from
+  the generated stream directly. The attempt surfaced a real, previously-hidden
+  generator bug that must be fixed FIRST (and is the same blocker as 4.4):
+  - **Input-bearing plans never actually cut over.** The cutover's genResults
+    harvest iterates every plan node WITH a result and requires each to have a
+    GENERATED slot (`gen.nodeSlot`). The per-step `tensorFromArray` inputs of the
+    forward/loss plans (node[1]/node[29] — the tokens/targets) are EXTERNALS: they
+    have a `node.result` but are not *produced* by the plan, so they have no
+    generated slot → `genOk=false` → the cutover bails. Pre-4.3 that was
+    invisible and harmless: a RECORDED plan always existed (recording was
+    unconditional), so these plans silently rode the *recorded* replay. So
+    "every recurring plan cuts over" (4.2) was true only for the produced-only
+    (backward/optimizer) plans; the input-bearing forward/loss plans always used
+    the recording.
+  - **Their generated replay is buggy.** Skipping the external nodes in the
+    harvest (so they DO cut over) made the trajectory diverge ~3e-2 over 30 steps
+    — even though the command-level diff was byte-clean (0 diverged). Classic
+    frozen-uniform signature: step-0 loss matches exactly, divergence grows. The
+    generated forward/loss plan freezes some per-step-varying value the RECORDED
+    plan repacks (a missing TAG_UNIFORM volatile repack, or the GradScaler
+    loss-scale / CE-backward seed). The recorded replay of the SAME plan is
+    correct (matches `=0`).
+  - A partial 4.3 (skip recording only for produced-only plans, fall back to
+    recording for input-bearing ones via a `streamGenFailed` retry) was built and
+    is numerically SAFE (parity 9e-6) — but it (a) only half-removes the recorder
+    and (b) measured **+57 MB** vs the recorded path (3135 vs 3078 MB on the 124M
+    regression), violating no-regression. Reverted.
+  - **Real next step:** fix the input-bearing-plan generated replay (find the
+    per-step value the generated forward/loss plan freezes; cross-check via a
+    forced-cutover trajectory diff, NOT the command diff — the command diff is
+    blind to it). Once input-bearing plans cut over correctly, 4.3 (and 4.4)
+    unblock: every plan builds from generated, recording becomes CI-only.
 - **4.4 Build-without-execution → serializable plans** (LARGE, the headline
   dividend). Build the CompiledPlan from the lowered IR at COMPILE time, with NO
   first lowered execution. Requires the generator to derive ALL metadata from
@@ -455,6 +482,10 @@ cutover alone. The deletions decompose into gated sub-phases:
   come from `node.shape`/`dtype` + the captured layouts, the same capture-don't-
   synthesize discipline phase 3 already established). This kills the ~700 ms cold
   start AND makes plans serializable (no live GPU pointers) — the actual payoff.
+  GATED ON the 4.3 blocker: build-without-execution forces EVERY plan onto the
+  generated replay, including the input-bearing forward/loss plans whose
+  generated replay currently diverges (see 4.3). That divergence must be fixed
+  before either phase can proceed.
 - **4.5 Retire the now-dead lowered-path machinery** (MEDIUM, gated on 4.4).
   Once 4.4 removes the lowered first execution, audit + delete what it alone
   used: the per-position arena hints/pre-pinning/conflict paths, the params-
@@ -467,8 +498,11 @@ Dividends (realized progressively, fully at 4.4): serializable compiled plans
 (generated plans have no live GPU pointers → ~700 ms cold start dies); single
 answer to "who owns this buffer"; the architecture-debt rules enforced by
 construction. Net: 4.1 DONE (cutover default-on) + 4.2 DONE (chunked
-full-reduction sum covered → every recurring plan cuts over). 4.3 (demote the
-recorder to CI-only) is the next step; 4.4 is the big structural win.
+full-reduction sum covered → every PRODUCED-ONLY recurring plan cuts over). 4.3
+attempt EXPOSED that input-bearing forward/loss plans never cut over (they ride
+the recorded replay) and their generated replay diverges — fixing that is the
+real next step and the shared prerequisite for both 4.3 (demote recorder) and
+4.4 (build-without-execution).
 
 **Cutover WIP (2026-06-13, flag-gated `TORCHLETTE_GENERATED_PLAN=1`, DEFAULT
 OFF — default path + gate fully green).** Wired: `finalizeCompiledPlan` (the
