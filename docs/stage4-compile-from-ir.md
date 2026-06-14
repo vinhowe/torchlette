@@ -512,19 +512,25 @@ cutover alone. The deletions decompose into gated sub-phases:
   - **Net / is-it-a-bug:** YES, but a **pre-existing one, not a generated-plan
     bug.** The divergence (correctness) is FIXED and general (grad_bias exposure +
     bail rule); generated plans pack IDENTICALLY (planner registry byte-for-byte).
-    The +57 MB is the per-position arena **failing to reclaim its warmup buffers
-    after a plan cuts over to compiled/planner replay** — a latent ~209 MB
-    inefficiency already present at `=0`, which the no-record warmup widens by
-    57 MB. **THE FIX (separate, benefits both modes ~209 MB):** free a
-    `loweredPlan`'s `bufferArena.resolve`/`alloc` buffers once it has a valid
-    planner-backed compiledPlan (the arena is provably never re-touched — replay
-    binds planner entries). Risk: those warmup buffers can be external inputs to
-    other not-yet-compiled plans, so reclaim must be gated on the buffer no longer
-    being live/referenced (consult `bufferPool.canRecycle` + `arenaBufferSet`
-    ownership) and routed through `deferredDestroy` (never immediate, mid-step).
-  - The logsumexp multi-output gap (attention oi=1 in the checkpoint-recompute
-    path) still needs exposing — same one-line pattern as grad_bias — for the
-    forward plan to cut over without the bail-rule recording fallback.
+    The +57 MB was the per-position arena failing to reclaim its warmup buffers
+    after a plan cuts over to compiled/planner replay — a latent inefficiency
+    already present at `=0`.
+  - **FIXED 2026-06-14 (commit 78c6f73, arena-reclaim).** On the compiled path,
+    once a plan has a valid planner-backed `compiledPlan` (which binds registry
+    buffers and never calls `resolveOutputBuffer`), its dead warmup arena buffers
+    are reclaimed via `destroyArena` — `canRecycle`-gated (a buffer still live as
+    an external input to a not-yet-compiled consumer is orphaned to the
+    pool-release chain, never destroyed-while-live; freeable ones are fence-gated
+    `deferredDestroy`'d), guarded on `plannerEntries` + non-empty arrays (no-op
+    once reclaimed; arrays re-grow on a lowered fallback). **A DEFAULT-PATH win,
+    independent of stage-4:** production regression peak **3078 → 2754 MB
+    (−323 MB)**, 124M mem-probe 3.20 → 3.12 GB, loss baseline-exact, zero growth;
+    gates 4/4, full suite green, fullstack parity 7e-6. Because BOTH recorded and
+    generated replay take the compiled path, both reclaim their warmup arena → the
+    +57 MB no-record delta is erased (4.3 no longer blocked on the memory axis).
+  - Remaining for full no-record 4.3: the logsumexp multi-output gap (attention
+    oi=1 in the checkpoint-recompute path) — same one-line pattern as grad_bias —
+    so the forward plan cuts over without the bail-rule recording fallback.
 - **4.4 Build-without-execution → serializable plans** (LARGE, the headline
   dividend). Build the CompiledPlan from the lowered IR at COMPILE time, with NO
   first lowered execution. Requires the generator to derive ALL metadata from
