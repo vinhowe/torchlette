@@ -536,20 +536,31 @@ cutover alone. The deletions decompose into gated sub-phases:
     **cutting the FORWARD plan over to generated replay costs +36 MB** (forward
     on recorded 2752/2754 MB ≈ `=0`; forward cut over 2788 MB — stable). The
     generated forward plan's steady-state replay is ~36 MB heavier than its
-    recorded replay (the activation-heavy plan packs worse on the generated side;
-    arena-reclaim does NOT cover this — it's a planner/replay difference, not
-    warmup arena). Backward/optimizer plans cut over memory-NEUTRALLY.
+    recorded replay. Backward/optimizer plans cut over memory-NEUTRALLY.
+  - **+36 MB ISOLATED (2026-06-14, size-class histogram + alloc-stack diff).** It
+    is NOT the planner working set: per-plan registry totals are byte-identical
+    (forward 866.9, backward ~1353, optimizer 98.7, loss 50.7 MB) and `cur` is
+    flat round-0→9 in both. The delta is **+1 buffer (~33.5 MB) in the >16 MB
+    bucket** allocated at `buffer-arena.ts:572 ← dispatch.ts:747` — the
+    **arena-liveness SPILL path** (big activation buffers exceeding the arena
+    threshold spill to the POOL during the lowered WARMUP). At steady state the
+    compiled replay binds planner buffers (`compiled-plan.ts:1134`); the warmup's
+    spilled pool buffers are never reused, just held **idle in the pool**. The
+    generated/cutover warmup runs WITHOUT recording (op caches LIVE → cache-hit
+    sizing) and spills ~33.5 MB MORE than the recorded warmup (cache-bypass). So
+    it's the **spill-pool sibling of the arena residue** the arena-reclaim already
+    fixed — idle, reusable, within the pool budget, NOT a leak and NOT a
+    working-set increase.
   - **DECISION:** the memory-optimal config **keeps the forward plan on recorded
     replay** (the bail rule routes it there at no cost) and cuts over everything
-    else. Full recorder demotion (forward too) would cost +36 MB — not worth it
-    until the generated-forward replay packs as tightly as recorded. So the
-    no-record path + `producedNodes` were REVERTED (they force the forward
-    cutover → +36 MB default regression); the committed state is arena-reclaim
-    (−323 MB) + the cutover for the memory-neutral plans. The recorder is demoted
-    to: the forward/loss plan + the gate cross-check.
-  - Open follow-up: WHY the generated forward plan packs +36 MB worse than
-    recorded (same planner, both arena-reclaimed) — the last thing between us and
-    a zero-cost full recorder demotion / 4.4.
+    else. Forcing the forward cutover surfaces +33.5 MB of idle warmup-spill pool
+    residue — not worth it. So the no-record path + `producedNodes` were REVERTED;
+    the committed state is arena-reclaim (−323 MB) + cutover for the
+    memory-neutral plans. Recorder demoted to the forward/loss plan + gate.
+  - Optional future win (BOTH modes, like arena-reclaim): evict the idle
+    warmup-spilled POOL buffers once a plan cuts over to planner replay (they're
+    never reused — replay binds planner entries). Low value (reusable/within
+    budget) and pool-shared, so deferred.
 - **4.4 Build-without-execution → serializable plans** (LARGE, the headline
   dividend). Build the CompiledPlan from the lowered IR at COMPILE time, with NO
   first lowered execution. Requires the generator to derive ALL metadata from
