@@ -14,6 +14,7 @@
 import { clipGradNorm_ } from "../../nn/index.ts";
 import { normal_ } from "../../nn/init.ts";
 import { Adam, GradScaler } from "../../optim/index.ts";
+import type { WebGPUTensor } from "../../backend/webgpu/gpu-types.ts";
 import type { Tensor } from "../../frontend/tensor.ts";
 import type { Torchlette } from "../../frontend/torchlette.ts";
 import { NesterovOuterOptimizer } from "../outer-optimizer.ts";
@@ -469,17 +470,64 @@ export class WebGPUGPT2Trainer implements Trainer {
 
   async revertToAnchor(): Promise<void> {
     this.requireInit();
-    await this.api.beginStep();
-    for (let i = 0; i < this.params.length; i++) {
-      this.api.copy_(
-        this.params[i],
-        this.api.tensorFromArray(this.anchor[i], this.params[i].shape, {
-          device: "webgpu",
-        }),
+    // Direct-write restore (no transient upload tensors). The old
+    // beginStep+copy_(tensorFromArray) version held N upload tensors live
+    // until markStep — ~500MB at 124M — which tipped a memory-tight browser
+    // peer over its budget on a failed round (observed: OOM at 7.99/8GB in
+    // revertToAnchor's markStep). Restoring params == overwriting their
+    // buffers with the anchor bytes; identical to applyF16W's mechanism.
+    await this.writeParamsInPlace(this.anchor);
+  }
+
+  /**
+   * Overwrite every param's EXISTING GPU buffer with `values` directly via
+   * queue.writeBuffer — no transient upload tensors, no step boundaries (which
+   * add GPU residency / disrupt the state machine's step accounting). Shared
+   * by applyF16W (late-joiner sync) and revertToAnchor (failed-round restore).
+   * Bypasses the lazy graph, so: (1) materialize params to concrete buffers,
+   * (2) fence first so no in-flight submit still reads a buffer before we
+   * overwrite it, (3) write each, asserting the dense/contiguous/f32 layout at
+   * the seam (writeBuffer at offset 0 only overwrites a base, contiguous, f32
+   * region). Source the device THROUGH this.api's backend, NOT a direct
+   * requireContext() import — in the browser Vite loads the backend module
+   * twice (package vs this trainer's relative src import), so a fresh
+   * requireContext() reads a second, uninitialized gpuContext and throws
+   * "WebGPU backend not initialized". (Node dedupes the module, so that only
+   * bit in the browser.)
+   */
+  private async writeParamsInPlace(values: Float32Array[]): Promise<void> {
+    if (values.length !== this.params.length) {
+      throw new Error(
+        `writeParamsInPlace: count ${values.length} != ${this.params.length}`,
       );
     }
-    this.api.endStep();
-    await this.api.markStep();
+    await this.api._runtime().forceAllPending();
+    const backend = this.api._runtime().getBackend("webgpu") as unknown as {
+      device: GPUDevice | null;
+    };
+    const queue = backend.device?.queue;
+    if (!queue) {
+      throw new Error("writeParamsInPlace: WebGPU device/queue unavailable");
+    }
+    await queue.onSubmittedWorkDone?.();
+    for (let i = 0; i < this.params.length; i++) {
+      const bt = this.params[i]._unwrap().backendTensor as WebGPUTensor;
+      if (bt.dtype !== "f32") {
+        throw new Error(`writeParamsInPlace: param ${i} dtype ${bt.dtype} != f32`);
+      }
+      if (!bt.isContiguous || (bt.offset ?? 0) !== 0) {
+        throw new Error(
+          `writeParamsInPlace: param ${i} not a dense base buffer (contiguous=${bt.isContiguous} offset=${bt.offset})`,
+        );
+      }
+      if (bt.size !== values[i].length) {
+        throw new Error(
+          `writeParamsInPlace: param ${i} size ${bt.size} != payload ${values[i].length}`,
+        );
+      }
+      queue.writeBuffer(bt.buffer, 0, values[i]);
+    }
+    await queue.onSubmittedWorkDone?.();
   }
 
   async snapshotAnchor(): Promise<Float32Array[]> {
@@ -494,22 +542,11 @@ export class WebGPUGPT2Trainer implements Trainer {
         `applyF16W: payload tensor count ${params.length} != ${this.params.length}`,
       );
     }
-    // Memory-efficient: upload + copy_ ONE param per step. The all-in-one-step
-    // version kept all N transient upload tensors live until markStep (~500MB
-    // GPU for a 124M model), which OOMs memory-tight browser peers during the
-    // late-joiner sync. Per-param stepping bounds the transient to a single
-    // upload (≤ the largest param, ~154MB for wte) on top of the model.
-    await this.api.beginStep();
-    for (let i = 0; i < this.params.length; i++) {
-      this.api.copy_(
-        this.params[i],
-        this.api.tensorFromArray(params[i], this.params[i].shape, {
-          device: "webgpu",
-        }),
-      );
-    }
-    this.api.endStep();
-    await this.api.markStep();
+    // Memory-efficient late-joiner sync: overwrite the param buffers directly
+    // (no transient upload tensors that would spike ~250MB at 124M and OOM a
+    // memory-tight browser peer mid-sync). Then adopt the synced params as the
+    // new anchor.
+    await this.writeParamsInPlace(params);
     this.anchor = params.map((p) => new Float32Array(p));
   }
 
