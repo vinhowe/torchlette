@@ -39,4 +39,15 @@ export interface Transport {
 
   /** Disconnect; subsequent sends are no-ops, no further receives fire. */
   close(): void;
+
+  /**
+   * Optional: ms since the last inbound CHUNK of a chunked (oversized tensor)
+   * frame, or Infinity if none / not chunk-aware. Lets the state machine tell
+   * whether a large transfer (f16w / grad) is actively streaming in, so it can
+   * avoid re-requesting it mid-flight — a re-request makes the head fire a
+   * fresh full transfer, piling up gigabytes in the relay's send buffer to a
+   * slow peer and congesting the link so the first transfer never completes.
+   * In-process / non-chunking transports may omit this.
+   */
+  msSinceLastChunk?(): number;
 }

@@ -96,6 +96,12 @@ export class WebSocketBrowserTransport implements Transport {
   private readonly reassembler = new FrameReassembler();
   private reconnectDelayMs = 1_000;
   private readonly reconnectDelayMaxMs = 30_000;
+  /** Timestamp (ms) of the last inbound chunk — see Transport.msSinceLastChunk. */
+  private lastChunkMs = 0;
+
+  msSinceLastChunk(): number {
+    return this.lastChunkMs === 0 ? Infinity : Date.now() - this.lastChunkMs;
+  }
 
   private constructor(opts: WebSocketBrowserTransportOptions) {
     this.peerId = opts.peerId;
@@ -202,6 +208,7 @@ export class WebSocketBrowserTransport implements Transport {
       if (data instanceof ArrayBuffer) {
         const chunk = tryPeekChunk(new Uint8Array(data));
         if (chunk) {
+          this.lastChunkMs = Date.now();
           const full = this.reassembler.feed(
             chunk.id,
             chunk.i,

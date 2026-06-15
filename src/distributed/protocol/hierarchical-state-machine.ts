@@ -261,7 +261,15 @@ export class HierarchicalBarrierStateMachine {
       }
       const now = Date.now();
       if (now >= nextResendAt) {
-        sendRequest();
+        // Suppress the re-request while the f16w is actively streaming in
+        // (chunks arriving). Re-requesting mid-transfer makes the head fire a
+        // fresh full f16w, piling up gigabytes in the relay's send buffer to a
+        // slow peer and congesting the link so the first transfer never
+        // finishes. Only re-request after a genuine stall (no chunk for a
+        // whole interval) — a lost request/response, not a slow-but-progressing
+        // transfer.
+        const sinceChunk = this.transport.msSinceLastChunk?.() ?? Infinity;
+        if (sinceChunk >= retransmit) sendRequest();
         nextResendAt = now + retransmit;
       }
       const remaining = Math.min(deadline - now, nextResendAt - now);

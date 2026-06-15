@@ -112,6 +112,8 @@ export class WebSocketRelayTransport implements Transport {
   private readonly reconnectDelayMaxMs = 30_000;
   /** Periodic ping so the relay doesn't mark us stale during long quiet waits. */
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  /** Timestamp (ms) of the last inbound chunk — see Transport.msSinceLastChunk. */
+  private lastChunkMs = 0;
 
   private constructor(opts: WebSocketRelayTransportOptions) {
     this.peerId = opts.peerId;
@@ -372,6 +374,7 @@ export class WebSocketRelayTransport implements Transport {
         new Uint8Array(raw.buffer, raw.byteOffset, raw.length),
       );
       if (chunk) {
+        this.lastChunkMs = Date.now();
         const full = this.reassembler.feed(
           chunk.id,
           chunk.i,
@@ -511,6 +514,10 @@ export class WebSocketRelayTransport implements Transport {
       return;
     }
     for (const h of this.handlers.slice()) h(msg);
+  }
+
+  msSinceLastChunk(): number {
+    return this.lastChunkMs === 0 ? Infinity : Date.now() - this.lastChunkMs;
   }
 
   close(): void {
