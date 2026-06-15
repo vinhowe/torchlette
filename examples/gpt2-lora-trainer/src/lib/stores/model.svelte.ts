@@ -136,13 +136,13 @@ async function loadForPretraining(): Promise<void> {
 
     progressText = "Initializing random weights (seed 42)...";
     const loraConfig = createLoRAConfig(1, 1); // rank=1 alpha=1 to match V100
-    // Half-size GPT-2 for TinyStories (must match V100 agent config)
+    // GPT-2 Small (124M) — must match V100 agent config (tools/diloco-webrtc-agent.ts)
     const PRETRAIN_CONFIG = {
       vocabSize: 50257,
       blockSize: 1024,
-      numLayers: 6,
-      numHeads: 6,
-      embedDim: 384,
+      numLayers: 12,
+      numHeads: 12,
+      embedDim: 768,
       dropoutRate: 0,
     };
     model = new GPT2WithLoRA(api, PRETRAIN_CONFIG, loraConfig, "webgpu");

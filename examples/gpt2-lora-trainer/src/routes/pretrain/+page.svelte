@@ -432,10 +432,15 @@ async function connect() {
           payload.byteLength,
         );
         let doff = 0;
+        // Frame body: [round (4)][numParams (4)][per-param: nel(4) + f16 data]
+        const sourceRound = dv.getUint32(doff, true);
+        doff += 4;
         const np = dv.getUint32(doff, true);
         doff += 4;
         const totalMB = (payload.length / 1024 / 1024).toFixed(1);
         if (np === allP.length) {
+          // Adopt the swarm's current round so subsequent staleness math is correct.
+          round = sourceRound;
           downloadLabel = `Loading ${np} params to GPU (0/${totalMB}MB)...`;
           await api.beginStep();
           for (let i = 0; i < np; i++) {
@@ -588,26 +593,40 @@ async function startPretraining() {
   const optimizer = new Adam(params, { lr: 1e-4, weightDecay: 0.1 }, api);
   const outerOpt = new NesterovOuterOptimizer(api, { lr: 0.7, momentum: 0.9 });
 
-  // Match V100 agent: half-size model, TinyStories, seq=256
+  // Match V100 agent: GPT-2 Small (124M), FineWeb-Edu sample-10BT, seq=256
   const BATCH = 1;
   const SEQ = 256;
   const INNER = 20;
-  const HF_TOTAL_ROWS = 2_119_719;
+  const HF_TOTAL_ROWS = 9_672_101;
   const HF_FETCH_ROWS = 100;
   let totalTokens = 0;
 
   async function fetchFreshData(): Promise<number[]> {
-    const offset = Math.floor(Math.random() * (HF_TOTAL_ROWS - HF_FETCH_ROWS));
-    const url = `https://datasets-server.huggingface.co/rows?dataset=roneneldan/TinyStories&config=default&split=train&offset=${offset}&length=${HF_FETCH_ROWS}`;
-    const resp = await fetch(url);
-    const data = await resp.json();
-    const text = data.rows.map((r: any) => r.row.text).join("\n\n");
-    const toks = tokenizer.encode(text);
-    status = `Round ${round}: ${toks.length.toLocaleString()} tokens (offset ${offset})`;
-    return toks;
+    let consecutiveFailures = 0;
+    while (true) {
+      const offset = Math.floor(Math.random() * (HF_TOTAL_ROWS - HF_FETCH_ROWS));
+      const url = `https://datasets-server.huggingface.co/rows?dataset=HuggingFaceFW/fineweb-edu&config=sample-10BT&split=train&offset=${offset}&length=${HF_FETCH_ROWS}`;
+      try {
+        const resp = await fetch(url, { signal: AbortSignal.timeout(30000) });
+        const ct = resp.headers.get("content-type") ?? "";
+        if (!resp.ok || !ct.includes("application/json"))
+          throw new Error(`HF ${resp.status} ${ct.split(";")[0]}`);
+        const data = await resp.json();
+        if (!data.rows) throw new Error("HF response missing rows");
+        const text = data.rows.map((r: any) => r.row.text).join("\n\n");
+        const toks = tokenizer.encode(text);
+        status = `Round ${round}: ${toks.length.toLocaleString()} tokens (offset ${offset})`;
+        return toks;
+      } catch (e) {
+        consecutiveFailures++;
+        const wait = Math.min(60000, 2000 * 2 ** Math.min(consecutiveFailures, 5));
+        status = `HF fetch failed (${consecutiveFailures}): ${(e as Error).message} — retry in ${wait / 1000}s`;
+        await new Promise((r) => setTimeout(r, wait));
+      }
+    }
   }
 
-  for (let r = 0; ; r++) {
+  for (let r = round; ; r++) {
     if (!running) break;
     round = r;
 
