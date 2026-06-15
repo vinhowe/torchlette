@@ -116,17 +116,24 @@ export function decodeTensors(
     }
     return out;
   }
-  const u16 = new Uint16Array(
+  // Read f16 codes via DataView: the payload's byteOffset within its frame
+  // buffer is arbitrary (the transport's header is not 2-byte aligned), and a
+  // Uint16Array view requires an even byteOffset — so a direct view throws
+  // "start offset should be a multiple of 2" on odd-offset frames. DataView
+  // imposes no alignment. Little-endian matches the encoder's native-endian
+  // Uint16Array store on our (LE) hosts.
+  const dv = new DataView(
     payload.buffer,
     payload.byteOffset,
-    payload.byteLength >> 1,
+    payload.byteLength,
   );
   let pos = 0;
   for (const shape of shapes) {
     const n = shape.reduce((a, b) => a * b, 1);
     const arr = new Float32Array(n);
     const u32 = new Uint32Array(arr.buffer);
-    for (let i = 0; i < n; i++) u32[i] = f16BitsToF32Bits(u16[pos + i]);
+    for (let i = 0; i < n; i++)
+      u32[i] = f16BitsToF32Bits(dv.getUint16((pos + i) * 2, true));
     out.push(arr);
     pos += n;
   }

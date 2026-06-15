@@ -494,6 +494,11 @@ export class WebGPUGPT2Trainer implements Trainer {
         `applyF16W: payload tensor count ${params.length} != ${this.params.length}`,
       );
     }
+    // Memory-efficient: upload + copy_ ONE param per step. The all-in-one-step
+    // version kept all N transient upload tensors live until markStep (~500MB
+    // GPU for a 124M model), which OOMs memory-tight browser peers during the
+    // late-joiner sync. Per-param stepping bounds the transient to a single
+    // upload (≤ the largest param, ~154MB for wte) on top of the model.
     await this.api.beginStep();
     for (let i = 0; i < this.params.length; i++) {
       this.api.copy_(

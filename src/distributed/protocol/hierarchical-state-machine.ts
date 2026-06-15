@@ -47,6 +47,7 @@ import type {
   PeerInfo,
   ProtocolMessage,
   RoundNumber,
+  RoundReadyMessage,
 } from "./messages.ts";
 import type { Trainer } from "./trainer.ts";
 import type { Transport } from "./transport.ts";
@@ -63,6 +64,14 @@ export interface HierarchicalOptions {
   /** Deadline (ms) for waiting for the global aggregate (non-heads). */
   globalDeadlineMs: number;
   f16wDebounceMs: number;
+  /**
+   * How long a non-head waits for the global-aggregate before nudging its
+   * head to resend it (and re-nudging each interval). Capped internally to
+   * globalDeadlineMs/2 so it always fires at least once before the deadline.
+   * This is the drift-free recovery for a single lost global — far cheaper
+   * than reverting and pulling a full-params f16w.
+   */
+  globalRetransmitMs: number;
 }
 
 export const defaultHierarchicalOptions: HierarchicalOptions = {
@@ -72,6 +81,7 @@ export const defaultHierarchicalOptions: HierarchicalOptions = {
   interDeadlineMs: 60_000,
   globalDeadlineMs: 60_000,
   f16wDebounceMs: 10_000,
+  globalRetransmitMs: 2_000,
 };
 
 interface PendingF16W {
@@ -115,6 +125,27 @@ export class HierarchicalBarrierStateMachine {
   >();
   /** Global-aggregate received from our CH, keyed by round. */
   private readonly globalAgg = new Map<RoundNumber, GradMessage>();
+  /**
+   * Heads only: the last few global-aggregates this head broadcast, keyed by
+   * round, so it can answer a `resend-global` request from a member that
+   * missed the broadcast. `anchor` is the round's anchor (pre-commit), which
+   * is what the requesting member still expects. Bounded to a handful of
+   * entries (insert-capped) — each is params-sized, but a member's resend
+   * request always arrives within a round or two of the broadcast.
+   */
+  private readonly recentGlobals = new Map<
+    RoundNumber,
+    { anchor: AnchorRound; peerCount: number; payload: Float32Array[] }
+  >();
+  private static readonly RECENT_GLOBALS_KEEP = 3;
+  /**
+   * Ready/grad messages that arrived exactly one anchor ahead of us (the
+   * sender committed an outer step we haven't finished yet). Replayed the
+   * instant we advance our anchor. Bounded so a misbehaving peer can't grow
+   * it without limit.
+   */
+  private earlyMessages: Array<RoundReadyMessage | GradMessage> = [];
+  private static readonly EARLY_BUFFER_MAX = 512;
 
   private pendingF16W: PendingF16W | null = null;
   private lastF16WSentMs = 0;
@@ -192,19 +223,30 @@ export class HierarchicalBarrierStateMachine {
    */
   private async fetchInitialF16W(): Promise<boolean> {
     if (!this.self) return false;
-    // Bypass the "have we already requested at this anchor" debounce —
-    // we're at anchor=0 with random init, so 0 is what we'd send anyway,
-    // but we want this to fire unconditionally on cold join.
-    this.lastF16WRequestedAtAnchor = -1;
-    this.transport.send(
-      { kind: "broadcast" },
-      {
-        type: "f16w-request",
-        peerId: this.self.peerId,
-        atLeastAnchor: 0,
-      },
-    );
+    const sendRequest = () => {
+      // Bypass the "have we already requested at this anchor" debounce —
+      // we're at anchor=0 with random init, so 0 is what we'd send anyway,
+      // but we want this to fire unconditionally on cold join.
+      this.lastF16WRequestedAtAnchor = -1;
+      this.transport.send(
+        { kind: "broadcast" },
+        { type: "f16w-request", peerId: this.self!.peerId, atLeastAnchor: 0 },
+      );
+    };
+    sendRequest();
     const deadline = Date.now() + this.opts.intraDeadlineMs;
+    // Re-broadcast the request periodically: a single lost request (or lost
+    // response — e.g. across a transient reconnect) must NOT strand the late
+    // joiner for the whole deadline. The interval clears the head's f16w
+    // debounce so a retry actually triggers a fresh snapshot+send.
+    const retransmit = Math.max(
+      this.opts.f16wDebounceMs + 1_000,
+      Math.min(this.opts.globalRetransmitMs, Math.floor(this.opts.intraDeadlineMs / 2)),
+    );
+    let nextResendAt = Date.now() + retransmit;
+    // NB: this runs BEFORE run() sets this.running = true, so do NOT gate the
+    // loop on this.running here (that would bail on the first iteration and
+    // skip the sync entirely — caught by the strict params-equality gate).
     while (Date.now() < deadline) {
       if (this.pendingF16W) {
         const blob = this.pendingF16W;
@@ -214,10 +256,16 @@ export class HierarchicalBarrierStateMachine {
         this.anchorRound = blob.sourceAnchor;
         this.currentRound = blob.sourceCurrentRound;
         this.needsSync = false;
+        this.replayEarly();
         return true;
       }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
+      const now = Date.now();
+      if (now >= nextResendAt) {
+        sendRequest();
+        nextResendAt = now + retransmit;
+      }
+      const remaining = Math.min(deadline - now, nextResendAt - now);
+      if (remaining <= 0) continue;
       await this.waitForSignal(remaining);
     }
     this.needsSync = false;
@@ -248,7 +296,14 @@ export class HierarchicalBarrierStateMachine {
 
   // ─── Round body ──────────────────────────────────────────────────────
   private async runRound(): Promise<RoundReport> {
-    const round = this.currentRound;
+    // The barrier's matching coordinate is the ANCHOR, not the local loop
+    // counter. Two peers at the same anchor are at the same point in weight
+    // space and MUST aggregate — even if their currentRound counters have
+    // drifted (which they do: each peer advances currentRound on every loop
+    // iteration including solo/failed rounds, at its own wall-clock rate). Key
+    // readys/grads/globals by anchor so same-anchor peers always align;
+    // currentRound stays a purely local iteration counter (loop bound + logs).
+    const round = this.anchorRound;
 
     if (await this.maybeApplyPendingF16W()) {
       this.cleanupRound(round);
@@ -392,7 +447,11 @@ export class HierarchicalBarrierStateMachine {
         clustersContributed = interResult.grads.length;
       }
 
-      // Phase G: broadcast global to cluster members.
+      // Phase G: broadcast global to cluster members. Retain it (keyed by
+      // round, tagged with the pre-commit anchor a member still expects) so a
+      // member that missed the broadcast can cheaply re-request it instead of
+      // drifting an anchor and pulling a full-params f16w.
+      this.retainGlobal(round, this.anchorRound, totalContributors, globalAggregate);
       this.transport.send(
         { kind: "cluster", clusterId: self.clusterId },
         {
@@ -423,6 +482,7 @@ export class HierarchicalBarrierStateMachine {
     // Phase H: apply outer step.
     await this.trainer.applyOuterStep(globalAggregate);
     this.anchorRound += 1;
+    this.replayEarly();
     this.cleanupRound(round);
     return this.report(round, true, totalContributors, clustersContributed, false);
   }
@@ -565,13 +625,56 @@ export class HierarchicalBarrierStateMachine {
     round: RoundNumber,
   ): Promise<GradMessage | null> {
     const deadline = Date.now() + this.opts.globalDeadlineMs;
+    // Nudge the head to resend if the global doesn't show up promptly. Capped
+    // to half the deadline so at least one resend fires before we give up and
+    // fall back to the (expensive) revert + f16w path.
+    const retransmit = Math.max(
+      200,
+      Math.min(this.opts.globalRetransmitMs, Math.floor(this.opts.globalDeadlineMs / 2)),
+    );
+    const head = this.self ? this.findClusterHead(this.self.clusterId) : null;
+    // Bounded resends: if the head can't answer after several nudges it has
+    // likely left or evicted the entry — escalate to a full f16w and bail.
+    const MAX_RESENDS = 4;
+    let resends = 0;
+    let nextResendAt = Date.now() + retransmit;
     while (Date.now() < deadline) {
       if (!this.running) return null;
+      // A pending f16w that advances us strictly past this round wins (genuine
+      // far-behind resync). A +1 skew does NOT set pendingF16W anymore (see
+      // requestF16WIfNeeded) so it can't preempt the cheap resend below.
       if (this.pendingF16WAdvances()) return null;
       const g = this.globalAgg.get(round);
       if (g) return g;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
+      const now = Date.now();
+      if (head && head !== this.self?.peerId && now >= nextResendAt) {
+        if (resends >= MAX_RESENDS) {
+          // Resends unanswered — escalate to a full-params f16w resync.
+          this.lastF16WRequestedAtAnchor = -1;
+          this.transport.send(
+            { kind: "broadcast" },
+            {
+              type: "f16w-request",
+              peerId: this.self!.peerId,
+              atLeastAnchor: this.anchorRound + 1,
+            },
+          );
+          return null;
+        }
+        this.transport.send(
+          { kind: "peer", peerId: head },
+          {
+            type: "resend-global",
+            fromPeerId: this.self!.peerId,
+            round,
+            anchor: this.anchorRound,
+          },
+        );
+        resends += 1;
+        nextResendAt = now + retransmit;
+      }
+      const remaining = Math.min(deadline - now, nextResendAt - now);
+      if (remaining <= 0) continue;
       await this.waitForSignal(remaining);
     }
     return this.globalAgg.get(round) ?? null;
@@ -596,6 +699,7 @@ export class HierarchicalBarrierStateMachine {
     await this.trainer.resetOptimState();
     this.anchorRound = blob.sourceAnchor;
     this.currentRound = blob.sourceCurrentRound;
+    this.replayEarly();
     return true;
   }
 
@@ -666,7 +770,60 @@ export class HierarchicalBarrierStateMachine {
     this.signal();
   }
 
+  /** Dispatch a ready/grad whose anchor matches ours into its buffer. */
+  private applyReadyOrGrad(msg: RoundReadyMessage | GradMessage): void {
+    if (msg.type === "round-ready") {
+      this.markReady(msg.round, msg.peerId);
+      return;
+    }
+    switch (msg.kind) {
+      case "peer-grad":
+        this.storeIntraGrad(msg.round, msg.fromPeerId, msg);
+        return;
+      case "cluster-aggregate":
+        this.storeInterAgg(msg.round, msg.fromPeerId, msg);
+        return;
+      case "global-aggregate":
+        this.storeGlobal(msg.round, msg);
+        return;
+    }
+  }
+
+  private bufferEarly(msg: RoundReadyMessage | GradMessage): void {
+    if (this.earlyMessages.length >= HierarchicalBarrierStateMachine.EARLY_BUFFER_MAX) {
+      this.earlyMessages.shift();
+    }
+    this.earlyMessages.push(msg);
+  }
+
+  /**
+   * Called after any anchor advance (outer step or f16w apply). Replays
+   * buffered messages that now match our anchor, keeps those still ahead, and
+   * drops those now stale.
+   */
+  private replayEarly(): void {
+    if (this.earlyMessages.length === 0) return;
+    const nowMatching: Array<RoundReadyMessage | GradMessage> = [];
+    const stillAhead: Array<RoundReadyMessage | GradMessage> = [];
+    for (const m of this.earlyMessages) {
+      if (m.anchor === this.anchorRound) nowMatching.push(m);
+      else if (m.anchor > this.anchorRound) stillAhead.push(m);
+      // else: stale (anchor < ours) — drop.
+    }
+    this.earlyMessages = stillAhead;
+    for (const m of nowMatching) this.applyReadyOrGrad(m);
+  }
+
   private cleanupRound(round: RoundNumber): void {
+    // Only clear once the anchor has advanced past this round. A FAILED round
+    // stays at the same anchor and retries; its readys/grads are still valid
+    // for that retry. Clearing them on every failure forced both peers to
+    // re-overlap their attempts in wall-clock to re-exchange readys (cleared
+    // between attempts), which they routinely missed → permanent solo spin at
+    // the same anchor. Keying by anchor + retaining across retries lets the
+    // exchange accumulate until quorum forms. Success/f16w advance the anchor
+    // first (round < anchorRound here), so the now-stale buffers are cleared.
+    if (round >= this.anchorRound) return;
     this.readySet.delete(round);
     this.intraGrads.delete(round);
     this.interAggs.delete(round);
@@ -725,34 +882,27 @@ export class HierarchicalBarrierStateMachine {
         this.signal();
         return;
       }
-      case "round-ready": {
+      case "round-ready":
+      case "grad": {
         if (msg.anchor === this.anchorRound) {
-          this.markReady(msg.round, msg.peerId);
+          this.applyReadyOrGrad(msg);
+        } else if (msg.anchor === this.anchorRound + 1) {
+          // Arrived one anchor early: the sender already committed the outer
+          // step we're still finishing. Buffer and replay it the instant we
+          // advance, instead of dropping it (which would strand the sender's
+          // next round — they don't retransmit readys). This is the symmetric
+          // partner to the global-resend recovery; together they keep peers
+          // in lockstep across a single lost/late message without a full
+          // f16w resync.
+          this.bufferEarly(msg);
         } else if (msg.anchor > this.anchorRound) {
           this.requestF16WIfNeeded(msg.anchor);
         }
         return;
       }
-      case "grad": {
-        if (msg.anchor !== this.anchorRound) {
-          if (msg.anchor > this.anchorRound) {
-            this.requestF16WIfNeeded(msg.anchor);
-          }
-          return;
-        }
-        switch (msg.kind) {
-          case "peer-grad":
-            this.storeIntraGrad(msg.round, msg.fromPeerId, msg);
-            return;
-          case "cluster-aggregate":
-            this.storeInterAgg(msg.round, msg.fromPeerId, msg);
-            return;
-          case "global-aggregate":
-            this.storeGlobal(msg.round, msg);
-            return;
-        }
+      case "resend-global":
+        this.handleResendGlobal(msg.fromPeerId, msg.round);
         return;
-      }
       case "f16w-request":
         this.handleF16WRequest();
         return;
@@ -779,8 +929,57 @@ export class HierarchicalBarrierStateMachine {
     }
   }
 
+  /** Head-side: retain a broadcast global so we can resend it on request. */
+  private retainGlobal(
+    round: RoundNumber,
+    anchor: AnchorRound,
+    peerCount: number,
+    payload: Float32Array[],
+  ): void {
+    this.recentGlobals.set(round, { anchor, peerCount, payload });
+    // Insert-cap: drop the oldest (lowest round) beyond the keep window.
+    while (this.recentGlobals.size > HierarchicalBarrierStateMachine.RECENT_GLOBALS_KEEP) {
+      let oldest = Infinity;
+      for (const r of this.recentGlobals.keys()) if (r < oldest) oldest = r;
+      this.recentGlobals.delete(oldest);
+    }
+  }
+
+  /**
+   * Head-side: a cluster member missed our global broadcast for `round` and
+   * asked us to resend it. If we still hold it, re-send to just that peer
+   * (tagged with the round's pre-commit anchor, which the member still
+   * expects). If we've advanced past it and dropped the entry, this is a
+   * no-op — the member falls back to the f16w path.
+   */
+  private handleResendGlobal(toPeerId: PeerId, round: RoundNumber): void {
+    if (!this.self) return;
+    const entry = this.recentGlobals.get(round);
+    if (!entry) return;
+    this.transport.send(
+      { kind: "peer", peerId: toPeerId },
+      {
+        type: "grad",
+        fromPeerId: this.self.peerId,
+        round,
+        anchor: entry.anchor,
+        kind: "global-aggregate",
+        peerCount: entry.peerCount,
+        payload: entry.payload,
+      },
+    );
+  }
+
   private requestF16WIfNeeded(peerAnchor: AnchorRound): void {
     if (!this.self) return;
+    // A +1 anchor skew means we missed exactly one outer step's global — the
+    // cheap, drift-free recovery is the global-resend path (awaitGlobal nudges
+    // the head to resend the round's global so we complete the SAME round). A
+    // full-params f16w here would be the expensive thrash we're eliminating.
+    // Only escalate to f16w when we're >=2 behind: too far for one round's
+    // global to bridge. (awaitGlobal still escalates to f16w on its own if the
+    // resend goes unanswered — the head left or dropped the entry.)
+    if (peerAnchor <= this.anchorRound + 1) return;
     if (this.lastF16WRequestedAtAnchor >= peerAnchor) return;
     this.lastF16WRequestedAtAnchor = peerAnchor;
     this.transport.send(

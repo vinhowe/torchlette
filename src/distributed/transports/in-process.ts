@@ -87,8 +87,23 @@ interface BusPeer {
   closed: boolean;
 }
 
+/**
+ * Test-only fault injector. Consulted for every routed message (NOT for the
+ * bus-originated join-ack / peer-list, which model the coordinator, not the
+ * peer link). Return `drop` to model a lost message, `delayMs` to model link
+ * latency (a slow peer). Undefined = current instant queueMicrotask delivery.
+ */
+export type FaultHook = (ctx: {
+  from: PeerId;
+  to: PeerId;
+  message: ProtocolMessage;
+}) => { drop?: boolean; delayMs?: number } | void;
+
 export class InProcessBus {
   private readonly peers = new Map<PeerId, BusPeer>();
+
+  /** Test-only: see {@link FaultHook}. Default undefined = no faults. */
+  faultHook: FaultHook | undefined = undefined;
 
   constructor(private readonly assigner: ClusterAssigner) {}
 
@@ -211,9 +226,25 @@ export class InProcessBus {
       }
     })();
 
-    queueMicrotask(() => {
-      for (const t of targets) this.deliverTo(t, message);
-    });
+    const hook = this.faultHook;
+    if (!hook) {
+      queueMicrotask(() => {
+        for (const t of targets) this.deliverTo(t, message);
+      });
+      return;
+    }
+    // Per-target fault evaluation so a slow/lossy link to one peer doesn't
+    // affect delivery to others (matches a real per-connection relay).
+    for (const t of targets) {
+      const verdict = hook({ from: fromPeerId, to: t.info.peerId, message }) || {};
+      if (verdict.drop) continue;
+      const deliver = () => this.deliverTo(t, message);
+      if (verdict.delayMs && verdict.delayMs > 0) {
+        setTimeout(deliver, verdict.delayMs);
+      } else {
+        queueMicrotask(deliver);
+      }
+    }
   }
 
   private deliverTo(peer: BusPeer, message: ProtocolMessage): void {

@@ -138,6 +138,24 @@ export interface F16WRequestMessage {
 }
 
 /**
+ * A non-head that finished its inner steps and routed its peer-grad but never
+ * received the round's global-aggregate (lost/late on the wire, e.g. across a
+ * transient reconnect) asks its cluster head to resend it. This is the cheap,
+ * drift-free recovery for a single lost global: the head retains the last few
+ * global-aggregates and re-sends the matching one to just this peer, so the
+ * non-head completes the SAME round's outer step instead of reverting and
+ * diverging by an anchor (which would force a full-params f16w resync). If the
+ * head has already advanced past it and dropped the entry, the request is a
+ * no-op and the non-head falls back to the f16w path.
+ */
+export interface ResendGlobalMessage {
+  type: "resend-global";
+  fromPeerId: PeerId;
+  round: RoundNumber;
+  anchor: AnchorRound;
+}
+
+/**
  * Full f16-encoded parameter dump used for recovery after long disconnects
  * or for late-joiners. The receiver applies these params, sets its anchor
  * to `sourceAnchor`, advances currentRound to `sourceCurrentRound`, and
@@ -160,6 +178,7 @@ export type ProtocolMessage =
   | LeaveMessage
   | RoundReadyMessage
   | GradMessage
+  | ResendGlobalMessage
   | F16WRequestMessage
   | F16WMessage;
 

@@ -51,6 +51,11 @@ import {
   defaultWireDtype,
   encodeTensors,
 } from "../wire-codec";
+import {
+  FrameReassembler,
+  splitIntoChunks,
+  tryPeekChunk,
+} from "./frame-chunking";
 
 function takeTensorPayload(
   msg: ProtocolMessage,
@@ -101,9 +106,12 @@ export class WebSocketRelayTransport implements Transport {
   private closed = false;
   /** Reconnect bookkeeping: true while a reconnect attempt is in flight. */
   private reconnecting = false;
+  private readonly reassembler = new FrameReassembler();
   /** Exponential backoff for reconnect attempts. Resets to base on success. */
   private reconnectDelayMs = 1_000;
   private readonly reconnectDelayMaxMs = 30_000;
+  /** Periodic ping so the relay doesn't mark us stale during long quiet waits. */
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 
   private constructor(opts: WebSocketRelayTransportOptions) {
     this.peerId = opts.peerId;
@@ -200,10 +208,31 @@ export class WebSocketRelayTransport implements Transport {
 
   /** Wire up the post-registration message + close listeners on `ws`. */
   private attachSteadyStateHandlers(ws: WebSocket): void {
+    // Keepalive: the relay marks a peer stale and drops it after a silence
+    // window (~150s observed), refreshing lastSeen only on RECEIVED messages.
+    // A head waiting alone at the barrier (or for a slow partner's grad) sends
+    // one round-ready then goes quiet for up to its deadline (300s) — far past
+    // the window — so the relay terminated it mid-round, losing the in-flight
+    // grad exchange and stranding both peers at the same anchor (never able to
+    // close a round). Ping well under the window. Mirrors the browser transport.
+    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+    this.keepaliveTimer = setInterval(() => {
+      if (this.ws === ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: "ping" }));
+        } catch {
+          /* socket closing — close handler will clean up */
+        }
+      }
+    }, 30_000);
     ws.on("message", (raw, isBinary) =>
       this.onWsMessage(raw, isBinary === true),
     );
     ws.on("close", () => {
+      if (this.keepaliveTimer) {
+        clearInterval(this.keepaliveTimer);
+        this.keepaliveTimer = null;
+      }
       if (this.closed) {
         this.log("websocket closed (intentional)");
         return;
@@ -337,6 +366,25 @@ export class WebSocketRelayTransport implements Transport {
   }
 
   private onWsMessage(raw: WebSocket.RawData, isBinary: boolean): void {
+    // Reassemble chunked tensor frames before parsing (symmetric with send).
+    if (isBinary && Buffer.isBuffer(raw)) {
+      const chunk = tryPeekChunk(
+        new Uint8Array(raw.buffer, raw.byteOffset, raw.length),
+      );
+      if (chunk) {
+        const full = this.reassembler.feed(
+          chunk.id,
+          chunk.i,
+          chunk.n,
+          chunk.body,
+        );
+        if (full) {
+          const parsed = this.parseFrame(Buffer.from(full), true);
+          if (parsed && parsed.kind === "protocol") this.deliver(parsed.value);
+        }
+        return;
+      }
+    }
     const parsed = this.parseFrame(raw, isBinary);
     if (!parsed || parsed.kind !== "protocol") return;
     this.deliver(parsed.value);
@@ -419,7 +467,15 @@ export class WebSocketRelayTransport implements Transport {
       const lenBuf = Buffer.alloc(FOUR);
       lenBuf.writeUInt32LE(envBytes.length, 0);
       const payloadBuf = Buffer.from(encodeTensors(taken.tensors, wireDtype));
-      this.ws.send(Buffer.concat([lenBuf, envBytes, payloadBuf]));
+      const full = Buffer.concat([lenBuf, envBytes, payloadBuf]);
+      // Split oversized tensor frames into bounded chunks (symmetric with the
+      // browser transport — see frame-chunking). Small frames send unchanged.
+      const chunks = splitIntoChunks(full, this.peerId, target);
+      if (chunks) {
+        for (const c of chunks) this.ws.send(c);
+      } else {
+        this.ws.send(full);
+      }
     } else {
       const envelope: Envelope = {
         from: this.peerId,
@@ -459,6 +515,10 @@ export class WebSocketRelayTransport implements Transport {
 
   close(): void {
     this.closed = true;
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
     if (this.ws) {
       try {
         this.ws.close();

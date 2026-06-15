@@ -18,6 +18,16 @@ import type {
   SendTarget,
 } from "../protocol/messages.ts";
 import type { Transport } from "../protocol/transport.ts";
+import {
+  decodeTensors,
+  defaultWireDtype,
+  encodeTensors,
+} from "../wire-codec.ts";
+import {
+  FrameReassembler,
+  splitIntoChunks,
+  tryPeekChunk,
+} from "./frame-chunking.ts";
 
 export interface WebSocketBrowserTransportOptions {
   serverUrl: string;
@@ -82,6 +92,8 @@ export class WebSocketBrowserTransport implements Transport {
   private hasReplayedToFirstSubscriber = false;
   private closed = false;
   private reconnecting = false;
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly reassembler = new FrameReassembler();
   private reconnectDelayMs = 1_000;
   private readonly reconnectDelayMaxMs = 30_000;
 
@@ -167,12 +179,51 @@ export class WebSocketBrowserTransport implements Transport {
   }
 
   private attachSteadyStateHandlers(ws: WebSocket): void {
+    // Keepalive: the relay drops peers that send nothing for KEEPALIVE_MS — it
+    // refreshes lastSeen only on RECEIVED messages. A browser peer goes silent
+    // during long waits (the initial ~250MB f16w sync, quorum/barrier waits),
+    // so without a periodic ping the server terminates it MID-SYNC (observed:
+    // "websocket closed unexpectedly" right in the f16w window → sync lost →
+    // browser trains unsynced at its own anchor). Ping well under the window.
+    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+    this.keepaliveTimer = setInterval(() => {
+      if (this.ws === ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: "ping" }));
+        } catch {
+          /* socket closing — close handler will clean up */
+        }
+      }
+    }, 30_000);
     ws.addEventListener("message", (event) => {
-      const parsed = this.parseFrame(event.data);
+      const data = event.data;
+      // Chunked frames (oversized tensor payloads): buffer until complete, then
+      // re-parse the reassembled frame. Normal frames fall through.
+      if (data instanceof ArrayBuffer) {
+        const chunk = tryPeekChunk(new Uint8Array(data));
+        if (chunk) {
+          const full = this.reassembler.feed(
+            chunk.id,
+            chunk.i,
+            chunk.n,
+            chunk.body,
+          );
+          if (full) {
+            const parsed = this.parseFrame(full.buffer);
+            if (parsed && parsed.kind === "protocol") this.deliver(parsed.value);
+          }
+          return;
+        }
+      }
+      const parsed = this.parseFrame(data);
       if (!parsed || parsed.kind !== "protocol") return;
       this.deliver(parsed.value);
     });
     ws.addEventListener("close", () => {
+      if (this.keepaliveTimer) {
+        clearInterval(this.keepaliveTimer);
+        this.keepaliveTimer = null;
+      }
       if (this.closed) return;
       if (this.ws !== ws) return;
       this.ws = null;
@@ -368,7 +419,15 @@ export class WebSocketBrowserTransport implements Transport {
       new DataView(out.buffer).setUint32(0, envBytes.byteLength, true);
       out.set(envBytes, FOUR);
       out.set(payload, FOUR + envBytes.byteLength);
-      this.ws.send(out.buffer);
+      // A browser WebSocket silently drops a single huge message (a 124M f16
+      // grad/weight frame is ~250MB), so split oversized frames into bounded,
+      // individually-routed chunks (small frames send unchanged).
+      const chunks = splitIntoChunks(out, this.peerId, target);
+      if (chunks) {
+        for (const c of chunks) this.ws.send(c);
+      } else {
+        this.ws.send(out.buffer);
+      }
     } else {
       const envelope: Envelope = {
         from: this.peerId,
@@ -405,6 +464,10 @@ export class WebSocketBrowserTransport implements Transport {
 
   close(): void {
     this.closed = true;
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
     if (this.ws) {
       try {
         this.ws.close();
