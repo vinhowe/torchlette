@@ -102,7 +102,6 @@ export class WebGPUGPT2Trainer implements Trainer {
   private params: Tensor[] = [];
   private innerOpt!: Adam;
   private outerOpt!: NesterovOuterOptimizer;
-  private accumGrads: Tensor[] = [];
   private scaler: GradScaler | null = null;
 
   /** Anchor params snapshot on CPU. Updated by setAnchor / applyOuterStep. */
@@ -199,9 +198,6 @@ export class WebGPUGPT2Trainer implements Trainer {
       lr: this.opts.outerLr,
       momentum: this.opts.outerMu,
     });
-    this.accumGrads = this.params.map((p) =>
-      this.api.zeros(p.shape, { device: "webgpu" }),
-    );
     if (this.opts.useAutocast) {
       // GradScaler is required when forward runs in fp16 — without it,
       // small-magnitude gradients underflow during the bf16/fp16 backward
@@ -316,61 +312,17 @@ export class WebGPUGPT2Trainer implements Trainer {
       innerStepBatches.push({ input: inputData, target: targetData });
     }
 
-    // accumSteps=1: single forward+backward+step inside one beginStep,
-    // matching the standalone regression harness exactly. Skipping the
-    // accumGrads dance is both an FLOP saving and a precision win — the
-    // extra mul(accumGrads, 1) lazy op introduces an additional materialization
-    // boundary that produced a measurable ~0.7-0.8 nat convergence gap vs.
-    // the no-accum path.
-    if (opts.accumSteps === 1) {
-      const batch = innerStepBatches[0]!;
-      await api.beginStep();
-      const input = api.tensorFromArray(
-        batch.input,
-        [opts.batchSize, opts.seqLen],
-        { device: "webgpu" },
-      );
-      const target = api.tensorFromArray(
-        batch.target,
-        [opts.batchSize, opts.seqLen],
-        { device: "webgpu" },
-      );
-      const loss = api.tidy(() => {
-        const fwd = () =>
-          this.model.forwardWithLoss(input, target, {
-            useCheckpoint: this.opts.checkpointing,
-          }).loss;
-        const l = this.opts.useAutocast ? api.autocast(fwd) : fwd();
-        api.keep(l);
-        return l;
-      });
-      totalLoss += await loss.item();
-      const backwardTarget = scaler ? scaler.scale(loss) : loss;
-      await backwardTarget.backward();
-      if (scaler) scaler.unscale_(this.innerOpt);
-      if (this.opts.gradClipNorm > 0) {
-        clipGradNorm_(api, this.params, this.opts.gradClipNorm);
-      }
-      if (scaler) {
-        scaler.step(this.innerOpt);
-        scaler.update();
-      } else {
-        this.innerOpt.step();
-      }
-      this.innerOpt.zeroGrad();
-      input.dispose();
-      target.dispose();
-      api.endStep();
-      await api.markStep();
-      return totalLoss / opts.accumSteps;
-    }
-
-    // accumSteps>1: accumulate gradients across micro-batches, then step.
-    for (const ag of this.accumGrads) api.zero_(ag);
-
+    // One beginStep spans the whole inner step: run every micro-batch's
+    // forward+backward, then ONE optimizer step. Each backward() ACCUMULATES
+    // into .grad (PyTorch semantics) — no manual accumGrads buffer. For
+    // accumSteps=1 this is a single forward+backward+step, bit-identical to the
+    // old no-accum path (no extra mul on the grad). Keeping all micro-backwards
+    // in one beginStep means .grad never crosses a markStep, so no cross-step
+    // grad persistence is needed; each backward() materializes the running
+    // .grad, so the lazy graph doesn't grow across micro-steps.
+    await api.beginStep();
     for (let acc = 0; acc < opts.accumSteps; acc++) {
       const batch = innerStepBatches[acc]!;
-      await api.beginStep();
       const input = api.tensorFromArray(
         batch.input,
         [opts.batchSize, opts.seqLen],
@@ -391,43 +343,23 @@ export class WebGPUGPT2Trainer implements Trainer {
         return l;
       });
       totalLoss += await loss.item();
-      const backwardTarget = scaler ? scaler.scale(loss) : loss;
+      // Average the gradient over micro-batches by scaling each micro-loss by
+      // 1/accumSteps before backward (accumSteps=1 skips the extra op).
+      const microLoss =
+        opts.accumSteps === 1 ? loss : api.mul(loss, 1 / opts.accumSteps);
+      const backwardTarget = scaler ? scaler.scale(microLoss) : microLoss;
       await backwardTarget.backward();
-      for (let i = 0; i < this.params.length; i++) {
-        // biome-ignore lint/suspicious/noExplicitAny: tensor.grad isn't strongly typed
-        const grad = (this.params[i] as any).grad;
-        if (grad) {
-          api.add_(this.accumGrads[i], api.mul(grad, 1 / opts.accumSteps));
-        }
-      }
-      await api._runtime().forceAllPending();
-      this.innerOpt.zeroGrad();
       input.dispose();
       target.dispose();
-      api.endStep();
-      await api.markStep();
     }
-
-    await api.beginStep();
-    for (let i = 0; i < this.params.length; i++) {
-      // biome-ignore lint/suspicious/noExplicitAny: tensor._setGrad isn't strongly typed
-      (this.params[i] as any)._setGrad(api.mul(this.accumGrads[i], 1));
+    if (scaler) scaler.unscale_(this.innerOpt);
+    if (this.opts.gradClipNorm > 0) {
+      clipGradNorm_(api, this.params, this.opts.gradClipNorm);
     }
     if (scaler) {
-      scaler.unscale_(this.innerOpt);
-      if (this.opts.gradClipNorm > 0) {
-        clipGradNorm_(
-          api,
-          this.params,
-          this.opts.gradClipNorm * scaler.getScale(),
-        );
-      }
       scaler.step(this.innerOpt);
       scaler.update();
     } else {
-      if (this.opts.gradClipNorm > 0) {
-        clipGradNorm_(api, this.params, this.opts.gradClipNorm);
-      }
       this.innerOpt.step();
     }
     this.innerOpt.zeroGrad();

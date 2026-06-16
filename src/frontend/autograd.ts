@@ -362,6 +362,31 @@ export async function backwardImpl(
           }
         }
 
+        // Cross-call gradient accumulation (PyTorch semantics): if a leaf (or
+        // retained tensor) already carries a .grad from an EARLIER backward()
+        // that wasn't zeroed, fold it into this pass's gradient — `.grad` is an
+        // accumulator, exactly like torch.Tensor.grad (zeroGrad/zero_grad
+        // resets it). Done BEFORE the force so the sum and BOTH its inputs (the
+        // existing .grad + this pass's grad) materialize in the same merged
+        // plan; the old .grad is disposed only later by _setGrad, after the sum
+        // is concrete. Standard loops zero each iteration, so the existing grad
+        // is null here and this is a no-op (accumulate ≡ overwrite) — the
+        // change is invisible unless you intentionally skip zeroGrad (grad
+        // accumulation across micro-batches).
+        for (const tensor of gradMap.keys()) {
+          if (!(leafTensors.has(tensor) || retainTensors.has(tensor))) continue;
+          const existing = tensor.grad;
+          if (!existing || existing.disposed) continue;
+          const cur = gradMap.get(tensor);
+          if (!cur || cur.disposed) continue;
+          const summed = torch.runtime.add(existing._unwrap(), cur);
+          gradMap.set(tensor, summed);
+          // `cur` stays alive (input to `summed`); just hand the survivor slot
+          // to `summed` so it (not the un-summed grad) gets forced + written.
+          survivorSet.delete(cur);
+          survivorSet.add(summed);
+        }
+
         // Force the surviving gradients in one merged plan.
         const allGrads = [...survivorSet].filter(
           (g) => !g.isMaterialized() && !g.disposed,
