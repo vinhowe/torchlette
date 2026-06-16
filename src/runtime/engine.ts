@@ -369,6 +369,13 @@ export class RuntimeEngine {
   private lastFusionStats: OptimizedExecutionStats | null = null;
   private cumulativeFusionStats: OptimizedExecutionStats | null = null;
   private earlyReleaseEnabled = false;
+  /**
+   * When true, fused execution runs arena-free (pool buffers) so the liveness
+   * early-release frees intermediates. Set by the trainer for checkpointed
+   * training — the retained arena would otherwise keep all forward activations
+   * resident, defeating checkpointing's memory savings.
+   */
+  private bufferArenaDisabled = false;
   private checkpointSegmentationEnabled = false;
   private _rngCounter = 0;
   private trueSegmentationEnabled = false;
@@ -509,6 +516,17 @@ export class RuntimeEngine {
    */
   setEarlyReleaseEnabled(enabled: boolean): void {
     this.earlyReleaseEnabled = enabled;
+  }
+
+  /**
+   * Run fused execution arena-free (pool buffers) so the liveness early-release
+   * frees intermediates as their last consumer completes. Set by the trainer
+   * for checkpointed training: the per-step arena otherwise retains every
+   * forward activation across steps, defeating checkpointing's memory savings.
+   * Trade-off: arena-free plans run lowered (no compiled-plan replay).
+   */
+  setBufferArenaDisabled(disabled: boolean): void {
+    this.bufferArenaDisabled = disabled;
   }
 
   /**
@@ -746,6 +764,7 @@ export class RuntimeEngine {
         enableFusion: true,
         enableVectorization: this.vectorizationEnabled,
         enableEarlyRelease: this.earlyReleaseEnabled,
+        arenaDisabled: this.bufferArenaDisabled,
       });
       this.lastFusionStats = optimizedResult.stats;
       this.accumulateFusionStats(optimizedResult.stats);
@@ -868,6 +887,7 @@ export class RuntimeEngine {
         enableFusion: true,
         enableVectorization: this.vectorizationEnabled,
         enableEarlyRelease: this.earlyReleaseEnabled,
+        arenaDisabled: this.bufferArenaDisabled,
       });
       this.lastFusionStats = optimizedResult.stats;
       this.accumulateFusionStats(optimizedResult.stats);

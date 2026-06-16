@@ -11,6 +11,7 @@
  * HuggingFace dataset; tests can supply a stub.
  */
 
+import { ENV } from "../../core/env.ts";
 import { clipGradNorm_ } from "../../nn/index.ts";
 import { normal_ } from "../../nn/init.ts";
 import { Adam, GradScaler } from "../../optim/index.ts";
@@ -144,6 +145,20 @@ export class WebGPUGPT2Trainer implements Trainer {
    */
   async initialize(): Promise<void> {
     if (this.initialized) return;
+    // Checkpointing trades compute for memory; tie the buffer arena to it.
+    // The per-step arena retains every forward activation across steps (for
+    // bind-group stability + compiled replay), which keeps ALL of them resident
+    // and defeats checkpointing — so when checkpointing, run arena-free and let
+    // the liveness early-release free activations as soon as they're consumed
+    // (measured 124M/seq256: steady 6.6GB->2.6GB, peak 7.8->7.66GB; loss
+    // identical — checkpointing is numerically transparent). Opt back into the
+    // arena (e.g. to compare) with TORCHLETTE_CHECKPOINT_ARENA=1.
+    if (this.opts.checkpointing && ENV.TORCHLETTE_CHECKPOINT_ARENA !== "1") {
+      this.api._runtime().setBufferArenaDisabled(true);
+      this.opts.log(
+        "checkpointing on → buffer arena disabled (frees forward activations)",
+      );
+    }
     // Use the plain (non-LoRA) GPT-2 model. The trainer drives full
     // fine-tuning from random init, so the LoRA-wrapped version would only
     // add a structurally dead branch (loraA/loraB stay at zero through

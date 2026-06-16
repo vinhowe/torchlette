@@ -146,6 +146,12 @@ interface OptimizedExecutionOptions {
   enableVectorization?: boolean;
   /** Enable early buffer release based on lifetime analysis */
   enableEarlyRelease?: boolean;
+  /**
+   * Run arena-free (pool buffers) so the liveness early-release can actually
+   * free intermediates instead of the per-step arena retaining them. Set by
+   * the engine for checkpointed training (see RuntimeEngine.setBufferArenaDisabled).
+   */
+  arenaDisabled?: boolean;
 }
 
 /**
@@ -3010,7 +3016,14 @@ export async function executePlanOptimized(
   // exist in browsers and Vite replaces process.env at compile time).
   const arenaDisabled =
     !!ENV.TORCHLETTE_NO_ARENA ||
-    !!(globalThis as { __torchletteNoArena?: boolean }).__torchletteNoArena;
+    !!(globalThis as { __torchletteNoArena?: boolean }).__torchletteNoArena ||
+    // Per-engine opt-out: the trainer disables the arena when checkpointing so
+    // the liveness early-release can actually free forward activations (the
+    // retained arena would otherwise keep them resident, defeating the point of
+    // checkpointing — measured 124M/seq256: steady 6.6GB->2.6GB, peak unchanged
+    // 7.8->7.66GB). Trade-off: these plans run lowered (no compiled replay),
+    // consistent with checkpointing already trading compute for memory.
+    options.arenaDisabled === true;
   const bufferArena = arenaDisabled
     ? undefined
     : ((cachedTemplate ?? fusionAnalysisCache.get(fingerprint.primary))
