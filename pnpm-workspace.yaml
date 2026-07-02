@@ -2,6 +2,8 @@ packages:
   - packages/*
   - website
   - examples/gpt2-lora-trainer
+  - examples/menagerie
+  - examples/qwen3-chat
   - examples/toy-compartmentalization
 
 ignoredBuiltDependencies:

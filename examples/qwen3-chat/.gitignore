@@ -1,0 +1,4 @@
+node_modules/
+dist/
+# Licensed font (fetched from the sequence-ui repo; do not commit)
+public/Berkeley Mono Variable.woff2
