@@ -44,6 +44,7 @@ export {
 } from "./dispatch";
 export {
   destroyWebGPU,
+  getGpuUncapturedErrorCount,
   getMaxStorageBufferBindingSize,
   getWebGPUDevice,
   getWebGPUInitError,

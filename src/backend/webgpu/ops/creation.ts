@@ -23,7 +23,7 @@ import {
   WORKGROUP_SIZE,
 } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
-import { createBufferWithData, createTensor } from "../tensor";
+import { createBufferWithData, createTensor, writeBufferChunked } from "../tensor";
 import { arenaBufferSet } from "../webgpu-state";
 import {
   arangeWGSL,
@@ -47,7 +47,7 @@ function getContiguous(a: WebGPUTensor): WebGPUTensor {
 }
 
 export function tensorFromArray(
-  values: number[] | Float32Array | Int32Array | Uint32Array,
+  values: number[] | Float32Array | Int32Array | Uint32Array | Uint16Array,
   shape: number[],
   dtype: DType = "f32",
 ): WebGPUTensor {
@@ -58,12 +58,17 @@ export function tensorFromArray(
   }
   // Non-f32 dtypes go through the typed-buffer path (supports i32/u32/f16).
   if (dtype !== "f32") {
+    // Uint16Array with dtype f16 = RAW f16 bits: upload as-is, no conversion
+    // and no Array.from copy (loaders convert off the hot path themselves).
+    if (dtype === "f16" && values instanceof Uint16Array) {
+      return tensorFromArrayWithDtype(values, shape, dtype);
+    }
     const arr =
       values instanceof Float32Array ||
       values instanceof Int32Array ||
       values instanceof Uint32Array
         ? Array.from(values)
-        : values;
+        : (values as number[]);
     return tensorFromArrayWithDtype(arr, shape, dtype);
   }
   const f32data =
@@ -72,9 +77,7 @@ export function tensorFromArray(
   // This eliminates bind group cache misses from data-source ops in lowered plans.
   if (getActiveArena()) {
     const buffer = resolveOutputBuffer(ctx.device, f32data.byteLength, []);
-    profileApiCall("writeBuffer", () =>
-      ctx.queue.writeBuffer(buffer, 0, f32data),
-    );
+    writeBufferChunked(ctx.queue, buffer, f32data);
     return createTensor(shape, buffer);
   }
   const buffer = createBufferWithData(ctx.device, f32data, ctx.queue);
@@ -128,16 +131,18 @@ export function zeros(shape: number[], dtype: DType = "f32"): WebGPUTensor {
   if (numElements === 0) {
     throw new Error("webgpu tensors cannot be empty yet");
   }
-  // Non-f32 dtypes: allocate via typed-buffer path (bitwise zero is a valid
-  // zero for all current DTypes: f32, f16, i32, u32).
-  if (dtype !== "f32") {
-    return tensorFromArrayWithDtype(
-      new Array(numElements).fill(0),
-      shape,
-      dtype,
+  // f16 support check up front (mirrors tensorFromArrayWithDtype).
+  if (dtype === "f16" && !ctx.f16Supported) {
+    throw new Error(
+      "f16 dtype requires shader-f16 device feature which is not available",
     );
   }
-  const sizeBytes = numElements * F32_BYTES;
+  // ALL dtypes take the buffer+clear path: bitwise zero is a valid zero for
+  // f32, f16, i32, and u32. (This used to route non-f32 through a
+  // new Array(n).fill(0) + per-element conversion — for a 1.7B-param f16
+  // model that lazily materialized ~1.4B JS doubles inside the first GPU
+  // flush and wedged 16GB machines.)
+  const sizeBytes = numElements * (dtype === "f16" ? 2 : F32_BYTES);
   const alignedSize = alignBufferSize(sizeBytes);
   // Arena-aware output allocation for stable buffer identity across steps
   const buffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
@@ -163,7 +168,7 @@ export function zeros(shape: number[], dtype: DType = "f32"): WebGPUTensor {
   // recordClear relies on the slot assigned by resolveOutputBuffer above.
   recordClear(buffer, alignedSize);
 
-  return createTensor(shape, buffer);
+  return createTensor(shape, buffer, undefined, 0, dtype);
 }
 
 /**
@@ -362,7 +367,7 @@ export function bernoulli(
  * Supports f32 (default), i32, u32, and f16 (if device supports shader-f16).
  */
 export function tensorFromArrayWithDtype(
-  values: number[],
+  values: number[] | Uint16Array,
   shape: number[],
   dtype: DType,
 ): WebGPUTensor {
@@ -382,25 +387,25 @@ export function tensorFromArrayWithDtype(
   let typedData: Float32Array | Int32Array | Uint32Array | Uint16Array;
   switch (dtype) {
     case "i32":
-      typedData = Int32Array.from(values);
+      typedData = Int32Array.from(values as number[]);
       break;
     case "u32":
-      typedData = Uint32Array.from(values);
+      typedData = Uint32Array.from(values as number[]);
       break;
     case "f16":
-      typedData = f32ArrayToF16Array(values);
+      // Uint16Array input = raw f16 bits (pre-converted by the caller).
+      typedData =
+        values instanceof Uint16Array ? values : f32ArrayToF16Array(values as number[]);
       break;
     default:
-      typedData = Float32Array.from(values);
+      typedData = Float32Array.from(values as number[]);
       break;
   }
 
   // Arena fast path: use resolveOutputBuffer for stable buffer identity across steps
   if (getActiveArena()) {
     const buffer = resolveOutputBuffer(ctx.device, typedData.byteLength, []);
-    profileApiCall("writeBuffer", () =>
-      ctx.queue.writeBuffer(buffer, 0, typedData),
-    );
+    writeBufferChunked(ctx.queue, buffer, typedData);
     return createTensor(shape, buffer, undefined, 0, dtype);
   }
   const buffer = createBufferWithData(ctx.device, typedData, ctx.queue);

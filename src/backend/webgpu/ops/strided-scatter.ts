@@ -37,6 +37,11 @@ import { ensureContiguous } from "./views";
 
 type ScatterOp = "copy" | "add";
 
+/** Element byte size per dtype (f16 is the only sub-4-byte dtype we store). */
+function dtypeBytes(dtype: string | undefined): number {
+  return dtype === "f16" ? 2 : 4;
+}
+
 /** Direct strided scatter dispatch (small tensors that fit in a single binding). */
 function stridedScatterDirect(
   op: ScatterOp,
@@ -48,6 +53,17 @@ function stridedScatterDirect(
   const baseSize = sizeOf(baseTensor.shape);
   const viewSize = sizeOf(viewShape);
   const ctx = requireContext();
+
+  // The scatter tile-IR kernels read/write array<f32>; a non-f32 tensor here
+  // would be silently reinterpreted (observed: f16 pairs read as one f32 —
+  // see examples/qwen3/probe-f16b.ts). Same-dtype FULL contiguous copies are
+  // handled by the DMA fast path in stridedScatterImpl before reaching this.
+  if (baseTensor.dtype !== "f32" || srcTensor.dtype !== "f32") {
+    throw new Error(
+      `stridedScatter${op === "copy" ? "Copy" : "Add"}: kernel path only supports f32 (got base=${baseTensor.dtype}, src=${srcTensor.dtype}). ` +
+        `Non-f32 in-place updates are only supported as full contiguous copies.`,
+    );
+  }
 
   const maxSize = Math.max(baseSize, viewSize);
   const totalWorkgroups = Math.ceil(maxSize / WORKGROUP_SIZE);
@@ -118,8 +134,12 @@ function stridedScatterImpl(
   const ctx = requireContext();
   const maxBindingSize =
     ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
-  const baseSizeBytes = baseSize * 4;
-  const srcSizeBytes = srcTensor.size * 4;
+  // Byte math must follow the tensor dtype — with hardcoded f32 sizes an f16
+  // full copy_ failed the fast-path size check below and fell into the
+  // f32-typed kernel, silently corrupting the destination.
+  const bpe = dtypeBytes(baseTensor.dtype);
+  const baseSizeBytes = baseSize * bpe;
+  const srcSizeBytes = srcTensor.size * bpe;
 
   // TRUE IN-PLACE fast path for full contiguous overwrites (copy_ semantics):
   // one recorded buffer-to-buffer DMA into the base's EXISTING buffer, zero
@@ -139,6 +159,7 @@ function stridedScatterImpl(
   // per call (148 region refills/step at 124M = tens of GB of churn, OOM).
   if (
     op === "copy" &&
+    baseTensor.dtype === srcTensor.dtype &&
     offset >= 0 &&
     offset + viewSize <= baseSize &&
     checkContiguousStrides(viewShape, viewStrides) &&
@@ -147,27 +168,27 @@ function stridedScatterImpl(
     (srcTensor.isContiguous ||
       checkContiguousStrides(srcTensor.shape, srcTensor.strides)) &&
     srcTensor.buffer !== baseTensor.buffer &&
-    viewSize * 4 <= srcTensor.buffer.size - (srcTensor.offset ?? 0) * 4
+    viewSize * bpe <= srcTensor.buffer.size - (srcTensor.offset ?? 0) * bpe
   ) {
-    const regionBytes = viewSize * 4;
+    const regionBytes = viewSize * bpe;
     trackSharedEncoderWrite(baseTensor.buffer);
     const enc = getSharedEncoderInstance();
     if (enc) {
       recordedCopyBufferToBuffer(
         enc,
         srcTensor.buffer,
-        (srcTensor.offset ?? 0) * 4,
+        (srcTensor.offset ?? 0) * bpe,
         baseTensor.buffer,
-        offset * 4,
+        offset * bpe,
         regionBytes,
       );
     } else {
       const cmdEnc = ctx.device.createCommandEncoder();
       cmdEnc.copyBufferToBuffer(
         srcTensor.buffer,
-        (srcTensor.offset ?? 0) * 4,
+        (srcTensor.offset ?? 0) * bpe,
         baseTensor.buffer,
-        offset * 4,
+        offset * bpe,
         regionBytes,
       );
       submitOrCollect(cmdEnc.finish());
@@ -177,7 +198,13 @@ function stridedScatterImpl(
     // so the buffer isn't double-released when its handle drops.
     if (baseTensor.ownsBuffer) bufferPool.decRef(baseTensor.buffer);
     baseTensor.destroy = () => {};
-    return createTensor(baseTensor.shape, baseTensor.buffer);
+    return createTensor(
+      baseTensor.shape,
+      baseTensor.buffer,
+      undefined,
+      0,
+      baseTensor.dtype,
+    );
   }
 
   if (baseSizeBytes > maxBindingSize || srcSizeBytes > maxBindingSize) {

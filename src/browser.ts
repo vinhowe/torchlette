@@ -8,6 +8,7 @@ export {
   elementwiseGrid,
   enableAllAllocDebug,
   getAndResetFlowCounters,
+  getGpuUncapturedErrorCount,
   getGPUMemoryStats,
   getWebGPUDevice,
   getWebGPUInitError,

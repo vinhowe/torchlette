@@ -223,7 +223,7 @@ export type AdamBatchResult = {
 
 export interface BackendOps {
   tensorFromArray(
-    values: number[] | Float32Array | Int32Array | Uint32Array,
+    values: number[] | Float32Array | Int32Array | Uint32Array | Uint16Array,
     shape: Shape,
     dtype?: DType,
   ): BackendTensor;

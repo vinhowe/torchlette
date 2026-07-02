@@ -253,6 +253,30 @@ export function createTrackedBuffer(
   }
 }
 
+/** Upload in ≤256MB slices: a single gigabyte-scale writeBuffer (or a
+ * mappedAtCreation range of that size) forces the browser to stage the whole
+ * payload at once — observed to wedge Chrome on unified-memory Macs when
+ * uploading a 1.24GB embedding table. Slices let the queue drain. */
+const UPLOAD_CHUNK_BYTES = 256 * 1024 * 1024;
+export function writeBufferChunked(
+  queue: GPUQueue,
+  buffer: GPUBuffer,
+  data: Float32Array | Int32Array | Uint32Array | Uint16Array,
+): void {
+  const total = data.byteLength;
+  if (total <= UPLOAD_CHUNK_BYTES) {
+    profileApiCall("writeBuffer", () => queue.writeBuffer(buffer, 0, data));
+    return;
+  }
+  const bytes = new Uint8Array(data.buffer, data.byteOffset, total);
+  for (let off = 0; off < total; off += UPLOAD_CHUNK_BYTES) {
+    const len = Math.min(UPLOAD_CHUNK_BYTES, total - off);
+    profileApiCall("writeBuffer", () =>
+      queue.writeBuffer(buffer, off, bytes.subarray(off, off + len)),
+    );
+  }
+}
+
 export function createBufferWithData(
   device: GPUDevice,
   data: Float32Array | Int32Array | Uint32Array | Uint16Array,
@@ -288,12 +312,21 @@ export function createBufferWithData(
     // NOTE: Don't call trackAllocation here! The buffer was already tracked
     // when it was first created, and we don't call trackDeallocation when
     // releasing to pool. Memory tracking stays consistent throughout pool lifecycle.
-    profileApiCall("writeBuffer", () => queue.writeBuffer(pooled, 0, data));
+    writeBufferChunked(queue, pooled, data);
     return pooled;
   }
   // Release back to pool if we acquired but didn't use
   if (pooled) {
     bufferPool.deferredDestroy(pooled, pooled.size);
+  }
+
+  // Huge payloads: skip mappedAtCreation (a gigabyte-scale getMappedRange
+  // forces the browser to materialize + copy the whole range at once) and
+  // upload via chunked writeBuffer instead.
+  if (queue && data.byteLength > UPLOAD_CHUNK_BYTES) {
+    const buffer = createTrackedBuffer(device, { size: alignedSize, usage });
+    writeBufferChunked(queue, buffer, data);
+    return buffer;
   }
 
   // Create new buffer with mappedAtCreation for efficient initial write.

@@ -929,7 +929,7 @@ export class RuntimeEngine {
   }
 
   tensorFromArray(
-    values: number[] | Float32Array | Int32Array | Uint32Array,
+    values: number[] | Float32Array | Int32Array | Uint32Array | Uint16Array,
     shape: number[],
     device?: DeviceKind,
     dtype: DType = "f32",

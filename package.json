@@ -8,6 +8,10 @@
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     },
+    "./nn": {
+      "import": "./dist/nn.js",
+      "types": "./dist/nn.d.ts"
+    },
     "./browser": {
       "import": "./dist/browser.js",
       "types": "./dist/browser.d.ts"
@@ -21,6 +25,7 @@
   ],
   "scripts": {
     "build": "tsdown",
+    "prepare": "tsdown",
     "dev": "tsdown --watch",
     "lint": "biome check --error-on-warnings",
     "format": "biome format --write",
@@ -66,7 +71,8 @@
     "fast-check": "^4.5.3",
     "playwright": "^1.57.0",
     "size-limit": "^8.2.4",
-    "tsdown": "^0.15.0",
+    "tsdown": "^0.22.3",
+    "tsx": "^4.19.0",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   }

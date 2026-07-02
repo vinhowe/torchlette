@@ -9,6 +9,11 @@ import { Module } from "./module";
 export type EmbeddingOptions = {
   /** Device to create parameters on */
   device?: DeviceKind;
+  /**
+   * Parameter dtype. Default: "f32". Non-f32 skips random init (weight is
+   * zeros) — intended for pretrained-weight loading.
+   */
+  dtype?: import("../backend/types").DType;
 };
 
 /**
@@ -41,11 +46,15 @@ export class Embedding extends Module {
     this.embeddingDim = embeddingDim;
 
     const device = options?.device;
+    const dtype = options?.dtype ?? "f32";
 
-    // Initialize with standard normal distribution
+    // Initialize with standard normal distribution (f32 only; non-f32 is the
+    // pretrained-loading path and starts as zeros).
     this.registerParameter(
       "weight",
-      api.randn([numEmbeddings, embeddingDim], { requiresGrad: true, device }),
+      dtype === "f32"
+        ? api.randn([numEmbeddings, embeddingDim], { requiresGrad: true, device })
+        : api.zeros([numEmbeddings, embeddingDim], { requiresGrad: true, device, dtype }),
     );
   }
 

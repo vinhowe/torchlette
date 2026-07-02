@@ -10,6 +10,7 @@ export {
   enableAllAllocDebug,
   enableProfiling,
   getAndResetFlowCounters,
+  getGpuUncapturedErrorCount,
   getGPUMemoryStats,
   getLeakedAllocCount,
   getLeakedAllocCountForStep,
@@ -41,6 +42,9 @@ export {
   torch,
 } from "./frontend/torchlette";
 export { storageTracker } from "./graph/storage-tracker";
+// Runtime namespace (works at runtime). NOTE: the dts bundler does not emit a
+// usable type for this re-export, so for TYPED access consumers should import
+// from the "torchlette/nn" subpath (named exports, fully typed).
 export * as nn from "./nn";
 export {
   Adam,
