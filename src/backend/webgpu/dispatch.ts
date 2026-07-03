@@ -294,10 +294,14 @@ export function dispatchBinary(
       a.shape.length === b.shape.length &&
       a.shape.every((d, i) => d === b.shape[i]);
 
+    // Chunked binding slices buffers from element 0 — require offset 0 in
+    // addition to contiguous strides (offset-view class, task #58).
+    const aRB = a.isContiguous && (a.offset ?? 0) === 0;
+    const bRB = b.isContiguous && (b.offset ?? 0) === 0;
     if (
-      (sameShape && a.isContiguous && b.isContiguous) ||
-      (aIsScalar && b.isContiguous) ||
-      (bIsScalar && a.isContiguous)
+      (sameShape && aRB && bRB) ||
+      (aIsScalar && aRB && bRB) ||
+      (bIsScalar && bRB && aRB)
     ) {
       return binaryChunked(
         op,
@@ -314,8 +318,8 @@ export function dispatchBinary(
     }
 
     if (sameShape) {
-      const aC = a.isContiguous ? a : ensureContiguous(a);
-      const bC = b.isContiguous ? b : ensureContiguous(b);
+      const aC = ensureContiguous(a);
+      const bC = ensureContiguous(b);
       const result = binaryChunked(
         op,
         aC,
@@ -333,13 +337,19 @@ export function dispatchBinary(
       return result;
     }
 
-    if (!a.isContiguous && aSizeBytes > maxBindingSize) {
+    if (
+      !(a.isContiguous && (a.offset ?? 0) === 0) &&
+      aSizeBytes > maxBindingSize
+    ) {
       const aC = ensureContiguous(a);
       const result = dispatchBinary(op, aC, b, options);
       aC.destroy?.();
       return result;
     }
-    if (!b.isContiguous && bSizeBytes > maxBindingSize) {
+    if (
+      !(b.isContiguous && (b.offset ?? 0) === 0) &&
+      bSizeBytes > maxBindingSize
+    ) {
       const bC = ensureContiguous(b);
       const result = dispatchBinary(op, a, bC, options);
       bC.destroy?.();
@@ -481,8 +491,14 @@ export function dispatchUnary(
   const maxBindingSize =
     ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
 
-  // Chunked dispatch for large contiguous tensors
-  if (a.size * bytesPerElement > maxBindingSize && a.isContiguous) {
+  // Chunked dispatch for large contiguous tensors (offset 0 required: the
+  // chunked binding slices the buffer from element 0 — offset-view class,
+  // task #58).
+  if (
+    a.size * bytesPerElement > maxBindingSize &&
+    a.isContiguous &&
+    (a.offset ?? 0) === 0
+  ) {
     const outSize = a.size;
     const outBuffer = resolveOutputBuffer(
       ctx.device,

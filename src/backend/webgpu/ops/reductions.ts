@@ -44,7 +44,7 @@ import { alignBufferSize, contiguousStrides, dtypeBytes } from "../shape-utils";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import { createTileKernelDispatcher } from "../tile-dispatch";
 
-import { contiguous } from "./views";
+import { contiguous, ensureContiguous } from "./views";
 
 // ============================================================================
 // Shared Metadata
@@ -199,8 +199,13 @@ function addEpilogueBindings(
 ): void {
   for (const eop of epilogueOps) {
     if (eop.kind === "binary" && eop.inputIndex !== undefined) {
-      buffers[`ep_in${eop.inputIndex}`] = asGPUTensor(
-        epilogueInputs[eop.inputIndex],
+      // Epilogue inputs are bound raw from element 0 — offset/strided views
+      // must be materialized (offset-view class, task #58). NOTE: any copy
+      // created here is intentionally leaked to the step-scoped cleanup;
+      // epilogue inputs are framework-produced contiguous tensors in
+      // practice, this is a correctness backstop.
+      buffers[`ep_in${eop.inputIndex}`] = ensureContiguous(
+        asGPUTensor(epilogueInputs[eop.inputIndex]),
       ).buffer;
     }
   }
@@ -224,7 +229,10 @@ export function reduction(
   let tensor = asGPUTensor(a);
   let contiguousCopy: ReturnType<typeof asGPUTensor> | null = null;
 
-  if (!tensor.isContiguous) {
+  // Materialize non-raw-bindable inputs: contiguous strides with offset>0
+  // (narrow views) would otherwise be bound flat from element 0 and reduce
+  // the WRONG region (offset-view class, task #58).
+  if (!tensor.isContiguous || (tensor.offset ?? 0) !== 0) {
     tensor = asGPUTensor(contiguous(tensor));
     contiguousCopy = tensor;
   }
@@ -331,7 +339,10 @@ function dimReductionKey(
 ): string {
   const epiSig = epilogueOps
     ? epilogueOps
-        .map((e) => `${e.kind}:${(e as { op?: string }).op ?? ""}:${(e as { inputIndex?: number }).inputIndex ?? ""}`)
+        .map(
+          (e) =>
+            `${e.kind}:${(e as { op?: string }).op ?? ""}:${(e as { inputIndex?: number }).inputIndex ?? ""}`,
+        )
         .join("|")
     : "";
   return `${op}Dim:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim ? 1 : 0}:${epiSig}`;
@@ -370,7 +381,13 @@ export function planDimReductionDispatch(
 ): import("../tile-dispatch").TileKernelPlan | null {
   const setup = prepareDimReduction(inputShape, dim, keepdim);
   if (!setup) return null; // all dims reduced → caller should use full reduction
-  return getDimReductionDispatcher(op, inputShape, setup, keepdim, undefined).plan({
+  return getDimReductionDispatcher(
+    op,
+    inputShape,
+    setup,
+    keepdim,
+    undefined,
+  ).plan({
     outSize: setup.outSize,
     reductionSize: setup.reductionSize,
   });
@@ -577,12 +594,15 @@ function sumFullReductionChunked(
 
   // Final reduction of partials → scalar. Fresh arena alloc (kind 1).
   const outBuffer = allocateOutputBuffer(4);
-  const finalParamsBuffer = createParamsBuffer(ctx.device, plan.finalParamsData!);
-  const finalBindGroup = cachedCreateBindGroup(ctx.device, plan.finalPipeline!, [
-    partialsBuffer,
-    outBuffer,
-    finalParamsBuffer,
-  ]);
+  const finalParamsBuffer = createParamsBuffer(
+    ctx.device,
+    plan.finalParamsData!,
+  );
+  const finalBindGroup = cachedCreateBindGroup(
+    ctx.device,
+    plan.finalPipeline!,
+    [partialsBuffer, outBuffer, finalParamsBuffer],
+  );
   dispatchComputePass(plan.finalPipeline!, finalBindGroup, 1);
   releaseParamsBuffer(finalParamsBuffer);
 
@@ -868,7 +888,9 @@ export function batchedReduction(
   const ctx = requireContext();
   const tensors = inputs.map((t) => {
     const gpu = asGPUTensor(t);
-    return gpu.isContiguous ? gpu : asGPUTensor(contiguous(gpu));
+    return gpu.isContiguous && (gpu.offset ?? 0) === 0
+      ? gpu
+      : asGPUTensor(contiguous(gpu));
   });
 
   const inputShape = tensors[0].shape;

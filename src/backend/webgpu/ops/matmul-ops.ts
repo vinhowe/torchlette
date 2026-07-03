@@ -383,9 +383,14 @@ function matmulChunked(
     );
   }
 
+  // sliceColumns reads B flat from element 0 — materialize offset>0 views
+  // first (offset-view class, task #58). contiguous() uses a buffer-to-buffer
+  // DMA for offset-only views, which is not subject to the binding limit.
+  const bEffective = ensureContiguous(b);
+
   const result = matmulChunkedContiguous(
     aContiguous,
-    b,
+    bEffective,
     M,
     K,
     N,
@@ -395,6 +400,7 @@ function matmulChunked(
     minAlignment,
   );
   if (aWasCopied) aContiguous.destroy?.();
+  if (bEffective !== b) bEffective.destroy?.();
   return result;
 }
 
@@ -621,12 +627,17 @@ function matmulChunkedContiguous(
  */
 function matmulChunkedOutput(
   a: WebGPUTensor,
-  b: WebGPUTensor,
+  _b: WebGPUTensor,
   maxBindingSize: number,
 ): WebGPUTensor {
   const ctx = requireContext();
   const limits = ctx.device.limits;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
+
+  // sliceBColumns reads B flat from element 0 with contiguous [batch,K,N]
+  // indexing — materialize offset/strided views first (offset-view class,
+  // task #58). (A flows through dispatchMatmul, which preps its own inputs.)
+  const b = ensureContiguous(_b);
 
   // Get shapes
   const aShape = a.shape;
@@ -715,6 +726,7 @@ function matmulChunkedOutput(
     partialResult.destroy?.();
   }
 
+  if (b !== _b) b.destroy?.();
   return createTensor(outShape, outBuffer, undefined, 0, "f32", true);
 }
 

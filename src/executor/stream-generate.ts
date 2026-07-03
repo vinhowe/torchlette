@@ -17,15 +17,39 @@
  * each sharing its spec/codegen with the imperative dispatcher so pipeline
  * identity resolves through the same caches.
  */
+
+import { planAdamStepDispatch } from "../backend/webgpu/adam-kernel";
 import {
+  type AttentionStepPlan,
+  planFlashAttentionBackward,
+  planFlashAttentionForward,
+} from "../backend/webgpu/attention-kernel";
+import {
+  planCrossEntropyBackwardDispatch,
+  planCrossEntropyForwardDispatch,
+} from "../backend/webgpu/cross-entropy-kernel";
+import type { BareMatmulPlan } from "../backend/webgpu/dispatch";
+import {
+  getPipeline,
   planBinaryDirect,
   planUnaryDirect,
 } from "../backend/webgpu/dispatch";
+import { planFusedKernel } from "../backend/webgpu/fusion-dispatch";
+import { requireContext } from "../backend/webgpu/gpu-context";
+import { gpuBuffer } from "../backend/webgpu/gpu-types";
 import {
-  planCastDirect,
-  planContiguousDirect,
-  planNarrowBackward,
-} from "../backend/webgpu/ops/views";
+  planLayerNormBackwardGradWeightBias,
+  planLayerNormBackwardGradXDispatch,
+  planLayerNormForwardDispatch,
+} from "../backend/webgpu/layernorm-kernel";
+import {
+  lookupKSplitTempBuffer,
+  planTiledMatmul,
+} from "../backend/webgpu/matmul/dispatch";
+import {
+  planGatherDirect,
+  planScatterAddDirect,
+} from "../backend/webgpu/ops/gather-scatter";
 import {
   fullReductionNeedsChunking,
   planChunkedFullReduction,
@@ -34,46 +58,20 @@ import {
   planMeanDivDispatch,
 } from "../backend/webgpu/ops/reductions";
 import {
-  planGatherDirect,
-  planScatterAddDirect,
-} from "../backend/webgpu/ops/gather-scatter";
-import {
-  planLayerNormBackwardGradWeightBias,
-  planLayerNormBackwardGradXDispatch,
-  planLayerNormForwardDispatch,
-} from "../backend/webgpu/layernorm-kernel";
-import {
-  planCrossEntropyBackwardDispatch,
-  planCrossEntropyForwardDispatch,
-} from "../backend/webgpu/cross-entropy-kernel";
-import { planFusedKernel } from "../backend/webgpu/fusion-dispatch";
-import {
-  lookupKSplitTempBuffer,
-  planTiledMatmul,
-} from "../backend/webgpu/matmul/dispatch";
-import {
-  type AttentionStepPlan,
-  planFlashAttentionBackward,
-  planFlashAttentionForward,
-} from "../backend/webgpu/attention-kernel";
-import type { BareMatmulPlan } from "../backend/webgpu/dispatch";
-import { dtypeBytes } from "../backend/webgpu/shape-utils";
-import { planAdamStepDispatch } from "../backend/webgpu/adam-kernel";
+  planCastDirect,
+  planContiguousDirect,
+  planNarrowBackward,
+} from "../backend/webgpu/ops/views";
+import { alignBufferSize, dtypeBytes } from "../backend/webgpu/shape-utils";
+import type { WebGPUTensor } from "../backend/webgpu/tensor";
+import type { TileKernelPlan } from "../backend/webgpu/tile-dispatch";
+import { planUnscaleGradDispatch } from "../backend/webgpu/unscale-kernel";
+import { sizeOf } from "../core/shape";
+import type { LazyIRNode, StorageHandle } from "../graph/types";
 import {
   lookupPackedBuffers,
   planPackedGroups,
 } from "../optim/packed-dispatch";
-import { getInputStorage } from "./op-dispatch";
-import { lookupScalarStorage } from "./scalar-table";
-import { planUnscaleGradDispatch } from "../backend/webgpu/unscale-kernel";
-import type { TileKernelPlan } from "../backend/webgpu/tile-dispatch";
-import { requireContext } from "../backend/webgpu/gpu-context";
-import { getPipeline } from "../backend/webgpu/dispatch";
-import { alignBufferSize } from "../backend/webgpu/shape-utils";
-import { gpuBuffer } from "../backend/webgpu/gpu-types";
-import type { WebGPUTensor } from "../backend/webgpu/tensor";
-import type { LazyIRNode, StorageHandle } from "../graph/types";
-import { sizeOf } from "../core/shape";
 import type { GpuCommand, Slot, SlotSource } from "./compiled-plan";
 import {
   TAG_ALLOC,
@@ -85,6 +83,8 @@ import {
   TAG_WRITE,
 } from "./compiled-plan";
 import type { AttnInputContig, LoweredPlan } from "./lowered-plan";
+import { getInputStorage } from "./op-dispatch";
+import { lookupScalarStorage } from "./scalar-table";
 
 export interface GeneratedStream {
   /** Per-covered-action command segments, in action order. Verified against
@@ -221,7 +221,9 @@ export function generateStream(
   // multi-output producers (attention dQ/dK/dV, logsumexp) whose non-primary
   // outputs are released by plan-build and have no recoverable buffer.
   const nodeSlotExtra = new Map<string, Slot>();
-  const resolveRefSlot = (ref: LazyIRNode["inputs"][number]): Slot | undefined => {
+  const resolveRefSlot = (
+    ref: LazyIRNode["inputs"][number],
+  ): Slot | undefined => {
     if (ref.kind === "scalar") return undefined;
     if (ref.kind !== "materialized") {
       const oi = ref.outputIndex ?? 0;
@@ -231,14 +233,11 @@ export function generateStream(
           oi === 0 ? nodeSlot.get(idx) : nodeSlotExtra.get(`${idx}:${oi}`);
         if (s !== undefined) return s;
       }
-      const storage =
-        oi === 0 ? ref.node.result : ref.node.results?.[oi];
+      const storage = oi === 0 ? ref.node.result : ref.node.results?.[oi];
       if (!storage) return undefined;
       return bufferToSlot.get(gpuBuffer(storage.backendTensor) as unknown);
     }
-    return bufferToSlot.get(
-      gpuBuffer(ref.storage.backendTensor) as unknown,
-    );
+    return bufferToSlot.get(gpuBuffer(ref.storage.backendTensor) as unknown);
   };
   // Slot for a REAL buffer object (config caches, inf flags): one slot per
   // buffer, shared across the stream — mirroring the recording's
@@ -312,7 +311,9 @@ export function generateStream(
         const node = planNodes[action.nodeIndex];
         const gen = generateDataSource(node, action.nodeIndex, slots);
         if (!gen) {
-          miss(`data-source:${node.op}${node.dtype !== "f32" ? `:${node.dtype}` : ""}`);
+          miss(
+            `data-source:${node.op}${node.dtype !== "f32" ? `:${node.dtype}` : ""}`,
+          );
           phantom(node, action.nodeIndex);
           break;
         }
@@ -377,7 +378,8 @@ export function generateStream(
                 slots,
                 resolveRefSlot,
                 bufferSlot,
-                (action as { cachedInputShapes?: number[][] }).cachedInputShapes,
+                (action as { cachedInputShapes?: number[][] })
+                  .cachedInputShapes,
                 (action as { cachedStridedInputs?: (AttnInputContig | null)[] })
                   .cachedStridedInputs,
               );
@@ -393,7 +395,10 @@ export function generateStream(
         }
         commands.push(...gen.commands);
         if (gen.commands.length > 0) {
-          segments.push({ nodeIndex: action.nodeIndex, commands: gen.commands });
+          segments.push({
+            nodeIndex: action.nodeIndex,
+            commands: gen.commands,
+          });
         }
         mapNodeResult(node, gen.outSlot, bufferToSlot);
         nodeSlot.set(action.nodeIndex, gen.outSlot);
@@ -414,7 +419,14 @@ export function generateStream(
       case "fused": {
         const fa = action as FusedActionShape;
         const gen = backend
-          ? generateFused(fa, planNodes, slots, resolveRefSlot, bufferSlot, backend)
+          ? generateFused(
+              fa,
+              planNodes,
+              slots,
+              resolveRefSlot,
+              bufferSlot,
+              backend,
+            )
           : "no-backend";
         if (typeof gen === "string") {
           miss(`fused[${gen}]`);
@@ -427,7 +439,10 @@ export function generateStream(
           break;
         }
         commands.push(...gen.commands);
-        segments.push({ nodeIndex: fa.outputNodeIndex, commands: gen.commands });
+        segments.push({
+          nodeIndex: fa.outputNodeIndex,
+          commands: gen.commands,
+        });
         for (const o of gen.outputs) {
           mapNodeResult(planNodes[o.nodeIndex], o.slot, bufferToSlot);
           nodeSlot.set(o.nodeIndex, o.slot);
@@ -438,7 +453,14 @@ export function generateStream(
       case "matmul-epilogue": {
         const me = action as MatmulEpilogueActionShape;
         const gen = backend
-          ? generateMatmulEpilogue(me, planNodes, slots, resolveRefSlot, bufferSlot, backend)
+          ? generateMatmulEpilogue(
+              me,
+              planNodes,
+              slots,
+              resolveRefSlot,
+              bufferSlot,
+              backend,
+            )
           : "no-backend";
         if (typeof gen === "string") {
           miss(`matmul-epilogue[${gen}]`);
@@ -446,7 +468,10 @@ export function generateStream(
           break;
         }
         commands.push(...gen.commands);
-        segments.push({ nodeIndex: me.matmulNodeIndex, commands: gen.commands });
+        segments.push({
+          nodeIndex: me.matmulNodeIndex,
+          commands: gen.commands,
+        });
         mapNodeResult(planNodes[me.outputNodeIndex], gen.outSlot, bufferToSlot);
         nodeSlot.set(me.outputNodeIndex, gen.outSlot);
         coveredActions++;
@@ -455,7 +480,14 @@ export function generateStream(
       case "adam-batch": {
         const ab = action as { nodeIndices: number[] };
         const gen = backend
-          ? generateAdamBatch(ab, planNodes, slots, resolveRefSlot, bufferSlot, backend)
+          ? generateAdamBatch(
+              ab,
+              planNodes,
+              slots,
+              resolveRefSlot,
+              bufferSlot,
+              backend,
+            )
           : "no-backend";
         if (typeof gen === "string") {
           miss(`adam-batch[${gen}]`);
@@ -471,7 +503,10 @@ export function generateStream(
           }
         }
         commands.push(...gen.commands);
-        segments.push({ nodeIndex: gen.firstNodeIndex, commands: gen.commands });
+        segments.push({
+          nodeIndex: gen.firstNodeIndex,
+          commands: gen.commands,
+        });
         for (const o of gen.outputs) {
           // adamStep is multi-output (param oi0, m oi1, v oi2). Primary → the
           // node→slot + buffer→slot channels; m/v extras → the extra channel so
@@ -505,7 +540,10 @@ export function generateStream(
           break;
         }
         commands.push(...gen.commands);
-        segments.push({ nodeIndex: gen.firstNodeIndex, commands: gen.commands });
+        segments.push({
+          nodeIndex: gen.firstNodeIndex,
+          commands: gen.commands,
+        });
         for (const o of gen.outputs) {
           mapNodeResult(planNodes[o.nodeIndex], o.slot, bufferToSlot);
           nodeSlot.set(o.nodeIndex, o.slot);
@@ -706,8 +744,7 @@ function generateSequential(
     return generateScatterCopyDMA(node, resolveRefSlot);
   if (node.op === "fusedLayerNormForward")
     return generateLayerNormForward(node, slots, resolveRefSlot, bufferSlot);
-  if (node.op === "gather")
-    return generateGather(node, slots, resolveRefSlot);
+  if (node.op === "gather") return generateGather(node, slots, resolveRefSlot);
   if (node.op === "scatterAdd")
     return generateScatterAdd(node, slots, resolveRefSlot);
   if (node.op === "fusedLayerNormBackwardGradX")
@@ -715,11 +752,21 @@ function generateSequential(
   if (node.op === "fusedLayerNormBackwardGradWeightBias")
     return generateLayerNormGradWB(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "narrowBackward")
-    return generateNarrowBackward(node, slots, resolveRefSlot, cachedInputShapes);
+    return generateNarrowBackward(
+      node,
+      slots,
+      resolveRefSlot,
+      cachedInputShapes,
+    );
   if (node.op === "fusedCrossEntropyForward")
     return generateCrossEntropyForward(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "fusedCrossEntropyBackward")
-    return generateCrossEntropyBackward(node, slots, resolveRefSlot, bufferSlot);
+    return generateCrossEntropyBackward(
+      node,
+      slots,
+      resolveRefSlot,
+      bufferSlot,
+    );
   if (node.op === "mean")
     return generateMean(node, slots, resolveRefSlot, bufferSlot);
   const wgslOp = BINARY_OPS.get(node.op);
@@ -763,9 +810,9 @@ function generateSequential(
     const storage =
       ref.kind === "materialized"
         ? ref.storage
-        : ((ref.outputIndex ?? 0) === 0
-            ? ref.node.result
-            : ref.node.results?.[ref.outputIndex ?? 0]);
+        : (ref.outputIndex ?? 0) === 0
+          ? ref.node.result
+          : ref.node.results?.[ref.outputIndex ?? 0];
     let meta: WebGPUTensor;
     if (storage) {
       meta = storage.backendTensor as WebGPUTensor;
@@ -830,7 +877,7 @@ function generateSequential(
     // Already-contiguous fast path: a non-owning view, ZERO commands — the
     // node's result shares the input buffer (mapNodeResult will re-map the
     // same buffer to the input's slot; out slot is the input's).
-    if (ins[0].isContiguous) {
+    if (ins[0].isContiguous && (ins[0].offset ?? 0) === 0) {
       return { commands: [], outSlot: inSlots[0] };
     }
     plan = planContiguousDirect(ins[0]);
@@ -917,7 +964,9 @@ function generateFullReduction(
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
 ): { commands: GpuCommand[]; outSlot: Slot } | string {
   const reduceOp = "sum";
-  const payload = node.payload as { dim?: number | number[] | null } | undefined;
+  const payload = node.payload as
+    | { dim?: number | number[] | null }
+    | undefined;
   if (payload?.dim != null)
     return generateDimReduction(node, slots, resolveRefSlot, bufferSlot);
   if (node.inputs.length !== 1) return "arity";
@@ -926,16 +975,16 @@ function generateFullReduction(
   const storage =
     ref.kind === "materialized"
       ? ref.storage
-      : ((ref.outputIndex ?? 0) === 0
-          ? ref.node.result
-          : ref.node.results?.[ref.outputIndex ?? 0]);
+      : (ref.outputIndex ?? 0) === 0
+        ? ref.node.result
+        : ref.node.results?.[ref.outputIndex ?? 0];
   const inSlot = resolveRefSlot(ref);
   if (inSlot === undefined) return "untracked-producer";
   let size: number;
   let bytesPerElement = 4;
   if (storage) {
     const t = storage.backendTensor as WebGPUTensor;
-    if (!t.isContiguous) return "non-contiguous";
+    if (!t.isContiguous || (t.offset ?? 0) !== 0) return "non-contiguous";
     size = t.size;
     bytesPerElement = dtypeBytes(t.dtype);
   } else if (ref.kind !== "materialized" && !VIEW_OPS.has(ref.node.op)) {
@@ -960,7 +1009,13 @@ function generateFullReduction(
   if (!bindings) return "config-missing";
   return {
     commands: [
-      { tag: TAG_ALLOC, slot: outSlot, bytes: 4, allocKind: 0, inputSlots: [inSlot] },
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: 4,
+        allocKind: 0,
+        inputSlots: [inSlot],
+      },
       {
         tag: TAG_DISPATCH,
         pipeline: plan.pipeline,
@@ -991,7 +1046,11 @@ function generateChunkedFullReduction(
   inSlot: Slot,
   slots: SlotSource[],
 ): { commands: GpuCommand[]; outSlot: Slot } {
-  const plan = planChunkedFullReduction(size, bytesPerElement, requireContext());
+  const plan = planChunkedFullReduction(
+    size,
+    bytesPerElement,
+    requireContext(),
+  );
   const commands: GpuCommand[] = [];
 
   const partialsSlot = slots.length;
@@ -1076,13 +1135,13 @@ function generateDimReduction(
   const storage =
     ref.kind === "materialized"
       ? ref.storage
-      : ((ref.outputIndex ?? 0) === 0
-          ? ref.node.result
-          : ref.node.results?.[ref.outputIndex ?? 0]);
+      : (ref.outputIndex ?? 0) === 0
+        ? ref.node.result
+        : ref.node.results?.[ref.outputIndex ?? 0];
   let inShape: number[];
   if (storage) {
     const t = storage.backendTensor as WebGPUTensor;
-    if (!t.isContiguous) return "non-contiguous";
+    if (!t.isContiguous || (t.offset ?? 0) !== 0) return "non-contiguous";
     inShape = t.shape;
   } else {
     const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
@@ -1100,11 +1159,21 @@ function generateDimReduction(
   const outBytes = sizeOf(outShape) * 4;
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
-  const bindings = tilePlanBindings(plan, { input: inSlot, out: outSlot }, bufferSlot);
+  const bindings = tilePlanBindings(
+    plan,
+    { input: inSlot, out: outSlot },
+    bufferSlot,
+  );
   if (!bindings) return "config-missing";
   return {
     commands: [
-      { tag: TAG_ALLOC, slot: outSlot, bytes: outBytes, allocKind: 0, inputSlots: [inSlot] },
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: outBytes,
+        allocKind: 0,
+        inputSlots: [inSlot],
+      },
       {
         tag: TAG_DISPATCH,
         pipeline: plan.pipeline,
@@ -1141,13 +1210,13 @@ function generateMean(
   const storage =
     ref.kind === "materialized"
       ? ref.storage
-      : ((ref.outputIndex ?? 0) === 0
-          ? ref.node.result
-          : ref.node.results?.[ref.outputIndex ?? 0]);
+      : (ref.outputIndex ?? 0) === 0
+        ? ref.node.result
+        : ref.node.results?.[ref.outputIndex ?? 0];
   let inShape: number[];
   if (storage) {
     const t = storage.backendTensor as WebGPUTensor;
-    if (!t.isContiguous) return "non-contiguous";
+    if (!t.isContiguous || (t.offset ?? 0) !== 0) return "non-contiguous";
     inShape = t.shape;
   } else {
     const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
@@ -1162,7 +1231,9 @@ function generateMean(
           d < 0 ? d + inShape.length : d,
         );
   const count =
-    dims == null ? sizeOf(inShape) : dims.reduce((acc, d) => acc * inShape[d], 1);
+    dims == null
+      ? sizeOf(inShape)
+      : dims.reduce((acc, d) => acc * inShape[d], 1);
 
   // --- sum part (cached full or dim reduction) ---
   let sumPlan: TileKernelPlan;
@@ -1173,29 +1244,68 @@ function generateMean(
     sumPlan = planFullReductionDispatch("sum", inSize);
     sumOutBytes = 4;
   } else {
-    const p = planDimReductionDispatch("sum", inShape, payload!.dim!, payload?.keepdim ?? false);
+    const p = planDimReductionDispatch(
+      "sum",
+      inShape,
+      payload!.dim!,
+      payload?.keepdim ?? false,
+    );
     if (!p) return "all-dims-or-epilogue";
     sumPlan = p;
     sumOutBytes = outSize * 4;
   }
   const sumSlot = slots.length;
   slots.push({ kind: "arena" });
-  const sumBindings = tilePlanBindings(sumPlan, { input: inSlot, out: sumSlot }, bufferSlot);
+  const sumBindings = tilePlanBindings(
+    sumPlan,
+    { input: inSlot, out: sumSlot },
+    bufferSlot,
+  );
   if (!sumBindings) return "config-missing";
 
   // --- meanDiv part (cached "meanDiv", size+count uniforms) ---
   const divPlan = planMeanDivDispatch(outSize, count);
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
-  const divBindings = tilePlanBindings(divPlan, { input: sumSlot, out: outSlot }, bufferSlot);
+  const divBindings = tilePlanBindings(
+    divPlan,
+    { input: sumSlot, out: outSlot },
+    bufferSlot,
+  );
   if (!divBindings) return "config-missing";
 
   return {
     commands: [
-      { tag: TAG_ALLOC, slot: sumSlot, bytes: sumOutBytes, allocKind: 0, inputSlots: [inSlot] },
-      { tag: TAG_DISPATCH, pipeline: sumPlan.pipeline, bindings: sumBindings, gx: sumPlan.grid[0], gy: sumPlan.grid[1], gz: sumPlan.grid[2] },
-      { tag: TAG_ALLOC, slot: outSlot, bytes: outSize * 4, allocKind: 0, inputSlots: [sumSlot] },
-      { tag: TAG_DISPATCH, pipeline: divPlan.pipeline, bindings: divBindings, gx: divPlan.grid[0], gy: divPlan.grid[1], gz: divPlan.grid[2] },
+      {
+        tag: TAG_ALLOC,
+        slot: sumSlot,
+        bytes: sumOutBytes,
+        allocKind: 0,
+        inputSlots: [inSlot],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: sumPlan.pipeline,
+        bindings: sumBindings,
+        gx: sumPlan.grid[0],
+        gy: sumPlan.grid[1],
+        gz: sumPlan.grid[2],
+      },
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: outSize * 4,
+        allocKind: 0,
+        inputSlots: [sumSlot],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: divPlan.pipeline,
+        bindings: divBindings,
+        gx: divPlan.grid[0],
+        gy: divPlan.grid[1],
+        gz: divPlan.grid[2],
+      },
     ],
     outSlot,
   };
@@ -1210,13 +1320,21 @@ function generateMean(
  *  would take the true-batched path (reductionSize ≤ 64) — a different command
  *  shape — or when any member isn't generatable. */
 function generateBatchedReduction(
-  action: { nodeIndices: number[]; reduceOp: string; payload: { dim: number | number[]; keepdim?: boolean } },
+  action: {
+    nodeIndices: number[];
+    reduceOp: string;
+    payload: { dim: number | number[]; keepdim?: boolean };
+  },
   planNodes: LazyIRNode[],
   slots: SlotSource[],
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
 ):
-  | { commands: GpuCommand[]; outputs: Array<{ nodeIndex: number; slot: Slot }>; firstNodeIndex: number }
+  | {
+      commands: GpuCommand[];
+      outputs: Array<{ nodeIndex: number; slot: Slot }>;
+      firstNodeIndex: number;
+    }
   | string {
   if (action.nodeIndices.length === 0) return "empty";
   const op = action.reduceOp;
@@ -1236,13 +1354,13 @@ function generateBatchedReduction(
     const storage =
       ref.kind === "materialized"
         ? ref.storage
-        : ((ref.outputIndex ?? 0) === 0
-            ? ref.node.result
-            : ref.node.results?.[ref.outputIndex ?? 0]);
+        : (ref.outputIndex ?? 0) === 0
+          ? ref.node.result
+          : ref.node.results?.[ref.outputIndex ?? 0];
     let inShape: number[];
     if (storage) {
       const t = storage.backendTensor as WebGPUTensor;
-      if (!t.isContiguous) return "non-contiguous";
+      if (!t.isContiguous || (t.offset ?? 0) !== 0) return "non-contiguous";
       inShape = t.shape;
     } else {
       const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
@@ -1260,10 +1378,20 @@ function generateBatchedReduction(
     if (!plan) return "all-dims-or-epilogue";
     const outSlot = slots.length;
     slots.push({ kind: "arena" });
-    const bindings = tilePlanBindings(plan, { input: inSlot, out: outSlot }, bufferSlot);
+    const bindings = tilePlanBindings(
+      plan,
+      { input: inSlot, out: outSlot },
+      bufferSlot,
+    );
     if (!bindings) return "config-missing";
     commands.push(
-      { tag: TAG_ALLOC, slot: outSlot, bytes: sizeOf(node.shape) * 4, allocKind: 0, inputSlots: [inSlot] },
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: sizeOf(node.shape) * 4,
+        allocKind: 0,
+        inputSlots: [inSlot],
+      },
       {
         tag: TAG_DISPATCH,
         pipeline: plan.pipeline,
@@ -1303,7 +1431,13 @@ function refShapeDtype(
 /** Contiguous-view ops whose logical node.shape == physical layout: a flat
  *  kernel binding the shared base buffer reads them correctly. Strided views
  *  (narrow/transpose/slice/expand) are deliberately excluded. */
-const CONTIGUOUS_VIEW_OPS = new Set(["reshape", "view", "flatten", "squeeze", "unsqueeze"]);
+const CONTIGUOUS_VIEW_OPS = new Set([
+  "reshape",
+  "view",
+  "flatten",
+  "squeeze",
+  "unsqueeze",
+]);
 
 /** Logical shape/dtype for a released contiguous-view producer (oi 0). Returns
  *  undefined for non-views, strided views, or multi-output extras. */
@@ -1343,7 +1477,8 @@ function generateScatterAdd(
   // above); refShapeDtype skips all VIEW_OPS, so derive it here for the
   // contiguous-reshape class only — strided views (narrow/transpose) would
   // mislead the flat-indexed kernel and must keep bailing.
-  const src = refShapeDtype(node.inputs[2]) ?? contiguousViewShapeDtype(node.inputs[2]);
+  const src =
+    refShapeDtype(node.inputs[2]) ?? contiguousViewShapeDtype(node.inputs[2]);
   if (!a || !idx || !src) return "no-shape";
   const plan = planScatterAddDirect(a.shape, src.shape, cfg.dim, idx.dtype);
   if (!plan) return "chunked";
@@ -1444,11 +1579,12 @@ function resolveContiguousInputSlot(
   const storage =
     ref.kind === "materialized"
       ? ref.storage
-      : ((ref.outputIndex ?? 0) === 0
-          ? ref.node.result
-          : ref.node.results?.[ref.outputIndex ?? 0]);
+      : (ref.outputIndex ?? 0) === 0
+        ? ref.node.result
+        : ref.node.results?.[ref.outputIndex ?? 0];
   if (storage) {
-    if (!(storage.backendTensor as WebGPUTensor).isContiguous) return "non-contiguous";
+    const sbt = storage.backendTensor as WebGPUTensor;
+    if (!sbt.isContiguous || (sbt.offset ?? 0) !== 0) return "non-contiguous";
   } else if (!(refShapeDtype(ref) ?? contiguousViewShapeDtype(ref))) {
     return "no-storage";
   }
@@ -1494,8 +1630,21 @@ function generateCrossEntropyForward(
   if (!bindings) return "config-missing";
   return {
     commands: [
-      { tag: TAG_ALLOC, slot: outSlot, bytes: cfg.batchSize * 4, allocKind: 1, inputSlots: [] },
-      { tag: TAG_DISPATCH, pipeline: plan.pipeline, bindings, gx: plan.grid[0], gy: plan.grid[1], gz: plan.grid[2] },
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: cfg.batchSize * 4,
+        allocKind: 1,
+        inputSlots: [],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: plan.pipeline,
+        bindings,
+        gx: plan.grid[0],
+        gy: plan.grid[1],
+        gz: plan.grid[2],
+      },
     ],
     outSlot,
   };
@@ -1533,14 +1682,32 @@ function generateCrossEntropyBackward(
   slots.push({ kind: "arena" });
   const bindings = tilePlanBindings(
     plan,
-    { logits: logitsSlot, targets: targetsSlot, grad_output: gradSlot, grad_logits: outSlot },
+    {
+      logits: logitsSlot,
+      targets: targetsSlot,
+      grad_output: gradSlot,
+      grad_logits: outSlot,
+    },
     bufferSlot,
   );
   if (!bindings) return "config-missing";
   return {
     commands: [
-      { tag: TAG_ALLOC, slot: outSlot, bytes: cfg.batchSize * cfg.vocabSize * 4, allocKind: 1, inputSlots: [] },
-      { tag: TAG_DISPATCH, pipeline: plan.pipeline, bindings, gx: plan.grid[0], gy: plan.grid[1], gz: plan.grid[2] },
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: cfg.batchSize * cfg.vocabSize * 4,
+        allocKind: 1,
+        inputSlots: [],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: plan.pipeline,
+        bindings,
+        gx: plan.grid[0],
+        gy: plan.grid[1],
+        gz: plan.grid[2],
+      },
     ],
     outSlot,
   };
@@ -1562,7 +1729,12 @@ function generateLayerNormForward(
   const cfg = node.payload as
     | { numRows?: number; featureDim?: number; eps?: number }
     | undefined;
-  if (!cfg || cfg.numRows == null || cfg.featureDim == null || cfg.eps == null) {
+  if (
+    !cfg ||
+    cfg.numRows == null ||
+    cfg.featureDim == null ||
+    cfg.eps == null
+  ) {
     return "payload";
   }
   const inSlots: Slot[] = [];
@@ -1620,7 +1792,12 @@ function generateLayerNormGradX(
   const cfg = node.payload as
     | { numRows?: number; featureDim?: number; eps?: number }
     | undefined;
-  if (!cfg || cfg.numRows == null || cfg.featureDim == null || cfg.eps == null) {
+  if (
+    !cfg ||
+    cfg.numRows == null ||
+    cfg.featureDim == null ||
+    cfg.eps == null
+  ) {
     return "payload";
   }
   const inSlots: Slot[] = [];
@@ -1689,7 +1866,10 @@ function generateAttention(
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
   inputContig: AttnInputContig[] | undefined,
 ):
-  | { commands: GpuCommand[]; outputs: Array<{ outputIndex: number; slot: Slot }> }
+  | {
+      commands: GpuCommand[];
+      outputs: Array<{ outputIndex: number; slot: Slot }>;
+    }
   | string {
   const cfg = node.payload as
     | {
@@ -1768,12 +1948,31 @@ function generateAttention(
     return {
       commands: [
         ...prologue,
-        { tag: TAG_ALLOC, slot: outSlot, bytes: p.outBytes, allocKind: 1, inputSlots: [] },
-        { tag: TAG_ALLOC, slot: lseSlot, bytes: p.lseBytes, allocKind: 1, inputSlots: [] },
+        {
+          tag: TAG_ALLOC,
+          slot: outSlot,
+          bytes: p.outBytes,
+          allocKind: 1,
+          inputSlots: [],
+        },
+        {
+          tag: TAG_ALLOC,
+          slot: lseSlot,
+          bytes: p.lseBytes,
+          allocKind: 1,
+          inputSlots: [],
+        },
         {
           tag: TAG_DISPATCH,
           pipeline: p.plan.pipeline,
-          bindings: [inSlots[0], inSlots[1], inSlots[2], outSlot, lseSlot, cfgSlot],
+          bindings: [
+            inSlots[0],
+            inSlots[1],
+            inSlots[2],
+            outSlot,
+            lseSlot,
+            cfgSlot,
+          ],
           gx: p.plan.grid[0],
           gy: p.plan.grid[1],
           gz: p.plan.grid[2],
@@ -1814,13 +2013,47 @@ function generateAttention(
   return {
     commands: [
       ...prologue,
-      { tag: TAG_ALLOC, slot: dBufSlot, bytes: p.dBytes, allocKind: 1, inputSlots: [] },
+      {
+        tag: TAG_ALLOC,
+        slot: dBufSlot,
+        bytes: p.dBytes,
+        allocKind: 1,
+        inputSlots: [],
+      },
       dispatch(p.dPlan, [dOS, oS, dBufSlot, cfgSlot]),
-      { tag: TAG_ALLOC, slot: dQSlot, bytes: p.dqBytes, allocKind: 1, inputSlots: [] },
+      {
+        tag: TAG_ALLOC,
+        slot: dQSlot,
+        bytes: p.dqBytes,
+        allocKind: 1,
+        inputSlots: [],
+      },
       dispatch(p.dqPlan, [qS, kS, vS, lseS, dBufSlot, dOS, dQSlot, cfgSlot]),
-      { tag: TAG_ALLOC, slot: dKSlot, bytes: p.dkvBytes, allocKind: 1, inputSlots: [] },
-      { tag: TAG_ALLOC, slot: dVSlot, bytes: p.dkvBytes, allocKind: 1, inputSlots: [] },
-      dispatch(p.dkvPlan, [qS, kS, vS, lseS, dBufSlot, dOS, dKSlot, dVSlot, cfgSlot]),
+      {
+        tag: TAG_ALLOC,
+        slot: dKSlot,
+        bytes: p.dkvBytes,
+        allocKind: 1,
+        inputSlots: [],
+      },
+      {
+        tag: TAG_ALLOC,
+        slot: dVSlot,
+        bytes: p.dkvBytes,
+        allocKind: 1,
+        inputSlots: [],
+      },
+      dispatch(p.dkvPlan, [
+        qS,
+        kS,
+        vS,
+        lseS,
+        dBufSlot,
+        dOS,
+        dKSlot,
+        dVSlot,
+        cfgSlot,
+      ]),
     ],
     outputs: [
       { outputIndex: 0, slot: dQSlot },
@@ -1848,7 +2081,12 @@ function generateLayerNormGradWB(
   const cfg = node.payload as
     | { numRows?: number; featureDim?: number; eps?: number }
     | undefined;
-  if (!cfg || cfg.numRows == null || cfg.featureDim == null || cfg.eps == null) {
+  if (
+    !cfg ||
+    cfg.numRows == null ||
+    cfg.featureDim == null ||
+    cfg.eps == null
+  ) {
     return "payload";
   }
   if (node.inputs[0].kind === "scalar" || node.inputs[1].kind === "scalar") {
@@ -1906,10 +2144,7 @@ function generateLayerNormGradWB(
   );
   if (!reduceBindings) return "config-missing";
 
-  const dispatch = (
-    plan: TileKernelPlan,
-    bindings: Slot[],
-  ): GpuCommand => ({
+  const dispatch = (plan: TileKernelPlan, bindings: Slot[]): GpuCommand => ({
     tag: TAG_DISPATCH,
     pipeline: plan.pipeline,
     bindings,
@@ -1960,7 +2195,12 @@ function generateNarrowBackward(
   const cfg = node.payload as
     | { dim?: number; start?: number; originalLength?: number }
     | undefined;
-  if (!cfg || cfg.dim == null || cfg.start == null || cfg.originalLength == null) {
+  if (
+    !cfg ||
+    cfg.dim == null ||
+    cfg.start == null ||
+    cfg.originalLength == null
+  ) {
     return "payload";
   }
   const ref = node.inputs[0];
@@ -2040,15 +2280,15 @@ function generateUnscaleGrad(
   const storage =
     ref.kind === "materialized"
       ? ref.storage
-      : ((ref.outputIndex ?? 0) === 0
-          ? ref.node.result
-          : ref.node.results?.[ref.outputIndex ?? 0]);
+      : (ref.outputIndex ?? 0) === 0
+        ? ref.node.result
+        : ref.node.results?.[ref.outputIndex ?? 0];
   const inSlot = resolveRefSlot(ref);
   if (inSlot === undefined) return "untracked-producer";
   let size: number;
   if (storage) {
     const t = storage.backendTensor as WebGPUTensor;
-    if (!t.isContiguous) return "non-contiguous";
+    if (!t.isContiguous || (t.offset ?? 0) !== 0) return "non-contiguous";
     size = t.size;
   } else if (ref.kind !== "materialized" && !VIEW_OPS.has(ref.node.op)) {
     size = sizeOf(ref.node.shape);
@@ -2105,9 +2345,9 @@ function refSlotAndMeta(
   const storage =
     ref.kind === "materialized"
       ? ref.storage
-      : ((ref.outputIndex ?? 0) === 0
-          ? ref.node.result
-          : ref.node.results?.[ref.outputIndex ?? 0]);
+      : (ref.outputIndex ?? 0) === 0
+        ? ref.node.result
+        : ref.node.results?.[ref.outputIndex ?? 0];
   let meta: WebGPUTensor;
   if (storage) {
     meta = storage.backendTensor as WebGPUTensor;
@@ -2172,8 +2412,7 @@ function generateScatterCopyDMA(
       (base.meta.offset ?? 0) === 0 &&
       (src.meta.isContiguous || isContig(src.meta.shape, src.meta.strides)) &&
       viewSize * 4 <=
-        (src.meta.buffer as { size: number }).size -
-          (src.meta.offset ?? 0) * 4
+        (src.meta.buffer as { size: number }).size - (src.meta.offset ?? 0) * 4
     )
   ) {
     return "non-dma-route";
@@ -2231,9 +2470,17 @@ function generateBareMatmul(
     if (!temp) return "ksplit-temp-missing";
     const tempSlot = bufferSlot(temp as unknown, "persistent");
     const ksplitParamsSlot = slots.length;
-    slots.push({ kind: "params", seqIndex: -1, data: m.ksplitParamsData.slice() });
+    slots.push({
+      kind: "params",
+      seqIndex: -1,
+      data: m.ksplitParamsData.slice(),
+    });
     const reduceParamsSlot = slots.length;
-    slots.push({ kind: "params", seqIndex: -1, data: m.reduceParamsData.slice() });
+    slots.push({
+      kind: "params",
+      seqIndex: -1,
+      data: m.reduceParamsData.slice(),
+    });
     return {
       commands: [
         {
@@ -2411,7 +2658,10 @@ interface FusedActionShape {
   additionalOutputNodeIndices?: number[];
   neededIntermediateNodeIndices?: number[];
   enableVectorization?: boolean;
-  cachedExternalInputPattern?: Array<{ nodeLocalIdx: number; inputIdx: number }>;
+  cachedExternalInputPattern?: Array<{
+    nodeLocalIdx: number;
+    inputIdx: number;
+  }>;
   recipe: import("../backend/webgpu/fusion-types").FusedKernelRecipe;
   runtimeScalarInputs?: Set<number>;
 }
@@ -2449,7 +2699,12 @@ function generateFused(
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
   backend: import("../backend/types").Backend,
-): { commands: GpuCommand[]; outputs: Array<{ nodeIndex: number; slot: Slot }> } | string {
+):
+  | {
+      commands: GpuCommand[];
+      outputs: Array<{ nodeIndex: number; slot: Slot }>;
+    }
+  | string {
   const device = (backend as { device?: GPUDevice }).device;
   if (!device) return "no-device";
   if (!action.cachedExternalInputPattern) return "no-input-pattern";
@@ -2465,7 +2720,11 @@ function generateFused(
   // (only their count + the donated position), so a liveness-RELEASED
   // producer is fine: synthesize its metadata, resolve its slot via the
   // logical channel. Real buffers are kept for donation detection.
-  const dispatchInputs: Array<{ buffer: GPUBuffer; shape: number[]; dtype: DType }> = [];
+  const dispatchInputs: Array<{
+    buffer: GPUBuffer;
+    shape: number[];
+    dtype: DType;
+  }> = [];
   const inputSlots: Slot[] = [];
   const inputBufs: Array<GPUBuffer | null> = [];
   for (let i = 0; i < recipe.inputs.length; i++) {
@@ -2518,7 +2777,10 @@ function generateFused(
   // POST-HOC donation: out0's result buffer aliasing one of the (live) inputs.
   const outNode = planNodes[action.outputNodeIndex];
   let donatedRecipeIdx: number | undefined;
-  if (outNode?.result && (outNode.result.backendTensor as WebGPUTensor).buffer) {
+  if (
+    outNode?.result &&
+    (outNode.result.backendTensor as WebGPUTensor).buffer
+  ) {
     const out0buf = (outNode.result.backendTensor as WebGPUTensor).buffer;
     let pos = 0;
     for (let i = 0; i < recipe.inputs.length; i++) {
@@ -2653,7 +2915,11 @@ function generateAdamBatch(
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
   backend: import("../backend/types").Backend,
 ):
-  | { commands: GpuCommand[]; outputs: Array<{ nodeIndex: number; outputIndex: number; slot: Slot }>; firstNodeIndex: number }
+  | {
+      commands: GpuCommand[];
+      outputs: Array<{ nodeIndex: number; outputIndex: number; slot: Slot }>;
+      firstNodeIndex: number;
+    }
   | string {
   const device = (backend as { device?: GPUDevice }).device;
   if (!device) return "no-device";
@@ -2708,9 +2974,21 @@ function generateAdamBatch(
   // the persistent m/v optimizer state can't be carried across steps (the
   // genOk bail that kept backward+optimizer plans on the recorded path).
   for (const it of itemList) {
-    outputs.push({ nodeIndex: it.nodeIndex, outputIndex: 0, slot: it.bufSlots[1] });
-    outputs.push({ nodeIndex: it.nodeIndex, outputIndex: 1, slot: it.bufSlots[2] });
-    outputs.push({ nodeIndex: it.nodeIndex, outputIndex: 2, slot: it.bufSlots[3] });
+    outputs.push({
+      nodeIndex: it.nodeIndex,
+      outputIndex: 0,
+      slot: it.bufSlots[1],
+    });
+    outputs.push({
+      nodeIndex: it.nodeIndex,
+      outputIndex: 1,
+      slot: it.bufSlots[2],
+    });
+    outputs.push({
+      nodeIndex: it.nodeIndex,
+      outputIndex: 2,
+      slot: it.bufSlots[3],
+    });
   }
 
   // PACKED groups (planPackedGroups mirrors dispatchPackedOptimizer's
@@ -2752,7 +3030,9 @@ function generateAdamBatch(
     const alignedBytes = alignBufferSize(totalElements * 4);
     const packed = lookupPackedBuffers(4, alignedBytes);
     if (!packed) return "packed-buffers-missing";
-    const packedSlots = packed.map((b) => bufferSlot(b as unknown, "persistent"));
+    const packedSlots = packed.map((b) =>
+      bufferSlot(b as unknown, "persistent"),
+    );
     // Scatter: each item's [grad,param,m,v] → packed[b] at i*elementBytes.
     for (let i = 0; i < g.indices.length; i++) {
       const it = itemList[g.indices[i]];
@@ -2780,7 +3060,12 @@ function generateAdamBatch(
     if (!planned) return "adam-plan-null";
     const bindings = adamBinding(
       planned.plan,
-      { grad: packedSlots[0], param: packedSlots[1], m: packedSlots[2], v: packedSlots[3] },
+      {
+        grad: packedSlots[0],
+        param: packedSlots[1],
+        m: packedSlots[2],
+        v: packedSlots[3],
+      },
       infFlag,
     );
     if (!bindings) return "adam-bind-null";

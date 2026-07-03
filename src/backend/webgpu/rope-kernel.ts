@@ -32,13 +32,26 @@ const ropeSpec = elementwiseKernel({
     sin_table: { storage: "read", type: "f32" },
     output: { storage: "read_write", type: "f32" },
   },
-  uniforms: { seq_len: "u32", head_dim: "u32", sin_scale: "f32" },
+  // cos_offset/sin_offset: element offsets into the cos/sin tables. Lets
+  // callers pass narrow() views of a persistent [maxSeqLen, D/2] table
+  // zero-copy (the offset-view class, task #58): the view's element offset
+  // is folded into the table index here instead of materializing a
+  // contiguous slice.
+  uniforms: {
+    seq_len: "u32",
+    head_dim: "u32",
+    sin_scale: "f32",
+    cos_offset: "u32",
+    sin_offset: "u32",
+  },
   sizeUniform: "total",
   kernel(ctx, idx) {
     const S = ctx.uniform("seq_len");
     const D = ctx.uniform("head_dim");
     const half = ctx.emitLet("half", D.div(ctx.u32(2)));
     const sinScale = ctx.uniform("sin_scale");
+    const cosOffset = ctx.uniform("cos_offset");
+    const sinOffset = ctx.uniform("sin_offset");
 
     // Decompose flat idx → (outer, s, d) where outer = b*H
     const d = ctx.emitLet("d", idx.mod(D));
@@ -60,10 +73,13 @@ const ropeSpec = elementwiseKernel({
     const qi = ctx.emitLet("qi", ctx.load("input", idx));
     const qp = ctx.emitLet("qp", ctx.load("input", partnerIdx));
     const cosIdx = ctx.emitLet("cos_idx", s.mul(half).add(dHalf));
-    const cosV = ctx.emitLet("cos_v", ctx.load("cos_table", cosIdx));
+    const cosV = ctx.emitLet(
+      "cos_v",
+      ctx.load("cos_table", cosIdx.add(cosOffset)),
+    );
     const sinV = ctx.emitLet(
       "sin_v",
-      ctx.load("sin_table", cosIdx).mul(sinScale),
+      ctx.load("sin_table", cosIdx.add(sinOffset)).mul(sinScale),
     );
 
     // sign = +1 for second half, -1 for first half (multiplies partner*sin)
@@ -87,6 +103,8 @@ const ropeTileKernel = createTileKernelDispatcher(ropeSpec);
  * @param seqLen     S
  * @param headDim    D
  * @param sinScale   +1 for forward, -1 for backward
+ * @param cosOffset  element offset into cos table (narrow-view support)
+ * @param sinOffset  element offset into sin table (narrow-view support)
  */
 export function dispatchRoPE(
   qkBuffer: GPUBuffer,
@@ -96,6 +114,8 @@ export function dispatchRoPE(
   seqLen: number,
   headDim: number,
   sinScale: number,
+  cosOffset = 0,
+  sinOffset = 0,
 ): GPUBuffer {
   const outBuf = allocateOutputBuffer(total * 4);
   ropeTileKernel.dispatch(
@@ -105,7 +125,14 @@ export function dispatchRoPE(
       sin_table: sinBuffer,
       output: outBuf,
     },
-    { total, seq_len: seqLen, head_dim: headDim, sin_scale: sinScale },
+    {
+      total,
+      seq_len: seqLen,
+      head_dim: headDim,
+      sin_scale: sinScale,
+      cos_offset: cosOffset,
+      sin_offset: sinOffset,
+    },
   );
   return outBuf;
 }

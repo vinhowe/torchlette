@@ -12,11 +12,11 @@ import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
 import { asGPUTensor } from "../gpu-types";
 import {
   computeEffectiveBroadcastStrides,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
+  F32_BYTES,
   sizeOf,
   toIndexShape,
   WORKGROUP_SIZE,
-  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
-  F32_BYTES,
 } from "../shape-utils";
 import { createTensor } from "../tensor";
 import { createTileKernelDispatcher } from "../tile-dispatch";
@@ -62,9 +62,16 @@ export function where(
     const condIsScalar = condTensor.size <= 1;
     const xIsScalar = xTensor.size <= 1;
     const yIsScalar = yTensor.size <= 1;
-    const condChunkable = condIsScalar || condTensor.isContiguous;
-    const xChunkable = xIsScalar || xTensor.isContiguous;
-    const yChunkable = yIsScalar || yTensor.isContiguous;
+    // Chunked binding slices each input by byte ranges from element 0 —
+    // offset>0 views are NOT chunkable even with contiguous strides
+    // (offset-view class, task #58).
+    const condChunkable =
+      condIsScalar ||
+      (condTensor.isContiguous && (condTensor.offset ?? 0) === 0);
+    const xChunkable =
+      xIsScalar || (xTensor.isContiguous && (xTensor.offset ?? 0) === 0);
+    const yChunkable =
+      yIsScalar || (yTensor.isContiguous && (yTensor.offset ?? 0) === 0);
 
     if (condChunkable && xChunkable && yChunkable) {
       return whereChunked(

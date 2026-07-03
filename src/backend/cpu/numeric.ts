@@ -177,7 +177,9 @@ function triangularMask(
 ): Tensor {
   if (a.shape.length < 2)
     throw new Error("tril/triu requires at least 2 dimensions");
-  const data = Float32Array.from(a.data);
+  // toArray() honors strides + offset — reading a.data raw would take the
+  // base buffer's leading elements for any view (offset-view class, task #58).
+  const data = Float32Array.from(a.toArray());
   const H = a.shape[a.shape.length - 2];
   const W = a.shape[a.shape.length - 1];
   const batchSize = data.length / (H * W);

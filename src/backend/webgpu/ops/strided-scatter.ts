@@ -11,11 +11,6 @@ import {
 } from "../bind-group-cache";
 import { resolveOutputBuffer } from "../buffer-arena";
 import { bufferPool, destroyCopy } from "../buffer-pool";
-import {
-  getSharedEncoderInstance,
-  submitOrCollect,
-} from "../shared-encoder";
-import { trackSharedEncoderWrite } from "../webgpu-state";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { requireContext } from "../gpu-context";
 import type { WebGPUTensor } from "../gpu-types";
@@ -26,8 +21,10 @@ import {
   sizeOf,
   WORKGROUP_SIZE,
 } from "../shape-utils";
+import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { createTensor } from "../tensor";
 import { createTileKernelDispatcher } from "../tile-dispatch";
+import { trackSharedEncoderWrite } from "../webgpu-state";
 import {
   flatOpSpec,
   stridedScatterAddTileIR,
@@ -70,9 +67,10 @@ function stridedScatterDirect(
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  const contiguousBase = baseTensor.isContiguous
-    ? baseTensor
-    : ensureContiguous(baseTensor);
+  // ensureContiguous also materializes offset>0 views with contiguous
+  // strides — the kernel reads `base` flat from element 0 and treats the
+  // viewMeta `offset` as base-relative (offset-view class, task #58).
+  const contiguousBase = ensureContiguous(baseTensor);
   const srcStrides = srcTensor.strides;
   const srcOffset = srcTensor.offset;
 

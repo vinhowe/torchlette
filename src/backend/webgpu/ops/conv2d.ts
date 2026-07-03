@@ -12,7 +12,6 @@ import type { BackendTensor } from "../../types";
 import { resolveOutputBuffer } from "../buffer-arena";
 import { requireContext } from "../gpu-context";
 import type { GPUBuffer } from "../gpu-types";
-import { asGPUTensor } from "../gpu-types";
 import { WORKGROUP_SIZE } from "../shape-utils";
 import { createTensor } from "../tensor";
 import {
@@ -21,6 +20,7 @@ import {
 } from "../tile-dispatch";
 import type { DataType, TileKernelSpec } from "../tile-ir";
 import { elementwiseGrid } from "../tile-ir";
+import { asContiguous } from "./views";
 
 const WG = WORKGROUP_SIZE; // 256
 
@@ -205,9 +205,11 @@ export function conv2d(
   _bias: BackendTensor | undefined,
   options?: Conv2dOptions,
 ): BackendTensor {
-  const input = asGPUTensor(_input);
-  const weight = asGPUTensor(_weight);
-  const bias = _bias ? asGPUTensor(_bias) : undefined;
+  // The kernel indexes all inputs as flat contiguous arrays from element 0;
+  // materialize offset/strided views first (offset-view class, task #58).
+  const input = asContiguous(_input);
+  const weight = asContiguous(_weight);
+  const bias = _bias ? asContiguous(_bias) : undefined;
 
   if (input.shape.length !== 4)
     throw new Error(`conv2d: input must be 4D [N,C,H,W], got ${input.shape}`);

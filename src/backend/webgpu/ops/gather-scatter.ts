@@ -6,6 +6,7 @@
  */
 
 import { sizeOf } from "../../../core/shape";
+import { recordedCopyBufferToBuffer } from "../../../executor/compiled-plan";
 import type {
   BackendTensor,
   CatOptions,
@@ -20,22 +21,27 @@ import {
   releaseParamsBuffer,
 } from "../bind-group-cache";
 import { resolveOutputBuffer } from "../buffer-arena";
-import { recordedCopyBufferToBuffer } from "../../../executor/compiled-plan";
+import { destroyCopy } from "../buffer-pool";
 import { computeDimChunkLayout } from "../chunked-dispatch";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { requireContext } from "../gpu-context";
 import type { GPUBufferBinding } from "../gpu-types";
 import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
-import { compute2DDispatch, dtypeBytes, F32_BYTES, WORKGROUP_SIZE } from "../shape-utils";
+import {
+  compute2DDispatch,
+  dtypeBytes,
+  F32_BYTES,
+  WORKGROUP_SIZE,
+} from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { createTensor, createTrackedBuffer } from "../tensor";
-import { ensureContiguous } from "./views";
 import {
   chunkedGatherTileIR,
   chunkedScatterAddTileIR,
   gatherTileIR,
   scatterAddTileIR,
 } from "./ops-tile-ir";
+import { ensureContiguous } from "./views";
 
 // ============================================================================
 // Gather
@@ -94,7 +100,11 @@ export function gather(
   options: GatherOptions,
 ): BackendTensor {
   const ctx = requireContext();
-  const tensorA = asGPUTensor(a);
+  // Input is indexed as a flat contiguous array from element 0 (both the
+  // direct kernel and the chunked path's byte-offset slicing assume it);
+  // materialize offset/strided views first (offset-view class, task #58).
+  const tensorAOrig = asGPUTensor(a);
+  const tensorA = ensureContiguous(tensorAOrig);
   // Index is read as a flat contiguous array; materialize any view first.
   const tensorIndex = ensureContiguous(asGPUTensor(index));
   const { dim } = options;
@@ -123,11 +133,7 @@ export function gather(
   // Index dtype: gather kernel reads indices as native i32/u32/f32 to avoid
   // round-trip casts at call sites (e.g. i32 token ids from embedding).
   const indexDtype = tensorIndex.dtype;
-  if (
-    indexDtype !== "f32" &&
-    indexDtype !== "i32" &&
-    indexDtype !== "u32"
-  ) {
+  if (indexDtype !== "f32" && indexDtype !== "i32" && indexDtype !== "u32") {
     throw new Error(
       `gather: index dtype must be f32/i32/u32, got ${indexDtype}`,
     );
@@ -151,6 +157,7 @@ export function gather(
     ]);
     dispatchComputePass(pipeline, bindGroup, plan.dispatchX, plan.dispatchY);
     releaseParamsBuffer(uniformBuf);
+    if (tensorA !== tensorAOrig) destroyCopy(tensorA);
     return createTensor(plan.outShape, outBuffer);
   }
 
@@ -208,6 +215,7 @@ export function gather(
     releaseParamsBuffer(uniformBuffer);
   }
 
+  if (tensorA !== tensorAOrig) destroyCopy(tensorA);
   return createTensor(outShape, outBuffer);
 }
 
@@ -237,7 +245,10 @@ export function planScatterAddDirect(
 } | null {
   const ctx = requireContext();
   const outSize = sizeOf(inputShape);
-  if (outSize * F32_BYTES > (ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024)) {
+  if (
+    outSize * F32_BYTES >
+    (ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024)
+  ) {
     return null; // chunked
   }
   if (indexDtype !== "f32" && indexDtype !== "i32" && indexDtype !== "u32") {
@@ -266,7 +277,10 @@ export function scatterAdd(
   options: ScatterAddOptions,
 ): BackendTensor {
   const ctx = requireContext();
-  const tensorA = asGPUTensor(a);
+  // The accumulator seed is a flat buffer copy of `a` from byte 0 — an
+  // offset/strided view of `a` must be materialized first (offset-view
+  // class, task #58).
+  const tensorA = ensureContiguous(asGPUTensor(a));
   // Kernel reads `src` and `indices` as flat contiguous arrays. If the caller
   // passes a broadcasted/strided view (common when gradients come in from an
   // expand()/sum-backward path), force materialization first.
@@ -297,11 +311,7 @@ export function scatterAdd(
 
   // Index dtype: scatterAdd kernel reads indices as native i32/u32/f32.
   const indexDtype = tensorIndex.dtype;
-  if (
-    indexDtype !== "f32" &&
-    indexDtype !== "i32" &&
-    indexDtype !== "u32"
-  ) {
+  if (indexDtype !== "f32" && indexDtype !== "i32" && indexDtype !== "u32") {
     throw new Error(
       `scatterAdd: index dtype must be f32/i32/u32, got ${indexDtype}`,
     );
@@ -309,8 +319,14 @@ export function scatterAdd(
 
   // --- Direct path — single-sourced with the stream generator. ---
   if (!chunked) {
-    const plan = planScatterAddDirect(inputShape, tensorSrc.shape, dim, indexDtype);
-    if (!plan) throw new Error("scatterAdd: direct path but planScatterAddDirect null");
+    const plan = planScatterAddDirect(
+      inputShape,
+      tensorSrc.shape,
+      dim,
+      indexDtype,
+    );
+    if (!plan)
+      throw new Error("scatterAdd: direct path but planScatterAddDirect null");
     const pipeline = getPipeline(ctx, plan.key, plan.shader);
     const outBuffer = resolveOutputBuffer(ctx.device, plan.outputBytes, [
       tensorA.buffer,
@@ -323,10 +339,23 @@ export function scatterAdd(
     // and the grad inflates +1x per step (embedding-grad accumulation bug).
     const enc = getSharedEncoderInstance();
     if (enc) {
-      recordedCopyBufferToBuffer(enc, tensorA.buffer, 0, outBuffer, 0, plan.outputBytes);
+      recordedCopyBufferToBuffer(
+        enc,
+        tensorA.buffer,
+        0,
+        outBuffer,
+        0,
+        plan.outputBytes,
+      );
     } else {
       const cmdEnc = ctx.device.createCommandEncoder();
-      cmdEnc.copyBufferToBuffer(tensorA.buffer, 0, outBuffer, 0, plan.outputBytes);
+      cmdEnc.copyBufferToBuffer(
+        tensorA.buffer,
+        0,
+        outBuffer,
+        0,
+        plan.outputBytes,
+      );
       submitOrCollect(cmdEnc.finish());
     }
     const uniformBuf = createParamsBuffer(ctx.device, plan.paramsData);
@@ -342,7 +371,12 @@ export function scatterAdd(
   }
 
   // Generate shader for the chunked path.
-  const code = chunkedScatterAddTileIR(inputShape, tensorSrc.shape, dim, indexDtype);
+  const code = chunkedScatterAddTileIR(
+    inputShape,
+    tensorSrc.shape,
+    dim,
+    indexDtype,
+  );
   const pipelineKey = `scatterAddChunked:${inputShape.join(",")}:${tensorSrc.shape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   const pipeline = getPipeline(ctx, pipelineKey, code);
 
@@ -359,10 +393,23 @@ export function scatterAdd(
   {
     const enc = getSharedEncoderInstance();
     if (enc) {
-      recordedCopyBufferToBuffer(enc, tensorA.buffer, 0, outBuffer, 0, outSize * F32_BYTES);
+      recordedCopyBufferToBuffer(
+        enc,
+        tensorA.buffer,
+        0,
+        outBuffer,
+        0,
+        outSize * F32_BYTES,
+      );
     } else {
       const cmdEnc = ctx.device.createCommandEncoder();
-      cmdEnc.copyBufferToBuffer(tensorA.buffer, 0, outBuffer, 0, outSize * F32_BYTES);
+      cmdEnc.copyBufferToBuffer(
+        tensorA.buffer,
+        0,
+        outBuffer,
+        0,
+        outSize * F32_BYTES,
+      );
       submitOrCollect(cmdEnc.finish());
     }
   }
@@ -423,8 +470,18 @@ export function cat(
   if (tensors.length === 1) return tensors[0];
 
   const ctx = requireContext();
-  const gpuTensors = tensors.map((t) => asGPUTensor(t));
-  const bytesPerElement = dtypeBytes(gpuTensors[0].dtype);
+  // The copy offsets below are computed from SHAPES assuming each input is a
+  // contiguous block. A view input with an element OFFSET (narrow) is folded
+  // into srcByteOffset when 4-byte aligned; non-contiguous strides (or
+  // unaligned offsets, e.g. odd-element f16) are materialized first
+  // (offset-view class, task #58).
+  const originals = tensors.map((t) => asGPUTensor(t));
+  const bytesPerElement = dtypeBytes(originals[0].dtype);
+  const gpuTensors = originals.map((t) =>
+    t.isContiguous && (t.offset * bytesPerElement) % 4 === 0
+      ? t
+      : ensureContiguous(t),
+  );
 
   // Compute output shape
   const dim = options.dim;
@@ -450,8 +507,10 @@ export function cat(
   for (const t of gpuTensors) {
     const tDimSize = t.shape[dim];
     const copyBytes = tDimSize * innerSize * bytesPerElement;
+    const tBaseByteOffset = t.offset * bytesPerElement;
     for (let o = 0; o < outerSize; o++) {
-      const srcByteOffset = o * tDimSize * innerSize * bytesPerElement;
+      const srcByteOffset =
+        tBaseByteOffset + o * tDimSize * innerSize * bytesPerElement;
       const dstByteOffset =
         (o * outDimSize + dimOffset) * innerSize * bytesPerElement;
       if (enc) {
@@ -482,5 +541,8 @@ export function cat(
     dimOffset += tDimSize;
   }
 
+  for (let i = 0; i < gpuTensors.length; i++) {
+    if (gpuTensors[i] !== originals[i]) destroyCopy(gpuTensors[i]);
+  }
   return createTensor(outShape, outBuffer, undefined, 0, gpuTensors[0].dtype);
 }

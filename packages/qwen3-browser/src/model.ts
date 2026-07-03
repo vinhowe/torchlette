@@ -13,11 +13,7 @@
  * callback applied between blocks.
  */
 
-import type {
-  DeviceKind,
-  Tensor,
-  Torchlette,
-} from "torchlette";
+import type { DeviceKind, Tensor, Torchlette } from "torchlette";
 import { Embedding, Linear, Module, ModuleList, RMSNorm } from "torchlette/nn";
 
 // ============================================================================
@@ -57,7 +53,9 @@ export function configFromHF(
     numLayers: hf.num_hidden_layers as number,
     numHeads: hf.num_attention_heads as number,
     numKVHeads: hf.num_key_value_heads as number,
-    headDim: (hf.head_dim as number) ?? (hf.hidden_size as number) / (hf.num_attention_heads as number),
+    headDim:
+      (hf.head_dim as number) ??
+      (hf.hidden_size as number) / (hf.num_attention_heads as number),
     intermediateSize: hf.intermediate_size as number,
     ropeTheta: (hf.rope_theta as number) ?? 1e6,
     rmsNormEps: (hf.rms_norm_eps as number) ?? 1e-6,
@@ -139,12 +137,34 @@ export class Qwen3Attention extends Module {
     const qDim = config.numHeads * config.headDim;
     const kvDim = config.numKVHeads * config.headDim;
     const dtype = config.weightDtype ?? "f32";
-    this.qProj = new Linear(api, config.hiddenSize, qDim, { bias: false, device, dtype });
-    this.kProj = new Linear(api, config.hiddenSize, kvDim, { bias: false, device, dtype });
-    this.vProj = new Linear(api, config.hiddenSize, kvDim, { bias: false, device, dtype });
-    this.oProj = new Linear(api, qDim, config.hiddenSize, { bias: false, device, dtype });
-    this.qNorm = new RMSNorm(api, config.headDim, { eps: config.rmsNormEps, device });
-    this.kNorm = new RMSNorm(api, config.headDim, { eps: config.rmsNormEps, device });
+    this.qProj = new Linear(api, config.hiddenSize, qDim, {
+      bias: false,
+      device,
+      dtype,
+    });
+    this.kProj = new Linear(api, config.hiddenSize, kvDim, {
+      bias: false,
+      device,
+      dtype,
+    });
+    this.vProj = new Linear(api, config.hiddenSize, kvDim, {
+      bias: false,
+      device,
+      dtype,
+    });
+    this.oProj = new Linear(api, qDim, config.hiddenSize, {
+      bias: false,
+      device,
+      dtype,
+    });
+    this.qNorm = new RMSNorm(api, config.headDim, {
+      eps: config.rmsNormEps,
+      device,
+    });
+    this.kNorm = new RMSNorm(api, config.headDim, {
+      eps: config.rmsNormEps,
+      device,
+    });
   }
 
   /** GQA: [B, numKVHeads, S, D] -> [B, numHeads, S, D] (HF repeat_kv order). */
@@ -189,7 +209,7 @@ export class Qwen3Attention extends Module {
     };
     let q = toHeads(this.qProj.forward(x), this.numHeads, this.qNorm);
     let k = toHeads(this.kProj.forward(x), this.numKVHeads, this.kNorm);
-    let v = toHeads(this.vProj.forward(x), this.numKVHeads);
+    const v = toHeads(this.vProj.forward(x), this.numKVHeads);
     q = this.api.applyRoPE(q, rope.cos, rope.sin);
     k = this.api.applyRoPE(k, rope.cos, rope.sin);
 
@@ -206,7 +226,13 @@ export class Qwen3Attention extends Module {
     let attnOutput: Tensor;
     if (ctx.mask === null) {
       // Prefill from position 0: fresh K/V are the whole context.
-      attnOutput = this.api.scaledDotProductAttention(q, this.expandKV(k), this.expandKV(v), scale, true);
+      attnOutput = this.api.scaledDotProductAttention(
+        q,
+        this.expandKV(k),
+        this.expandKV(v),
+        scale,
+        true,
+      );
     } else {
       const kE = this.expandKV(ctx.kSlot.narrow(2, 0, ctx.bucketLen));
       const vE = this.expandKV(ctx.vSlot.narrow(2, 0, ctx.bucketLen));
@@ -268,20 +294,18 @@ export class Qwen3Attention extends Module {
       attnOutput = this.api.scaledDotProductAttention(q, kE, vE, scale, true);
     } else {
       // Decomposed path for cached decode (q seq len != kv seq len).
-      // No GPU mask buffer + narrow here: offset views feed kernels wrong data
-      // (see probe-narrow.ts). seqLen===1 needs no mask (all past visible);
-      // multi-token-with-cache builds a small CPU mask fresh per call.
+      // seqLen===1 needs no mask (all past visible); multi-token-with-cache
+      // builds the additive causal mask ON the GPU: -1e9 where j > qStart+i,
+      // i.e. triu(full(-1e9), k=qStart+1). (The old CPU-built upload was a
+      // dodge for the offset-view bug — fixed in the core, task #58.)
       const kT = kE.transpose({ dim0: 2, dim1: 3 });
       let scores = q.matmul(kT).mul(scale); // [B, H, S, kvS]
       if (seqLen > 1) {
-        const maskArr = new Float32Array(seqLen * kvSeqLen);
         const qStart = kvSeqLen - seqLen;
-        for (let i = 0; i < seqLen; i++) {
-          for (let j = qStart + i + 1; j < kvSeqLen; j++) {
-            maskArr[i * kvSeqLen + j] = -1e9;
-          }
-        }
-        const mask = this.api.tensorFromArray(maskArr, [1, 1, seqLen, kvSeqLen]);
+        const mask = this.api.triu(
+          this.api.full([1, 1, seqLen, kvSeqLen], -1e9),
+          qStart + 1,
+        );
         scores = this.api.add(scores, mask);
       }
       const attnWeights = scores.softmax(-1);
@@ -314,9 +338,23 @@ export class Qwen3MLP extends Module {
     super(api);
     const device = options?.device;
     const dtype = config.weightDtype ?? "f32";
-    this.gateProj = new Linear(api, config.hiddenSize, config.intermediateSize, { bias: false, device, dtype });
-    this.upProj = new Linear(api, config.hiddenSize, config.intermediateSize, { bias: false, device, dtype });
-    this.downProj = new Linear(api, config.intermediateSize, config.hiddenSize, { bias: false, device, dtype });
+    this.gateProj = new Linear(
+      api,
+      config.hiddenSize,
+      config.intermediateSize,
+      { bias: false, device, dtype },
+    );
+    this.upProj = new Linear(api, config.hiddenSize, config.intermediateSize, {
+      bias: false,
+      device,
+      dtype,
+    });
+    this.downProj = new Linear(
+      api,
+      config.intermediateSize,
+      config.hiddenSize,
+      { bias: false, device, dtype },
+    );
   }
 
   forward(x: Tensor): Tensor {
@@ -343,9 +381,15 @@ export class Qwen3Block extends Module {
   ) {
     super(api);
     const device = options?.device;
-    this.inputNorm = new RMSNorm(api, config.hiddenSize, { eps: config.rmsNormEps, device });
+    this.inputNorm = new RMSNorm(api, config.hiddenSize, {
+      eps: config.rmsNormEps,
+      device,
+    });
     this.attn = new Qwen3Attention(api, config, options);
-    this.postAttnNorm = new RMSNorm(api, config.hiddenSize, { eps: config.rmsNormEps, device });
+    this.postAttnNorm = new RMSNorm(api, config.hiddenSize, {
+      eps: config.rmsNormEps,
+      device,
+    });
     this.mlp = new Qwen3MLP(api, config, options);
   }
 
@@ -407,11 +451,13 @@ export class Qwen3 extends Module {
   readonly embedTokens: Embedding;
   readonly layers: ModuleList;
   readonly norm: RMSNorm;
-  // RoPE tables kept CPU-side; the per-forward slice is uploaded fresh.
-  // (GPU-side narrow(0, posOffset, S) views hit the offset-view readback bug —
-  // see probe-narrow.ts — and the slices are tiny: seqLen × headDim/2 floats.)
-  private readonly ropeCosArr: Float32Array;
-  private readonly ropeSinArr: Float32Array;
+  // RoPE tables uploaded to the GPU ONCE at construction ([maxSeqLen, D/2]);
+  // each forward takes a zero-copy narrow(0, posOffset, seqLen) view. The
+  // fused RoPE kernel folds the view's element offset into its table
+  // indexing (task #58 — this replaces the old per-forward CPU subarray
+  // upload that dodged the offset-view bug).
+  private readonly ropeCos: Tensor;
+  private readonly ropeSin: Tensor;
 
   constructor(
     api: Torchlette,
@@ -424,25 +470,37 @@ export class Qwen3 extends Module {
 
     // Embedding stays f32: the gather kernel is f32-only, and the tied
     // lm_head matmul then runs as a plain f32 matmul.
-    this.embedTokens = new Embedding(api, config.vocabSize, config.hiddenSize, { device });
+    this.embedTokens = new Embedding(api, config.vocabSize, config.hiddenSize, {
+      device,
+    });
     this.layers = new ModuleList(api);
     for (let i = 0; i < config.numLayers; i++) {
       this.layers.append(new Qwen3Block(api, config, options));
     }
-    this.norm = new RMSNorm(api, config.hiddenSize, { eps: config.rmsNormEps, device });
+    this.norm = new RMSNorm(api, config.hiddenSize, {
+      eps: config.rmsNormEps,
+      device,
+    });
 
-    // Precompute RoPE tables [maxSeqLen, headDim/2] (half-split convention).
+    // Precompute RoPE tables [maxSeqLen, headDim/2] (half-split convention)
+    // and upload them to the device once as persistent tensors.
     const half = config.headDim / 2;
-    this.ropeCosArr = new Float32Array(config.maxSeqLen * half);
-    this.ropeSinArr = new Float32Array(config.maxSeqLen * half);
+    const cosArr = new Float32Array(config.maxSeqLen * half);
+    const sinArr = new Float32Array(config.maxSeqLen * half);
     for (let s = 0; s < config.maxSeqLen; s++) {
       for (let i = 0; i < half; i++) {
         const freq = 1 / config.ropeTheta ** ((2 * i) / config.headDim);
         const ang = s * freq;
-        this.ropeCosArr[s * half + i] = Math.cos(ang);
-        this.ropeSinArr[s * half + i] = Math.sin(ang);
+        cosArr[s * half + i] = Math.cos(ang);
+        sinArr[s * half + i] = Math.sin(ang);
       }
     }
+    this.ropeCos = api.tensorFromArray(cosArr, [config.maxSeqLen, half], {
+      device,
+    });
+    this.ropeSin = api.tensorFromArray(sinArr, [config.maxSeqLen, half], {
+      device,
+    });
   }
 
   /** Allocate a zeroed static KV cache (one pair of buffers per layer). */
@@ -466,35 +524,48 @@ export class Qwen3 extends Module {
     options?: Qwen3ForwardOptions,
   ): { logits: Tensor; presentKVs: KVCache[]; hidden?: Tensor[] } {
     const [_batch, seqLen] = idx.shape;
-    const posOffset = options?.staticKV ? options.staticKV.len : (options?.posOffset ?? 0);
+    const posOffset = options?.staticKV
+      ? options.staticKV.len
+      : (options?.posOffset ?? 0);
     if (posOffset + seqLen > this.config.maxSeqLen) {
       throw new Error(
         `Sequence length ${posOffset + seqLen} exceeds maxSeqLen ${this.config.maxSeqLen}`,
       );
     }
 
+    // Row-slices of the persistent GPU RoPE tables at the current positions.
+    // Position enters as an INDEX TENSOR (data) — same pattern as the KV
+    // scatterIdx below — so the plan template stays stable across decode
+    // steps. A narrow(0, posOffset, seqLen) view is equally CORRECT now
+    // (offset-view class fixed in the core, task #58, and gated by
+    // test/offset-views.spec.ts), but its per-token-varying `start` is
+    // PAYLOAD, which the template fingerprint deliberately hashes (the
+    // anti-frozen-scalar rule) — every decode step would re-lower instead
+    // of replaying (~5x slower decode).
     const half = this.config.headDim / 2;
+    const ropeIdxArr = new Float32Array(seqLen * half);
+    for (let s = 0; s < seqLen; s++)
+      ropeIdxArr.fill(posOffset + s, s * half, (s + 1) * half);
+    const ropeIdx = this.api.tensorFromArray(ropeIdxArr, [seqLen, half]);
     const rope: RopeSlices = {
-      cos: this.api.tensorFromArray(
-        this.ropeCosArr.subarray(posOffset * half, (posOffset + seqLen) * half),
-        [seqLen, half],
-      ),
-      sin: this.api.tensorFromArray(
-        this.ropeSinArr.subarray(posOffset * half, (posOffset + seqLen) * half),
-        [seqLen, half],
-      ),
+      cos: this.api.gather(this.ropeCos, ropeIdx, { dim: 0 }),
+      sin: this.api.gather(this.ropeSin, ropeIdx, { dim: 0 }),
     };
 
     // Embedding output is f32 (f32 table); with weightDtype "f16" the linears
     // run mixed-dtype (f32 activations × f16 weights → f32).
     let x = this.embedTokens.forward(idx);
-    const hidden: Tensor[] | undefined = options?.collectHidden ? [x] : undefined;
+    const hidden: Tensor[] | undefined = options?.collectHidden
+      ? [x]
+      : undefined;
 
     const presentKVs: KVCache[] = [];
     const cache = options?.staticKV;
     if (cache) {
       if (posOffset + seqLen > cache.maxSeqLen) {
-        throw new Error(`static KV overflow: ${posOffset + seqLen} > ${cache.maxSeqLen}`);
+        throw new Error(
+          `static KV overflow: ${posOffset + seqLen} > ${cache.maxSeqLen}`,
+        );
       }
       const { numKVHeads, headDim } = this.config;
       // Scatter index [1, kvH, S, D]: every element of row s targets cache
@@ -503,10 +574,19 @@ export class Qwen3 extends Module {
       const idxArr = new Float32Array(numKVHeads * seqLen * headDim);
       for (let h = 0; h < numKVHeads; h++) {
         for (let s = 0; s < seqLen; s++) {
-          idxArr.fill(posOffset + s, (h * seqLen + s) * headDim, (h * seqLen + s + 1) * headDim);
+          idxArr.fill(
+            posOffset + s,
+            (h * seqLen + s) * headDim,
+            (h * seqLen + s + 1) * headDim,
+          );
         }
       }
-      const scatterIdx = this.api.tensorFromArray(idxArr, [1, numKVHeads, seqLen, headDim]);
+      const scatterIdx = this.api.tensorFromArray(idxArr, [
+        1,
+        numKVHeads,
+        seqLen,
+        headDim,
+      ]);
       // Decode mask over the bucketed prefix: 0 for valid, -1e9 for padding.
       // Prefill (from pos 0) attends its own fresh K/V with the fused causal
       // kernel and needs no mask.
@@ -514,7 +594,10 @@ export class Qwen3 extends Module {
       const bucketLen = kvBucketLen(posOffset + seqLen, cache.maxSeqLen);
       let mask: Tensor | null = null;
       if (!isPrefill) {
-        if (seqLen !== 1) throw new Error("static KV: incremental multi-token decode unsupported");
+        if (seqLen !== 1)
+          throw new Error(
+            "static KV: incremental multi-token decode unsupported",
+          );
         const maskArr = new Float32Array(bucketLen).fill(-1e9);
         maskArr.fill(0, 0, posOffset + 1);
         mask = this.api.tensorFromArray(maskArr, [1, 1, 1, bucketLen]);
@@ -538,7 +621,11 @@ export class Qwen3 extends Module {
     } else {
       for (let i = 0; i < this.layers.length; i++) {
         const block = this.layers.get(i) as Qwen3Block;
-        const { out, presentKV } = block.forward(x, rope, options?.pastKVs?.[i]);
+        const { out, presentKV } = block.forward(
+          x,
+          rope,
+          options?.pastKVs?.[i],
+        );
         x = out;
         if (options?.residualHook) x = options.residualHook(x, i);
         if (presentKV) presentKVs.push(presentKV);

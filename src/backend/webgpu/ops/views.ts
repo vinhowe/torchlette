@@ -3,7 +3,7 @@
  * detectSimpleTranspose, ensureContiguous.
  */
 import { inferReshapeStrides } from "../../../core/shape";
-import { expandMeta, narrowMeta, permuteMeta } from "./view-meta";
+import { recordedCopyBufferToBuffer } from "../../../executor/compiled-plan";
 import type { BackendTensor, DType, TransposeOptions } from "../../types";
 import {
   cachedCreateBindGroup,
@@ -32,9 +32,13 @@ import {
   sizeOf,
   WORKGROUP_SIZE,
 } from "../shape-utils";
+import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import { createTileKernelDispatcher } from "../tile-dispatch";
-import { isCompilationRecording } from "../webgpu-state";
+import {
+  isCompilationRecording,
+  trackSharedEncoderWrite,
+} from "../webgpu-state";
 import {
   castSpec,
   castTileIR,
@@ -42,6 +46,7 @@ import {
   contiguousTileIR,
   narrowBackwardTileIR,
 } from "./ops-tile-ir";
+import { expandMeta, narrowMeta, permuteMeta } from "./view-meta";
 
 /**
  * Cast tensor to a different dtype.
@@ -329,19 +334,54 @@ export function expand(a: BackendTensor, shape: number[]): BackendTensor {
 }
 
 /**
- * Materialize a non-contiguous tensor to a new contiguous buffer.
- * If already contiguous, returns the same tensor (no-op).
+ * THE raw-bind safety predicate (single source of truth at the seam).
+ *
+ * `isContiguous` is computed from STRIDES ONLY — a narrow(dim0, start>0) view
+ * has contiguous strides but a non-zero element OFFSET into its base buffer.
+ * Any path that binds `t.buffer` starting at element 0 (readback copies,
+ * fused kernels taking raw GPUBuffers, flat tile-IR kernels) must use THIS
+ * predicate, never bare `isContiguous`: treating offset>0 views as bindable
+ * silently reads the WRONG REGION with the right shape (task #58).
+ */
+export function isRawBindable(t: WebGPUTensor): boolean {
+  return t.isContiguous && (t.offset ?? 0) === 0;
+}
+
+/**
+ * LOUD guard for raw-bind sites: throws if the tensor cannot be bound from
+ * element 0. Place after the site's materialization/offset-fold so that any
+ * future regression of the prep logic fails loudly instead of silently
+ * reading the wrong region.
+ */
+export function assertRawBindable(t: WebGPUTensor, site: string): WebGPUTensor {
+  if (!isRawBindable(t)) {
+    throw new Error(
+      `[offset-view] ${site}: tensor bound raw from element 0 but has ` +
+        `offset=${t.offset} strides=[${t.strides.join(",")}] shape=[${t.shape.join(",")}]. ` +
+        `Route through ensureContiguous()/asContiguous() or fold the offset into the kernel's indexing.`,
+    );
+  }
+  return t;
+}
+
+/**
+ * Materialize a non-contiguous OR offset (element offset > 0) tensor to a new
+ * contiguous buffer at offset 0. If already raw-bindable, returns a
+ * non-owning view (no-op).
  * Handles large tensors by processing in chunks.
  */
 export function contiguous(a: BackendTensor): BackendTensor {
   const tensor = asGPUTensor(a);
 
-  // Fast path: already contiguous - return a non-owning view.
+  // Fast path: already contiguous AND offset 0 - return a non-owning view.
   // Returning the same tensor object would cause the executor to create a
   // second StorageHandle for the same GPUBuffer.  When the intermediate
   // handle becomes unreachable, destroyUnreachable() would destroy the
   // buffer while the original tensor still references it.
-  if (tensor.isContiguous) {
+  // NOTE offset>0 views with contiguous strides do NOT take the fast path:
+  // contiguous() is the designated materialization point for raw-bind
+  // consumers, so its result must start at element 0 of its buffer.
+  if (isRawBindable(tensor)) {
     return createTensor(
       tensor.shape,
       tensor.buffer,
@@ -357,6 +397,60 @@ export function contiguous(a: BackendTensor): BackendTensor {
 
   if (outSize === 0) {
     throw new Error("contiguous: empty tensors not supported");
+  }
+
+  // Offset-only view (contiguous strides, offset>0) of a base buffer LARGER
+  // than maxStorageBufferBindingSize: pure DMA copy from the byte offset —
+  // copyBufferToBuffer is not subject to the binding limit, covering narrow
+  // views of huge bases the chunked shader path can't (it only supports 2D
+  // transposes). Requires 4-byte-aligned offset+size per the WebGPU copy
+  // rules. Deliberately NOT used at normal sizes: the stream generator
+  // mirrors contiguous() as a contiguousTileIR DISPATCH (planContigCopy /
+  // the contiguous direct-op handler), and routing small views through a
+  // COPY here would diverge recording vs generation at that seam.
+  {
+    const bpe = dtypeBytes(tensor.dtype);
+    const offsetBytes = tensor.offset * bpe;
+    const dataBytes = outSize * bpe;
+    const maxBinding =
+      requireContext().device.limits?.maxStorageBufferBindingSize ??
+      128 * 1024 * 1024;
+    if (
+      tensor.isContiguous &&
+      tensor.offset > 0 &&
+      tensor.buffer.size > maxBinding &&
+      offsetBytes % 4 === 0 &&
+      dataBytes % 4 === 0 &&
+      offsetBytes + dataBytes <= tensor.buffer.size
+    ) {
+      const ctx = requireContext();
+      const outBuffer = resolveOutputBuffer(ctx.device, dataBytes, [
+        tensor.buffer,
+      ]);
+      trackSharedEncoderWrite(outBuffer);
+      const enc = getSharedEncoderInstance();
+      if (enc) {
+        recordedCopyBufferToBuffer(
+          enc,
+          tensor.buffer,
+          offsetBytes,
+          outBuffer,
+          0,
+          dataBytes,
+        );
+      } else {
+        const cmdEnc = ctx.device.createCommandEncoder();
+        cmdEnc.copyBufferToBuffer(
+          tensor.buffer,
+          offsetBytes,
+          outBuffer,
+          0,
+          dataBytes,
+        );
+        submitOrCollect(cmdEnc.finish());
+      }
+      return createTensor(shape, outBuffer, undefined, 0, tensor.dtype);
+    }
   }
 
   // Check if input buffer exceeds max binding size
@@ -633,10 +727,14 @@ export function detectSimpleTranspose(tensor: WebGPUTensor): number[] | null {
 }
 
 /**
- * Helper to ensure a tensor is contiguous, materializing if needed.
+ * Helper to ensure a tensor is RAW-BINDABLE (contiguous strides AND element
+ * offset 0), materializing if needed. This is the sanctioned prep for any
+ * kernel that binds the buffer from element 0 — a contiguous-strides view
+ * with offset>0 (e.g. narrow along dim 0) MUST be materialized here, or the
+ * kernel silently reads the wrong region.
  */
 export function ensureContiguous(tensor: WebGPUTensor): WebGPUTensor {
-  if (tensor.isContiguous) return tensor;
+  if (isRawBindable(tensor)) return tensor;
   return asGPUTensor(contiguous(tensor));
 }
 

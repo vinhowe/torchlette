@@ -2,6 +2,7 @@
  * Tensor creation ops: tensorFromArray, zeros, full, arange, tril/triu, rand/randn/bernoulli.
  */
 
+import { recordClear } from "../../../executor/compiled-plan";
 import type { DType } from "../../types";
 import {
   cachedCreateBindGroup,
@@ -9,7 +10,6 @@ import {
   releaseParamsBuffer,
 } from "../bind-group-cache";
 import { getActiveArena, resolveOutputBuffer } from "../buffer-arena";
-import { recordClear } from "../../../executor/compiled-plan";
 import { bufferPool, destroyCopy } from "../buffer-pool";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { f32ArrayToF16Array, requireContext } from "../gpu-context";
@@ -23,7 +23,11 @@ import {
   WORKGROUP_SIZE,
 } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
-import { createBufferWithData, createTensor, writeBufferChunked } from "../tensor";
+import {
+  createBufferWithData,
+  createTensor,
+  writeBufferChunked,
+} from "../tensor";
 import { arenaBufferSet } from "../webgpu-state";
 import {
   arangeWGSL,
@@ -108,7 +112,11 @@ function dispatchCreationKernel(
   const totalWorkgroups = Math.ceil(threads / WORKGROUP_SIZE);
   const { x, y } = compute2DDispatch(totalWorkgroups);
   const pipeline = getPipeline(ctx, cacheKey, shader);
-  const outBuffer = resolveOutputBuffer(ctx.device, numElements * F32_BYTES, []);
+  const outBuffer = resolveOutputBuffer(
+    ctx.device,
+    numElements * F32_BYTES,
+    [],
+  );
   const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
     outBuffer,
@@ -246,8 +254,10 @@ function triangularOp(
   const W = a.shape[a.shape.length - 1];
   const numElements = sizeOf(a.shape);
 
-  // Ensure contiguous input
-  const input = a.isContiguous ? a : getContiguous(a);
+  // Ensure raw-bindable input: the kernel reads flat from element 0, so
+  // offset>0 views (contiguous strides included) must be materialized
+  // (offset-view class, task #58).
+  const input = a.isContiguous && (a.offset ?? 0) === 0 ? a : getContiguous(a);
 
   const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
   const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
@@ -395,7 +405,9 @@ export function tensorFromArrayWithDtype(
     case "f16":
       // Uint16Array input = raw f16 bits (pre-converted by the caller).
       typedData =
-        values instanceof Uint16Array ? values : f32ArrayToF16Array(values as number[]);
+        values instanceof Uint16Array
+          ? values
+          : f32ArrayToF16Array(values as number[]);
       break;
     default:
       typedData = Float32Array.from(values as number[]);

@@ -1,7 +1,4 @@
-import { ENV } from "../core/env";
 import { getBackend } from "../backend/registry";
-import { diffSegmentsAligned, diffStreams } from "./stream-diff";
-import { type GeneratedStream, generateStream } from "./stream-generate";
 import type {
   AdamStepConfig,
   Backend,
@@ -10,8 +7,8 @@ import type {
 } from "../backend/types";
 import { isFusedBackend } from "../backend/types";
 import {
-  type BufferArena,
   arenaLivenessEnabled,
+  type BufferArena,
   beginSharedEncoder,
   clearActiveArena,
   clearArenaConflictDetected,
@@ -28,15 +25,19 @@ import {
 } from "../backend/webgpu";
 import { getDispatchSequenceCounters } from "../backend/webgpu/bind-group-cache";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
-import { reshapeMeta, VIEW_META_OPS, viewResultMeta } from "../backend/webgpu/ops/view-meta";
-import { detectSimpleTranspose } from "../backend/webgpu/ops/views";
-import { dtypeBytes } from "../backend/webgpu/shape-utils";
 import {
   asGPUTensor,
   type GPUBuffer,
   gpuBuffer,
 } from "../backend/webgpu/gpu-types";
 import type { EpilogueConfig } from "../backend/webgpu/matmul/types";
+import {
+  reshapeMeta,
+  VIEW_META_OPS,
+  viewResultMeta,
+} from "../backend/webgpu/ops/view-meta";
+import { detectSimpleTranspose } from "../backend/webgpu/ops/views";
+import { dtypeBytes } from "../backend/webgpu/shape-utils";
 import type { FusionGroup } from "../compiler/fusion-detect";
 import {
   buildIdPositionMap,
@@ -53,7 +54,13 @@ import {
   _detectTransposeView,
   executeMatmulWithEpilogue,
 } from "../compiler/matmul-epilogue";
-import { checkContiguous, contiguousStrides, shapesEqual, sizeOf } from "../core/shape";
+import { ENV } from "../core/env";
+import {
+  checkContiguous,
+  contiguousStrides,
+  shapesEqual,
+  sizeOf,
+} from "../core/shape";
 import {
   _webgpuMatmulGeomImports,
   _webgpuMatmulImports,
@@ -80,6 +87,9 @@ import type {
   LazyRef,
   StorageHandle,
 } from "../graph/types";
+import { diffSegmentsAligned, diffStreams } from "./stream-diff";
+import { type GeneratedStream, generateStream } from "./stream-generate";
+
 /** Mark a storage's GPU buffer as liveness-safe for immediate pool reuse. */
 function markLivenessSafe(storage: StorageHandle): void {
   const buf = (storage.backendTensor as { buffer?: GPUBuffer }).buffer;
@@ -96,23 +106,16 @@ import {
   buildCompiledPlanFromGenerated,
   type CompiledPlan,
   destroyCompiledPlanBuffers,
-  resetPlannerRegistry,
   executeCompiledPlan,
-  setRecordingNodeIndex,
-} from "./compiled-plan";
-import {
   isCompilationRecordingActive,
   type NodeResult,
   recordBarrier,
   recordWrite,
+  resetPlannerRegistry,
+  setRecordingNodeIndex,
   startCompilationRecording,
   stopCompilationRecording,
 } from "./compiled-plan";
-import {
-  clearActiveScalarTable,
-  destroyScalarTable,
-  refreshScalarTable,
-} from "./scalar-table";
 import {
   buildLoweredPlanFromAnalysis,
   getActionNodeIndices,
@@ -125,6 +128,11 @@ import {
   withProfileContext,
 } from "./op-dispatch";
 import { pretunePlanMatmuls } from "./plan-builder";
+import {
+  clearActiveScalarTable,
+  destroyScalarTable,
+  refreshScalarTable,
+} from "./scalar-table";
 import {
   ensureFusionImports,
   executeFusedSegment,
@@ -308,7 +316,10 @@ function notePayloadThrash(
   }
   if (seen.size <= PAYLOAD_THRASH_THRESHOLD) seen.add(fingerprint.primary);
   const n = seen.size;
-  if (n < PAYLOAD_THRASH_THRESHOLD || structuralWarned.has(fingerprint.structural)) {
+  if (
+    n < PAYLOAD_THRASH_THRESHOLD ||
+    structuralWarned.has(fingerprint.structural)
+  ) {
     return;
   }
   structuralWarned.add(fingerprint.structural);
@@ -403,7 +414,10 @@ export function getCompiledStreams(): Array<{
   for (const [fp, template] of fusionAnalysisCache) {
     const cp = template.loweredPlan?.compiledPlan;
     if (cp?.valid) {
-      out.push({ label: `fp=0x${fp.toString(16)}`, commands: cp.commands.slice() });
+      out.push({
+        label: `fp=0x${fp.toString(16)}`,
+        commands: cp.commands.slice(),
+      });
     }
   }
   // Deterministic order for cross-snapshot comparison.
@@ -780,7 +794,9 @@ function captureActionLayouts(
         buffer: { size: number };
       };
       return {
-        contiguous: w.isContiguous !== false,
+        // Mirrors ensureContiguous EXACTLY: offset>0 views (even with
+        // contiguous strides) are materialized (offset-view class, task #58).
+        contiguous: w.isContiguous !== false && (w.offset ?? 0) === 0,
         shape: w.shape.slice(),
         strides: w.strides.slice(),
         offset: w.offset ?? 0,
@@ -837,10 +853,11 @@ function captureActionLayouts(
   // permute / narrow): that producer is released by plan-build and its
   // stride-bearing layout isn't shape-derivable, so capture each such input's
   // layout (incl. broadcast stride-0). Empty array marks "checked, none".
-  if (action.kind === "sequential" && action.cachedStridedInputs === undefined) {
-    let caps:
-      | (import("./lowered-plan").AttnInputContig | null)[]
-      | undefined;
+  if (
+    action.kind === "sequential" &&
+    action.cachedStridedInputs === undefined
+  ) {
+    let caps: (import("./lowered-plan").AttnInputContig | null)[] | undefined;
     for (let i = 0; i < node.inputs.length; i++) {
       const ref = node.inputs[i];
       if (
@@ -962,10 +979,7 @@ function makeMetaDeriver(): {
     return deriveNodeMeta(ref.node, oi); // recurse: intra-plan intermediate
   };
 
-  const deriveNodeMeta = (
-    node: LazyIRNode,
-    oi: number,
-  ): DerivedMeta | null => {
+  const deriveNodeMeta = (node: LazyIRNode, oi: number): DerivedMeta | null => {
     const key = `${node.id}:${oi}`;
     const cached = memo.get(key);
     if (cached !== undefined) return cached;
@@ -1104,12 +1118,18 @@ function populateCapturesFromIR(
     ) {
       const a = stubs[0];
       const b = stubs[1];
+      // Must mirror resolveMatmulInput: ensureContiguous COPIES when strides
+      // are non-contiguous OR the element offset is non-zero (offset-view
+      // class, task #58) — planBareMatmul on such a stub would dispatch a
+      // real contiguous kernel on a fake buffer.
+      const rawBindable = (t: { isContiguous: boolean; offset?: number }) =>
+        t.isContiguous && (t.offset ?? 0) === 0;
       const unsafe =
         stubs.length < 2 ||
         !a ||
         !b ||
-        (!a.isContiguous && detectSimpleTranspose(a as never) === null) ||
-        (!b.isContiguous && detectSimpleTranspose(b as never) === null);
+        (!rawBindable(a) && detectSimpleTranspose(a as never) === null) ||
+        (!rawBindable(b) && detectSimpleTranspose(b as never) === null);
       if (unsafe) action.cachedMatmulPlan = "ir-noncontig-matmul";
     }
 
@@ -1530,7 +1550,11 @@ export async function executeLoweredPlan(
     (!arenaLivenessEnabled() || compiledPlannedEnabled())
   ) {
     await ensureFusionImports();
-    const { reset } = populateCapturesFromIR(loweredPlan, planNodes, backend.name);
+    const { reset } = populateCapturesFromIR(
+      loweredPlan,
+      planNodes,
+      backend.name,
+    );
     let genPlan: CompiledPlan | undefined;
     const gen = generateStream(loweredPlan, planNodes, backend);
     if (gen?.fullyCovered) {
@@ -1629,8 +1653,7 @@ export async function executeLoweredPlan(
     (!arenaLivenessEnabled() || compiledPlannedEnabled()) &&
     // Debug bisection: only compile plans up to N nodes.
     (!ENV.TORCHLETTE_COMPILED_MAX_NODES ||
-      planNodes.length <=
-        parseInt(ENV.TORCHLETTE_COMPILED_MAX_NODES, 10)) &&
+      planNodes.length <= parseInt(ENV.TORCHLETTE_COMPILED_MAX_NODES, 10)) &&
     // Debug bisection: only compile plans whose node count is in the list.
     (!ENV.TORCHLETTE_COMPILED_ONLY_NODES ||
       ENV.TORCHLETTE_COMPILED_ONLY_NODES.split(",").includes(
@@ -1761,7 +1784,8 @@ export async function executeLoweredPlan(
           // this they inherit the PREVIOUS sequential node's index, polluting
           // its segment in the stream differential (and misattributing any
           // volatile-uniform recordings).
-          if (compilationRecording) setRecordingNodeIndex(action.outputNodeIndex);
+          if (compilationRecording)
+            setRecordingNodeIndex(action.outputNodeIndex);
           // Reconstruct FusionGroup from plan nodes
           const groupNodes = action.coveredNodeIndices.map((i) => planNodes[i]);
           const outputNode = planNodes[action.outputNodeIndex];
@@ -1912,7 +1936,8 @@ export async function executeLoweredPlan(
         }
 
         case "matmul-epilogue": {
-          if (compilationRecording) setRecordingNodeIndex(action.matmulNodeIndex);
+          if (compilationRecording)
+            setRecordingNodeIndex(action.matmulNodeIndex);
           const matmulNode = planNodes[action.matmulNodeIndex];
           const outputNode = planNodes[action.outputNodeIndex];
 
@@ -2137,7 +2162,8 @@ export async function executeLoweredPlan(
         }
 
         case "batched-reduction": {
-          if (compilationRecording) setRecordingNodeIndex(action.nodeIndices[0]);
+          if (compilationRecording)
+            setRecordingNodeIndex(action.nodeIndices[0]);
           const batchNodes = action.nodeIndices.map((i) => planNodes[i]);
           const batchBackend = getBackend(batchNodes[0].device) ?? backend;
           const batchInputs = batchNodes.map((node) => {
@@ -2189,20 +2215,24 @@ export async function executeLoweredPlan(
           // Tag the node for recording hooks (volatile uniform attribution).
           if (compilationRecording) setRecordingNodeIndex(nodeIdx);
 
-                  setProfileModule(node.module ?? "unknown");
+          setProfileModule(node.module ?? "unknown");
           let inputs;
           try {
-            inputs = node.inputs.map((ref) =>
-              getInputStorage(ref, backend),
-            );
+            inputs = node.inputs.map((ref) => getInputStorage(ref, backend));
           } catch (e) {
             // Dump context for debugging
-            console.error(`[lowered-plan] Action #${actionIndex} kind=${action.kind} nodeIdx=${nodeIdx} node=${node.id}:${node.op} shape=${JSON.stringify(node.shape)}`);
+            console.error(
+              `[lowered-plan] Action #${actionIndex} kind=${action.kind} nodeIdx=${nodeIdx} node=${node.id}:${node.op} shape=${JSON.stringify(node.shape)}`,
+            );
             for (let ii = 0; ii < node.inputs.length; ii++) {
               const ref = node.inputs[ii];
               if (ref.kind === "pending") {
-                const depPlanIdx = planNodes.findIndex(n => n.id === ref.node.id);
-                console.error(`[lowered-plan]   input[${ii}]: pending node=${ref.node.id}:${ref.node.op} result=${!!ref.node.result} planIdx=${depPlanIdx}`);
+                const depPlanIdx = planNodes.findIndex(
+                  (n) => n.id === ref.node.id,
+                );
+                console.error(
+                  `[lowered-plan]   input[${ii}]: pending node=${ref.node.id}:${ref.node.op} result=${!!ref.node.result} planIdx=${depPlanIdx}`,
+                );
               }
             }
             throw e;
@@ -2250,7 +2280,8 @@ export async function executeLoweredPlan(
         }
 
         case "row-program": {
-          if (compilationRecording) setRecordingNodeIndex(action.outputNodeIndex);
+          if (compilationRecording)
+            setRecordingNodeIndex(action.outputNodeIndex);
           // Remap inputRefs to current step's nodes (template reuse makes
           // the original refs stale — they point to cleared previous-step nodes).
           const remappedRefs = action.inputRefs.map((ref, i) => {
@@ -2297,8 +2328,7 @@ export async function executeLoweredPlan(
       // during recording as before — arena identities are already stable.
       if (
         livenessReleaseSchedule &&
-        (!compilationRecording ||
-          compiledPlannedEnabled())
+        (!compilationRecording || compiledPlannedEnabled())
       ) {
         // Register newly-produced storages for release tracking
         const covered = getActionNodeIndices(action);
@@ -2715,8 +2745,13 @@ export async function executePlanOptimized(
   let loweredPlan: LoweredPlan;
 
   // Validate cache hit via secondary fingerprint.
-  let validatedTemplate = cachedTemplate?.loweredPlan ? cachedTemplate : undefined;
-  if (validatedTemplate && validatedTemplate.fingerprintSecondary !== fingerprint.secondary) {
+  let validatedTemplate = cachedTemplate?.loweredPlan
+    ? cachedTemplate
+    : undefined;
+  if (
+    validatedTemplate &&
+    validatedTemplate.fingerprintSecondary !== fingerprint.secondary
+  ) {
     if (validatedTemplate.loweredPlan?.compiledPlan) {
       destroyCompiledPlanBuffers(validatedTemplate.loweredPlan.compiledPlan);
     }
@@ -2756,13 +2791,20 @@ export async function executePlanOptimized(
       for (const node of planNodes) {
         for (const inp of node.inputs) {
           if (inp.kind === "pending") {
-            consumerCount.set(inp.node.id, (consumerCount.get(inp.node.id) ?? 0) + 1);
+            consumerCount.set(
+              inp.node.id,
+              (consumerCount.get(inp.node.id) ?? 0) + 1,
+            );
             if (!consumers.has(inp.node.id)) consumers.set(inp.node.id, []);
             consumers.get(inp.node.id)!.push(node);
           }
         }
       }
-      runPasses({ planNodes, consumers, consumerCount }, new Set(), SIMPLIFICATION_PASSES);
+      runPasses(
+        { planNodes, consumers, consumerCount },
+        new Set(),
+        SIMPLIFICATION_PASSES,
+      );
     }
 
     loweredPlan = validatedTemplate.loweredPlan!;

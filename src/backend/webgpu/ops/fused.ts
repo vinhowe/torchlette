@@ -33,7 +33,12 @@ import { createTileKernelDispatcher } from "../tile-dispatch";
 import type { TileKernelSpec } from "../tile-ir";
 import { elementwiseGrid } from "../tile-ir";
 import { gpuContext, sharedEncoderActive } from "../webgpu-state";
-import { asContiguous, cast as castOp, ensureContiguous } from "./views";
+import {
+  asContiguous,
+  assertRawBindable,
+  cast as castOp,
+  ensureContiguous,
+} from "./views";
 
 /** Destroy contiguous copies that differ from their originals. */
 function cleanupContiguous(...pairs: [BackendTensor, WebGPUTensor][]) {
@@ -42,12 +47,12 @@ function cleanupContiguous(...pairs: [BackendTensor, WebGPUTensor][]) {
   }
 }
 
-import { dispatchAdamStep as dispatchAdamStepKernel } from "../adam-kernel";
 import {
   dispatchPackedOptimizer,
   type PackedOptimizerItem,
 } from "../../../optim/packed-dispatch";
 import type { AdamBatchItem, AdamBatchResult } from "../../types";
+import { dispatchAdamStep as dispatchAdamStepKernel } from "../adam-kernel";
 import {
   dispatchFlashAttentionBackwardD as dispatchFABwdDKernel,
   dispatchFlashAttentionBackwardDKV as dispatchFABwdDKVKernel,
@@ -589,8 +594,14 @@ export function fusedRoPE(
   config: import("../../types").FusedRoPEConfig,
 ): BackendTensor {
   const qkT = asContiguous(qk);
-  const cosT = asContiguous(cos);
-  const sinT = asContiguous(sin);
+  // cos/sin: a narrow() row-slice of a persistent [maxSeqLen, D/2] table has
+  // contiguous strides + element offset — fold the offset into the kernel's
+  // table indexing (zero-copy) instead of materializing. Non-contiguous
+  // strides still materialize.
+  const cosG = asGPUTensor(cos);
+  const sinG = asGPUTensor(sin);
+  const cosT = cosG.isContiguous ? cosG : asContiguous(cos);
+  const sinT = sinG.isContiguous ? sinG : asContiguous(sin);
   const outBuf = dispatchRoPEKernel(
     qkT.buffer,
     cosT.buffer,
@@ -599,6 +610,8 @@ export function fusedRoPE(
     config.seqLen,
     config.headDim,
     config.sinScale,
+    cosT.offset,
+    sinT.offset,
   );
   cleanupContiguous([qk, qkT], [cos, cosT], [sin, sinT]);
   return createTensor(qkT.shape.slice(), outBuf);
@@ -736,7 +749,10 @@ export function fusedAttentionBackward(
  */
 export function startScalarReadback(a: BackendTensor): () => Promise<number> {
   const ctx = requireContext();
-  const tensor = asGPUTensor(a);
+  // Offset/strided views must not be read from byte 0 (offset-view class —
+  // task #58): materialize first. Scalars are tiny, so the copy is cheap.
+  const original = asGPUTensor(a);
+  const tensor = ensureContiguous(original);
   const bytesPerElement = dtypeBytes(tensor.dtype);
   const totalBytes = tensor.size * bytesPerElement;
   const alignedBytes = alignBufferSize(totalBytes);
@@ -757,6 +773,7 @@ export function startScalarReadback(a: BackendTensor): () => Promise<number> {
     profileApiCall("queue.submit", () => ctx.queue.submit([encoder.finish()]));
     incrementSubmitCount();
   }
+  if (tensor !== original) destroyCopy(tensor);
 
   // Return a finish function that maps the staging buffer and reads the scalar
   const dtype = tensor.dtype;
@@ -798,14 +815,30 @@ export async function read(a: BackendTensor): Promise<number[]> {
     flushSharedEncoder();
   }
 
-  // Materialize non-contiguous tensors before reading
+  // Materialize views before reading. A narrow view can have CONTIGUOUS
+  // strides with a non-zero element OFFSET — copying its buffer from byte 0
+  // silently returns the wrong region (offset-view class, task #58). When
+  // the view is contiguous-strided and the offset is 4-byte aligned we can
+  // copy directly from the byte offset; otherwise materialize via
+  // contiguous() (which folds offset/strides in its kernel).
   const originalTensor = tensor;
-  if (!tensor.isContiguous) {
-    tensor = ensureContiguous(tensor);
-  }
-
   const bytesPerElement = dtypeBytes(tensor.dtype);
   const totalBytes = tensor.size * bytesPerElement;
+  let srcByteOffset = 0;
+  if (!tensor.isContiguous) {
+    tensor = ensureContiguous(tensor);
+  } else if (tensor.offset > 0) {
+    const offsetBytes = tensor.offset * bytesPerElement;
+    if (
+      offsetBytes % 4 === 0 &&
+      offsetBytes + alignBufferSize(totalBytes) <= tensor.buffer.size
+    ) {
+      srcByteOffset = offsetBytes;
+    } else {
+      tensor = ensureContiguous(tensor);
+    }
+  }
+
   const alignedBytes = alignBufferSize(totalBytes);
   const readBuffer = createTrackedBuffer(ctx.device, {
     size: alignedBytes,
@@ -814,12 +847,24 @@ export async function read(a: BackendTensor): Promise<number[]> {
   // Use the shared encoder for the copy if active, otherwise create a standalone one
   const sharedEnc = getSharedEncoderInstance();
   if (sharedEnc) {
-    sharedEnc.copyBufferToBuffer(tensor.buffer, 0, readBuffer, 0, alignedBytes);
+    sharedEnc.copyBufferToBuffer(
+      tensor.buffer,
+      srcByteOffset,
+      readBuffer,
+      0,
+      alignedBytes,
+    );
     // Flush to submit the copy command
     flushSharedEncoder();
   } else {
     const encoder = ctx.device.createCommandEncoder();
-    encoder.copyBufferToBuffer(tensor.buffer, 0, readBuffer, 0, alignedBytes);
+    encoder.copyBufferToBuffer(
+      tensor.buffer,
+      srcByteOffset,
+      readBuffer,
+      0,
+      alignedBytes,
+    );
     profileApiCall("queue.submit", () => ctx.queue.submit([encoder.finish()]));
     incrementSubmitCount();
   }
@@ -910,5 +955,10 @@ const mulScalarKernel = createTileKernelDispatcher(mulScalarInPlaceSpec);
  */
 export function mulScalarInPlace(tensor: BackendTensor, scalar: number): void {
   const a = asGPUTensor(tensor);
+  // In-place op binding the buffer flat from element 0: an offset/strided
+  // view here would CORRUPT the base's leading region — auto-materialize is
+  // not an option for in-place semantics, so throw loudly (offset-view
+  // class, task #58).
+  assertRawBindable(a, "mulScalarInPlace");
   mulScalarKernel.dispatch({ data: a.buffer }, { scalar, size: a.size });
 }
