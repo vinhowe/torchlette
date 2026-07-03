@@ -1453,12 +1453,21 @@ export class Torchlette {
             record,
           });
         } else {
-          this.keep(tensor);
+          // Graph-owned retention: the autograd node takes an INDEPENDENT
+          // storage-level reference on the saved value (PyTorch semantics), so
+          // it survives tidy/step scope exit AND disposal of the user's handle.
+          // Released in cleanupAutogradGraph (and the backward error-path
+          // finally) for a symmetric rc release. Replaces the old
+          // escapes-flag `keep(tensor)`, which only survived tidy, not scope
+          // reclamation or manual dispose (the "disposing intermediates breaks
+          // autograd" footgun).
+          const retained = tensor._unwrap()._cloneForRetention();
           const record = this.runtime._debug_saveForBackward(tensor.baseId);
           savedSlots.push({
             packed: tensor,
             unpackHook: (t) => t as Tensor,
             record,
+            retained,
           });
         }
       }
@@ -1633,49 +1642,15 @@ export class Torchlette {
 
   dispose(tensor: Tensor): void {
     this.assertSameEngine(tensor);
-    this._disposeAutogradChain(tensor);
+    // NOTE(scoped-memory stage 1): disposing a tensor releases only ITS OWN
+    // handle. It no longer tears down the upstream autograd graph — the graph
+    // now INDEPENDENTLY owns its saved values (per-slot `retained` rc), so a
+    // downstream loss can still be backwarded after an intermediate handle is
+    // disposed (the old "disposing intermediates breaks autograd" footgun).
+    // The graph and its retained rcs are released by cleanupAutogradGraph at
+    // backward, or by GC/FinalizationRegistry if a graph is abandoned without
+    // backward (dead lazy nodes are dropped unforced — scoped-memory §10).
     this.runtime.dispose(tensor._engineTensor());
-  }
-
-  /**
-   * Walk the autograd graph rooted at `tensor` and deterministically clean up
-   * all pending saved tensors. Without this, saved tensors deep in the chain
-   * (e.g., attention logsumexp reshapes) survive as zombie pending RuntimeTensors
-   * until GC, causing stale-graph crashes in forceAllPending().
-   */
-  private _disposeAutogradChain(tensor: Tensor): void {
-    const visited = new Set<Tensor>();
-    const stack: Tensor[] = [tensor];
-    while (stack.length > 0) {
-      const t = stack.pop()!;
-      if (visited.has(t)) continue;
-      visited.add(t);
-      const gradNode = t._gradNode();
-      if (!gradNode) continue;
-      // Dispose pending (unmaterialized) saved tensors.
-      // Materialized tensors (e.g., model params) are shared and must not be disposed.
-      for (const slot of gradNode.savedSlots) {
-        const saved = slot.packed;
-        if (
-          saved &&
-          typeof (saved as Tensor).disposed === "boolean" &&
-          !(saved as Tensor).disposed &&
-          typeof (saved as Tensor)._unwrap === "function"
-        ) {
-          const rt = (saved as Tensor)._unwrap();
-          if (!rt.isMaterialized()) {
-            this.runtime.dispose((saved as Tensor)._engineTensor());
-          }
-        }
-      }
-      gradNode.savedSlots.length = 0;
-      // Recurse into autograd inputs
-      for (const input of gradNode.inputs) {
-        stack.push(input);
-      }
-      gradNode.inputs.length = 0;
-      t._setGradNode(null);
-    }
   }
 
   /**

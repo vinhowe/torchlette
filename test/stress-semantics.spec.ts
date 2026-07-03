@@ -198,16 +198,18 @@ describe("stress: autograd corner cases", () => {
   // torchlette ties tensor lifecycle to the user handle. This is a known
   // design choice: use tidy() or let scope handle cleanup, don't manually
   // dispose tensors that are part of an active backward graph.
-  it("dispose intermediate before backward loses gradient", async () => {
+  it("dispose intermediate before backward keeps gradient (scoped-memory stage 1)", async () => {
     const a = t([1, 2, 3, 4], [2, 2], true);
     const b = api.mul(a, 2);
     const c = api.add(b, 1);
     const loss = api.sum(c);
     b.dispose();
     await loss.backward();
-    // Gradient may be null because the graph was broken by dispose
-    // This documents the behavior, not asserts correctness
-    expect(a.grad).toBeNull();
+    // The autograd graph now INDEPENDENTLY retains its saved values, so
+    // disposing an intermediate handle no longer breaks backward. dloss/da = 2.
+    expect(a.grad).not.toBeNull();
+    const grad = await a.grad!.cpu();
+    for (const g of grad) expect(g).toBeCloseTo(2, 5);
   });
 });
 

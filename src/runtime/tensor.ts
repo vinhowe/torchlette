@@ -342,6 +342,32 @@ export class Tensor {
     return this.backendTensor.toArray();
   }
 
+  /**
+   * Create an INDEPENDENT RuntimeTensor sharing this tensor's lazy ref, for
+   * autograd graph-owned retention (PyTorch "saved tensors own their storage").
+   *
+   * - If this tensor is PENDING, the clone registers as pending on the SAME
+   *   node, so it materializes to the same storage when the node executes,
+   *   taking its OWN reference count on that storage.
+   * - If MATERIALIZED, the clone takes its own rc on the storage immediately.
+   *   View storages keep their base alive via the baseStorageId retain chain,
+   *   so a saved VIEW keeps its base automatically.
+   *
+   * The clone is NOT registered in any tidy/step scope (it is created directly,
+   * bypassing createAndTrack/createTensor), so it survives scope exit, step
+   * reclamation, and disposal of the user's handle. The autograd graph owns it
+   * and MUST dispose it at graph cleanup for a symmetric rc release.
+   */
+  _cloneForRetention(): Tensor {
+    return new Tensor(
+      this.baseId,
+      this._lazyRef,
+      this.shape.slice(),
+      this.device,
+      this.dtype,
+    );
+  }
+
   view(shape: number[]): Tensor {
     const backend = this.backendTensor as BackendTensor & {
       view?: (shape: Shape) => BackendTensor;

@@ -71,6 +71,14 @@ export interface SavedTensorSlot {
   unpackHook: UnpackHook;
   /** Metadata for validation */
   record: SavedTensorRecord;
+  /**
+   * Graph-owned, scope-independent RuntimeTensor that keeps this saved value's
+   * storage alive until backward (PyTorch saved-tensor semantics). Set for the
+   * default (non-hook) save path; undefined for checkpoint hook slots, whose
+   * value is recomputed and lifetime-managed by the checkpoint scope. The
+   * autograd graph disposes it at cleanup for a symmetric rc release.
+   */
+  retained?: RuntimeTensor;
 }
 
 /**

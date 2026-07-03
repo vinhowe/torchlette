@@ -41,7 +41,23 @@ function collectSavedTensors(
       }
       const unpackedTensors: Tensor[] = [];
       for (const slot of node.savedSlots) {
-        const tensor = slot.unpackHook(slot.packed);
+        // Default (non-hook) slots carry a graph-owned RuntimeTensor whose rc
+        // keeps the saved value's storage alive independent of any scope. In
+        // the common case the user's handle is still usable, so read through
+        // it (backward math unchanged). If it was disposed / scope-reclaimed,
+        // wrap the graph-owned tensor into a fresh handle so gradients stay
+        // correct (the "disposing intermediates breaks autograd" fix). Hook
+        // slots (checkpointing) recompute their value via unpackHook.
+        const userHandle = slot.packed as Tensor;
+        const handleUsable =
+          !slot.retained ||
+          (!!userHandle &&
+            typeof userHandle._unwrap === "function" &&
+            !userHandle.disposed);
+        const tensor =
+          handleUsable || !slot.retained
+            ? slot.unpackHook(slot.packed)
+            : torch._wrap(slot.retained, false);
         unpackedTensors.push(tensor);
       }
       unpacked.set(node, unpackedTensors);
@@ -202,6 +218,12 @@ function cleanupAutogradGraph(
     if (visitedNodes.has(node)) return;
     visitedNodes.add(node);
     for (const slot of node.savedSlots) {
+      // Release the graph-owned retention rc (symmetric with save time). This
+      // is the SAME machinery as the compiled-plan harvest view-base retains —
+      // every retain needs a release on every graph-teardown path.
+      if (slot.retained && !slot.retained.disposed) {
+        slot.retained.dispose();
+      }
       const savedTensor = slot.packed as Tensor;
       if (savedTensor && typeof savedTensor.dispose === "function") {
         if (!preserved.has(savedTensor) && !savedTensor.disposed) {
@@ -283,6 +305,7 @@ export async function backwardImpl(
         const rootNode = a._gradNode();
         if (rootNode) visit(rootNode);
 
+        try {
         // Collect saved tensors (triggers checkpoint recomputation if any).
         const { unpacked: allUnpackedTensors, hasCheckpoints } =
           collectSavedTensors(torch, ordered);
@@ -413,6 +436,20 @@ export async function backwardImpl(
         // Dispose the gradient seed if we created it. Like TF.js, don't rely
         // on tidy to catch it — explicitly dispose consumed intermediates.
         if (ownsSeed) seed.dispose();
+        } finally {
+          // Symmetric release of graph-owned retention rcs on EVERY exit,
+          // including an error thrown before cleanupAutogradGraph. On the
+          // success path cleanupAutogradGraph already cleared savedSlots, so
+          // this loop is a no-op; on the error path it prevents a leaked rc
+          // (a leaked retain pins GPU memory forever).
+          for (const node of ordered) {
+            for (const slot of node.savedSlots) {
+              if (slot.retained && !slot.retained.disposed) {
+                slot.retained.dispose();
+              }
+            }
+          }
+        }
       });
     } finally {
       torch.runtime.popDispatchMode();
