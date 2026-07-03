@@ -7,7 +7,7 @@
  */
 
 import type { Torchlette } from "torchlette";
-import type { KVCache, Qwen3 } from "./model";
+import type { Qwen3 } from "./model";
 
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
@@ -148,12 +148,14 @@ export async function generateChat(
   };
 
   const t0 = Date.now();
-  let kv: KVCache[];
+  // Static KV cache: preallocated per-layer buffers updated in place —
+  // decode steps within a length bucket share one plan template, which the
+  // recurring-plan replay machinery accelerates automatically.
+  const staticKV = model.allocStaticKV(maxSeq);
   let nextTok: number;
   {
     const idx = api.tensorFromArray(promptIds, [1, promptIds.length]);
-    const { logits, presentKVs } = api.noGrad(() => model.forward(idx));
-    kv = presentKVs;
+    const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
     const flat = new Float32Array(await logits.cpu());
     logits.dispose();
     nextTok = sampleToken(flat, (promptIds.length - 1) * vocab, vocab, temperature, topK, topP);
@@ -170,13 +172,9 @@ export async function generateChat(
   while (count < maxNew && !QWEN3_STOP_TOKENS.has(nextTok) && !isAborted()) {
     emit(nextTok);
     count++;
-    const posOffset = promptIds.length + count - 1;
     const t0 = performance.now();
     const idx = api.tensorFromArray([nextTok], [1, 1]);
-    const { logits, presentKVs } = api.noGrad(() =>
-      model.forward(idx, { pastKVs: kv, posOffset }),
-    );
-    kv = presentKVs;
+    const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
     const t1 = performance.now();
     // cpu()'s synchronous prefix is the plan/lower/encode JS; the await is
     // the GPU fence + readback.
@@ -195,8 +193,9 @@ export async function generateChat(
     tSample += t4 - t3;
     tStep += t5 - t4;
   }
-  // Drop KV refs, then flush so the cache buffers get reclaimed.
-  kv = [];
+  // Drop KV cache refs, then flush so the buffers get reclaimed.
+  staticKV.k.length = 0;
+  staticKV.v.length = 0;
   await api.markStep();
 
   const seconds = (Date.now() - t0) / 1000;

@@ -67,10 +67,30 @@ async function main() {
     if (!SKIP_MARKSTEP) await api.markStep();
   }
 
+  // --- With STATIC cache: prefill writes into preallocated buffers, decode
+  // reads the bucketed prefix under a padding mask (shape-stable plans).
+  const stat = [...PROMPT];
+  const staticKV = model.allocStaticKV(256);
+  {
+    const idx = api.tensorFromArray(stat, [1, stat.length]);
+    const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
+    stat.push(await argmaxLast(logits, stat.length - 1));
+    if (!SKIP_MARKSTEP) await api.markStep();
+  }
+  for (let i = 1; i < NUM_NEW; i++) {
+    const idx = api.tensorFromArray([stat[stat.length - 1]], [1, 1]);
+    const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
+    stat.push(await argmaxLast(logits, 0));
+    if (!SKIP_MARKSTEP) await api.markStep();
+  }
+
   console.log("no-cache:", JSON.stringify(noCache));
   console.log("cached:  ", JSON.stringify(cached));
-  const match = JSON.stringify(noCache) === JSON.stringify(cached);
-  console.log(match ? "KV DIFFERENTIAL PASS" : "KV DIFFERENTIAL FAIL");
+  console.log("static:  ", JSON.stringify(stat));
+  const match =
+    JSON.stringify(noCache) === JSON.stringify(cached) &&
+    JSON.stringify(noCache) === JSON.stringify(stat);
+  console.log(match ? "KV DIFFERENTIAL PASS (cat + static)" : "KV DIFFERENTIAL FAIL");
   process.exit(match ? 0 : 1);
 }
 

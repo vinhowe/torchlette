@@ -73,6 +73,32 @@ export function configFromHF(
 /** Per-layer KV cache, stored at numKVHeads (pre-GQA-expansion). */
 export type KVCache = { k: Tensor; v: Tensor };
 
+/**
+ * Static (preallocated, in-place) KV cache for shape-stable decode.
+ *
+ * Buffers are allocated ONCE at [1, kvHeads, maxSeqLen, headDim] per layer
+ * and updated in place with copy_ region writes (the framework's persistent-
+ * state pattern — same path as packed optimizer state). Attention reads a
+ * BUCKETED prefix (length padded to BUCKET multiples) with an additive
+ * padding mask uploaded per step as data, so every decode step within a
+ * bucket executes the identical plan template — which the recurring-plan
+ * replay machinery then accelerates automatically.
+ */
+export type StaticKV = {
+  k: Tensor[]; // per layer, [1, kvH, maxSeqLen, headDim] f32
+  v: Tensor[];
+  /** Valid positions written so far. */
+  len: number;
+  maxSeqLen: number;
+};
+
+export const KV_BUCKET = 128;
+
+/** Padded attention length for a given valid length. */
+export function kvBucketLen(len: number, maxSeqLen: number): number {
+  return Math.min(Math.ceil(len / KV_BUCKET) * KV_BUCKET, maxSeqLen);
+}
+
 /** RoPE tables sliced to the current positions: [seqLen, headDim/2]. */
 type RopeSlices = { cos: Tensor; sin: Tensor };
 
@@ -133,6 +159,69 @@ export class Qwen3Attention extends Module {
       .reshape([b, kvH * nRep, s, d]);
   }
 
+  /**
+   * Static-cache attention step. Writes this step's K/V into the preallocated
+   * cache via scatterAdd (position enters as an INDEX TENSOR = data, so the
+   * plan template is stable and the replay machinery applies; add ≡ copy
+   * because every slot is written exactly once into zeroed cache). Attention
+   * reads the bucketed cache prefix under `mask`. For prefill (`mask` null),
+   * attention computes over the fresh K/V with the fused causal kernel — the
+   * cache write is only for later decode steps.
+   * Returns the UPDATED cache tensors (out-of-place; caller replaces refs).
+   */
+  forwardStatic(
+    x: Tensor,
+    rope: RopeSlices,
+    ctx: {
+      kSlot: Tensor;
+      vSlot: Tensor;
+      scatterIdx: Tensor; // [1, kvH, S, D] filled with target positions
+      bucketLen: number;
+      mask: Tensor | null; // decode: [1,1,1,bucketLen] additive; prefill: null
+    },
+  ): { out: Tensor } {
+    const [batch, seqLen, _hidden] = x.shape;
+    const toHeads = (t: Tensor, numHeads: number, norm?: RMSNorm) => {
+      let h = t.reshape([batch, seqLen, numHeads, this.headDim]);
+      if (norm) h = norm.forward(h);
+      if (seqLen === 1) return h.reshape([batch, numHeads, 1, this.headDim]);
+      return h.permute([0, 2, 1, 3]).contiguous();
+    };
+    let q = toHeads(this.qProj.forward(x), this.numHeads, this.qNorm);
+    let k = toHeads(this.kProj.forward(x), this.numKVHeads, this.kNorm);
+    let v = toHeads(this.vProj.forward(x), this.numKVHeads);
+    q = this.api.applyRoPE(q, rope.cos, rope.sin);
+    k = this.api.applyRoPE(k, rope.cos, rope.sin);
+
+    // IN-PLACE cache update with stable buffer identity: scatterAdd is
+    // out-of-place (position as index DATA keeps the template stable), and
+    // the full-overwrite copy_ DMAs the result back into the cache's OWN
+    // buffer — replayed plans rebind the same external input every step.
+    // (Replace-and-hold here is the documented anti-pattern: replays bind
+    // recorded buffers, so external persistent inputs must not churn.)
+    ctx.kSlot.copy_(ctx.kSlot.scatterAdd(ctx.scatterIdx, k, { dim: 2 }));
+    ctx.vSlot.copy_(ctx.vSlot.scatterAdd(ctx.scatterIdx, v, { dim: 2 }));
+
+    const scale = 1.0 / Math.sqrt(this.headDim);
+    let attnOutput: Tensor;
+    if (ctx.mask === null) {
+      // Prefill from position 0: fresh K/V are the whole context.
+      attnOutput = this.api.scaledDotProductAttention(q, this.expandKV(k), this.expandKV(v), scale, true);
+    } else {
+      const kE = this.expandKV(ctx.kSlot.narrow(2, 0, ctx.bucketLen));
+      const vE = this.expandKV(ctx.vSlot.narrow(2, 0, ctx.bucketLen));
+      const scores = q.matmul(kE.transpose({ dim0: 2, dim1: 3 })).mul(scale);
+      const attnWeights = this.api.add(scores, ctx.mask).softmax(-1);
+      attnOutput = attnWeights.matmul(vE);
+    }
+
+    const attnConcat = attnOutput
+      .permute([0, 2, 1, 3])
+      .contiguous()
+      .reshape([batch, seqLen, this.numHeads * this.headDim]);
+    return { out: this.oProj.forward(attnConcat) };
+  }
+
   forward(
     x: Tensor,
     rope: RopeSlices,
@@ -145,6 +234,10 @@ export class Qwen3Attention extends Module {
     const toHeads = (t: Tensor, numHeads: number, norm?: RMSNorm) => {
       let h = t.reshape([batch, seqLen, numHeads, this.headDim]);
       if (norm) h = norm.forward(h);
+      // Decode fast path: with S=1, [B,1,H,D] and [B,H,1,D] have identical
+      // memory layout — the head transpose is a free reshape, no permute or
+      // materializing copy (saves ~3 contiguous dispatches/layer/token).
+      if (seqLen === 1) return h.reshape([batch, numHeads, 1, this.headDim]);
       return h.permute([0, 2, 1, 3]).contiguous();
     };
     let q = toHeads(this.qProj.forward(x), this.numHeads, this.qNorm);
@@ -270,6 +363,22 @@ export class Qwen3Block extends Module {
     h = this.api.add(h, this.mlp.forward(this.postAttnNorm.forward(h)));
     return { out: h, presentKV };
   }
+
+  /** Static-cache variant of forward — see Qwen3Attention.forwardStatic. */
+  forwardStatic(
+    x: Tensor,
+    rope: RopeSlices,
+    ctx: Parameters<Qwen3Attention["forwardStatic"]>[2],
+  ): { out: Tensor } {
+    const { out: attnOut } = this.attn.forwardStatic(
+      this.inputNorm.forward(x),
+      rope,
+      ctx,
+    );
+    let h = this.api.add(x, attnOut);
+    h = this.api.add(h, this.mlp.forward(this.postAttnNorm.forward(h)));
+    return { out: h };
+  }
 }
 
 // ============================================================================
@@ -279,6 +388,12 @@ export class Qwen3Block extends Module {
 export type Qwen3ForwardOptions = {
   /** Per-layer KV cache from previous forward. */
   pastKVs?: KVCache[];
+  /**
+   * Static preallocated KV cache (see StaticKV): shape-stable decode for
+   * plan-replay. Mutually exclusive with pastKVs. Positions/RoPE derive from
+   * cache.len; forward advances cache.len by seqLen.
+   */
+  staticKV?: StaticKV;
   /** Position offset (= past sequence length) for RoPE. */
   posOffset?: number;
   /** Residual-stream hook applied after each block (steering seam). */
@@ -330,6 +445,18 @@ export class Qwen3 extends Module {
     }
   }
 
+  /** Allocate a zeroed static KV cache (one pair of buffers per layer). */
+  allocStaticKV(maxSeqLen = this.config.maxSeqLen): StaticKV {
+    const { numKVHeads, headDim, numLayers } = this.config;
+    const k: Tensor[] = [];
+    const v: Tensor[] = [];
+    for (let i = 0; i < numLayers; i++) {
+      k.push(this.api.zeros([1, numKVHeads, maxSeqLen, headDim]));
+      v.push(this.api.zeros([1, numKVHeads, maxSeqLen, headDim]));
+    }
+    return { k, v, len: 0, maxSeqLen };
+  }
+
   /**
    * Forward pass. Returns logits [batch, seqLen, vocabSize], the per-layer
    * KV cache, and (optionally) per-layer hidden states.
@@ -339,7 +466,7 @@ export class Qwen3 extends Module {
     options?: Qwen3ForwardOptions,
   ): { logits: Tensor; presentKVs: KVCache[]; hidden?: Tensor[] } {
     const [_batch, seqLen] = idx.shape;
-    const posOffset = options?.posOffset ?? 0;
+    const posOffset = options?.staticKV ? options.staticKV.len : (options?.posOffset ?? 0);
     if (posOffset + seqLen > this.config.maxSeqLen) {
       throw new Error(
         `Sequence length ${posOffset + seqLen} exceeds maxSeqLen ${this.config.maxSeqLen}`,
@@ -364,13 +491,59 @@ export class Qwen3 extends Module {
     const hidden: Tensor[] | undefined = options?.collectHidden ? [x] : undefined;
 
     const presentKVs: KVCache[] = [];
-    for (let i = 0; i < this.layers.length; i++) {
-      const block = this.layers.get(i) as Qwen3Block;
-      const { out, presentKV } = block.forward(x, rope, options?.pastKVs?.[i]);
-      x = out;
-      if (options?.residualHook) x = options.residualHook(x, i);
-      if (presentKV) presentKVs.push(presentKV);
-      hidden?.push(x);
+    const cache = options?.staticKV;
+    if (cache) {
+      if (posOffset + seqLen > cache.maxSeqLen) {
+        throw new Error(`static KV overflow: ${posOffset + seqLen} > ${cache.maxSeqLen}`);
+      }
+      const { numKVHeads, headDim } = this.config;
+      // Scatter index [1, kvH, S, D]: every element of row s targets cache
+      // position posOffset+s. Position enters the graph as DATA (index
+      // tensor), keeping the plan template stable across steps.
+      const idxArr = new Float32Array(numKVHeads * seqLen * headDim);
+      for (let h = 0; h < numKVHeads; h++) {
+        for (let s = 0; s < seqLen; s++) {
+          idxArr.fill(posOffset + s, (h * seqLen + s) * headDim, (h * seqLen + s + 1) * headDim);
+        }
+      }
+      const scatterIdx = this.api.tensorFromArray(idxArr, [1, numKVHeads, seqLen, headDim]);
+      // Decode mask over the bucketed prefix: 0 for valid, -1e9 for padding.
+      // Prefill (from pos 0) attends its own fresh K/V with the fused causal
+      // kernel and needs no mask.
+      const isPrefill = posOffset === 0 && seqLen > 1;
+      const bucketLen = kvBucketLen(posOffset + seqLen, cache.maxSeqLen);
+      let mask: Tensor | null = null;
+      if (!isPrefill) {
+        if (seqLen !== 1) throw new Error("static KV: incremental multi-token decode unsupported");
+        const maskArr = new Float32Array(bucketLen).fill(-1e9);
+        maskArr.fill(0, 0, posOffset + 1);
+        mask = this.api.tensorFromArray(maskArr, [1, 1, 1, bucketLen]);
+      }
+      for (let i = 0; i < this.layers.length; i++) {
+        const block = this.layers.get(i) as Qwen3Block;
+        // Cache tensors are updated IN PLACE (stable buffer identity — the
+        // replay contract for external persistent inputs); no reassignment.
+        const { out } = block.forwardStatic(x, rope, {
+          kSlot: cache.k[i],
+          vSlot: cache.v[i],
+          scatterIdx,
+          bucketLen,
+          mask,
+        });
+        x = out;
+        if (options?.residualHook) x = options.residualHook(x, i);
+        hidden?.push(x);
+      }
+      cache.len = posOffset + seqLen;
+    } else {
+      for (let i = 0; i < this.layers.length; i++) {
+        const block = this.layers.get(i) as Qwen3Block;
+        const { out, presentKV } = block.forward(x, rope, options?.pastKVs?.[i]);
+        x = out;
+        if (options?.residualHook) x = options.residualHook(x, i);
+        if (presentKV) presentKVs.push(presentKV);
+        hidden?.push(x);
+      }
     }
 
     x = this.norm.forward(x);
