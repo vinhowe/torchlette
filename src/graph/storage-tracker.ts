@@ -177,7 +177,10 @@ class StorageTracker {
       // Gen-scoped snapshot (implied boundaries): tensors created AFTER the
       // boundary belong to the next step's lazily-built work — treating
       // them as persistent would exempt them from cleanup forever.
-      if (maxGen !== undefined && (this._wrapperGen.get(target) ?? 0) > maxGen) {
+      if (
+        maxGen !== undefined &&
+        (this._wrapperGen.get(target) ?? 0) > maxGen
+      ) {
         continue;
       }
       this._stepStartTensors.add(target);
@@ -197,6 +200,17 @@ class StorageTracker {
    */
   adoptIntoSnapshot(tensor: object): void {
     this._stepStartTensors?.add(tensor);
+  }
+
+  /**
+   * Drop the active step snapshot without releasing anything. Used when
+   * step-scoped markStep cleanup (Torchlette.setStepScopedCleanup) is
+   * DISABLED: its end-of-markStep snapshot must not linger, or a later bare
+   * markStep — back on historical semantics — would consume it and reclaim
+   * tensors created after the disable.
+   */
+  clearStepSnapshot(): void {
+    this._stepStartTensors = null;
   }
 
   /**

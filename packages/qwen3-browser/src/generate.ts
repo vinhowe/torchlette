@@ -9,7 +9,10 @@
 import type { Torchlette } from "torchlette";
 import type { Qwen3 } from "./model";
 
-export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+export type ChatMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+};
 
 export type TokenizerLike = {
   encode(text: string): number[];
@@ -52,7 +55,9 @@ export type GenerateStats = {
   };
 };
 
-export const QWEN3_STOP_TOKENS = new Set([151645 /* <|im_end|> */, 151643 /* <|endoftext|> */]);
+export const QWEN3_STOP_TOKENS = new Set([
+  151645 /* <|im_end|> */, 151643 /* <|endoftext|> */,
+]);
 
 /** Qwen3 chat format, thinking disabled (empty think block, per the official template). */
 export function buildChatPrompt(messages: ChatMessage[]): string {
@@ -166,10 +171,15 @@ export async function generateChat(
   const prompt = buildChatPrompt(messages);
   const promptIds = tokenizer.encode(prompt);
   if (promptIds.length + 8 >= maxSeq) {
-    throw new Error(`Conversation too long (${promptIds.length} tokens, max ~${maxSeq})`);
+    throw new Error(
+      `Conversation too long (${promptIds.length} tokens, max ~${maxSeq})`,
+    );
   }
   const vocab = model.config.vocabSize;
-  const maxNew = Math.min(options?.maxNewTokens ?? 400, maxSeq - promptIds.length - 1);
+  const maxNew = Math.min(
+    options?.maxNewTokens ?? 400,
+    maxSeq - promptIds.length - 1,
+  );
   const isAborted = options?.isAborted ?? (() => false);
   const { temperature, topK, topP } = options ?? {};
 
@@ -192,83 +202,102 @@ export async function generateChat(
   // decode steps within a length bucket share one plan template, which the
   // recurring-plan replay machinery accelerates automatically.
   const staticKV = model.allocStaticKV(maxSeq);
-  // Top-K prefilter readback: K=64 covers any sensible sampling topK and the
-  // GPU kernel reduces the per-token readback from the full vocab row (600KB)
-  // to 64 (value, index) pairs (512B). Greedy = indices[0], bit-identical to
-  // a full-logits argmax (gated by examples/qwen3/topk-equivalence.ts).
-  const K_PREFILTER = Math.max(64, topK ?? 20);
-  let nextTok: number;
-  {
-    const idx = api.tensorFromArray(promptIds, [1, promptIds.length]);
-    const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
-    const top = await api.readTopK(logits, K_PREFILTER, {
-      offset: (promptIds.length - 1) * vocab,
-      length: vocab,
-    });
-    logits.dispose();
-    nextTok = sampleFromTopK(top.values, top.indices, temperature, topK, topP);
-    await api.markStep();
-  }
-  const prefillMs = Date.now() - t0;
+  // Ceremony-free step-scoped cleanup: each markStep reclaims the interval's
+  // graph temporaries deterministically (without it, decode leaks ~1 storage
+  // handle per graph node per token until V8 GC collects the wrappers and
+  // the markStep sweep cost grows unboundedly). Safe here: static-KV decode
+  // holds NO tensors created inside an interval across markStep (cache slots
+  // are updated in place via copy_; logits are read before markStep).
+  // Restored on exit so surrounding app code (e.g. steering/analysis holding
+  // tensors across steps) keeps default markStep semantics.
+  const prevStepScope = api.setStepScopedCleanup(true);
+  try {
+    // Top-K prefilter readback: K=64 covers any sensible sampling topK and the
+    // GPU kernel reduces the per-token readback from the full vocab row (600KB)
+    // to 64 (value, index) pairs (512B). Greedy = indices[0], bit-identical to
+    // a full-logits argmax (gated by examples/qwen3/topk-equivalence.ts).
+    const K_PREFILTER = Math.max(64, topK ?? 20);
+    let nextTok: number;
+    {
+      const idx = api.tensorFromArray(promptIds, [1, promptIds.length]);
+      const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
+      const top = await api.readTopK(logits, K_PREFILTER, {
+        offset: (promptIds.length - 1) * vocab,
+        length: vocab,
+      });
+      logits.dispose();
+      nextTok = sampleFromTopK(
+        top.values,
+        top.indices,
+        temperature,
+        topK,
+        topP,
+      );
+      await api.markStep();
+    }
+    const prefillMs = Date.now() - t0;
 
-  let count = 0;
-  let tBuild = 0;
-  let tLower = 0;
-  let tFence = 0;
-  let tSample = 0;
-  let tStep = 0;
-  while (count < maxNew && !QWEN3_STOP_TOKENS.has(nextTok) && !isAborted()) {
-    emit(nextTok);
-    count++;
-    const t0 = performance.now();
-    // Step-scoped cleanup: snapshot persistents (weights, static KV slots) at
-    // beginStep so markStep's releaseStepTemps reclaims this step's ~1600
-    // graph temps deterministically. Without it inference leaks storage
-    // handles every token (only V8 GC eventually reclaims them) and the
-    // markStep sweep cost grows unboundedly. Safe here because static-KV
-    // decode holds NO graph-derived tensors across steps (cache slots are
-    // updated in place via copy_; logits are read before markStep).
-    await api.beginStep();
-    const idx = api.tensorFromArray([nextTok], [1, 1]);
-    const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
-    const t1 = performance.now();
-    // readTopK's synchronous prefix is the plan/lower/encode JS; the await is
-    // the GPU fence + the 512B top-K readback.
-    const readback = api.readTopK(logits, K_PREFILTER, { length: vocab });
-    const t2 = performance.now();
-    const top = await readback;
-    const t3 = performance.now();
-    logits.dispose();
-    nextTok = sampleFromTopK(top.values, top.indices, temperature, topK, topP);
-    const t4 = performance.now();
-    api.endStep();
+    let count = 0;
+    let tBuild = 0;
+    let tLower = 0;
+    let tFence = 0;
+    let tSample = 0;
+    let tStep = 0;
+    while (count < maxNew && !QWEN3_STOP_TOKENS.has(nextTok) && !isAborted()) {
+      emit(nextTok);
+      count++;
+      const t0 = performance.now();
+      const idx = api.tensorFromArray([nextTok], [1, 1]);
+      const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
+      const t1 = performance.now();
+      // readTopK's synchronous prefix is the plan/lower/encode JS; the await is
+      // the GPU fence + the 512B top-K readback.
+      const readback = api.readTopK(logits, K_PREFILTER, { length: vocab });
+      const t2 = performance.now();
+      const top = await readback;
+      const t3 = performance.now();
+      logits.dispose();
+      nextTok = sampleFromTopK(
+        top.values,
+        top.indices,
+        temperature,
+        topK,
+        topP,
+      );
+      const t4 = performance.now();
+      api.endStep();
+      await api.markStep();
+      const t5 = performance.now();
+      tBuild += t1 - t0;
+      tLower += t2 - t1;
+      tFence += t3 - t2;
+      tSample += t4 - t3;
+      tStep += t5 - t4;
+    }
+    // Drop KV cache refs, then flush so the buffers get reclaimed.
+    staticKV.k.length = 0;
+    staticKV.v.length = 0;
     await api.markStep();
-    const t5 = performance.now();
-    tBuild += t1 - t0;
-    tLower += t2 - t1;
-    tFence += t3 - t2;
-    tSample += t4 - t3;
-    tStep += t5 - t4;
-  }
-  // Drop KV cache refs, then flush so the buffers get reclaimed.
-  staticKV.k.length = 0;
-  staticKV.v.length = 0;
-  await api.markStep();
 
-  const seconds = (Date.now() - t0) / 1000;
-  const per = (t: number) => Number((t / Math.max(count, 1)).toFixed(1));
-  return {
-    promptTokens: promptIds.length,
-    newTokens: count,
-    seconds: Number(seconds.toFixed(2)),
-    prefillMs,
-    tokPerSec: Number((count / Math.max(seconds - prefillMs / 1000, 0.001)).toFixed(1)),
-    decodeBreakdown: {
-      buildMs: per(tBuild),
-      lowerMs: per(tLower),
-      fenceMs: per(tFence),
-      sampleMs: per(tSample),
-      stepMs: per(tStep),
-    },
-  };
+    const seconds = (Date.now() - t0) / 1000;
+    const per = (t: number) => Number((t / Math.max(count, 1)).toFixed(1));
+    return {
+      promptTokens: promptIds.length,
+      newTokens: count,
+      seconds: Number(seconds.toFixed(2)),
+      prefillMs,
+      tokPerSec: Number(
+        (count / Math.max(seconds - prefillMs / 1000, 0.001)).toFixed(1),
+      ),
+      decodeBreakdown: {
+        buildMs: per(tBuild),
+        lowerMs: per(tLower),
+        fenceMs: per(tFence),
+        sampleMs: per(tSample),
+        stepMs: per(tStep),
+      },
+    };
+  } finally {
+    api.setStepScopedCleanup(prevStepScope);
+  }
 }

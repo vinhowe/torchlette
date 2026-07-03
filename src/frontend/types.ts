@@ -115,4 +115,14 @@ export type TorchletteOptions = {
   executionHook?: import("../runtime/engine").ExecutionHook;
   /** Replace local tensor readback with a custom hook (e.g., remote download). */
   readHook?: import("../runtime/engine").ReadHook;
+  /**
+   * Step-scoped cleanup on bare markStep() — the inference-loop equivalent of
+   * the beginStep/endStep ceremony. When enabled, every markStep() ends by
+   * snapshotting the currently-alive tensors; the NEXT markStep() reclaims
+   * everything created in between (graph temporaries) deterministically,
+   * without waiting for JS GC to collect their wrappers. See
+   * Torchlette.setStepScopedCleanup() for the semantics and the persist()
+   * escape hatch. Default: false (existing markStep semantics unchanged).
+   */
+  stepScopedCleanup?: boolean;
 };

@@ -214,6 +214,10 @@ async function main() {
     await api.markStep();
   }
 
+  // Ceremony-free step-scoped cleanup: bare markStep reclaims interval temps.
+  // The decomposed markStep below replicates the flag's end-snapshot manually.
+  api.setStepScopedCleanup(true);
+
   const MEASURE = new Set([numSteps - 3, numSteps - 2]); // two steady-state steps
   for (let i = 0; i < numSteps; i++) {
     const measured = MEASURE.has(i);
@@ -229,8 +233,6 @@ async function main() {
     bufferMs = 0;
     recording = measured;
 
-    await api.beginStep();
-    mark("beginStep");
     const last = tokens[tokens.length - 1];
     const idx = api.tensorFromArray([last], [1, 1]);
     mark("tensorFromArray(idx)");
@@ -252,9 +254,8 @@ async function main() {
     mark("argmax (indices[0])");
     logits.dispose();
 
-    // markStep, decomposed (mirrors Torchlette.markStep):
-    api.endStep();
-    mark("endStep");
+    // markStep, decomposed (mirrors Torchlette.markStep with
+    // stepScopedCleanup enabled):
     // biome-ignore lint/suspicious/noExplicitAny: harness
     (api as any)._pendingStepBoundary = null;
     await awaitDeferredFence();
@@ -281,6 +282,10 @@ async function main() {
     issueDeferredFence();
     await awaitDeferredFence();
     mark("markStep: fence");
+    // Implicit boundary (stepScopedCleanup): snapshot survivors — the next
+    // markStep's releaseStepTemps reclaims everything created after this.
+    storageTracker.snapshotForStep();
+    mark("markStep: end snapshot");
 
     recording = false;
     const wall = now() - stepT0;

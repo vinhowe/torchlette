@@ -93,6 +93,9 @@ async function main() {
     return ref.argmax;
   };
 
+  // Ceremony-free step-scoped cleanup — same loop shape as the generate loops.
+  api.setStepScopedCleanup(true);
+
   // Prefill (checks the offset path: last row of [1, S, V])
   {
     const idx = api.tensorFromArray(tokens, [1, tokens.length]);
@@ -102,11 +105,9 @@ async function main() {
   }
 
   for (let i = 0; i < NUM_STEPS; i++) {
-    await api.beginStep();
     const idx = api.tensorFromArray([tokens[tokens.length - 1]], [1, 1]);
     const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
     tokens.push(await checkStep(logits, 0, `step ${i}`));
-    api.endStep();
     await api.markStep();
   }
 

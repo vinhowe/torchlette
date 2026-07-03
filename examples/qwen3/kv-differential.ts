@@ -27,11 +27,15 @@ async function main() {
   const model = await loadPretrainedQwen3(api, MODEL_DIR, { maxSeqLen: 256 });
   const vocab = model.config.vocabSize;
 
-  const argmaxLast = async (logits: import("../../src/frontend/torchlette").Tensor, pos: number) => {
+  const argmaxLast = async (
+    logits: import("../../src/frontend/torchlette").Tensor,
+    pos: number,
+  ) => {
     const flat = new Float32Array(await logits.cpu());
     const off = pos * vocab;
     let best = 0;
-    for (let v = 1; v < vocab; v++) if (flat[off + v] > flat[off + best]) best = v;
+    for (let v = 1; v < vocab; v++)
+      if (flat[off + v] > flat[off + best]) best = v;
     logits.dispose();
     return best;
   };
@@ -69,8 +73,15 @@ async function main() {
 
   // --- With STATIC cache: prefill writes into preallocated buffers, decode
   // reads the bucketed prefix under a padding mask (shape-stable plans).
+  //
+  // Ceremony-free step-scoped cleanup (setStepScopedCleanup): the same loop
+  // shape as the real generate loops — bare markStep() reclaims each
+  // interval's graph temporaries. NOT enabled for the cat loop above: its
+  // presentKVs are created inside an interval and held across markStep (the
+  // adversarial case for implicit boundaries — they'd need api.persist()).
   const stat = [...PROMPT];
   const staticKV = model.allocStaticKV(256);
+  if (!SKIP_MARKSTEP) api.setStepScopedCleanup(true);
   {
     const idx = api.tensorFromArray(stat, [1, stat.length]);
     const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
@@ -78,17 +89,10 @@ async function main() {
     if (!SKIP_MARKSTEP) await api.markStep();
   }
   for (let i = 1; i < NUM_NEW; i++) {
-    // Step-scoped ceremony (beginStep/endStep/markStep) — same loop shape as
-    // the real generate loops (packages/qwen3-browser/src/generate.ts), so
-    // this gate exercises step-scoped temp cleanup under static-KV decode.
-    if (!SKIP_MARKSTEP) await api.beginStep();
     const idx = api.tensorFromArray([stat[stat.length - 1]], [1, 1]);
     const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
     stat.push(await argmaxLast(logits, 0));
-    if (!SKIP_MARKSTEP) {
-      api.endStep();
-      await api.markStep();
-    }
+    if (!SKIP_MARKSTEP) await api.markStep();
   }
 
   console.log("no-cache:", JSON.stringify(noCache));
@@ -97,7 +101,9 @@ async function main() {
   const match =
     JSON.stringify(noCache) === JSON.stringify(cached) &&
     JSON.stringify(noCache) === JSON.stringify(stat);
-  console.log(match ? "KV DIFFERENTIAL PASS (cat + static)" : "KV DIFFERENTIAL FAIL");
+  console.log(
+    match ? "KV DIFFERENTIAL PASS (cat + static)" : "KV DIFFERENTIAL FAIL",
+  );
   process.exit(match ? 0 : 1);
 }
 

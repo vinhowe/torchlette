@@ -142,6 +142,74 @@ export class Torchlette {
       readHook: options?.readHook,
     });
     this.autocastContext = createAutocastContext();
+    if (options?.stepScopedCleanup) {
+      this.setStepScopedCleanup(true);
+    }
+  }
+
+  /** Step-scoped cleanup on bare markStep() — see setStepScopedCleanup(). */
+  private _stepScopedCleanup = false;
+
+  /**
+   * Enable/disable step-scoped cleanup on bare markStep() calls — the
+   * ceremony-free equivalent of beginStep()/endStep() for inference loops.
+   *
+   * When enabled, every markStep() ends by snapshotting the tensors alive at
+   * that moment; the NEXT markStep() releases everything created in between
+   * and not in the snapshot. This reclaims per-step graph temporaries
+   * deterministically (JS GC otherwise collects their wrappers lazily —
+   * a decode loop leaks ~1 storage handle per graph node per step and the
+   * markStep sweep cost grows unboundedly).
+   *
+   * SEMANTIC CONTRACT (same rule as the explicit ceremony, applied per
+   * markStep-to-markStep interval): a tensor CREATED between two markSteps
+   * and held across the second one is reclaimed even if user code still
+   * references it — JS offers no reliable way to distinguish "user still
+   * holds this wrapper" from "graph temporary whose wrapper GC hasn't run
+   * yet". Tensors alive at the moment of enabling (or at any markStep end)
+   * are persistent. For legitimately long-lived state created inside an
+   * interval (e.g. a KV cache built from cat() and carried forward), call
+   * persist(t) before markStep — or leave this flag off (the default), which
+   * keeps the exact historical markStep semantics.
+   *
+   * Explicit beginStep() supersedes the implicit snapshot (it re-snapshots),
+   * and the optimizer-queued implied boundaries are unaffected.
+   *
+   * TIMING: enabling ARMS the mechanism — the first markStep() after
+   * enabling is the baseline boundary (its end-snapshot runs after
+   * forceAllPending, so lazily-created state like preallocated KV slots is
+   * materialized and captured); reclamation applies from the SECOND
+   * markStep(). (A snapshot taken directly at enable time would miss
+   * still-lazy tensors — they only enter the tracker when their storage
+   * materializes — and would reclaim them after their first force.)
+   *
+   * Returns the previous value so callers can scope the setting:
+   *   const prev = api.setStepScopedCleanup(true);
+   *   try { ... } finally { api.setStepScopedCleanup(prev); }
+   */
+  setStepScopedCleanup(enabled: boolean): boolean {
+    const prev = this._stepScopedCleanup;
+    this._stepScopedCleanup = enabled;
+    if (prev && !enabled) {
+      // Disarm: drop any implicit end-of-markStep snapshot so a later bare
+      // markStep (back on historical semantics) doesn't consume it and
+      // reclaim tensors created after the disable.
+      storageTracker.clearStepSnapshot();
+    }
+    return prev;
+  }
+
+  /**
+   * Mark a tensor created mid-step (or mid markStep-interval under
+   * setStepScopedCleanup) as persistent: step-boundary cleanup will not
+   * reclaim its storage. THE escape hatch for long-lived state created
+   * inside a step — optimizer state, EMA shadows, KV caches built from
+   * graph ops and carried across markStep.
+   */
+  persist(a: Tensor): Tensor {
+    this._assertUsable(a);
+    this.runtime.persist(a._unwrap());
+    return a;
   }
 
   /**
@@ -928,7 +996,11 @@ export class Torchlette {
     return softmaxImpl(this, a, dim);
   }
 
-  _crossEntropyFused(logits: Tensor, targets: Tensor, ignoreIndex?: number): Tensor {
+  _crossEntropyFused(
+    logits: Tensor,
+    targets: Tensor,
+    ignoreIndex?: number,
+  ): Tensor {
     return crossEntropyFusedImpl(this, logits, targets, ignoreIndex);
   }
 
@@ -1708,6 +1780,14 @@ export class Torchlette {
       await awaitDeferredFence();
     } catch {
       // Safe to ignore if WebGPU backend is not initialized (CPU-only usage).
+    }
+
+    // Step 5 (opt-in): implicit step boundary for ceremony-free loops.
+    // Snapshot the survivors — the NEXT markStep's releaseStepTemps (Step 3.5)
+    // reclaims everything created after this point. An explicit beginStep()
+    // before then simply re-snapshots (supersedes). See setStepScopedCleanup.
+    if (this._stepScopedCleanup) {
+      storageTracker.snapshotForStep();
     }
   }
 
