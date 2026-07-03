@@ -20,15 +20,23 @@ import { getWarmupPipeline, recordPipeline } from "../pipeline-warmup";
 import { getCurrentOpLabel } from "../shared-encoder";
 import { F32_BYTES } from "../shape-utils";
 import { onTeardown } from "../webgpu-state";
+import { cacheTuningResult } from "./autotune";
 import {
-  cacheTuningResult,
-  generateNeighborConfigs,
-  getDefaultConfigForShape,
-} from "./autotune";
+  computeGemvRoute,
+  generateGemvShaderTileIR,
+  type GemvKernelOptions,
+  getGemvShaderCacheKey,
+} from "./gemv";
 import {
   generateKSplitReductionShaderTileIR,
   generateTiledMatmulShaderTileIR,
 } from "./tile-matmul";
+import {
+  getMatmulVariant,
+  MATMUL_VARIANTS,
+  type MatmulVariantChoice,
+  type MatmulVariantContext,
+} from "./variants";
 import {
   type CodegenOptions,
   classifyShape,
@@ -39,7 +47,6 @@ import {
   getSubgroupSupport,
   getTransposeMode,
   type MatmulKernelConfig,
-  type ShapeClass,
   validateConfig,
 } from "./types";
 
@@ -54,13 +61,47 @@ const pipelineCache = new Map<string, GPUComputePipeline>();
 const tuningCache = new Map<string, MatmulKernelConfig>();
 
 /**
- * Per-shape tuning cache: exact (M,N,K,dtype) → best config.
+ * Per-shape tuning cache: exact (M,N,K,dtype) → winning (variant, choice).
  * Used for bare matmuls only (epilogue matmuls use shape-class defaults).
+ * Populated by the autotuner (which benchmarks across ALL applicable
+ * variants × their candidates) or seeded via seedPerShapeMatmulChoice.
  */
-const perShapeTuningCache = new Map<string, MatmulKernelConfig>();
+const perShapeTuningCache = new Map<string, MatmulVariantChoice>();
 
 function getPerShapeKey(m: number, n: number, k: number, dtype: DType): string {
   return `${m}_${n}_${k}_${dtype}`;
+}
+
+/** Count of autotune searches actually executed (cache misses). Debug/tests. */
+let autotuneRunCount = 0;
+export function getAutotuneRunCount(): number {
+  return autotuneRunCount;
+}
+
+/** Read the tuned (variant, choice) for an exact shape, if any. Debug/tests. */
+export function getPerShapeMatmulChoice(
+  m: number,
+  n: number,
+  k: number,
+  dtype: DType,
+): MatmulVariantChoice | undefined {
+  return perShapeTuningCache.get(getPerShapeKey(m, n, k, dtype));
+}
+
+/** Seed a per-shape winner without benchmarking (tests / pre-seeded caches). */
+export function seedPerShapeMatmulChoice(
+  m: number,
+  n: number,
+  k: number,
+  dtype: DType,
+  choice: MatmulVariantChoice,
+): void {
+  perShapeTuningCache.set(getPerShapeKey(m, n, k, dtype), choice);
+}
+
+/** Clear per-shape tuned winners (tests). */
+export function clearPerShapeMatmulChoices(): void {
+  perShapeTuningCache.clear();
 }
 
 /**
@@ -96,29 +137,54 @@ export function isAutotuneEnabled(): boolean {
 }
 
 /**
- * Get the best kernel config for a shape class (from cache or default).
- * For bare matmuls, also checks the per-shape tuning cache when M,N,K are provided.
+ * Tiled choice for a ctx: shape-class tuning cache → heuristic defaults.
  */
-function getConfigForShape(
-  shapeClass: ShapeClass,
-  dtype: DType,
-  hasEpilogue: boolean = false,
-  m?: number,
-  n?: number,
-  k?: number,
-): MatmulKernelConfig {
-  // Per-shape cache (bare matmuls only)
-  if (!hasEpilogue && m !== undefined && n !== undefined && k !== undefined) {
-    const perShapeHit = perShapeTuningCache.get(getPerShapeKey(m, n, k, dtype));
-    if (perShapeHit) return perShapeHit;
-  }
-  // Fall through to shape-class cache → defaults
-  const key = `${shapeClass}_${dtype}_${hasEpilogue ? "epilogue" : "bare"}`;
+function tiledChoiceForContext(
+  ctx: MatmulVariantContext,
+): Extract<MatmulVariantChoice, { variant: "tiled" }> {
+  const shapeClass = classifyShape(ctx.m, ctx.n, ctx.k, ctx.batchSize);
+  const key = `${shapeClass}_${ctx.dtypeA}_${ctx.hasEpilogue ? "epilogue" : "bare"}`;
   const cached = tuningCache.get(key);
   if (cached) {
-    return cached;
+    return { variant: "tiled", config: cached };
   }
-  return getDefaultConfigForShape(shapeClass, hasEpilogue, m, n, k);
+  return getMatmulVariant("tiled").defaultChoice(ctx) as Extract<
+    MatmulVariantChoice,
+    { variant: "tiled" }
+  >;
+}
+
+/**
+ * Select the (variant, choice) for a matmul described by ctx.
+ *
+ * Order: explicit caller config (pins the tiled variant) → per-shape tuned
+ * winner (bare matmuls only; re-gated on isApplicable so a winner tuned in
+ * one context never forces an inapplicable variant) → first applicable
+ * registry variant's heuristic default (for tiled, via the shape-class
+ * tuning cache first). With autotune off the caches are empty and this
+ * reduces exactly to the pre-registry heuristics.
+ */
+function selectMatmulChoice(
+  ctx: MatmulVariantContext,
+  explicitConfig?: MatmulKernelConfig,
+): MatmulVariantChoice {
+  if (explicitConfig) {
+    return { variant: "tiled", config: explicitConfig };
+  }
+  // Per-shape tuned winner (bare matmuls only — same guard as pre-registry)
+  if (!ctx.hasEpilogue) {
+    const hit = perShapeTuningCache.get(
+      getPerShapeKey(ctx.m, ctx.n, ctx.k, ctx.dtypeA),
+    );
+    if (hit && getMatmulVariant(hit.variant).isApplicable(ctx)) {
+      return hit;
+    }
+  }
+  const variant = MATMUL_VARIANTS.find((v) => v.isApplicable(ctx));
+  if (!variant || variant.name === "tiled") {
+    return tiledChoiceForContext(ctx);
+  }
+  return variant.defaultChoice(ctx);
 }
 
 /**
@@ -129,7 +195,9 @@ export function resetMatmulState(): void {
   tuningCache.clear();
   perShapeTuningCache.clear();
   autotuneCounter = 0;
+  autotuneRunCount = 0;
   autotuningInProgress.clear();
+  gemvDispatchCount = 0;
 }
 onTeardown(resetMatmulState);
 
@@ -142,78 +210,93 @@ export function clearDispatchTuningCache(): void {
 }
 
 /**
- * Run autotuning for a specific shape if autotune mode is enabled and no cached result exists.
- * Returns the best config (from autotune, cache, or default).
- *
- * This is called during matmul dispatch when autotune is enabled.
+ * Build a bench plan for a candidate (variant, choice). Reuses the SAME plan
+ * seams real execution uses (planTiledMatmul with an explicit config pins the
+ * tiled variant, incl. its K-split/swapGrid decisions; planGemvRowMatmul is
+ * the GEMV route) so the autotuner measures exactly what would dispatch.
+ * Returns null when the choice degenerates for this geometry.
  */
-/**
- * Self-contained benchmark dispatch that bypasses all shared caching infrastructure
- * (params sequence, bind group cache, etc.) to avoid polluting model execution state.
- *
- * When kSplitFactor >= 2, dispatches the full K-split path: matmul into temp partials
- * + reduction kernel into output buffer. This ensures the autotuner benchmarks configs
- * under the same conditions as real execution (K-split eligibility depends on tile size).
- */
-function benchmarkDispatch(
+function buildBenchPlan(
   device: GPUDevice,
   queue: GPUQueue,
-  pipeline: GPUComputePipeline,
+  ctx: MatmulVariantContext,
+  choice: MatmulVariantChoice,
+): MatmulStandardPlan | MatmulKSplitPlan | null {
+  if (choice.variant === "gemv") {
+    return planGemvRowMatmul(
+      device,
+      ctx.n,
+      ctx.k,
+      ctx.transB,
+      1.0,
+      ctx.dtypeA,
+      ctx.dtypeB,
+      choice.wgSize,
+    );
+  }
+  return planTiledMatmul({
+    device,
+    queue,
+    a: undefined as unknown as GPUBuffer, // geometry-only at plan time
+    b: undefined as unknown as GPUBuffer,
+    out: undefined as unknown as GPUBuffer,
+    m: ctx.m,
+    n: ctx.n,
+    k: ctx.k,
+    transA: ctx.transA,
+    transB: ctx.transB,
+    dtype: ctx.dtypeA,
+    dtypeB: ctx.dtypeB !== ctx.dtypeA ? ctx.dtypeB : undefined,
+    config: choice.config,
+  });
+}
+
+/** Encode + submit one bench execution of a plan (standard or K-split).
+ *  Raw bind groups / own encoder — self-contained by design, so benching
+ *  never pollutes the shared params sequence or bind-group caches. */
+function benchmarkPlanOnce(
+  device: GPUDevice,
+  queue: GPUQueue,
+  plan: MatmulStandardPlan | MatmulKSplitPlan,
   a: GPUBuffer,
   b: GPUBuffer,
   out: GPUBuffer,
-  m: number,
-  n: number,
-  config: MatmulKernelConfig,
   paramsBuffer: GPUBuffer,
-  kSplitFactor: number,
   kSplitTempBuffer?: GPUBuffer,
-  reductionPipeline?: GPUComputePipeline,
   reduceParamsBuffer?: GPUBuffer,
 ): void {
-  const workgroupsX = Math.ceil(n / config.tileN);
-  const workgroupsY = Math.ceil(m / config.tileM);
-
-  if (
-    kSplitFactor >= 2 &&
-    kSplitTempBuffer &&
-    reductionPipeline &&
-    reduceParamsBuffer
-  ) {
-    // K-split path: matmul partials + reduction
+  const encoder = device.createCommandEncoder();
+  if (plan.kSplit) {
     const matmulBG = device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
+      layout: plan.ksplitPipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: a } },
         { binding: 1, resource: { buffer: b } },
-        { binding: 2, resource: { buffer: kSplitTempBuffer } },
+        { binding: 2, resource: { buffer: kSplitTempBuffer as GPUBuffer } },
         { binding: 3, resource: { buffer: paramsBuffer } },
       ],
     });
     const reduceBG = device.createBindGroup({
-      layout: reductionPipeline.getBindGroupLayout(0),
+      layout: plan.reducePipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: kSplitTempBuffer } },
+        { binding: 0, resource: { buffer: kSplitTempBuffer as GPUBuffer } },
         { binding: 1, resource: { buffer: out } },
-        { binding: 2, resource: { buffer: reduceParamsBuffer } },
+        { binding: 2, resource: { buffer: reduceParamsBuffer as GPUBuffer } },
       ],
     });
-    const encoder = device.createCommandEncoder();
     const pass1 = encoder.beginComputePass();
-    pass1.setPipeline(pipeline);
+    pass1.setPipeline(plan.ksplitPipeline);
     pass1.setBindGroup(0, matmulBG);
-    pass1.dispatchWorkgroups(workgroupsX, workgroupsY, kSplitFactor);
+    pass1.dispatchWorkgroups(...plan.ksplitDispatch);
     pass1.end();
     const pass2 = encoder.beginComputePass();
-    pass2.setPipeline(reductionPipeline);
+    pass2.setPipeline(plan.reducePipeline);
     pass2.setBindGroup(0, reduceBG);
-    pass2.dispatchWorkgroups(Math.ceil((m * n) / 256));
+    pass2.dispatchWorkgroups(...plan.reduceDispatch);
     pass2.end();
-    queue.submit([encoder.finish()]);
   } else {
-    // Standard path
     const bindGroup = device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
+      layout: plan.pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: a } },
         { binding: 1, resource: { buffer: b } },
@@ -221,16 +304,98 @@ function benchmarkDispatch(
         { binding: 3, resource: { buffer: paramsBuffer } },
       ],
     });
-    const encoder = device.createCommandEncoder();
     const pass = encoder.beginComputePass();
-    pass.setPipeline(pipeline);
+    pass.setPipeline(plan.pipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
+    pass.dispatchWorkgroups(plan.dispatchX, plan.dispatchY, plan.dispatchZ);
     pass.end();
-    queue.submit([encoder.finish()]);
+  }
+  queue.submit([encoder.finish()]);
+}
+
+/** Benchmark a plan: 2 warmups + 3 timed executions, median ms. Creates and
+ *  destroys its own params/temp buffers (per-candidate — params differ). */
+async function benchmarkPlanMedian(
+  device: GPUDevice,
+  queue: GPUQueue,
+  plan: MatmulStandardPlan | MatmulKSplitPlan,
+  a: GPUBuffer,
+  b: GPUBuffer,
+  out: GPUBuffer,
+): Promise<number> {
+  const makeUniform = (data: Uint32Array): GPUBuffer => {
+    const buf = device.createBuffer({
+      size: data.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    queue.writeBuffer(buf, 0, data);
+    return buf;
+  };
+
+  let paramsBuffer: GPUBuffer;
+  let kSplitTempBuffer: GPUBuffer | undefined;
+  let reduceParamsBuffer: GPUBuffer | undefined;
+  if (plan.kSplit) {
+    paramsBuffer = makeUniform(plan.ksplitParamsData);
+    reduceParamsBuffer = makeUniform(plan.reduceParamsData);
+    kSplitTempBuffer = device.createBuffer({
+      size: plan.tempBytes,
+      usage: GPUBufferUsage.STORAGE,
+    });
+  } else {
+    paramsBuffer = makeUniform(plan.paramsData);
+  }
+
+  try {
+    // Warmup
+    for (let i = 0; i < 2; i++) {
+      benchmarkPlanOnce(
+        device,
+        queue,
+        plan,
+        a,
+        b,
+        out,
+        paramsBuffer,
+        kSplitTempBuffer,
+        reduceParamsBuffer,
+      );
+    }
+    await queue.onSubmittedWorkDone?.();
+
+    // Timed iterations
+    const times: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const start = performance.now();
+      benchmarkPlanOnce(
+        device,
+        queue,
+        plan,
+        a,
+        b,
+        out,
+        paramsBuffer,
+        kSplitTempBuffer,
+        reduceParamsBuffer,
+      );
+      await queue.onSubmittedWorkDone?.();
+      times.push(performance.now() - start);
+    }
+    times.sort((x, y) => x - y);
+    return times[Math.floor(times.length / 2)];
+  } finally {
+    paramsBuffer.destroy();
+    kSplitTempBuffer?.destroy();
+    reduceParamsBuffer?.destroy();
   }
 }
 
+/**
+ * Run autotuning for a specific shape if no cached result exists: benchmark
+ * ALL applicable registry variants × their candidates and cache the winning
+ * (variant, choice) per exact shape. Called via pretuneMatmulShapes when
+ * autotune mode is enabled.
+ */
 async function autotuneIfNeeded(
   device: GPUDevice,
   queue: GPUQueue,
@@ -238,10 +403,10 @@ async function autotuneIfNeeded(
   n: number,
   k: number,
   dtype: DType,
-): Promise<MatmulKernelConfig> {
+): Promise<MatmulVariantChoice> {
   const perShapeKey = getPerShapeKey(m, n, k, dtype);
 
-  // Already have a per-shape tuned config
+  // Already have a per-shape tuned winner
   const perShapeCached = perShapeTuningCache.get(perShapeKey);
   if (perShapeCached) {
     return perShapeCached;
@@ -249,220 +414,119 @@ async function autotuneIfNeeded(
 
   // Prevent recursive autotuning
   if (autotuningInProgress.has(perShapeKey)) {
-    return DEFAULT_CONFIG;
+    return { variant: "tiled", config: DEFAULT_CONFIG };
   }
 
-  const subgroupSupport = getSubgroupSupport();
-  const includeSubgroups = subgroupSupport?.supported ?? false;
+  // Bench context: bare, unbatched, NN, f32-vs-f32 (same as pre-registry).
+  const ctx: MatmulVariantContext = {
+    m,
+    n,
+    k,
+    batchSize: 1,
+    dtypeA: dtype,
+    dtypeB: dtype,
+    transA: false,
+    transB: false,
+    hasEpilogue: false,
+    epiloguePresent: false,
+    hasInputCast: false,
+    hasExplicitConfig: false,
+    subgroupSupported: getSubgroupSupport()?.supported ?? false,
+  };
 
   autotuningInProgress.add(perShapeKey);
 
   try {
     const shapeClass = classifyShape(m, n, k, 1);
-    const baseConfig = getDefaultConfigForShape(shapeClass, false, m, n, k);
-    const candidates = generateNeighborConfigs(baseConfig, includeSubgroups);
-    // Add DEFAULT_CONFIG if not already included
-    const candidateKeys = new Set(
-      candidates.map(
-        (c) =>
-          `${c.tileM}_${c.tileN}_${c.tileK}_${c.threadTileM}_${c.threadTileN}_${c.vectorWidth}_${c.useSubgroups}`,
-      ),
-    );
-    const defaultKey = `${DEFAULT_CONFIG.tileM}_${DEFAULT_CONFIG.tileN}_${DEFAULT_CONFIG.tileK}_${DEFAULT_CONFIG.threadTileM}_${DEFAULT_CONFIG.threadTileN}_${DEFAULT_CONFIG.vectorWidth}_${DEFAULT_CONFIG.useSubgroups}`;
-    if (!candidateKeys.has(defaultKey)) {
-      candidates.push(DEFAULT_CONFIG);
-    }
 
-    // Create test buffers (reused across all candidates)
-    const aSize = m * k * F32_BYTES;
-    const bSize = k * n * F32_BYTES;
-    const outSize = m * n * F32_BYTES;
+    // Test buffers shared across all variants and candidates
     const aBuffer = device.createBuffer({
-      size: aSize,
+      size: m * k * F32_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
     const bBuffer = device.createBuffer({
-      size: bSize,
+      size: k * n * F32_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
     const outBuffer = device.createBuffer({
-      size: outSize,
+      size: m * n * F32_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     });
 
-    // Create params buffer (shared across all candidates — M,N,K are the same)
-    const lda = k; // NN transpose mode
-    const ldb = n;
-    const ldc = n;
-    const paramsData = packMatmulParams(
-      m,
-      n,
-      k,
-      lda,
-      ldb,
-      ldc,
-      1.0,
-      1,
-      m * k,
-      k * n,
-      m * n,
-    );
-    const paramsBuffer = device.createBuffer({
-      size: Math.max(paramsData.byteLength, 48),
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    queue.writeBuffer(paramsBuffer, 0, paramsData);
-
-    // Pre-compute the max K-split temp buffer needed across all candidates,
-    // and create the reduction params buffer (shared — same totalElements/alpha for all)
-    const totalElements = m * n;
-    let maxKSplitFactor = 0;
-    for (const config of candidates) {
-      const baseWG = Math.ceil(n / config.tileN) * Math.ceil(m / config.tileM);
-      const ksf = computeKSplitFactor(baseWG, k, config.tileK, 1, false);
-      if (ksf > maxKSplitFactor) maxKSplitFactor = ksf;
-    }
-
-    let kSplitTempBuffer: GPUBuffer | undefined;
-    let reduceParamsBuffer: GPUBuffer | undefined;
-    if (maxKSplitFactor >= 2) {
-      const tempBytes = maxKSplitFactor * totalElements * F32_BYTES;
-      kSplitTempBuffer = device.createBuffer({
-        size: tempBytes,
-        usage: GPUBufferUsage.STORAGE,
-      });
-      const reduceParamsBuf = new ArrayBuffer(8);
-      const reduceU32 = new Uint32Array(reduceParamsBuf);
-      const reduceF32 = new Float32Array(reduceParamsBuf);
-      reduceU32[0] = totalElements;
-      reduceF32[1] = 1.0; // alpha
-      reduceParamsBuffer = device.createBuffer({
-        size: 8,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      });
-      queue.writeBuffer(reduceParamsBuffer, 0, reduceU32);
-    }
-
     const flops = 2 * m * n * k;
-    let bestConfig = baseConfig;
+    // Fallback winner if every candidate fails: the tiled heuristic default.
+    const tiledDefault = getMatmulVariant("tiled").defaultChoice(
+      ctx,
+    ) as Extract<MatmulVariantChoice, { variant: "tiled" }>;
+    let bestChoice: MatmulVariantChoice = tiledDefault;
     let bestGflops = 0;
+    // Best TILED result feeds the shape-class cache (existing consumers).
+    let bestTiledConfig = tiledDefault.config;
+    let bestTiledGflops = 0;
 
     try {
-      for (const config of candidates) {
-        try {
-          const transposeMode = getTransposeMode(false, false);
-          const workgroupsX = Math.ceil(n / config.tileN);
-          const workgroupsY = Math.ceil(m / config.tileM);
-          const baseWorkgroups = workgroupsX * workgroupsY;
-          const kSplitFactor = computeKSplitFactor(
-            baseWorkgroups,
-            k,
-            config.tileK,
-            1,
-            false,
-          );
-
-          // Get or create pipeline (uses shared pipeline cache — this is safe,
-          // pipeline cache is content-addressed and doesn't have sequence state)
-          const pipeline = getOrCreatePipeline(
-            device,
-            kSplitFactor >= 2
-              ? {
-                  config,
-                  transposeMode,
-                  dtype,
-                  batched: false,
-                  kSplit: kSplitFactor,
-                }
-              : { config, transposeMode, dtype, batched: false },
-          );
-
-          // Get reduction pipeline if K-split
-          let reductionPipeline: GPUComputePipeline | undefined;
-          if (kSplitFactor >= 2) {
-            reductionPipeline = getOrCreateReductionPipeline(
-              device,
-              kSplitFactor,
-              dtype,
-            );
-          }
-
-          // Warmup
-          for (let i = 0; i < 2; i++) {
-            benchmarkDispatch(
+      for (const variant of MATMUL_VARIANTS) {
+        if (!variant.isApplicable(ctx)) continue;
+        for (const choice of variant.candidates(ctx)) {
+          try {
+            const plan = buildBenchPlan(device, queue, ctx, choice);
+            if (!plan) continue;
+            const medianMs = await benchmarkPlanMedian(
               device,
               queue,
-              pipeline,
+              plan,
               aBuffer,
               bBuffer,
               outBuffer,
-              m,
-              n,
-              config,
-              paramsBuffer,
-              kSplitFactor,
-              kSplitTempBuffer,
-              reductionPipeline,
-              reduceParamsBuffer,
             );
+            const gflops = flops / (medianMs * 1e6);
+            if (ENV.TORCHLETTE_DEBUG_AUTOTUNE === "1") {
+              const desc =
+                choice.variant === "gemv"
+                  ? `gemv wg${choice.wgSize}`
+                  : `tiled ${choice.config.tileM}x${choice.config.tileN}x${choice.config.tileK} t${choice.config.threadTileM}x${choice.config.threadTileN}${choice.config.useSubgroups ? " sg" : ""}`;
+              console.log(
+                `[autotune] ${m}x${n}x${k} ${dtype} ${desc}: ${medianMs.toFixed(3)}ms (${gflops.toFixed(1)} GFLOP/s)`,
+              );
+            }
+            if (gflops > bestGflops) {
+              bestGflops = gflops;
+              bestChoice = choice;
+            }
+            if (choice.variant === "tiled" && gflops > bestTiledGflops) {
+              bestTiledGflops = gflops;
+              bestTiledConfig = choice.config;
+            }
+          } catch {
+            // Skip failed candidates
           }
-          await queue.onSubmittedWorkDone?.();
-
-          // Timed iterations
-          const times: number[] = [];
-          for (let i = 0; i < 3; i++) {
-            const start = performance.now();
-            benchmarkDispatch(
-              device,
-              queue,
-              pipeline,
-              aBuffer,
-              bBuffer,
-              outBuffer,
-              m,
-              n,
-              config,
-              paramsBuffer,
-              kSplitFactor,
-              kSplitTempBuffer,
-              reductionPipeline,
-              reduceParamsBuffer,
-            );
-            await queue.onSubmittedWorkDone?.();
-            times.push(performance.now() - start);
-          }
-
-          times.sort((a, b) => a - b);
-          const medianMs = times[Math.floor(times.length / 2)];
-          const gflops = flops / (medianMs * 1e6);
-          if (gflops > bestGflops) {
-            bestGflops = gflops;
-            bestConfig = config;
-          }
-        } catch {
-          // Skip failed configs
         }
       }
     } finally {
       aBuffer.destroy();
       bBuffer.destroy();
       outBuffer.destroy();
-      paramsBuffer.destroy();
-      kSplitTempBuffer?.destroy();
-      reduceParamsBuffer?.destroy();
     }
 
-    // Cache the result
-    perShapeTuningCache.set(perShapeKey, bestConfig);
+    // Cache the overall winner per exact shape (variant + choice)…
+    perShapeTuningCache.set(perShapeKey, bestChoice);
+    autotuneRunCount++;
+    if (ENV.TORCHLETTE_DEBUG_AUTOTUNE === "1") {
+      console.log(
+        `[autotune] ${m}x${n}x${k} ${dtype} WINNER: ${JSON.stringify(bestChoice)} (${bestGflops.toFixed(1)} GFLOP/s)`,
+      );
+    }
+    // …and the best tiled config per shape class (pre-registry consumers).
     cacheTuningResult({
-      config: bestConfig,
-      gflopsPerSec: bestGflops,
-      medianMs: bestGflops > 0 ? flops / (bestGflops * 1e6) : Infinity,
+      config: bestTiledConfig,
+      gflopsPerSec: bestTiledGflops,
+      medianMs:
+        bestTiledGflops > 0 ? flops / (bestTiledGflops * 1e6) : Infinity,
       shapeClass,
       dtype,
     });
 
-    return bestConfig;
+    return bestChoice;
   } finally {
     autotuningInProgress.delete(perShapeKey);
   }
@@ -486,8 +550,7 @@ export async function pretuneMatmulShapes(
 ): Promise<void> {
   // Autotuning requires either env var TORCHLETTE_AUTOTUNE=1 or programmatic
   // setAutotuneEnabled(true) (used by compile({ autotune: true }))
-  const envEnabled =
-    ENV.TORCHLETTE_AUTOTUNE === "1";
+  const envEnabled = ENV.TORCHLETTE_AUTOTUNE === "1";
   if (!envEnabled && !isAutotuneEnabled()) {
     return;
   }
@@ -663,7 +726,13 @@ function getOrCreateReductionPipeline(
 }
 
 /** Minimum workgroups before considering K-split. */
-const KSPLIT_MIN_WORKGROUPS_THRESHOLD = 64;
+// K-split engages while the base grid is below the TARGET occupancy (128
+// workgroups), not below an arbitrary lower cliff: a [1,2048]×[2048,2048]
+// decode matmul launches only 64 single-row workgroups (<1 wave on an 80-SM
+// GPU) and was denied splitting by the old `>= 64` cutoff — conflating
+// workgroup count with occupancy. Shapes already at/above target never split
+// (training-scale grids are far above it), so their configs are unchanged.
+const KSPLIT_MIN_WORKGROUPS_THRESHOLD = 128;
 /** Minimum K dimension for K-split to be worthwhile. */
 const KSPLIT_MIN_K = 512;
 /** Target total workgroups after K-split. */
@@ -717,6 +786,8 @@ export interface MatmulStandardPlan {
   dispatchY: number;
   dispatchZ: number;
   numEpilogueInputs: number;
+  /** Profiler label suffix (e.g. "_gemv" for the M=1 GEMV kernel). */
+  label?: string;
 }
 
 /**
@@ -735,6 +806,101 @@ export interface MatmulKSplitPlan {
   reducePipeline: GPUComputePipeline;
   reduceParamsData: Uint32Array;
   reduceDispatch: [number, number, number];
+  /** Profiler label suffix (e.g. "_gemv" for the M=1 GEMV kernel). */
+  label?: string;
+}
+
+// --- GEMV (M=1) routing ---
+
+/** Count of dispatches routed to the GEMV kernels (probe/debug hook). */
+let gemvDispatchCount = 0;
+export function getGemvDispatchCount(): number {
+  return gemvDispatchCount;
+}
+
+/** Pack the GEMV uniform config {n, k, alpha, split_k} (16 bytes). */
+function packGemvParams(
+  n: number,
+  k: number,
+  alpha: number,
+  splitK: number,
+): Uint32Array {
+  const data = new ArrayBuffer(16);
+  const u32View = new Uint32Array(data);
+  u32View[0] = n;
+  u32View[1] = k;
+  new Float32Array(data)[2] = alpha;
+  u32View[3] = splitK;
+  return u32View;
+}
+
+/**
+ * Route an M=1, batch=1, no-epilogue matmul to the dedicated GEMV tile-IR
+ * kernels. Returns a plan shaped exactly like the tiled paths (standard
+ * single dispatch, or K-split partials + the shared reduction pass) so the
+ * dispatch tail, compiled-plan recording, and the stage-4 stream generator
+ * all consume it unchanged. Returns null to fall through to the tiled path.
+ * Opt-out: TORCHLETTE_GEMV=0.
+ */
+function planGemvRowMatmul(
+  device: GPUDevice,
+  n: number,
+  k: number,
+  transB: boolean,
+  alpha: number,
+  dtype: DType,
+  dtypeB: DType,
+  wgSize?: number,
+): MatmulStandardPlan | MatmulKSplitPlan | null {
+  const route = computeGemvRoute(n, k, transB, wgSize);
+  if (!route) return null;
+  const outputDtype: DType =
+    dtype === "f32" || dtypeB === "f32" ? "f32" : "f16";
+  const kernelOpts: GemvKernelOptions = {
+    mode: route.mode,
+    dtypeA: dtype,
+    dtypeB,
+    outputDtype,
+    kSplit: route.splitK >= 2,
+    wgSize,
+  };
+  const pipeline = cachedPipeline(
+    device,
+    pipelineCache,
+    getGemvShaderCacheKey(kernelOpts),
+    () => generateGemvShaderTileIR(kernelOpts),
+  );
+  if (route.splitK >= 2) {
+    const reduceParamsBuf = new ArrayBuffer(8);
+    const reduceU32 = new Uint32Array(reduceParamsBuf);
+    new Float32Array(reduceParamsBuf)[1] = alpha;
+    reduceU32[0] = n;
+    return {
+      kSplit: true,
+      tempBytes: route.splitK * n * F32_BYTES,
+      ksplitPipeline: pipeline,
+      ksplitParamsData: packGemvParams(n, k, 1.0, route.splitK),
+      ksplitDispatch: route.dispatch,
+      reducePipeline: getOrCreateReductionPipeline(
+        device,
+        route.splitK,
+        outputDtype,
+      ),
+      reduceParamsData: reduceU32,
+      reduceDispatch: [Math.ceil(n / 256), 1, 1],
+      label: "_gemv",
+    };
+  }
+  return {
+    kSplit: false,
+    pipeline,
+    paramsData: packGemvParams(n, k, alpha, 1),
+    dispatchX: route.dispatch[0],
+    dispatchY: route.dispatch[1],
+    dispatchZ: route.dispatch[2],
+    numEpilogueInputs: 0,
+    label: "_gemv",
+  };
 }
 
 export function planTiledMatmul(
@@ -761,10 +927,46 @@ export function planTiledMatmul(
     !!epilogue &&
     epilogue.ops.length > 0 &&
     epilogue.ops.some((op) => op.kind !== "none");
-  const shapeClass = classifyShape(m, n, k, batchSize);
+
+  // Variant selection (data-driven registry). Lives HERE — the single seam
+  // both dispatchTiledMatmul and the stage-4 stream generator consume — so
+  // the executed path and generated streams can't disagree.
+  const ctx: MatmulVariantContext = {
+    m,
+    n,
+    k,
+    batchSize,
+    dtypeA: dtype,
+    dtypeB: dtypeB ?? dtype,
+    transA,
+    transB,
+    hasEpilogue,
+    epiloguePresent: !!epilogue || epilogueInputs.length > 0,
+    hasInputCast: !!inputCastA || !!inputCastB,
+    hasExplicitConfig: !!options.config,
+    subgroupSupported: getSubgroupSupport()?.supported ?? false,
+  };
+  const choice = selectMatmulChoice(ctx, options.config);
+
+  if (choice.variant === "gemv") {
+    const gemvPlan = planGemvRowMatmul(
+      device,
+      n,
+      k,
+      transB,
+      alpha,
+      dtype,
+      dtypeB ?? dtype,
+      choice.wgSize,
+    );
+    if (gemvPlan) return gemvPlan;
+    // Route degenerated for this choice — fall through to the tiled family.
+  }
+
   const config =
-    options.config ??
-    getConfigForShape(shapeClass, dtype, hasEpilogue, m, n, k);
+    choice.variant === "tiled"
+      ? choice.config
+      : tiledChoiceForContext(ctx).config;
   validateConfig(config);
   const transposeMode = getTransposeMode(transA, transB);
   const lda = transA ? m : k;
@@ -872,76 +1074,17 @@ export function planTiledMatmul(
 }
 
 export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
-  const {
-    device,
-    a,
-    b,
-    out,
-    m,
-    n,
-    k,
-    batchSize = 1,
-    transA = false,
-    transB = false,
-    alpha = 1.0,
-    dtype = "f32",
-    dtypeB,
-    epilogue,
-    epilogueInputs = [],
-    inputCastA,
-    inputCastB,
-  } = options;
+  const { device, a, b, out, epilogueInputs = [] } = options;
 
-  // Check if epilogue is non-trivial (needed for config selection and K-split)
-  const hasEpilogue =
-    !!epilogue &&
-    epilogue.ops.length > 0 &&
-    epilogue.ops.some((op) => op.kind !== "none");
-
-  // Select kernel config (epilogue-aware: bare matmuls use larger thread tiles)
-  const shapeClass = classifyShape(m, n, k, batchSize);
-  const config =
-    options.config ??
-    getConfigForShape(shapeClass, dtype, hasEpilogue, m, n, k);
-
-  // Validate config
-  validateConfig(config);
-
-  // Get transpose mode
-  const transposeMode = getTransposeMode(transA, transB);
-
-  // Compute leading dimensions
-  const lda = transA ? m : k;
-  const ldb = transB ? k : n;
-  const ldc = n;
-
-  // Compute batch strides
-  const batchStrideA = options.batchStrideA ?? m * k;
-  const batchStrideB = options.batchStrideB ?? k * n;
-  const batchStrideC = options.batchStrideC ?? m * n;
-
-  // Compute base dispatch dimensions
-  const workgroupsX = Math.ceil(n / config.tileN);
-  const workgroupsY = Math.ceil(m / config.tileM);
-  const baseWorkgroups = workgroupsX * workgroupsY;
-
-  // Determine K-split factor
-  const kSplitFactor = computeKSplitFactor(
-    baseWorkgroups,
-    k,
-    config.tileK,
-    batchSize,
-    hasEpilogue,
-  );
-
-  void kSplitFactor;
-  // Decisions single-sourced in planTiledMatmul (the stream generator
-  // consumes the same plan — standard or K-split).
+  // ALL selection decisions (variant, config, K-split, grid) are
+  // single-sourced in planTiledMatmul (the stream generator consumes the
+  // same plan — standard or K-split or GEMV).
   const plan = planTiledMatmul(options);
+  if (plan.label === "_gemv") gemvDispatchCount++;
 
   if (plan.kSplit) {
     // --- K-split path: two dispatches over the cached partials temp. ---
-    const opLabel = getCurrentOpLabel() ?? "matmul";
+    const opLabel = (getCurrentOpLabel() ?? "matmul") + (plan.label ?? "");
     const tempBuffer = getKSplitTempBuffer(device, plan.tempBytes);
 
     const kSplitParamsBuffer = sharedCreateParamsBuffer(
@@ -995,6 +1138,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     std.dispatchX,
     std.dispatchY,
     std.dispatchZ,
+    std.label ? (getCurrentOpLabel() ?? "matmul") + std.label : undefined,
   );
   releaseParamsBuffer(paramsBuffer);
 }

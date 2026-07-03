@@ -239,6 +239,22 @@ export function getDefaultConfigForShape(
         threadTileN: 4,
       };
 
+    case "gemv_row":
+      // M=1 row-vector × matrix (decode steps, probes): a single real output
+      // row, so tileM=1/threadTileM=1 puts every thread on real work (the
+      // generic tile config idles (tileM-1)/tileM of the workgroup). One
+      // thread per output column, 64 threads/workgroup; occupancy comes from
+      // N/64 workgroups × K-split (these shapes are exactly the K-split
+      // sweet spot: tiny output grid, large K).
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 1,
+        tileN: 64,
+        tileK: 32,
+        threadTileM: 1,
+        threadTileN: 1,
+      };
+
     case "batched_small":
       // Small batched - conservative config
       return DEFAULT_CONFIG;

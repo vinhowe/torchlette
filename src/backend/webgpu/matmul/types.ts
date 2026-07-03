@@ -82,7 +82,8 @@ export type ShapeClass =
   | "short_wide" // N >> K or N >> M
   | "large_k" // K >> M and N (e.g. lm_head backward dX: K=50304)
   | "small_k" // K < 64, large output (e.g. lm_head backward dW)
-  | "gemv" // M=1 or N=1
+  | "gemv" // N=1 (column vector output)
+  | "gemv_row" // M=1 (row-vector × matrix — e.g. autoregressive decode, probes)
   | "batched_small"; // batch > 1, small matrices
 
 /**
@@ -148,7 +149,12 @@ export function classifyShape(
   k: number,
   batchSize: number,
 ): ShapeClass {
-  // GEMV cases
+  // GEMV cases. M=1 (row-vector × matrix) gets its own class: a generic
+  // tile config wastes (tileM-1)/tileM of every workgroup on rows that
+  // don't exist, and these shapes rely on K-split for occupancy.
+  if (m === 1 && n > 1) {
+    return "gemv_row";
+  }
   if (m === 1 || n === 1) {
     return "gemv";
   }

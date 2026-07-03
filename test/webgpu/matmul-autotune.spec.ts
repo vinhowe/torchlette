@@ -22,7 +22,17 @@ import {
   importTuningCache,
   quickAutotune,
 } from "../../src/backend/webgpu/matmul/autotune";
-import { dispatchTiledMatmul } from "../../src/backend/webgpu/matmul/dispatch";
+import {
+  clearPerShapeMatmulChoices,
+  dispatchTiledMatmul,
+  getAutotuneRunCount,
+  getPerShapeMatmulChoice,
+  planTiledMatmul,
+  pretuneMatmulShapes,
+  seedPerShapeMatmulChoice,
+  setAutotuneEnabled,
+} from "../../src/backend/webgpu/matmul/dispatch";
+import { GEMV_WG_SIZE_PARAM } from "../../src/backend/webgpu/matmul/gemv";
 import {
   classifyShape,
   DEFAULT_CONFIG,
@@ -31,6 +41,11 @@ import {
   type TuneResult,
   validateConfig,
 } from "../../src/backend/webgpu/matmul/types";
+import {
+  getMatmulVariant,
+  MATMUL_VARIANTS,
+  type MatmulVariantContext,
+} from "../../src/backend/webgpu/matmul/variants";
 
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -112,7 +127,9 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
 
   describe("classifyShape", () => {
     it("classifies GEMV shapes", () => {
-      expect(classifyShape(1, 100, 100, 1)).toBe("gemv");
+      // M=1 (row-vector × matrix) has its own class: full-thread config +
+      // K-split occupancy — decode steps, probes. N=1 keeps "gemv".
+      expect(classifyShape(1, 100, 100, 1)).toBe("gemv_row");
       expect(classifyShape(100, 1, 100, 1)).toBe("gemv");
     });
 
@@ -493,6 +510,221 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       const cached = getCachedTuningResult("square_medium", "f32");
       expect(cached).toBeDefined();
     });
+  });
+
+  describe("Variant Registry", () => {
+    const mkCtx = (
+      over: Partial<MatmulVariantContext> = {},
+    ): MatmulVariantContext => ({
+      m: 1,
+      n: 768,
+      k: 768,
+      batchSize: 1,
+      dtypeA: "f32",
+      dtypeB: "f32",
+      transA: false,
+      transB: true,
+      hasEpilogue: false,
+      epiloguePresent: false,
+      hasInputCast: false,
+      hasExplicitConfig: false,
+      subgroupSupported: false,
+      ...over,
+    });
+
+    afterEach(() => {
+      clearPerShapeMatmulChoices();
+      setAutotuneEnabled(false);
+    });
+
+    it("registry is ordered gemv-before-tiled and tiled is always applicable", () => {
+      expect(MATMUL_VARIANTS.map((v) => v.name)).toEqual(["gemv", "tiled"]);
+      expect(getMatmulVariant("tiled").isApplicable(mkCtx())).toBe(true);
+      expect(
+        getMatmulVariant("tiled").isApplicable(
+          mkCtx({ m: 512, batchSize: 8, epiloguePresent: true }),
+        ),
+      ).toBe(true);
+    });
+
+    it("gemv applicability filters on geometry/epilogue/cast/explicit-config", () => {
+      const gemv = getMatmulVariant("gemv");
+      expect(gemv.isApplicable(mkCtx())).toBe(true);
+      expect(gemv.isApplicable(mkCtx({ m: 2 }))).toBe(false);
+      expect(gemv.isApplicable(mkCtx({ batchSize: 2 }))).toBe(false);
+      expect(gemv.isApplicable(mkCtx({ epiloguePresent: true }))).toBe(false);
+      expect(gemv.isApplicable(mkCtx({ hasInputCast: true }))).toBe(false);
+      expect(gemv.isApplicable(mkCtx({ hasExplicitConfig: true }))).toBe(false);
+      // Geometry the GEMV route itself rejects (NN small grid: gx*splitK < 16)
+      expect(gemv.isApplicable(mkCtx({ transB: false, n: 128, k: 1024 }))).toBe(
+        false,
+      );
+    });
+
+    it("TORCHLETTE_GEMV=0 opt-out makes gemv inapplicable", () => {
+      const gemv = getMatmulVariant("gemv");
+      const saved = process.env.TORCHLETTE_GEMV;
+      try {
+        process.env.TORCHLETTE_GEMV = "0";
+        expect(gemv.isApplicable(mkCtx())).toBe(false);
+      } finally {
+        if (saved === undefined) delete process.env.TORCHLETTE_GEMV;
+        else process.env.TORCHLETTE_GEMV = saved;
+      }
+      expect(gemv.isApplicable(mkCtx())).toBe(true);
+    });
+
+    it("gemv candidates vary wgSize from the shared TuneParam", () => {
+      const gemv = getMatmulVariant("gemv");
+      const candidates = gemv.candidates(mkCtx());
+      expect(candidates.length).toBeGreaterThan(1);
+      const wgSizes = candidates.map((c) =>
+        c.variant === "gemv" ? c.wgSize : -1,
+      );
+      expect(new Set(wgSizes).size).toBe(candidates.length);
+      for (const w of wgSizes) {
+        expect(GEMV_WG_SIZE_PARAM.values).toContain(w);
+      }
+      // default choice is included
+      const def = gemv.defaultChoice(mkCtx());
+      expect(def.variant).toBe("gemv");
+      expect(wgSizes).toContain(def.variant === "gemv" ? def.wgSize : -1);
+    });
+
+    it("tiled candidates include the heuristic base and DEFAULT_CONFIG", () => {
+      const tiled = getMatmulVariant("tiled");
+      const ctx = mkCtx({ m: 512, n: 768, k: 768, transB: false });
+      const base = tiled.defaultChoice(ctx);
+      const candidates = tiled.candidates(ctx);
+      expect(candidates.length).toBeGreaterThan(5);
+      const key = (c: (typeof candidates)[number]) =>
+        c.variant === "tiled" ? JSON.stringify(c.config) : "";
+      expect(candidates.map(key)).toContain(key(base as never));
+      expect(candidates.map(key)).toContain(JSON.stringify(DEFAULT_CONFIG));
+      for (const c of candidates) {
+        expect(c.variant).toBe("tiled");
+        if (c.variant === "tiled") {
+          expect(() => validateConfig(c.config)).not.toThrow();
+        }
+      }
+    });
+
+    it("seeded per-shape gemv winner short-circuits planning and its wgSize flows into dispatch dims", () => {
+      const gpuContext = getWebGPUDevice();
+      if (!gpuContext) return;
+      const { device, queue } = gpuContext;
+      // NN m=1 n=3072 k=768: wgSize=256 → gx=12,splitK=3; wgSize=128 → gx=24,splitK=6
+      seedPerShapeMatmulChoice(1, 3072, 768, "f32", {
+        variant: "gemv",
+        wgSize: 128,
+      });
+      const plan = planTiledMatmul({
+        device,
+        queue,
+        a: undefined as never,
+        b: undefined as never,
+        out: undefined as never,
+        m: 1,
+        n: 3072,
+        k: 768,
+      });
+      expect(plan.label).toBe("_gemv");
+      expect(plan.kSplit).toBe(true);
+      if (plan.kSplit) {
+        expect(plan.ksplitDispatch).toEqual([24, 6, 1]);
+      }
+      // Default (unseeded) choice uses wgSize=256 → different grid
+      clearPerShapeMatmulChoices();
+      const defPlan = planTiledMatmul({
+        device,
+        queue,
+        a: undefined as never,
+        b: undefined as never,
+        out: undefined as never,
+        m: 1,
+        n: 3072,
+        k: 768,
+      });
+      expect(defPlan.label).toBe("_gemv");
+      if (defPlan.kSplit) {
+        expect(defPlan.ksplitDispatch).toEqual([12, 3, 1]);
+      }
+    });
+
+    it("seeded winner is re-gated on applicability (batched ctx falls back to tiled)", () => {
+      const gpuContext = getWebGPUDevice();
+      if (!gpuContext) return;
+      const { device, queue } = gpuContext;
+      seedPerShapeMatmulChoice(1, 3072, 768, "f32", {
+        variant: "gemv",
+        wgSize: 128,
+      });
+      const plan = planTiledMatmul({
+        device,
+        queue,
+        a: undefined as never,
+        b: undefined as never,
+        out: undefined as never,
+        m: 1,
+        n: 3072,
+        k: 768,
+        batchSize: 4,
+      });
+      expect(plan.label).toBeUndefined(); // tiled, not _gemv
+    });
+
+    it("real GPU autotune searches across variants, caches (variant, choice), and second run hits the cache", async () => {
+      const gpuContext = getWebGPUDevice();
+      if (!gpuContext) return;
+      const { device, queue } = gpuContext;
+
+      setAutotuneEnabled(true);
+      const runsBefore = getAutotuneRunCount();
+      // m=1 shape where BOTH variants apply, plus a tiled-only shape
+      await pretuneMatmulShapes(
+        device,
+        queue,
+        [
+          [1, 4096, 512],
+          [256, 256, 256],
+        ],
+        "f32",
+      );
+      expect(getAutotuneRunCount()).toBe(runsBefore + 2);
+
+      const gemvShapeChoice = getPerShapeMatmulChoice(1, 4096, 512, "f32");
+      expect(gemvShapeChoice).toBeDefined();
+      expect(["gemv", "tiled"]).toContain(gemvShapeChoice?.variant);
+      const tiledShapeChoice = getPerShapeMatmulChoice(256, 256, 256, "f32");
+      expect(tiledShapeChoice?.variant).toBe("tiled");
+
+      // Second run of the same shapes: pure cache hits, no new searches
+      await pretuneMatmulShapes(
+        device,
+        queue,
+        [
+          [1, 4096, 512],
+          [256, 256, 256],
+        ],
+        "f32",
+      );
+      expect(getAutotuneRunCount()).toBe(runsBefore + 2);
+
+      // The cached winner short-circuits planning without error
+      const plan = planTiledMatmul({
+        device,
+        queue,
+        a: undefined as never,
+        b: undefined as never,
+        out: undefined as never,
+        m: 1,
+        n: 4096,
+        k: 512,
+      });
+      if (gemvShapeChoice?.variant === "gemv") {
+        expect(plan.label).toBe("_gemv");
+      }
+    }, 60000);
   });
 
   describe("Real GPU Autotune", () => {
