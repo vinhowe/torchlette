@@ -49,6 +49,8 @@ export {
   getWebGPUDevice,
   getWebGPUInitError,
   initWebGPU,
+  type InitWebGPUOptions,
+  webgpuDeviceRequirements,
   isF16Supported,
   syncWebGPU,
   warmupFromRegistry,

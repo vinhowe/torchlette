@@ -365,30 +365,113 @@ export function getGpuUncapturedErrorCount(): number {
   return _gpuUncapturedErrorCount;
 }
 
-export async function initWebGPU(): Promise<boolean> {
+export type InitWebGPUOptions = {
+  /**
+   * Run torchlette on a caller-owned GPUDevice instead of requesting one.
+   * This is the interop path: WebGPU resources cannot cross devices, so a
+   * renderer that wants to bind torchlette tensor buffers (or vice versa)
+   * must share ONE device. Torchlette will not destroy an external device at
+   * teardown, and it chains — not clobbers — any onuncapturederror handler
+   * already installed.
+   *
+   * Create the device with `webgpuDeviceRequirements(adapter)` merged into
+   * your descriptor, or torchlette runs degraded: without "shader-f16" all
+   * f16 paths fall back to f32, and with default limits (256MB maxBufferSize)
+   * large-model weights cannot be allocated.
+   */
+  device?: GPUDevice;
+};
+
+/**
+ * The device-descriptor pieces a renderer should merge into its own
+ * `adapter.requestDevice()` call so the shared device satisfies torchlette:
+ * features gated on adapter support (subgroups, shader-f16, timestamp-query)
+ * and the storage/buffer limits raised to the adapter maximums.
+ */
+export function webgpuDeviceRequirements(adapter: GPUAdapter): {
+  requiredFeatures: string[];
+  requiredLimits: Record<string, number>;
+} {
+  const requiredFeatures: string[] = [];
+  if (adapter.features?.has("subgroups")) requiredFeatures.push("subgroups");
+  if (adapter.features?.has("shader-f16")) requiredFeatures.push("shader-f16");
+  if (adapter.features?.has("timestamp-query")) {
+    requiredFeatures.push("timestamp-query");
+  }
+  return {
+    requiredFeatures,
+    requiredLimits: {
+      maxStorageBufferBindingSize:
+        adapter.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024,
+      maxBufferSize: adapter.limits?.maxBufferSize ?? 256 * 1024 * 1024,
+      maxStorageBuffersPerShaderStage:
+        adapter.limits?.maxStorageBuffersPerShaderStage ?? 8,
+    },
+  };
+}
+
+type UncapturedErrorHandler =
+  | ((ev: { error: { message: string } }) => void)
+  | null;
+
+/** External device's pre-existing error handler, restored at destroyWebGPU. */
+let _chainedPriorErrorHandler: UncapturedErrorHandler = null;
+
+export async function initWebGPU(
+  options?: InitWebGPUOptions,
+): Promise<boolean> {
   if (gpuContext) {
+    if (options?.device && gpuContext.device !== options.device) {
+      throw new Error(
+        "initWebGPU: already initialized with a different device. " +
+          "Call destroyWebGPU() first, or initialize once with the shared device.",
+      );
+    }
     return true;
   }
   lastInitError = null;
 
-  const acquired = await acquireAdapter();
-  if (!acquired) return false;
-  const { adapter, provider } = acquired;
+  let device: GPUDevice;
+  let provider: WebGPUProvider | null;
+  let actualF16Supported: boolean;
+  let externalDevice = false;
 
-  const subgroupSupport: SubgroupSupport = adapter.features?.has("subgroups")
-    ? { supported: true, subgroupSize: 32 }
-    : { supported: false };
-  setSubgroupSupport(subgroupSupport);
+  if (options?.device) {
+    // External (caller-owned) device: derive capabilities from the DEVICE's
+    // enabled features — the adapter is not ours to inspect.
+    device = options.device;
+    provider = null;
+    externalDevice = true;
+    const features = (
+      device as unknown as { features?: { has(s: string): boolean } }
+    ).features;
+    const subgroupSupport: SubgroupSupport = features?.has("subgroups")
+      ? { supported: true, subgroupSize: 32 }
+      : { supported: false };
+    setSubgroupSupport(subgroupSupport);
+    actualF16Supported = features?.has("shader-f16") ?? false;
+  } else {
+    const acquired = await acquireAdapter();
+    if (!acquired) return false;
+    const { adapter } = acquired;
+    provider = acquired.provider;
 
-  const f16Supported = adapter.features?.has("shader-f16") ?? false;
+    const subgroupSupport: SubgroupSupport = adapter.features?.has("subgroups")
+      ? { supported: true, subgroupSize: 32 }
+      : { supported: false };
+    setSubgroupSupport(subgroupSupport);
 
-  const deviceResult = await requestDeviceWithFallback(
-    adapter,
-    f16Supported,
-    subgroupSupport,
-  );
-  if (!deviceResult) return false;
-  const { device, actualF16Supported } = deviceResult;
+    const f16Supported = adapter.features?.has("shader-f16") ?? false;
+
+    const deviceResult = await requestDeviceWithFallback(
+      adapter,
+      f16Supported,
+      subgroupSupport,
+    );
+    if (!deviceResult) return false;
+    device = deviceResult.device;
+    actualF16Supported = deviceResult.actualF16Supported;
+  }
 
   setGpuContext({
     provider,
@@ -396,6 +479,7 @@ export async function initWebGPU(): Promise<boolean> {
     queue: device.queue,
     pipelines: new Map(),
     f16Supported: actualF16Supported,
+    externalDevice,
   });
 
   // LOUD GPU ERRORS. A WebGPU validation error rejects the ENTIRE submit it
@@ -407,11 +491,16 @@ export async function initWebGPU(): Promise<boolean> {
   // archaeology. This handler makes the class observable: every uncaptured
   // device error is counted and clearly attributed, and
   // TORCHLETTE_STRICT_GPU=1 turns the first one into a crash.
-  (
-    device as unknown as {
-      onuncapturederror: ((ev: { error: { message: string } }) => void) | null;
-    }
-  ).onuncapturederror = (ev) => {
+  const deviceWithHandler = device as unknown as {
+    onuncapturederror: UncapturedErrorHandler;
+  };
+  // On a SHARED device the renderer may already have a handler installed —
+  // chain it (torchlette first for counting/strict, then theirs), and restore
+  // it at destroyWebGPU. Clobbering it would silence the host app's own
+  // error reporting.
+  const priorHandler = externalDevice ? deviceWithHandler.onuncapturederror : null;
+  _chainedPriorErrorHandler = priorHandler;
+  deviceWithHandler.onuncapturederror = (ev) => {
     _gpuUncapturedErrorCount++;
     if (_gpuUncapturedErrorCount <= 10) {
       console.error(
@@ -423,6 +512,7 @@ export async function initWebGPU(): Promise<boolean> {
         );
       }
     }
+    priorHandler?.(ev);
     if (
       ENV.TORCHLETTE_STRICT_GPU === "1"
     ) {
@@ -489,7 +579,17 @@ export function destroyWebGPU(): void {
   runTeardownCallbacks();
   clearWarmupCache();
   destroyProfilingFenceBuffer();
-  (gpuContext.device as unknown as { destroy(): void }).destroy();
+  if (gpuContext.externalDevice) {
+    // Caller-owned device: never destroy it; hand its error handler back.
+    (
+      gpuContext.device as unknown as {
+        onuncapturederror: UncapturedErrorHandler;
+      }
+    ).onuncapturederror = _chainedPriorErrorHandler;
+    _chainedPriorErrorHandler = null;
+  } else {
+    (gpuContext.device as unknown as { destroy(): void }).destroy();
+  }
   gpuContext.pipelines.clear();
   setGpuContext(null);
 }

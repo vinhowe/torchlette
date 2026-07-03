@@ -19,6 +19,8 @@ export {
   getWebGPUInitError,
   initGpuTimestamps,
   initWebGPU,
+  type InitWebGPUOptions,
+  webgpuDeviceRequirements,
   KernelContext,
   readGpuTimestamps,
   resetProfileStats,

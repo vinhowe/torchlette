@@ -158,12 +158,16 @@ export type WebGPUTensor = BackendTensor & {
 };
 
 export type WebGPUContext = {
-  provider: WebGPUProvider;
+  /** Null when the device was supplied externally (initWebGPU({ device })). */
+  provider: WebGPUProvider | null;
   device: GPUDevice;
   queue: GPUQueue;
   pipelines: Map<string, GPUComputePipeline>;
   /** Whether shader-f16 feature is enabled */
   f16Supported: boolean;
+  /** Device is owned by the caller (renderer interop): torchlette must never
+   *  destroy it, and must chain — not clobber — its error handler. */
+  externalDevice?: boolean;
 };
 
 /** Narrow a generic BackendTensor to WebGPUTensor for typed property access. */

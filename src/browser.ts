@@ -13,6 +13,8 @@ export {
   getWebGPUDevice,
   getWebGPUInitError,
   initWebGPU,
+  type InitWebGPUOptions,
+  webgpuDeviceRequirements,
   KernelContext,
   setProfilePhase,
   syncWebGPU,
