@@ -70,6 +70,17 @@ export interface StorageHandle {
   backendTensor: BackendTensor;
   /** For views: ID of the storage that owns the buffer. Views don't destroy buffers. */
   baseStorageId?: number;
+  /**
+   * Set on VIEW handles created by the compiled-plan harvest whose base
+   * retain is OWNED by the plan (tracked in CompiledPlan._viewBaseRetains and
+   * released at the next harvest / plan teardown). For such handles
+   * destroyStorageIds must NOT also fire the "view.destroyed" base release —
+   * that would double-release the base (the plan releases it exactly once).
+   * The plan is the SOLE owner of the base retain for harvested views,
+   * decoupling the base's refcount from the harvested handle's lifecycle
+   * (which may be destroyed at markStep OR leak-retained across replays).
+   */
+  planOwnedBaseRetain?: boolean;
 }
 
 /**

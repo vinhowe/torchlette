@@ -1616,17 +1616,19 @@ export async function executeCompiledPlan(
         sh.baseStorageId = base.id;
         rcRetain(base.id, "view.baseStorageId");
         // The harvest re-creates VIEW result handles every replay and rcRetains
-        // their base each time. The lowered path balances this retain via the
-        // view storage's destruction ("view.destroyed"), driven by the
-        // RuntimeTensor wrapper transitioning off the old storage; the compiled
-        // harvest has no wrapper transition and the prior handle is dropped
-        // (node.result/results reassigned or cleared by liveness between
-        // replays), so the prior base-retain is never released → +1 storage
-        // handle/step per re-harvested view. Invisible in GPU bytes (bases alias
-        // pooled buffers), so it slipped past the profiler (which never clips)
-        // and the regression check (which measures bytes). The PLAN owns the
-        // retains it creates and releases the PRIOR replay's set at harvest
-        // start (below) — robust regardless of how the prior handle was dropped.
+        // their base each time. The PLAN owns this retain: it releases the PRIOR
+        // replay's set at harvest start (below) and at teardown. Mark the handle
+        // `planOwnedBaseRetain` so destroyStorageIds does NOT ALSO fire the
+        // "view.destroyed" base release when this handle is reaped at markStep —
+        // that second release double-frees the base (rc → negative, base handle
+        // destroyed while its owning wrapper is still alive; the [lifetime]
+        // reclaimed-read false positive on GPT2.posIndices). The plan is the
+        // SOLE owner of the base retain, so the base's refcount is decoupled
+        // from whether the harvested handle is destroyed (this trajectory) or
+        // leak-retained across replays (the 867f6c1 optimizer-state case) —
+        // robust either way. Invisible in GPU bytes (bases alias pooled
+        // buffers), so it slipped past the profiler and the regression check.
+        sh.planOwnedBaseRetain = true;
         viewBaseRetains.push(base.id);
       }
       if (assignsPrimary) {

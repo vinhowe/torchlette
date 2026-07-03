@@ -162,8 +162,16 @@ class StorageTracker {
       const storage = this.allStorages.get(id);
       if (!storage) continue;
 
-      // Release view base ref (view is being destroyed → base loses a reference)
-      if (storage.baseStorageId !== undefined) {
+      // Release view base ref (view is being destroyed → base loses a reference).
+      // EXCEPT for compiled-plan harvested views whose base retain is owned by
+      // the plan (planOwnedBaseRetain): the plan releases that retain itself
+      // (at the next harvest / teardown), so releasing here too would
+      // double-free the base. See StorageHandle.planOwnedBaseRetain and
+      // compiled-plan.ts harvest.
+      if (
+        storage.baseStorageId !== undefined &&
+        !storage.planOwnedBaseRetain
+      ) {
         rcRelease(storage.baseStorageId, "view.destroyed");
       }
       rcDelete(id);
