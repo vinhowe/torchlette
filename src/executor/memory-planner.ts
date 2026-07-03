@@ -24,6 +24,7 @@
  * one entry; result slots never recycled) + the stage-4 ladder (stream
  * differential, fullstack parity, regression, suites, memory measurements).
  */
+import { bumpEpoch, currentEpoch } from "../core/epoch";
 import { getSizeClass, getSizeForClass } from "../graph/lifetime-analysis";
 import type { GpuCommand } from "./compiled-plan";
 import {
@@ -54,15 +55,21 @@ export interface PlannerEntry {
 }
 
 /**
- * Step-scoped shared buffer registry. Module-singleton (owned by
+ * Epoch-scoped shared buffer registry (plans of one epoch interval execute
+ * strictly sequentially on the queue — the sharing precondition; steps are
+ * one consumer of that interval). Module-singleton (owned by
  * compiled-plan.ts); engine-instance boundaries reset it alongside the
  * template cache (instance boundaries are cache boundaries).
  */
 export class PlannerRegistry {
   entries: PlannerEntry[] = [];
-  /** Bumped on reset; plans built against an older generation must not
-   *  touch the new entries array (index collision). */
-  generation = 0;
+  /** Registry-lifetime token, keyed by the engine EPOCH id
+   *  (src/core/epoch.ts): reset() stamps the epoch at which the new
+   *  lifetime began. Plans record the token at build and compare for
+   *  IDENTITY only — a plan built against an older lifetime must not
+   *  touch the new entries array (index collision). Epoch ids are
+   *  monotonic and never reused, so identity comparison is sound. */
+  generation = currentEpoch();
   /** sizeClass → entry indices shareable across plans (non-result temps).
    *  Membership is persistent: sharing is order-independent (temps are dead
    *  across plan boundaries in both directions), so an entry stays listed
@@ -105,13 +112,14 @@ export class PlannerRegistry {
     list.push(idx);
   }
 
-  /** Drop all entries (returning them for buffer teardown) and bump the
-   *  generation so stale plans can't index into the new array. */
+  /** Drop all entries (returning them for buffer teardown) and start a new
+   *  lifetime at a fresh epoch id so stale plans can't index into the new
+   *  array. */
   reset(): PlannerEntry[] {
     const old = this.entries;
     this.entries = [];
     this.shareable = new Map();
-    this.generation++;
+    this.generation = bumpEpoch("plannerReset");
     return old;
   }
 }

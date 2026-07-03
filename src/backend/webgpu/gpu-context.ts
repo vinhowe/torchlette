@@ -5,6 +5,7 @@
 import { ENV } from "../../core/env";
 import { clearBindGroupCache } from "./bind-group-cache";
 import { bufferPool, destroyProfilingFenceBuffer } from "./buffer-pool";
+import { advanceEpoch } from "./epoch";
 import type {
   GPUAdapter,
   GPUBuffer,
@@ -467,7 +468,9 @@ export async function syncWebGPU(): Promise<void> {
   if (typeof ctx.queue.onSubmittedWorkDone === "function") {
     await ctx.queue.onSubmittedWorkDone();
   }
-  bufferPool.flushPendingToAvailable();
+  // Fence completed — quiescent point: advance the engine epoch
+  // (flushes pending pool buffers).
+  advanceEpoch("syncWebGPU");
 }
 
 /**

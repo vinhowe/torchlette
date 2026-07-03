@@ -19,6 +19,7 @@ import { resetDispatchSequence } from "./bind-group-cache";
 import { pinnedOutputBuffers, prePinOutputBuffers } from "./buffer-arena";
 import { bufBeginScope, bufEndScope } from "./buffer-debug";
 import { awaitDeferredFence, bufferPool } from "./buffer-pool";
+import { advanceEpoch } from "./epoch";
 import type {
   GPUBuffer,
   GPUCommandBuffer,
@@ -95,8 +96,9 @@ export async function endBatchExecution(): Promise<void> {
   for (const buffer of batch.deferredDestroyBuffers) {
     buffer.destroy();
   }
-  // Also flush any pending pool buffers since GPU work is complete
-  bufferPool.flushPendingToAvailable();
+  // GPU work is complete — quiescent point: advance the engine epoch
+  // (flushes pending pool buffers).
+  advanceEpoch("endBatch");
 }
 
 /**
@@ -232,7 +234,7 @@ function finishAndSubmitEncoder(createNew: boolean): void {
  * NOTE: Does NOT flush pendingRelease to pool (§14.1). Mid-step buffer
  * reclamation causes corruption — buffers released during a step may still
  * be in-flight on the GPU when reacquired. Pending buffers are safely
- * flushed at endSharedEncoder() (end-of-step).
+ * flushed at endSharedEncoder() (the epoch advance at encoder close).
  */
 export function flushSharedEncoder(): void {
   if (!sharedEncoderActive) return;
@@ -254,10 +256,12 @@ export function endSharedEncoder(): void {
     finishAndSubmitEncoder(false);
     bufEndScope("shared-encoder");
 
-    // Flush storage buffer pendingRelease → main pool. The encoder was just
-    // submitted, so buffers released by earlier passes are safe to reuse.
-    bufferPool.flushPendingToAvailable();
-    bufferPool.beginWindow(); // End-of-step is also a window boundary
+    // The encoder was just submitted, so buffers released by earlier passes
+    // are safe to reuse: this is the buffer-pool epoch boundary. Advance the
+    // engine epoch (flushes pendingRelease → main pool). Steps consume this
+    // epoch — encoder close IS the quiescent point, not "end of step".
+    advanceEpoch("endSharedEncoder");
+    bufferPool.beginWindow(); // Encoder close is also a window boundary
   }
 }
 

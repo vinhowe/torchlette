@@ -11,6 +11,7 @@
  */
 
 import { ENV } from "../../core/env";
+import { bumpEpoch, epochTrace, epochTraceEnabled } from "../../core/epoch";
 import { getSizeClass, getSizeForClass } from "../../graph/lifetime-analysis";
 import type { DType } from "../types";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
@@ -570,6 +571,7 @@ class SimpleBufferPool {
     // Move pending buffers to pool, but skip any that are still referenced
     // by live owning tensors (refcount > 0). Those stay in pendingRelease
     // until the owning tensor is destroyed.
+    const pendingBefore = this.pendingRelease.length;
     const remaining: typeof this.pendingRelease = [];
     let remainingBytes = 0;
     for (const entry of this.pendingRelease) {
@@ -587,6 +589,11 @@ class SimpleBufferPool {
     }
     this.pendingRelease = remaining;
     this.pendingReleaseBytes = remainingBytes;
+    if (epochTraceEnabled()) {
+      epochTrace(
+        `poolFlush moved=${pendingBefore - remaining.length} kept=${remaining.length}`,
+      );
+    }
   }
 
   /**
@@ -625,6 +632,11 @@ class SimpleBufferPool {
       }
     }
     this.pendingDestroy = keep;
+    if (epochTraceEnabled()) {
+      epochTrace(
+        `destroyPending destroyed=${destroyed.size} kept=${keep.length}`,
+      );
+    }
 
     // Scrub destroyed buffers from every other tracking set so a future
     // acquire() / acquirePreferred() cannot hand out a destroyed GPUBuffer.
@@ -976,6 +988,10 @@ export function setBufferPoolBudget(bytes: number | null): void {
  * available before the async onSubmittedWorkDone() callback runs.
  */
 export function flushBufferPool(): void {
+  // Quiescent point (caller has fenced): advance the engine epoch. This is
+  // the same epoch advance as backend/webgpu/epoch.ts advanceEpoch(); it
+  // lives inline here to avoid an import cycle with that module.
+  bumpEpoch("flushBufferPool");
   bufferPool.flushPendingToAvailable();
   bufferPool.sortPoolBuckets(); // deterministic acquire order for bind group cache
   bufferPool.beginWindow(); // Advance window counter for demand tracking
@@ -1083,6 +1099,11 @@ export async function awaitDeferredFence(): Promise<void> {
     fenceState.pendingFencePromise = null;
   }
   if (fenceState.deferredPendingRelease) {
+    // Fence completed — quiescent point: advance the engine epoch. The
+    // quiesce-before-demotion-sweep ordering the step machinery relies on
+    // is expressed here: markStep awaits this fence BEFORE its sweep, so
+    // everything the sweep destroys is past its last GPU use.
+    bumpEpoch("deferredFence");
     bufferPool.flushPendingToPool();
     bufferPool.destroyPendingBuffers();
     fenceState.deferredPendingRelease = false;

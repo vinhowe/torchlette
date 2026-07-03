@@ -6,6 +6,7 @@ import { ENV } from "../../../core/env";
 import type { BackendTensor } from "../../types";
 import { allocateOutputBuffer } from "../buffer-arena";
 import { bufferPool, destroyCopy } from "../buffer-pool";
+import { advanceEpoch } from "../epoch";
 import {
   f16ArrayToF32Array,
   f16WeightCache,
@@ -825,8 +826,9 @@ export async function read(a: BackendTensor): Promise<number[]> {
   if (typeof ctx.queue.onSubmittedWorkDone === "function") {
     await ctx.queue.onSubmittedWorkDone();
   }
-  // GPU work is complete - safe to flush pending buffers
-  bufferPool.flushPendingToAvailable();
+  // GPU work is complete — quiescent point: advance the engine epoch
+  // (flushes pending pool buffers).
+  advanceEpoch("readback");
   await readBuffer.mapAsync(GPUMapMode.READ);
   const mapped = readBuffer.getMappedRange();
 
@@ -871,8 +873,9 @@ export async function waitForGPU(): Promise<void> {
   if (typeof ctx.queue.onSubmittedWorkDone === "function") {
     await ctx.queue.onSubmittedWorkDone();
   }
-  // GPU work is complete - safe to flush pending buffers
-  bufferPool.flushPendingToAvailable();
+  // GPU work is complete — quiescent point: advance the engine epoch
+  // (flushes pending pool buffers).
+  advanceEpoch("waitForGPU");
 }
 
 // ============================================================================

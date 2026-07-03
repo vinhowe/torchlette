@@ -1,4 +1,10 @@
 import {
+  bumpEpoch,
+  currentEpoch,
+  epochTrace,
+  epochTraceEnabled,
+} from "../core/epoch";
+import {
   findDeadTensorsAtStep,
   type TensorLifetime,
 } from "./lifetime-analysis";
@@ -34,17 +40,21 @@ class StorageTracker {
    *  ensures persistence survives storage replacement (e.g., Adam m/v updates). */
   private _stepStartTensors: WeakSet<object> | null = null;
 
-  /** Implied-step-boundary generation (see Torchlette.queueStepBoundary).
-   *  Bumped when an optimizer queues a step boundary; each owning TENSOR
-   *  OBJECT is stamped with the generation current when it is first seen.
-   *  Gen-scoped cleanup uses the stamps to separate "this step's tensors"
-   *  from work the NEXT step has already lazily built by the time the
-   *  boundary commits. The stamp is wrapper-level, like persistence itself:
-   *  a persistent tensor's STORAGE can be replaced mid-step (fused Adam's
-   *  m/v side outputs re-point the wrapper every step), so a storage-level
-   *  stamp would mis-classify long-lived state as next-step work and demote
-   *  it — live optimizer state corrupted, the persistence-UAF class. */
-  private _stepGen = 0;
+  /** Implied-step-boundary generation stamps (see
+   *  Torchlette.queueStepBoundary). Keyed by the engine EPOCH id
+   *  (src/core/epoch.ts): each owning TENSOR OBJECT is stamped with the
+   *  epoch current when it is first seen; a queued step boundary records
+   *  the current epoch as its closing generation and bumps the counter.
+   *  Stamps are compared only relatively (`stamp > boundaryEpoch`), so the
+   *  epoch also advancing at other quiesce points is harmless — monotonic
+   *  time-order is all that's used. Gen-scoped cleanup uses the stamps to
+   *  separate "this step's tensors" from work the NEXT step has already
+   *  lazily built by the time the boundary commits. The stamp is
+   *  wrapper-level, like persistence itself: a persistent tensor's STORAGE
+   *  can be replaced mid-step (fused Adam's m/v side outputs re-point the
+   *  wrapper every step), so a storage-level stamp would mis-classify
+   *  long-lived state as next-step work and demote it — live optimizer
+   *  state corrupted, the persistence-UAF class. */
   private _wrapperGen = new WeakMap<object, number>();
 
   /** Debug counters */
@@ -62,15 +72,18 @@ class StorageTracker {
   trackTensor(storageId: number, tensorRef: object): void {
     this.tensorWeakRefs.set(storageId, new WeakRef(tensorRef));
     if (!this._wrapperGen.has(tensorRef)) {
-      this._wrapperGen.set(tensorRef, this._stepGen);
+      this._wrapperGen.set(tensorRef, currentEpoch());
     }
   }
 
-  /** Advance the step generation (called when a step boundary is queued).
-   *  Returns the generation that closes: storages stamped <= this value
-   *  belong to the step being ended. */
+  /** Mark a step boundary (called when one is queued). Returns the epoch
+   *  that closes — wrappers stamped <= this value belong to the step being
+   *  ended — and bumps the engine epoch so everything created afterwards
+   *  is stamped strictly greater. */
   bumpStepGen(): number {
-    return this._stepGen++;
+    const closing = currentEpoch();
+    bumpEpoch("stepBoundary");
+    return closing;
   }
 
   /** Unregister a storage (after it's been destroyed or early-released). */
@@ -122,6 +135,9 @@ class StorageTracker {
 
       if (toDestroy.length === 0) break;
       totalDestroyed += this.destroyStorageIds(toDestroy);
+    }
+    if (epochTraceEnabled()) {
+      epochTrace(`sweep destroyed=${totalDestroyed}`);
     }
     return totalDestroyed;
   }
@@ -255,6 +271,9 @@ class StorageTracker {
       }
     }
     this._stepStartTensors = null;
+    if (epochTraceEnabled()) {
+      epochTrace(`releaseStepTemps released=${released}`);
+    }
     return released;
   }
 
