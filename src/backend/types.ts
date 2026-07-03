@@ -536,6 +536,16 @@ export interface BackendOps {
   read(a: BackendTensor): Promise<number[]>;
   /** Start async scalar readback: copy to staging buffer, return finish function. */
   startScalarReadback?(a: BackendTensor): () => Promise<number>;
+  /**
+   * GPU top-K prefilter readback: top-k (value, index) pairs of a 1-D slice
+   * of a forced f32 tensor, sorted by (value desc, index asc). Reads ~2k*4
+   * bytes instead of the full tensor — the sampling readback fast path.
+   */
+  readTopK?(
+    a: BackendTensor,
+    k: number,
+    opts?: { offset?: number; length?: number },
+  ): Promise<{ values: Float32Array; indices: Int32Array }>;
 }
 
 export interface Backend {

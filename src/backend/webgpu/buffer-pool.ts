@@ -394,6 +394,17 @@ class SimpleBufferPool {
     const source: Iterable<[number, number]> =
       this.reservation ?? this.newAllocsByClass;
 
+    // Step-0 prewarm fallback cap: newAllocsByClass is CUMULATIVE since
+    // process start, so after a large model load it wildly overestimates one
+    // step's demand (a 1.7B f32 load records ~20GB of upload/init churn;
+    // pre-creating that on a 32GB device is an instant OOM storm — thousands
+    // of dropped submits on the first beginStep after loading). The windowed
+    // reservation (step 1+) measures real per-step deficit and stays
+    // uncapped. Under-reserving is always safe: acquire() allocates on
+    // demand.
+    const PREWARM_FALLBACK_MAX_BYTES = 1 << 30; // 1GB
+    let fallbackBytes = 0;
+
     for (const [sizeClass, needed] of source) {
       const size = getSizeForClass(sizeClass);
       const deficit = this.reservation
@@ -407,6 +418,10 @@ class SimpleBufferPool {
           this.maxPoolBytes
         )
           break;
+        if (!this.reservation) {
+          if (fallbackBytes + size > PREWARM_FALLBACK_MAX_BYTES) break;
+          fallbackBytes += size;
+        }
         const buf = device.createBuffer({ size, usage: STORAGE_BUFFER_USAGE });
         this.getBucket(sizeClass).push(buf);
         this.pooledBytes += size;

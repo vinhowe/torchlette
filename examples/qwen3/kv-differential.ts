@@ -78,10 +78,17 @@ async function main() {
     if (!SKIP_MARKSTEP) await api.markStep();
   }
   for (let i = 1; i < NUM_NEW; i++) {
+    // Step-scoped ceremony (beginStep/endStep/markStep) — same loop shape as
+    // the real generate loops (packages/qwen3-browser/src/generate.ts), so
+    // this gate exercises step-scoped temp cleanup under static-KV decode.
+    if (!SKIP_MARKSTEP) await api.beginStep();
     const idx = api.tensorFromArray([stat[stat.length - 1]], [1, 1]);
     const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
     stat.push(await argmaxLast(logits, 0));
-    if (!SKIP_MARKSTEP) await api.markStep();
+    if (!SKIP_MARKSTEP) {
+      api.endStep();
+      await api.markStep();
+    }
   }
 
   console.log("no-cache:", JSON.stringify(noCache));

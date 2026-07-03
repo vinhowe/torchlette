@@ -219,6 +219,7 @@ import {
 import { cat, gather, scatterAdd } from "./ops/gather-scatter";
 import { matmul } from "./ops/matmul-ops";
 import { batchedReduction, max, mean, min, sum } from "./ops/reductions";
+import { readTopK } from "./topk-kernel";
 import { stridedScatterAdd, stridedScatterCopy } from "./ops/strided-scatter";
 import {
   cast,
@@ -367,6 +368,7 @@ export const webgpuBackend: FusedBackend & {
     readAndDestroyInfCount,
     read,
     startScalarReadback,
+    readTopK,
   },
   mulScalarInPlace,
   beginStep,

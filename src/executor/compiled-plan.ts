@@ -97,6 +97,18 @@ export interface WriteCommand {
   tag: 3; // "write" — host→device (tensorFromArray)
   slot: Slot;
   nodeIndex: number;
+  /**
+   * Plan-owned STABLE upload buffer (f32 fast path). The legacy replay
+   * re-executed the tensorFromArray node each step, allocating a fresh
+   * pool/arena buffer — the changed identity invalidated the cached bind
+   * group of EVERY consumer dispatch (Qwen3 decode: 141 createBindGroup
+   * calls/token from 4 upload slots). Replays instead queue.writeBuffer the
+   * fresh payload into this buffer (queue-ordered: lands before the step's
+   * encoder submits, after the previous step's fence), so consumer bind
+   * groups stay byte-identical across replays. Destroyed (deferred) at plan
+   * teardown.
+   */
+  stableBuf?: GPUBuffer;
 }
 
 export interface BarrierCommand {
@@ -145,6 +157,9 @@ export type GpuCommand =
   | BarrierCommand
   | ClearCommand
   | UniformCommand;
+
+/** TAG_WRITE stable-buffer fast path: only for small per-step host uploads. */
+const STABLE_WRITE_MAX_BYTES = 1 << 20; // 1MB
 
 // Numeric tags for fast switch in hot loop
 export const TAG_ALLOC = 0 as const;
@@ -641,6 +656,19 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
     compiled.plannerAssignment = undefined;
     compiled.plannerGen = undefined;
   }
+  // Destroy plan-owned stable upload buffers (TAG_WRITE fast path). Unpin
+  // first (deferredDestroy is pin-guarded), then defer: teardown can fire
+  // mid-step with encoded-but-unsubmitted passes binding them.
+  for (const cmd of compiled.commands) {
+    if (cmd.tag === TAG_WRITE && cmd.stableBuf) {
+      pinnedBufferSet.delete(cmd.stableBuf);
+      bufferPool.deferredDestroy(
+        cmd.stableBuf,
+        (cmd.stableBuf as { size?: number }).size ?? 0,
+      );
+      cmd.stableBuf = undefined;
+    }
+  }
 }
 
 // ============================================================================
@@ -1006,7 +1034,9 @@ import {
   endSharedEncoder,
   flushSharedEncoder,
   getSharedEncoderInstance,
+  incrementSharedEncoderPassCount,
 } from "../backend/webgpu/shared-encoder";
+import { gpuTimestampsActive } from "../backend/webgpu/profiler";
 import { createTensor } from "../backend/webgpu/tensor";
 import {
   paramsBufferSizeClass,
@@ -1048,6 +1078,24 @@ export async function executeCompiledPlan(
   // NOTE: Do NOT reset dispatch sequence here. The step-level beginStep() handles
   // the reset. Multiple plans within a step share the sequence counter — resetting
   // here would cause backward plan params to collide with forward plan params.
+
+  // Batched compute pass: consecutive TAG_DISPATCH commands encode into ONE
+  // compute pass instead of one pass each (WebGPU synchronizes storage access
+  // between dispatches in a pass — each dispatch is its own usage scope), which
+  // removes ~2 Dawn beginComputePass/end calls per dispatch (~700/step on the
+  // Qwen3 decode plan). The pass MUST be closed before any encoder-level
+  // command (copy/clear), before flushes (barriers), and before commands that
+  // can encode their own passes (legacy TAG_WRITE). When GPU timestamps are
+  // enabled the per-dispatch path is kept — timestampWrites are per-pass.
+  let openPass: ReturnType<GPUCommandEncoder["beginComputePass"]> | null = null;
+  let openPassEncoder: GPUCommandEncoder | null = null;
+  const closeOpenPass = () => {
+    if (openPass) {
+      openPass.end();
+      openPass = null;
+      openPassEncoder = null;
+    }
+  };
 
   try {
     // Phase 1: Pre-populate external + persistent slots
@@ -1237,6 +1285,12 @@ export async function executeCompiledPlan(
               for (let j = 0; j < bufs.length; j++) {
                 if (cmd.cachedBuffers[j] !== bufs[j]) {
                   match = false;
+                  if (ENV.TORCHLETTE_DEBUG_BINDMISS) {
+                    const src = compiled.slots[cmd.bindings[j]];
+                    console.log(
+                      `[bindmiss] cmd=${ci} label=${cmd.label ?? "?"} bindingIdx=${j} slot=${cmd.bindings[j]} slotKind=${src?.kind}`,
+                    );
+                  }
                   break;
                 }
               }
@@ -1265,17 +1319,34 @@ export async function executeCompiledPlan(
             cmd.cachedBuffers = bufs.slice();
           }
           if (cmd.module !== undefined) setProfileModule(cmd.module);
-          dispatchComputePass(
-            cmd.pipeline,
-            bg,
-            cmd.gx,
-            cmd.gy,
-            cmd.gz,
-            cmd.label,
-          );
+          const enc = getSharedEncoderInstance();
+          if (!enc || gpuTimestampsActive()) {
+            // Timestamp collection needs per-pass timestampWrites; no shared
+            // encoder means dispatchComputePass manages its own encoder.
+            closeOpenPass();
+            dispatchComputePass(
+              cmd.pipeline,
+              bg,
+              cmd.gx,
+              cmd.gy,
+              cmd.gz,
+              cmd.label,
+            );
+          } else {
+            if (!openPass || openPassEncoder !== enc) {
+              closeOpenPass();
+              openPass = enc.beginComputePass();
+              openPassEncoder = enc;
+            }
+            openPass.setPipeline(cmd.pipeline);
+            openPass.setBindGroup(0, bg as GPUBindGroup);
+            openPass.dispatchWorkgroups(cmd.gx, cmd.gy, cmd.gz);
+            incrementSharedEncoderPassCount();
+          }
           break;
         }
         case TAG_COPY: {
+          closeOpenPass(); // copy is an encoder-level command
           const encoder = getSharedEncoderInstance();
           if (ENV.TORCHLETTE_DEBUG_SHAPE) {
             console.log(
@@ -1298,20 +1369,103 @@ export async function executeCompiledPlan(
           const writeNode = planNodes[cmd.nodeIndex];
           const hadResult = !!writeNode.result;
           if (!writeNode.result) {
-            const inputs = writeNode.inputs.map((ref) =>
-              getInputStorage(ref, backend),
-            );
-            const backendInputs = inputs.map((s) => s.backendTensor);
-            const resultOrPromise = executeOpSync(
-              writeNode,
-              backendInputs,
-              backend,
-            );
-            const result: BackendTensor =
-              resultOrPromise instanceof Promise
-                ? await resultOrPromise
-                : resultOrPromise;
-            writeNode.result = createStorageHandle(writeNode.device, result);
+            // STABLE-upload fast path (f32 tensorFromArray): write the fresh
+            // payload into a plan-owned buffer via queue.writeBuffer instead
+            // of re-executing the node (which allocates a fresh pool/arena
+            // buffer whose changed identity invalidates every consumer's
+            // cached bind group — 141 createBindGroup/token on Qwen3 decode).
+            // Safe ordering: writeBuffer is queue-ordered BEFORE the step's
+            // encoder submits (consumers), and the previous step's reads
+            // completed at the markStep fence.
+            const payload =
+              writeNode.op === "tensorFromArray"
+                ? (writeNode.payload as
+                    | {
+                        values?: number[] | Float32Array | Int32Array | Uint32Array;
+                        dtype?: DType;
+                      }
+                    | undefined)
+                : undefined;
+            const wDtype = payload?.dtype ?? writeNode.dtype;
+            const wValues = payload?.values;
+            if (
+              wValues &&
+              wDtype === "f32" &&
+              // Small per-step host uploads only (decode: token idx / RoPE
+              // slices / masks / scatter indices, all ≤ a few KB). Large
+              // uploads (weight-loading plans push 8-50MB per write) stay on
+              // the legacy path — a dedicated stable copy would double their
+              // memory for no bind-group benefit once loading ends.
+              wValues.length * 4 <= STABLE_WRITE_MAX_BYTES &&
+              !(wValues instanceof Int32Array) &&
+              !(wValues instanceof Uint32Array)
+            ) {
+              const f32 =
+                wValues instanceof Float32Array
+                  ? wValues
+                  : Float32Array.from(wValues);
+              let sbuf = cmd.stableBuf;
+              if (!sbuf) {
+                sbuf = device.createBuffer({
+                  size: Math.max(16, (f32.byteLength + 15) & ~15),
+                  usage:
+                    GPUBufferUsage.STORAGE |
+                    GPUBufferUsage.COPY_SRC |
+                    GPUBufferUsage.COPY_DST,
+                });
+                gpuMemoryTracker.trackAllocation(sbuf, f32.byteLength);
+                // PIN: the buffer is wrapped NON-owning (never incRef'd), so
+                // without a pin every "is it free?" check sees it as
+                // ownerless — resolveOutputBuffer's in-place reuse hands it
+                // out as another dispatch's OUTPUT, whose owner later
+                // releases it into the POOL, and pool eviction destroys it
+                // while this command still writeBuffers into it every replay
+                // ("used in submit while destroyed", tokens diverge).
+                pinnedBufferSet.add(sbuf);
+                cmd.stableBuf = sbuf;
+                if (ENV.TORCHLETTE_DEBUG_STABLEBUF) {
+                  const orig = sbuf.destroy?.bind(sbuf);
+                  console.log(
+                    `[stablebuf] CREATE bytes=${f32.byteLength} node=${writeNode.id} cmd=${ci}`,
+                  );
+                  (sbuf as { destroy?: () => void }).destroy = () => {
+                    console.log(
+                      `[stablebuf] DESTROY bytes=${f32.byteLength} node=${writeNode.id}\n${new Error().stack}`,
+                    );
+                    orig?.();
+                  };
+                }
+              }
+              device.queue.writeBuffer(sbuf, 0, f32);
+              writeNode.result = createStorageHandle(
+                writeNode.device,
+                createTensor(
+                  writeNode.shape,
+                  sbuf,
+                  undefined,
+                  0,
+                  "f32",
+                  /* ownsBuffer */ false,
+                ),
+              );
+            } else {
+              // Legacy path may encode its own passes / flush (chunked ops).
+              closeOpenPass();
+              const inputs = writeNode.inputs.map((ref) =>
+                getInputStorage(ref, backend),
+              );
+              const backendInputs = inputs.map((s) => s.backendTensor);
+              const resultOrPromise = executeOpSync(
+                writeNode,
+                backendInputs,
+                backend,
+              );
+              const result: BackendTensor =
+                resultOrPromise instanceof Promise
+                  ? await resultOrPromise
+                  : resultOrPromise;
+              writeNode.result = createStorageHandle(writeNode.device, result);
+            }
           }
           slots[cmd.slot] = gpuBuffer(writeNode.result!.backendTensor);
           if (ENV.TORCHLETTE_DEBUG_WRITES) {
@@ -1322,6 +1476,7 @@ export async function executeCompiledPlan(
           break;
         }
         case TAG_CLEAR: {
+          closeOpenPass(); // clearBuffer is an encoder-level command
           const encoder = getSharedEncoderInstance();
           if (encoder) {
             encoder.clearBuffer(slots[cmd.slot], 0, cmd.bytes);
@@ -1344,6 +1499,7 @@ export async function executeCompiledPlan(
           break;
         }
         case TAG_BARRIER: {
+          closeOpenPass(); // encoder.finish() requires no open pass
           flushSharedEncoder();
           flushBufferPool();
           break;
@@ -1494,6 +1650,7 @@ export async function executeCompiledPlan(
       );
     }
   } finally {
+    closeOpenPass(); // encoder must have no open pass before finish()
     clearActiveArena();
     clearArenaExternalInputBuffers();
     endSharedEncoder();

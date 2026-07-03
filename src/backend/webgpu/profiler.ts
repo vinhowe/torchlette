@@ -237,6 +237,18 @@ export function setTimestampsEnabled(enabled: boolean): void {
   gpuTs.enabled = enabled;
 }
 
+/**
+ * Whether getTimestampWrites() would currently return a descriptor (without
+ * consuming query slots). Callers that batch multiple dispatches into one
+ * compute pass check this to fall back to per-dispatch passes while GPU
+ * timestamps are being collected (timestampWrites are per-pass).
+ */
+export function gpuTimestampsActive(): boolean {
+  return (
+    _profilingEnabled && gpuTs.supported && !!gpuTs.querySet && gpuTs.enabled
+  );
+}
+
 // ---------------------------------------------------------------------------
 // CPU API call wrapping
 // ---------------------------------------------------------------------------

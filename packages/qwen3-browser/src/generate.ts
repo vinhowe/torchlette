@@ -111,6 +111,46 @@ export function sampleToken(
 }
 
 /**
+ * Temperature + top-k + top-p sampling over a top-K prefilter result
+ * (api.readTopK: values sorted desc, ties by index asc — the same ordering
+ * sampleToken's partial select produces). Avoids reading the full vocab
+ * logits row to the CPU.
+ */
+export function sampleFromTopK(
+  values: Float32Array,
+  indices: Int32Array,
+  temperature = 0.7,
+  topK = 20,
+  topP = 0.95,
+): number {
+  const k = Math.min(topK, values.length);
+  const mx = values[0];
+  const exps = new Float64Array(k);
+  let sum = 0;
+  for (let i = 0; i < k; i++) {
+    exps[i] = Math.exp((values[i] - mx) / temperature);
+    sum += exps[i];
+  }
+  let cut = k;
+  let cum = 0;
+  for (let i = 0; i < k; i++) {
+    cum += exps[i] / sum;
+    if (cum >= topP) {
+      cut = i + 1;
+      break;
+    }
+  }
+  let cutSum = 0;
+  for (let i = 0; i < cut; i++) cutSum += exps[i];
+  let r = Math.random() * cutSum;
+  for (let i = 0; i < cut; i++) {
+    r -= exps[i];
+    if (r <= 0) return indices[i];
+  }
+  return indices[0];
+}
+
+/**
  * Generate a chat completion. Emits incremental text via `events`, returns
  * final stats. Prefills the full prompt, then decodes with the KV cache.
  */
@@ -152,13 +192,21 @@ export async function generateChat(
   // decode steps within a length bucket share one plan template, which the
   // recurring-plan replay machinery accelerates automatically.
   const staticKV = model.allocStaticKV(maxSeq);
+  // Top-K prefilter readback: K=64 covers any sensible sampling topK and the
+  // GPU kernel reduces the per-token readback from the full vocab row (600KB)
+  // to 64 (value, index) pairs (512B). Greedy = indices[0], bit-identical to
+  // a full-logits argmax (gated by examples/qwen3/topk-equivalence.ts).
+  const K_PREFILTER = Math.max(64, topK ?? 20);
   let nextTok: number;
   {
     const idx = api.tensorFromArray(promptIds, [1, promptIds.length]);
     const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
-    const flat = new Float32Array(await logits.cpu());
+    const top = await api.readTopK(logits, K_PREFILTER, {
+      offset: (promptIds.length - 1) * vocab,
+      length: vocab,
+    });
     logits.dispose();
-    nextTok = sampleToken(flat, (promptIds.length - 1) * vocab, vocab, temperature, topK, topP);
+    nextTok = sampleFromTopK(top.values, top.indices, temperature, topK, topP);
     await api.markStep();
   }
   const prefillMs = Date.now() - t0;
@@ -173,18 +221,27 @@ export async function generateChat(
     emit(nextTok);
     count++;
     const t0 = performance.now();
+    // Step-scoped cleanup: snapshot persistents (weights, static KV slots) at
+    // beginStep so markStep's releaseStepTemps reclaims this step's ~1600
+    // graph temps deterministically. Without it inference leaks storage
+    // handles every token (only V8 GC eventually reclaims them) and the
+    // markStep sweep cost grows unboundedly. Safe here because static-KV
+    // decode holds NO graph-derived tensors across steps (cache slots are
+    // updated in place via copy_; logits are read before markStep).
+    await api.beginStep();
     const idx = api.tensorFromArray([nextTok], [1, 1]);
     const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
     const t1 = performance.now();
-    // cpu()'s synchronous prefix is the plan/lower/encode JS; the await is
-    // the GPU fence + readback.
-    const readback = logits.cpu();
+    // readTopK's synchronous prefix is the plan/lower/encode JS; the await is
+    // the GPU fence + the 512B top-K readback.
+    const readback = api.readTopK(logits, K_PREFILTER, { length: vocab });
     const t2 = performance.now();
-    const flat = new Float32Array(await readback);
+    const top = await readback;
     const t3 = performance.now();
     logits.dispose();
-    nextTok = sampleToken(flat, 0, vocab, temperature, topK, topP);
+    nextTok = sampleFromTopK(top.values, top.indices, temperature, topK, topP);
     const t4 = performance.now();
+    api.endStep();
     await api.markStep();
     const t5 = performance.now();
     tBuild += t1 - t0;

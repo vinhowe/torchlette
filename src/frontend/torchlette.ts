@@ -1010,6 +1010,27 @@ export class Torchlette {
     });
   }
 
+  /**
+   * Top-K readback for sampling: the top-k (value, index) pairs of a 1-D
+   * slice of `a` (default: the whole flattened tensor), sorted by
+   * (value desc, index asc). On WebGPU this runs a GPU prefilter kernel and
+   * reads back only ~2k*4 bytes instead of the full tensor — the fast path
+   * for decode-time sampling over large vocab logits. `indices[0]` is the
+   * greedy argmax (bit-identical to a full-logits first-max linear scan).
+   * `offset`/`length` are in elements of the flattened tensor.
+   */
+  async readTopK(
+    a: Tensor,
+    k: number,
+    opts?: { offset?: number; length?: number },
+  ): Promise<{ values: Float32Array; indices: Int32Array }> {
+    this._assertUsable(a);
+    return this._runEntryPoint(async () => {
+      this.runtime.forceRead(a.baseId);
+      return this.runtime.readTopK(a._unwrap(), k, opts);
+    });
+  }
+
   // ============================================================================
   // Device transfer
   // ============================================================================

@@ -196,6 +196,13 @@ export async function loadPretrainedQwen3(
     }
   }
   await api.markStep();
+  // Release the pool's load-time buffer cache (upload staging + init-weight
+  // buffers). Loading transiently peaks at ~4x the model size on a 32GB
+  // V100 (init weights + uploads + pool retention) — evicting here returns
+  // the slack to the device so inference starts with full headroom. The
+  // first step re-acquires what it needs (one-time cost).
+  const { evictAllPoolBuffers } = await import("../../src/backend/webgpu");
+  evictAllPoolBuffers();
 
   if (skipped.length > 0) {
     console.warn(`Unmapped weights (${skipped.length}):`, skipped.slice(0, 10));

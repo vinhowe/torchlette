@@ -83,6 +83,13 @@ async function main() {
     }
     setTimestampsEnabled(i === TIMESTAMP_STEP);
     const t0 = performance.now();
+    // Static mode: step-scoped cleanup (snapshot at beginStep → releaseStepTemps
+    // at markStep). Without it, inference loops leak ~1 storage handle per graph
+    // node per step (nothing releases the temps' refs until V8 GC gets around to
+    // the wrappers) and the markStep sweep grows unboundedly (~15-20ms/step by
+    // step 10). Cat mode must NOT use this: its presentKVs are graph-derived
+    // tensors held across steps, which step-scoped cleanup would reclaim.
+    if (staticKV) await api.beginStep();
     const last = tokens[tokens.length - 1];
     const posOffset = tokens.length - 1;
     const idx = api.tensorFromArray([last], [1, 1]);
@@ -90,7 +97,13 @@ async function main() {
       staticKV ? model.forward(idx, { staticKV }) : model.forward(idx, { pastKVs: kv, posOffset }),
     );
     kv = presentKVs;
-    tokens.push(await argmaxLast(logits, 0));
+    // GPU top-K prefilter readback (512B instead of the 600KB vocab row);
+    // indices[0] is bit-identical to the full-logits argmax (gated by
+    // examples/qwen3/topk-equivalence.ts).
+    const top = await api.readTopK(logits, 64, { length: vocab });
+    logits.dispose();
+    tokens.push(top.indices[0]);
+    if (staticKV) api.endStep();
     await api.markStep();
     const dt = performance.now() - t0;
     if (i >= WARMUP) walls.push(dt);

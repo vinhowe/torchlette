@@ -1483,6 +1483,51 @@ export class RuntimeEngine {
   }
 
   /**
+   * Top-K readback: force the tensor, then read only the top-k
+   * (value, index) pairs of a 1-D slice, sorted by (value desc, index asc).
+   * Uses the backend's GPU prefilter kernel when available (reads ~2k*4
+   * bytes instead of the full tensor); otherwise falls back to a full read
+   * + CPU partial select with the identical ordering contract.
+   */
+  async readTopK(
+    a: Tensor,
+    k: number,
+    opts?: { offset?: number; length?: number },
+  ): Promise<{ values: Float32Array; indices: Int32Array }> {
+    await this.force(a);
+    const backend = this.getBackend(a.device);
+    if (!this._readHook && backend.ops.readTopK) {
+      return backend.ops.readTopK(a.backendTensor, k, opts);
+    }
+    const flat = this._readHook
+      ? await this._readHook(a.backendTensor)
+      : await backend.ops.read(a.backendTensor);
+    const offset = opts?.offset ?? 0;
+    const length = opts?.length ?? flat.length - offset;
+    if (k > length) {
+      throw new Error(`readTopK: k=${k} exceeds slice length ${length}`);
+    }
+    // Partial selection: keep k best, ties → smaller index (matches the GPU
+    // kernel and a linear first-max argmax scan).
+    const vals = new Float32Array(k).fill(Number.NEGATIVE_INFINITY);
+    const idxs = new Int32Array(k).fill(-1);
+    for (let i = 0; i < length; i++) {
+      const v = flat[offset + i];
+      if (v > vals[k - 1]) {
+        let p = k - 1;
+        while (p > 0 && vals[p - 1] < v) {
+          vals[p] = vals[p - 1];
+          idxs[p] = idxs[p - 1];
+          p--;
+        }
+        vals[p] = v;
+        idxs[p] = i;
+      }
+    }
+    return { values: vals, indices: idxs };
+  }
+
+  /**
    * Start an async scalar readback: force the tensor, copy its value to a
    * staging buffer, and return a finish function. The staging buffer is
    * excluded from the pool, so backward can reuse the source buffer freely.
