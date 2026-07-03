@@ -137,6 +137,7 @@ async function main() {
     }
     console.log(`warm-cache load: ${((Date.now() - tCache) / 1000).toFixed(1)}s, sawCached=${sawCached}`);
     if (!sawCached) throw new Error("warm load did not use the IndexedDB cache");
+
   }
 
   await browser.close();

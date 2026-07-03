@@ -95,6 +95,7 @@ async function handleLoad(modelId: string, requestedDtype?: "f16" | "f32") {
         status: status + heapMB() + (errs > 0 ? ` · ⚠ ${errs} GPU errors (see console)` : ""),
       });
     },
+    onTensorEvent: (ev) => post({ type: "tensor", ev }),
   });
   const errs = getGpuUncapturedErrorCount();
   if (errs > 0) {

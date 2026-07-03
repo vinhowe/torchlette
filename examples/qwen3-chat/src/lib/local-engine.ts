@@ -3,7 +3,9 @@
  * and conversion work runs in the worker; this just relays messages.
  */
 
-import type { ChatMessage, GenerateStats } from "qwen3-browser";
+import type { ChatMessage, GenerateStats, TensorLoadEvent } from "qwen3-browser";
+
+export type { TensorLoadEvent };
 
 export type EngineEvent =
   | { delta: string }
@@ -26,6 +28,8 @@ export const LOCAL_MODELS = [
 export async function createLocalEngine(
   modelId: string,
   onProgress: LoadProgress,
+  onTensorEvent?: (ev: TensorLoadEvent) => void,
+  onEngineError?: (error: string) => void,
 ): Promise<LocalEngine> {
   const worker = new Worker(new URL("./engine-worker.ts", import.meta.url), {
     type: "module",
@@ -39,6 +43,7 @@ export async function createLocalEngine(
     worker.onmessage = (e) => {
       const msg = e.data;
       if (msg.type === "progress") onProgress(msg.loaded, msg.total, msg.status);
+      else if (msg.type === "tensor") onTensorEvent?.(msg.ev);
       else if (msg.type === "loaded") resolve();
       else if (msg.type === "error") reject(new Error(msg.error));
     };
@@ -49,7 +54,11 @@ export async function createLocalEngine(
   worker.onmessage = (e) => {
     const msg = e.data;
     const handler = msg.id !== undefined ? inflight.get(msg.id) : undefined;
-    if (!handler) return;
+    if (!handler) {
+      // id-less error post-load (e.g. device lost).
+      if (msg.type === "error") onEngineError?.(msg.error);
+      return;
+    }
     if (msg.type === "delta") handler({ delta: msg.delta });
     else if (msg.type === "replace") handler({ replace: msg.text });
     else if (msg.type === "error") {

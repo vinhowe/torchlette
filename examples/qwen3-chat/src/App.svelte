@@ -11,7 +11,9 @@
     LOCAL_MODELS,
     type EngineEvent,
     type LocalEngine,
+    type TensorLoadEvent,
   } from "./lib/local-engine";
+  import NetworkViz from "./lib/NetworkViz.svelte";
 
   type Message = { role: "user" | "assistant"; content: string };
 
@@ -23,6 +25,14 @@
   let loadStatus = $state("");
   let loadBytes = $state(0);
   let loadTotal = $state(0);
+  let netTensors = $state<{ name: string; shape: number[]; elems: number; dtype: string; skipped: boolean }[]>([]);
+  let netFill = $state<Record<string, number>>({});
+  function onTensorEvent(ev: TensorLoadEvent) {
+    if (ev.type === "manifest") netTensors.push(...ev.tensors);
+    else if (ev.type === "start") netFill[ev.name] = 0;
+    else if (ev.type === "progress") netFill[ev.name] = ev.fraction;
+    else if (ev.type === "done") netFill[ev.name] = 1;
+  }
 
   let messages = $state<Message[]>([]);
   let input = $state("");
@@ -44,13 +54,20 @@
   async function loadLocal() {
     loading = true;
     error = null;
+    netTensors = [];
+    netFill = {};
     try {
-      localEngine = await createLocalEngine(localModelId, (loaded, total, status) => {
-        loadBytes = loaded;
-        loadTotal = total;
-        loadPct = total > 0 ? Math.min(100, (loaded / total) * 100) : 0;
-        loadStatus = status;
-      });
+      localEngine = await createLocalEngine(
+        localModelId,
+        (loaded, total, status) => {
+          loadBytes = loaded;
+          loadTotal = total;
+          loadPct = total > 0 ? Math.min(100, (loaded / total) * 100) : 0;
+          loadStatus = status;
+        },
+        onTensorEvent,
+        (e) => (error = e),
+      );
     } catch (e) {
       error = String(e);
       engineMode = "server";
@@ -187,18 +204,23 @@
       </div>
     </div>
 
-    {#if loading}
-      <div class="shrink-0 border-b border-border px-2 py-1.5">
-        <Panel title="Model download">
-          <CapacityBar
-            id="model-download"
-            label="Weights"
-            unit="MB"
-            max={Math.max(1, Math.round(loadTotal / 1e6))}
-            segments={[{ label: "downloaded", value: Math.round(loadBytes / 1e6) }]}
-          />
-          <Note label="Status">{loadStatus} ({loadPct.toFixed(0)}%)</Note>
-        </Panel>
+    {#if loading || netTensors.length > 0}
+      <div class="shrink-0 border-b border-border px-2 py-1.5 stack-tight">
+        {#if loading}
+          <Panel title="Model download">
+            <CapacityBar
+              id="model-download"
+              label="Weights"
+              unit="MB"
+              max={Math.max(1, Math.round(loadTotal / 1e6))}
+              segments={[{ label: "downloaded", value: Math.round(loadBytes / 1e6) }]}
+            />
+            <Note label="Status">{loadStatus} ({loadPct.toFixed(0)}%)</Note>
+          </Panel>
+        {/if}
+        {#if netTensors.length > 0}
+          <NetworkViz tensors={netTensors} fill={netFill} />
+        {/if}
       </div>
     {/if}
 

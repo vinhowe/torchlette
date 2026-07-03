@@ -40,6 +40,27 @@ export type LoadProgress = (
   status: string,
 ) => void;
 
+/**
+ * Structured per-tensor load events (drives network visualizations).
+ * Derived entirely from the safetensors manifest — model-architecture
+ * agnostic. `manifest` fires once per shard (after its header parses);
+ * progress fractions are 0..1 within one tensor.
+ */
+export type TensorLoadEvent =
+  | {
+      type: "manifest";
+      tensors: {
+        name: string;
+        shape: number[];
+        elems: number;
+        dtype: string;
+        skipped: boolean;
+      }[];
+    }
+  | { type: "start"; name: string }
+  | { type: "progress"; name: string; fraction: number }
+  | { type: "done"; name: string };
+
 type SafetensorsEntry = {
   dtype: string;
   shape: number[];
@@ -167,7 +188,7 @@ async function streamTensor(
   srcDtype: string,
   byteLength: number,
   destDtype: string,
-  onSlice: () => void,
+  onSlice: (fraction: number) => void,
 ): Promise<Float32Array | Uint16Array> {
   if (srcDtype !== "BF16" && srcDtype !== "F16" && srcDtype !== "F32") {
     throw new Error(`Unsupported safetensors dtype ${srcDtype}`);
@@ -213,7 +234,7 @@ async function streamTensor(
     const tail = stagingLen - elems * srcElemBytes;
     if (tail > 0) staging.copyWithin(0, elems * srcElemBytes, stagingLen);
     stagingLen = tail;
-    onSlice();
+    onSlice(consumed / byteLength);
     await yieldToUI();
   };
 
@@ -244,10 +265,12 @@ export async function loadQwen3FromUrl(
     maxSeqLen?: number;
     weightDtype?: "f32" | "f16";
     onProgress?: LoadProgress;
+    onTensorEvent?: (ev: TensorLoadEvent) => void;
   },
 ): Promise<Qwen3> {
   const base = baseUrl.replace(/\/$/, "");
   const progress = options?.onProgress ?? (() => {});
+  const tensorEvent = options?.onTensorEvent ?? (() => {});
 
   progress(0, 0, "Fetching config…");
   const hfConfig = await (await fetch(`${base}/config.json`)).json();
@@ -329,6 +352,17 @@ export async function loadQwen3FromUrl(
       .filter(([name]) => name !== "__metadata__")
       .sort((a, b) => a[1].data_offsets[0] - b[1].data_offsets[0]);
 
+    tensorEvent({
+      type: "manifest",
+      tensors: entries.map(([name, info]) => ({
+        name,
+        shape: info.shape,
+        elems: info.shape.reduce((a, b) => a * b, 1),
+        dtype: info.dtype,
+        skipped: resolveDest(model, name) === null,
+      })),
+    });
+
     let filePos = 0; // relative to data start
     for (const [name, info] of entries) {
       const [start, end] = info.data_offsets;
@@ -340,11 +374,18 @@ export async function loadQwen3FromUrl(
         // Skipped tensor (e.g. redundant tied lm_head): discard WITHOUT
         // allocating — progress still ticks via the stream byte counter.
         currentTensor = `${name} (skipped)`;
+        tensorEvent({ type: "start", name });
         await cursor.discard(end - start);
+        tensorEvent({ type: "done", name });
         continue;
       }
       currentTensor = name;
-      const data = await streamTensor(cursor, info.dtype, end - start, dest.dtype, emitProgress);
+      tensorEvent({ type: "start", name });
+      const data = await streamTensor(cursor, info.dtype, end - start, dest.dtype, (fraction) => {
+        emitProgress();
+        tensorEvent({ type: "progress", name, fraction });
+      });
+      tensorEvent({ type: "done", name });
       currentTensor = `${name} (upload)`;
       emitProgress();
       const src = api.tensorFromArray(data, info.shape, { dtype: dest.dtype });
