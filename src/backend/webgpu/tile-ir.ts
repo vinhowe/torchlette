@@ -304,6 +304,23 @@ interface Vec4SharedReadNode extends IRNodeBase {
   idx: IRNode;
 }
 
+/**
+ * vec4 load from a STORAGE binding: binding[(elemIndex) >> 2u] → vec4<f32>.
+ *
+ * The binding is declared as `array<vec4<T>>` (all other accesses to the same
+ * binding are rewritten to component indexing by the compiler). f16 bindings
+ * load vec4<f16> and are widened to vec4<f32> at the load site.
+ *
+ * PRECONDITION (caller guarantees): elemIndex is 4-element aligned
+ * (elemIndex % 4 === 0) and the binding's total element count is a multiple
+ * of 4 (the vec4 array view truncates any 1-3 element tail).
+ */
+interface LoadVec4Node extends IRNodeBase {
+  kind: "loadVec4";
+  binding: string;
+  elemIndex: IRNode;
+}
+
 export type IRNode =
   | ProgramIdNode
   | UniformNode
@@ -336,7 +353,8 @@ export type IRNode =
   | Vec4DynComponentNode
   | Vec4BinaryNode
   | Vec4ArrayReadNode
-  | Vec4SharedReadNode;
+  | Vec4SharedReadNode
+  | LoadVec4Node;
 
 // ============================================================================
 // Tile-Level IR Types (block-level, compiler-lowered)
@@ -1600,6 +1618,8 @@ export class KernelContext {
   }> = [];
   /** Vec4 shared memory arrays declared by this kernel. */
   readonly vec4SharedArrays: Array<{ name: string; size: number }> = [];
+  /** Storage bindings accessed via loadVec4 (declared as array<vec4<T>>). */
+  readonly vec4StorageBindings = new Set<string>();
   /** Binding specs from the kernel spec (for dataType resolution in load). */
   private readonly bindingSpecs: Record<string, BindingSpec>;
   /** Subgroup size (0 = no subgroup support). Set by compileTileKernel(). */
@@ -1619,9 +1639,31 @@ export class KernelContext {
   /** Workgroup size (product if 2D), set by buildKernelIR from spec.workgroupSize. */
   private _wgSize: number | [number, number] = 0;
 
-  constructor(bindings?: Record<string, BindingSpec>, subgroupSize = 0) {
+  /** Injected seam expressions from the spec (see TileKernelSpec.seams). */
+  private readonly seams: Record<string, SeamFn>;
+
+  constructor(
+    bindings?: Record<string, BindingSpec>,
+    subgroupSize = 0,
+    seams?: Record<string, SeamFn>,
+  ) {
     this.bindingSpecs = bindings ?? {};
     this.subgroupSize = subgroupSize;
+    this.seams = seams ?? {};
+  }
+
+  /**
+   * Apply the expression injected at a named seam point (identity when the
+   * spec injected nothing). Kernels DECLARE seam points by calling this at
+   * the appropriate place (e.g. GEMV applies "epilogue" to the accumulated
+   * output value right before the store); spec builders INJECT expressions
+   * via TileKernelSpec.seams. `args` carries seam-specific context the
+   * injected expression may use (e.g. `outIndex` — the output element index
+   * — so a bias load can address its input).
+   */
+  applySeam(name: string, value: BlockExpr, args: SeamArgs = {}): BlockExpr {
+    const fn = this.seams[name];
+    return fn ? fn(this, value, args) : value;
   }
 
   /** Get the DataType for a named binding, defaulting to "f32". */
@@ -1690,6 +1732,39 @@ export class KernelContext {
     };
     if (mask) partial.mask = mask.node;
     return new BlockExpr(this.trackNode(makeNode<LoadNode>(partial)));
+  }
+
+  /**
+   * vec4 load from a STORAGE binding: returns a vec4<f32> value usable with
+   * the existing vec4 ops (vec4Dot, vec4Add, vec4Component, ...).
+   *
+   * Marks the binding as vec4-viewed: it is declared `array<vec4<T>>` in WGSL
+   * and every OTHER (scalar) access to it is rewritten to component indexing
+   * (`b[(i)>>2u][(i)&3u]`) by the compiler. f16 bindings load vec4<f16> and
+   * are widened to vec4<f32> at the load site.
+   *
+   * PRECONDITION (caller guarantees): `elemIndex % 4 === 0`, and the
+   * binding's total element count is a multiple of 4 (the vec4 array view
+   * truncates a 1-3 element tail). Incompatible with whole-kernel
+   * `vectorize` mode and with atomic bindings (compiler throws).
+   */
+  loadVec4(binding: string, elemIndex: BlockExpr): BlockExpr {
+    const spec = this.bindingSpecs[binding];
+    if (spec?.storage === "atomic") {
+      throw new Error(`loadVec4: binding '${binding}' is atomic`);
+    }
+    this.vec4StorageBindings.add(binding);
+    return new BlockExpr(
+      this.trackNode(
+        makeNode<LoadVec4Node>({
+          kind: "loadVec4",
+          binding,
+          elemIndex: elemIndex.node,
+          valueType: "scalar",
+          dataType: "f32",
+        }),
+      ),
+    );
   }
 
   /** Read a uniform config value. Defaults to u32; pass dtype for i32 or f32 uniforms. */
@@ -1795,6 +1870,15 @@ export class KernelContext {
     const result = flatWgId.mul(this.u32(workgroupSize)).add(this.localIndex());
     this.flatGlobalIdNodeIds.push(result.node.id);
     return result;
+  }
+
+  /**
+   * Flat workgroup index for a `rowGrid2d` dispatch (rows > 65535 split over
+   * a 2D grid): row = wid.y * num_wg.x + wid.x. Pair with `rowGrid2d()`;
+   * tail workgroups (row >= num_rows) must be masked by the kernel.
+   */
+  rowIndex2d(): BlockExpr {
+    return this.programId(1).mul(this.numPrograms(0)).add(this.programId(0));
   }
 
   /**
@@ -2309,6 +2393,125 @@ export class KernelContext {
       op,
     );
     return smem.read(this.u32(0));
+  }
+
+  /**
+   * Segmented workgroup reduction: reduce independently within GROUPS of
+   * contiguous lanes. A workgroup of `wgSize` lanes is split into `groups`
+   * segments of `wgSize / groups` lanes each; segment g covers lanes
+   * [g*groupSize, (g+1)*groupSize). Each lane contributes `value`; the
+   * return value is the segment's reduction, valid for EVERY lane of the
+   * segment (all-lanes broadcast, like wgReduce's smem[0] read).
+   *
+   * Unlike wgReduce this takes an already-accumulated per-lane VALUE (the
+   * accumulation loop typically differs per segment, e.g. one output row per
+   * segment in a multi-row GEMV).
+   *
+   * Subgroup-aware:
+   *  - groupSize <= subgroupSize: pure-register shuffleXor butterfly
+   *    (0 barriers, no shared memory).
+   *  - groupSize a multiple of subgroupSize: subgroup intrinsic reduction,
+   *    leaders write partials, small per-segment shared-memory tree.
+   *  - otherwise: full shared-memory tree within each segment.
+   *
+   * Requirements: groups divides wgSize; groupSize is a power of two.
+   * Must be called in uniform control flow (it emits barriers on the
+   * shared-memory paths). Values are f32.
+   */
+  wgReduceSegmented(
+    op: "sum" | "max" | "min",
+    value: BlockExpr,
+    tid: BlockExpr,
+    wgSize: number,
+    groups: number,
+  ): BlockExpr {
+    if (groups < 1 || wgSize % groups !== 0) {
+      throw new Error(
+        `wgReduceSegmented: groups (${groups}) must divide wgSize (${wgSize})`,
+      );
+    }
+    const groupSize = wgSize / groups;
+    if ((groupSize & (groupSize - 1)) !== 0) {
+      throw new Error(
+        `wgReduceSegmented: group size ${groupSize} must be a power of two`,
+      );
+    }
+    const id = this.reduceCounter++;
+    const combine = (a: BlockExpr, b: BlockExpr): BlockExpr =>
+      op === "sum" ? a.add(b) : op === "max" ? a.max(b) : a.min(b);
+    const sg = this.subgroupSize;
+
+    // Path A: segment fits inside one subgroup → register butterfly.
+    // (Relies on the linear subgroup ↔ local_invocation_index mapping the
+    // existing wgReduce leader logic already assumes.)
+    if (sg > 0 && groupSize <= sg && sg % groupSize === 0 && groupSize > 1) {
+      this._usesSubgroups = true;
+      let val = this.emitLet(`_wgs${id}_v`, value);
+      for (let mask = groupSize >> 1; mask >= 1; mask >>= 1) {
+        val = this.emitLet(
+          `_wgs${id}_m${mask}`,
+          combine(val, val.subgroupShuffleXor(mask)),
+        );
+      }
+      return val;
+    }
+    if (groupSize === 1) return value;
+
+    const groupLocal = this.emitLet(
+      `_wgs${id}_l`,
+      tid.mod(this.u32(groupSize)),
+    );
+
+    // Path B: segment spans whole subgroups → subgroup intrinsic + small
+    // per-segment shared-memory tree over the subgroup partials.
+    if (sg > 0 && groupSize % sg === 0) {
+      this._usesSubgroups = true;
+      const sgReduced = this.emitLet(
+        `_wgs${id}_sgr`,
+        op === "sum"
+          ? value.subgroupAdd()
+          : op === "max"
+            ? value.subgroupMax()
+            : value.subgroupMin(),
+      );
+      const numSubgroups = wgSize / sg;
+      const perGroup = groupSize / sg;
+      const smem = this.sharedArray(`_wgs${id}_s`, numSubgroups);
+      this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
+        smem.write(tid.div(this.u32(sg)), sgReduced);
+      });
+      this.barrier();
+      const base = this.emitLet(
+        `_wgs${id}_b`,
+        tid.div(this.u32(groupSize)).mul(this.u32(perGroup)),
+      );
+      for (let stride = perGroup >> 1; stride >= 1; stride >>= 1) {
+        this.ifThen(groupLocal.lt(this.u32(stride)), () => {
+          const at = base.add(groupLocal);
+          smem.write(
+            at,
+            combine(smem.read(at), smem.read(at.add(this.u32(stride)))),
+          );
+        });
+        this.barrier();
+      }
+      return smem.read(base);
+    }
+
+    // Fallback: full shared-memory tree within each segment.
+    const smem = this.sharedArray(`_wgs${id}_s`, wgSize);
+    smem.write(tid, value);
+    this.barrier();
+    for (let stride = groupSize >> 1; stride >= 1; stride >>= 1) {
+      this.ifThen(groupLocal.lt(this.u32(stride)), () => {
+        smem.write(
+          tid,
+          combine(smem.read(tid), smem.read(tid.add(this.u32(stride)))),
+        );
+      });
+      this.barrier();
+    }
+    return smem.read(tid.sub(groupLocal));
   }
 
   /**
@@ -2969,6 +3172,24 @@ export interface BindingSpec {
   type: DataType;
 }
 
+// ---- Expression seams ----
+
+/** Context values a kernel passes to its seam points (e.g. output index). */
+export type SeamArgs = Record<string, BlockExpr>;
+
+/**
+ * An expression injected at a kernel's named seam point. Receives the
+ * kernel context, the seam's carrier value (e.g. the accumulated output
+ * before store) and the kernel-provided args; returns the replacement
+ * value. Spliced in symbolically at spec-build time — it participates in
+ * the same IR (CSE, folding) as the kernel body.
+ */
+export type SeamFn = (
+  ctx: KernelContext,
+  value: BlockExpr,
+  args: SeamArgs,
+) => BlockExpr;
+
 export type UniformType = "f32" | "u32" | "i32";
 
 export interface TileKernelSpec {
@@ -3001,6 +3222,11 @@ export interface TileKernelSpec {
   /** When true, disable auto-detected TPR (threads-per-row) optimization.
    *  Forces single-thread-per-row execution even when subgroups are available. */
   noTPR?: boolean;
+  /** Expressions injected at the kernel's named seam points (composable
+   *  epilogues). The kernel body declares the points via ctx.applySeam();
+   *  entries here are spliced in symbolically at spec-build time. Absent
+   *  entries leave the seam as identity. */
+  seams?: Record<string, SeamFn>;
   /** Compute grid dimensions from uniform values.
    *  If omitted, auto-inferred from uniforms: a u32 uniform named "size",
    *  "total_elements", "num_elements", or "outSize" triggers elementwiseGrid. */
@@ -3041,6 +3267,30 @@ export function elementwiseGrid(
 export function perRowGrid(rowUniform?: string): GridFn {
   const name = rowUniform ?? "num_rows";
   return (u) => [u[name]];
+}
+
+/**
+ * Balanced 2D split of a 1D workgroup count over the per-dimension limit
+ * (65535): gy = ceil(total / MAX), gx = ceil(total / gy). Overshoot
+ * (gx*gy - total) is < gy — tail workgroups must be masked by the kernel.
+ */
+export function splitWorkgroups2d(totalWorkgroups: number): [number, number] {
+  const gy = Math.ceil(totalWorkgroups / MAX_WORKGROUPS_PER_DIM);
+  return [Math.ceil(totalWorkgroups / gy), gy];
+}
+
+/**
+ * Grid for per-row kernels whose row count can exceed the 65535/dimension
+ * limit: dispatches ceil(rows / rowsPerWorkgroup) workgroups on a balanced
+ * 2D grid. The kernel recovers its flat workgroup index via
+ * `ctx.rowIndex2d()` and must mask tail workgroups (index >= row count).
+ * Subsumes the hand-rolled 2D mapping the GEMV NT kernel used.
+ */
+export function rowGrid2d(
+  rowUniform = "num_rows",
+  rowsPerWorkgroup = 1,
+): GridFn {
+  return (u) => splitWorkgroups2d(Math.ceil(u[rowUniform] / rowsPerWorkgroup));
 }
 
 /** Grid for simple 1D ceil-division dispatch. */
@@ -3288,7 +3538,7 @@ export function buildKernelIR(
   nextNodeId = 0;
   cseCache = new Map();
   try {
-    const ctx = new KernelContext(spec.bindings, subgroupSize);
+    const ctx = new KernelContext(spec.bindings, subgroupSize, spec.seams);
     ctx._setWgSize(spec.workgroupSize);
     spec.kernel(ctx);
     return ctx;

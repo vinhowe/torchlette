@@ -17,26 +17,21 @@ import type {
 } from "../gpu-types";
 import { GPUBufferUsage } from "../gpu-types";
 import { getWarmupPipeline, recordPipeline } from "../pipeline-warmup";
-import { getCurrentOpLabel } from "../shared-encoder";
 import { F32_BYTES } from "../shape-utils";
+import { getCurrentOpLabel } from "../shared-encoder";
 import { onTeardown } from "../webgpu-state";
 import { cacheTuningResult } from "./autotune";
 import {
   computeGemvRoute,
-  generateGemvShaderTileIR,
   type GemvKernelOptions,
+  gemvSupportsEpilogue,
+  generateGemvShaderTileIR,
   getGemvShaderCacheKey,
 } from "./gemv";
 import {
   generateKSplitReductionShaderTileIR,
   generateTiledMatmulShaderTileIR,
 } from "./tile-matmul";
-import {
-  getMatmulVariant,
-  MATMUL_VARIANTS,
-  type MatmulVariantChoice,
-  type MatmulVariantContext,
-} from "./variants";
 import {
   type CodegenOptions,
   classifyShape,
@@ -49,6 +44,12 @@ import {
   type MatmulKernelConfig,
   validateConfig,
 } from "./types";
+import {
+  getMatmulVariant,
+  MATMUL_VARIANTS,
+  type MatmulVariantChoice,
+  type MatmulVariantContext,
+} from "./variants";
 
 /**
  * Pipeline cache for compiled matmul kernels.
@@ -198,6 +199,7 @@ export function resetMatmulState(): void {
   autotuneRunCount = 0;
   autotuningInProgress.clear();
   gemvDispatchCount = 0;
+  gemvEpilogueDispatchCount = 0;
 }
 onTeardown(resetMatmulState);
 
@@ -232,6 +234,7 @@ function buildBenchPlan(
       ctx.dtypeA,
       ctx.dtypeB,
       choice.wgSize,
+      choice.rowsPerWg,
     );
   }
   return planTiledMatmul({
@@ -818,6 +821,12 @@ export function getGemvDispatchCount(): number {
   return gemvDispatchCount;
 }
 
+/** Count of GEMV dispatches with a fused epilogue seam (probe/debug hook). */
+let gemvEpilogueDispatchCount = 0;
+export function getGemvEpilogueDispatchCount(): number {
+  return gemvEpilogueDispatchCount;
+}
+
 /** Pack the GEMV uniform config {n, k, alpha, split_k} (16 bytes). */
 function packGemvParams(
   n: number,
@@ -851,11 +860,25 @@ function planGemvRowMatmul(
   dtype: DType,
   dtypeB: DType,
   wgSize?: number,
+  rowsPerWg?: number,
+  epilogue?: EpilogueConfig,
+  epilogueInputCount = 0,
 ): MatmulStandardPlan | MatmulKSplitPlan | null {
-  const route = computeGemvRoute(n, k, transB, wgSize);
+  const route = computeGemvRoute(n, k, transB, wgSize, rowsPerWg);
   if (!route) return null;
-  const outputDtype: DType =
-    dtype === "f32" || dtypeB === "f32" ? "f32" : "f16";
+  const hasEpilogueOps = !!epilogue && epilogue.ops.length > 0;
+  if (hasEpilogueOps) {
+    // Epilogue applies to the final output at the kernel's seam — never to
+    // K-split partials — and must be reconstructible as bias/unary.
+    if (route.splitK >= 2) return null;
+    if (!gemvSupportsEpilogue(epilogue)) return null;
+    if (epilogueInputCount !== epilogue.additionalInputCount) return null;
+  }
+  const outputDtype: DType = hasEpilogueOps
+    ? epilogue.outputDtype
+    : dtype === "f32" || dtypeB === "f32"
+      ? "f32"
+      : "f16";
   const kernelOpts: GemvKernelOptions = {
     mode: route.mode,
     dtypeA: dtype,
@@ -863,6 +886,9 @@ function planGemvRowMatmul(
     outputDtype,
     kSplit: route.splitK >= 2,
     wgSize,
+    rowsPerWg: route.rowsPerWg,
+    vec4: route.vec4,
+    epilogue: hasEpilogueOps ? epilogue : undefined,
   };
   const pipeline = cachedPipeline(
     device,
@@ -898,8 +924,8 @@ function planGemvRowMatmul(
     dispatchX: route.dispatch[0],
     dispatchY: route.dispatch[1],
     dispatchZ: route.dispatch[2],
-    numEpilogueInputs: 0,
-    label: "_gemv",
+    numEpilogueInputs: hasEpilogueOps ? epilogueInputCount : 0,
+    label: hasEpilogueOps ? "_gemv_epi" : "_gemv",
   };
 }
 
@@ -942,6 +968,7 @@ export function planTiledMatmul(
     transB,
     hasEpilogue,
     epiloguePresent: !!epilogue || epilogueInputs.length > 0,
+    epilogue,
     hasInputCast: !!inputCastA || !!inputCastB,
     hasExplicitConfig: !!options.config,
     subgroupSupported: getSubgroupSupport()?.supported ?? false,
@@ -958,6 +985,9 @@ export function planTiledMatmul(
       dtype,
       dtypeB ?? dtype,
       choice.wgSize,
+      choice.rowsPerWg,
+      epilogue,
+      epilogueInputs.length,
     );
     if (gemvPlan) return gemvPlan;
     // Route degenerated for this choice — fall through to the tiled family.
@@ -1080,7 +1110,10 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   // single-sourced in planTiledMatmul (the stream generator consumes the
   // same plan — standard or K-split or GEMV).
   const plan = planTiledMatmul(options);
-  if (plan.label === "_gemv") gemvDispatchCount++;
+  if (plan.label?.startsWith("_gemv")) {
+    gemvDispatchCount++;
+    if (plan.label === "_gemv_epi") gemvEpilogueDispatchCount++;
+  }
 
   if (plan.kSplit) {
     // --- K-split path: two dispatches over the cached partials temp. ---

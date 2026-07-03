@@ -60,6 +60,29 @@ import { getWgslFnName, getWgslInfix, getWgslPrefix } from "./ops/registry";
 type BindingMap = Map<number, string>;
 
 // ============================================================================
+// Vec4 Storage Bindings (ctx.loadVec4)
+// ============================================================================
+
+/**
+ * Bindings viewed as `array<vec4<T>>` because the kernel used ctx.loadVec4
+ * on them (binding name → element DataType). Module-level compile state
+ * (same pattern as tile-lowering's TPR): set by compileTileKernel, consulted
+ * by exprFor / emitStatement so SCALAR accesses to a vec4-declared binding
+ * are rewritten to component indexing at the seam — one declaration, every
+ * access derived from it.
+ */
+let activeVec4StorageBindings = new Map<string, string>();
+
+function isVec4StorageBinding(binding: string): boolean {
+  return activeVec4StorageBindings.has(binding);
+}
+
+/** Scalar element access into a vec4-declared binding: b[(i)>>2u][(i)&3u]. */
+function vec4ComponentAccess(binding: string, idxExpr: string): string {
+  return `${binding}[(${idxExpr}) >> 2u][(${idxExpr}) & 3u]`;
+}
+
+// ============================================================================
 // Vec4 Taint Tracking
 // ============================================================================
 
@@ -171,7 +194,17 @@ function exprFor(node: IRNode, bindings: BindingMap, v4?: Vec4Ctx): string {
     case "load": {
       const offs = exprFor(node.offsets, bindings, v4);
       if (v4) return `${node.binding}[(${offs}) >> 2u]`;
+      if (isVec4StorageBinding(node.binding))
+        return vec4ComponentAccess(node.binding, offs);
       return `${node.binding}[${offs}]`;
+    }
+    case "loadVec4": {
+      const offs = exprFor(node.elemIndex, bindings, v4);
+      const vecLoad = `${node.binding}[(${offs}) >> 2u]`;
+      // f16 bindings load vec4<f16>; widen to vec4<f32> at the load site.
+      return activeVec4StorageBindings.get(node.binding) === "f16"
+        ? `vec4<f32>(${vecLoad})`
+        : vecLoad;
     }
     case "binary": {
       const lhs = exprFor(node.lhs, bindings, v4);
@@ -426,9 +459,24 @@ export function compileTileKernel(spec: TileKernelSpec): string {
   // 6. Dead code elimination (remove unused let bindings)
   stmts = eliminateDeadCode(stmts);
 
+  // 7. Vec4 storage bindings (ctx.loadVec4): incompatible with whole-kernel
+  //    vectorize mode (both re-view bindings; the two indexings collide).
+  if (ctx.vec4StorageBindings.size > 0 && (spec.vectorize ?? 0) > 1) {
+    throw new Error(
+      `tile-ir: kernel "${spec.name}" uses loadVec4 together with vectorize mode`,
+    );
+  }
+  activeVec4StorageBindings = new Map(
+    [...ctx.vec4StorageBindings].map((name) => [
+      name,
+      spec.bindings[name]?.type ?? "f32",
+    ]),
+  );
+
   try {
     return compileImperativeKernel(spec, ctx, stmts);
   } finally {
+    activeVec4StorageBindings = new Map();
     resetLoweringState();
   }
 }
@@ -906,6 +954,10 @@ function emitStatement(
       const val = exprFor(stmt.value, bindings, v4);
       if (v4) {
         lines.push(`${indent}${stmt.binding}[(${idx}) >> 2u] = ${val};`);
+      } else if (isVec4StorageBinding(stmt.binding)) {
+        lines.push(
+          `${indent}${vec4ComponentAccess(stmt.binding, idx)} = ${val};`,
+        );
       } else {
         lines.push(`${indent}${stmt.binding}[${idx}] = ${val};`);
       }
@@ -919,14 +971,18 @@ function emitStatement(
       }
       const idx = exprFor(stmt.idx, bindings, v4);
       const val = exprFor(stmt.value, bindings, v4);
-      const storeIdx = v4 ? `(${idx}) >> 2u` : idx;
+      const storeLhs = v4
+        ? `${stmt.binding}[(${idx}) >> 2u]`
+        : isVec4StorageBinding(stmt.binding)
+          ? vec4ComponentAccess(stmt.binding, idx)
+          : `${stmt.binding}[${idx}]`;
       if (guard === "true") {
         // Constant-fold: emit unconditional store
-        lines.push(`${indent}${stmt.binding}[${storeIdx}] = ${val};`);
+        lines.push(`${indent}${storeLhs} = ${val};`);
       } else {
         const condExpr = exprFor(stmt.condition, bindings, v4);
         lines.push(`${indent}if (${condExpr}) {`);
-        lines.push(`${indent}  ${stmt.binding}[${storeIdx}] = ${val};`);
+        lines.push(`${indent}  ${storeLhs} = ${val};`);
         lines.push(`${indent}}`);
       }
       break;
@@ -974,9 +1030,7 @@ function emitStatement(
       const sumVar = `_addf_sum_${stmt.id}`;
       const ptrExpr = `&${stmt.binding}[${idx}]`;
       lines.push(`${indent}let ${addendVar}: f32 = ${addend};`);
-      lines.push(
-        `${indent}var ${expectedVar}: u32 = atomicLoad(${ptrExpr});`,
-      );
+      lines.push(`${indent}var ${expectedVar}: u32 = atomicLoad(${ptrExpr});`);
       lines.push(`${indent}loop {`);
       lines.push(
         `${indent}  let ${sumVar}: f32 = bitcast<f32>(${expectedVar}) + ${addendVar};`,
@@ -1017,6 +1071,8 @@ function someExprChild(node: IRNode, fn: (child: IRNode) => boolean): boolean {
       return fn(node.condition) || fn(node.trueVal) || fn(node.falseVal);
     case "load":
       return fn(node.offsets) || (node.mask ? fn(node.mask) : false);
+    case "loadVec4":
+      return fn(node.elemIndex);
     case "sharedRead":
     case "arrayRead":
     case "vec4ArrayRead":
@@ -1410,6 +1466,7 @@ function exprDependsOn(node: IRNode, names: Set<string>): boolean {
     case "namedRef":
       return names.has(node.name);
     case "load":
+    case "loadVec4":
       return true; // global loads always variant
     case "sharedRead":
     case "vec4SharedRead":
@@ -1430,7 +1487,7 @@ function exprDependsOn(node: IRNode, names: Set<string>): boolean {
 
 /** Check if an expression contains any global memory load. */
 function exprContainsLoad(node: IRNode): boolean {
-  if (node.kind === "load") return true;
+  if (node.kind === "load" || node.kind === "loadVec4") return true;
   return someExprChild(node, exprContainsLoad);
 }
 
@@ -1612,6 +1669,7 @@ function isTrivialNode(node: IRNode): boolean {
 function exprContainsMemoryRead(node: IRNode): boolean {
   if (
     node.kind === "load" ||
+    node.kind === "loadVec4" ||
     node.kind === "sharedRead" ||
     node.kind === "vec4SharedRead"
   )
@@ -1923,7 +1981,10 @@ function emitBindings(spec: TileKernelSpec): string[] {
       );
     } else {
       const access = binding.storage === "read" ? "read" : "read_write";
-      const elemType = isVec4Mode ? `vec4<${binding.type}>` : binding.type;
+      const elemType =
+        isVec4Mode || isVec4StorageBinding(name)
+          ? `vec4<${binding.type}>`
+          : binding.type;
       lines.push(
         `@group(0) @binding(${bindingIndex}) var<storage, ${access}> ${name}: array<${elemType}>;`,
       );

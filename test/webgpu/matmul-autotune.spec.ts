@@ -32,7 +32,10 @@ import {
   seedPerShapeMatmulChoice,
   setAutotuneEnabled,
 } from "../../src/backend/webgpu/matmul/dispatch";
-import { GEMV_WG_SIZE_PARAM } from "../../src/backend/webgpu/matmul/gemv";
+import {
+  GEMV_NT_ROWS_PER_WG_PARAM,
+  GEMV_WG_SIZE_PARAM,
+} from "../../src/backend/webgpu/matmul/gemv";
 import {
   classifyShape,
   DEFAULT_CONFIG,
@@ -574,21 +577,35 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       expect(gemv.isApplicable(mkCtx())).toBe(true);
     });
 
-    it("gemv candidates vary wgSize from the shared TuneParam", () => {
+    it("gemv candidates vary wgSize × rowsPerWg from the shared TuneParams", () => {
       const gemv = getMatmulVariant("gemv");
+      // NT ctx (transB=true): wgSize × rowsPerWg product
       const candidates = gemv.candidates(mkCtx());
       expect(candidates.length).toBeGreaterThan(1);
-      const wgSizes = candidates.map((c) =>
-        c.variant === "gemv" ? c.wgSize : -1,
+      const keys = candidates.map((c) =>
+        c.variant === "gemv" ? `${c.wgSize}_${c.rowsPerWg}` : "",
       );
-      expect(new Set(wgSizes).size).toBe(candidates.length);
-      for (const w of wgSizes) {
-        expect(GEMV_WG_SIZE_PARAM.values).toContain(w);
+      expect(new Set(keys).size).toBe(candidates.length);
+      for (const c of candidates) {
+        if (c.variant !== "gemv") continue;
+        expect(GEMV_WG_SIZE_PARAM.values).toContain(c.wgSize);
+        expect(GEMV_NT_ROWS_PER_WG_PARAM.values).toContain(c.rowsPerWg);
+        expect(c.wgSize % c.rowsPerWg).toBe(0);
       }
       // default choice is included
       const def = gemv.defaultChoice(mkCtx());
       expect(def.variant).toBe("gemv");
-      expect(wgSizes).toContain(def.variant === "gemv" ? def.wgSize : -1);
+      expect(keys).toContain(
+        def.variant === "gemv" ? `${def.wgSize}_${def.rowsPerWg}` : "",
+      );
+      // NN ctx: rowsPerWg is pinned to 1
+      const nnCandidates = gemv.candidates(
+        mkCtx({ transB: false, n: 8192, k: 768 }),
+      );
+      expect(nnCandidates.length).toBeGreaterThan(0);
+      for (const c of nnCandidates) {
+        if (c.variant === "gemv") expect(c.rowsPerWg).toBe(1);
+      }
     });
 
     it("tiled candidates include the heuristic base and DEFAULT_CONFIG", () => {
@@ -617,6 +634,7 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       seedPerShapeMatmulChoice(1, 3072, 768, "f32", {
         variant: "gemv",
         wgSize: 128,
+        rowsPerWg: 1,
       });
       const plan = planTiledMatmul({
         device,
@@ -658,6 +676,7 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       seedPerShapeMatmulChoice(1, 3072, 768, "f32", {
         variant: "gemv",
         wgSize: 128,
+        rowsPerWg: 1,
       });
       const plan = planTiledMatmul({
         device,

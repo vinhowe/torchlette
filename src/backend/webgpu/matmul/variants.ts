@@ -32,13 +32,17 @@ import { ENV } from "../../../core/env";
 import { generateNeighborConfigs, getDefaultConfigForShape } from "./autotune";
 import {
   computeGemvRoute,
+  defaultGemvNtRowsPerWg,
   GEMV_DEFAULT_WG_SIZE,
+  GEMV_NT_ROWS_PER_WG_PARAM,
   GEMV_WG_SIZE_PARAM,
+  gemvSupportsEpilogue,
 } from "./gemv";
 import {
   classifyShape,
   DEFAULT_CONFIG,
   type DType,
+  type EpilogueConfig,
   type MatmulKernelConfig,
 } from "./types";
 
@@ -58,8 +62,12 @@ export interface MatmulVariantContext {
   transB: boolean;
   /** Non-trivial epilogue ops present (tiled config selection keys on this). */
   hasEpilogue: boolean;
-  /** ANY epilogue object or epilogue inputs present (GEMV requires none). */
+  /** ANY epilogue object or epilogue inputs present. */
   epiloguePresent: boolean;
+  /** The epilogue config itself, when present — GEMV applicability inspects
+   *  the ops (bias/unary chains route to its "epilogue" seam; anything else
+   *  stays tiled). Optional so geometry-only callers can omit it. */
+  epilogue?: EpilogueConfig;
   /** inputCastA/inputCastB present (GEMV kernels don't implement load-casts). */
   hasInputCast: boolean;
   /** Caller pinned an explicit MatmulKernelConfig (forces the tiled variant). */
@@ -80,6 +88,9 @@ export type MatmulVariantChoice =
        *  shader are both derived from this at plan time via computeGemvRoute
        *  — single source, nothing else in the choice can disagree with it. */
       wgSize: number;
+      /** NT only: output rows per workgroup (lane-groups + segmented
+       *  reduce). Ignored by the NN route (always 1 there). */
+      rowsPerWg: number;
     };
 
 export interface MatmulVariant {
@@ -96,34 +107,58 @@ const tiledConfigKey = (c: MatmulKernelConfig): string =>
   `${c.tileM}_${c.tileN}_${c.tileK}_${c.threadTileM}_${c.threadTileN}_${c.vectorWidth}_${c.useSubgroups}`;
 
 /**
- * GEMV variant: M=1, batch=1, bare (no epilogue/casts), opt-out via
- * TORCHLETTE_GEMV=0. Mirrors exactly the pre-registry guard in
- * planTiledMatmul + computeGemvRoute's geometry bail-outs (the "tiled
- * gemv_row config wins here" threshold lives in the route, single-sourced).
+ * GEMV variant: M=1, batch=1, no input casts, opt-out via TORCHLETTE_GEMV=0.
+ * Bare matmuls AND simple epilogues (bias / unary activation — anything
+ * gemvSupportsEpilogue accepts) route here; the epilogue expression is
+ * injected at the kernel's "epilogue" seam. Epilogues on a K-split NN route
+ * degenerate back to tiled at plan time (partials must stay raw).
+ * computeGemvRoute holds the geometry bail-outs (single-sourced).
  */
 const gemvVariant: MatmulVariant = {
   name: "gemv",
   isApplicable(ctx) {
+    if (ctx.epiloguePresent) {
+      // Epilogue present but not reconstructible / not the supported shape.
+      if (!ctx.epilogue || !gemvSupportsEpilogue(ctx.epilogue)) return false;
+      // Epilogues can't apply to K-split partials; only splitK=1 routes.
+      const route = computeGemvRoute(ctx.n, ctx.k, ctx.transB);
+      if (!route || route.splitK >= 2) return false;
+    }
     return (
       ctx.m === 1 &&
       ctx.batchSize === 1 &&
-      !ctx.epiloguePresent &&
       !ctx.hasInputCast &&
       !ctx.hasExplicitConfig &&
       ENV.TORCHLETTE_GEMV !== "0" &&
       computeGemvRoute(ctx.n, ctx.k, ctx.transB) !== null
     );
   },
-  defaultChoice() {
-    return { variant: "gemv", wgSize: GEMV_DEFAULT_WG_SIZE };
+  defaultChoice(ctx) {
+    return {
+      variant: "gemv",
+      wgSize: GEMV_DEFAULT_WG_SIZE,
+      // NT: measured heuristic (multi-row only pays off at lm_head-scale N).
+      rowsPerWg: ctx.transB ? defaultGemvNtRowsPerWg(ctx.n) : 1,
+    };
   },
   candidates(ctx) {
-    // One TuneParam: wgSize (shared with gemvAutotuneConfig — same source).
-    // A candidate wgSize must itself yield a valid route (the NN route's
-    // split-k / grid thresholds depend on it).
-    return GEMV_WG_SIZE_PARAM.values
-      .filter((w) => computeGemvRoute(ctx.n, ctx.k, ctx.transB, w) !== null)
-      .map((wgSize) => ({ variant: "gemv" as const, wgSize }));
+    // TuneParams: wgSize × (NT only) rowsPerWg — shared with
+    // gemvAutotuneConfig, same source. A candidate must itself yield a
+    // valid route (the NN route's split-k / grid thresholds depend on
+    // wgSize; the NT route validates the wgSize/rowsPerWg combination).
+    const rowsValues = ctx.transB ? GEMV_NT_ROWS_PER_WG_PARAM.values : [1];
+    const out: MatmulVariantChoice[] = [];
+    for (const wgSize of GEMV_WG_SIZE_PARAM.values) {
+      for (const rowsPerWg of rowsValues) {
+        if (ctx.transB && wgSize % rowsPerWg !== 0) continue;
+        if (
+          computeGemvRoute(ctx.n, ctx.k, ctx.transB, wgSize, rowsPerWg) !== null
+        ) {
+          out.push({ variant: "gemv", wgSize, rowsPerWg });
+        }
+      }
+    }
+    return out;
   },
 };
 
