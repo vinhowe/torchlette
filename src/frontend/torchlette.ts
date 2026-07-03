@@ -208,7 +208,14 @@ export class Torchlette {
    */
   persist(a: Tensor): Tensor {
     this._assertUsable(a);
-    this.runtime.persist(a._unwrap());
+    const rt = a._unwrap();
+    this.runtime.persist(rt); // adopt into the active (step or innermost-scope) snapshot
+    // Scope-escape to ROOT: also adopt into every ancestor scope's snapshot so
+    // the tensor survives each LIFO restore (no-op when no scope is open — the
+    // pre-existing step-persist behavior).
+    for (const record of this._scopeStack) {
+      storageTracker.adoptIntoSnapshotToken(record.parentSnapshot, rt);
+    }
     return a;
   }
 
@@ -1635,9 +1642,165 @@ export class Torchlette {
     return this.runtime.runWithAsyncScope(fn);
   }
 
+  // ── Async scope surface (docs/scoped-memory-design.md §2-4) ───────────────
+  // A thin layer over the step path's snapshot/releaseStepTemps reclamation.
+  // No async_hooks / AsyncLocalStorage / AsyncContext — the whole mechanism is
+  // a synchronous module-level scope stack + a "synchronous region" pointer,
+  // so it behaves identically in the browser.
+
+  /** Open scope records (LIFO). Innermost is last. */
+  private _scopeStack: ScopeRecord[] = [];
+  /** The scope whose fn() body is CURRENTLY executing synchronously (up to its
+   *  first await), or null at the event-loop top level. A scope opened while
+   *  this is non-null is a legitimate SYNCHRONOUS nesting; a second ambient
+   *  root scope opened while this is null (i.e. a prior ambient scope is
+   *  suspended at an await) is a concurrent OVERLAP → throw (§4). */
+  private _syncRegionScope: ScopeRecord | null = null;
+  private _openAmbientCount = 0;
+  private _nextScopeSurfaceId = 1;
+
+  /**
+   * Run `fn` inside a reclamation scope. Tensors created during the call that
+   * are NOT returned (recursively through arrays/objects) are reclaimed when
+   * `fn` returns (sync) or its promise resolves (async); returned tensors — and
+   * anything their storage graph reaches, e.g. a returned view's base — are
+   * re-parented to the enclosing scope and survive. Works for sync and async
+   * `fn`; returns the fn's value (or a promise of it for async fn).
+   *
+   * Single-flight (§4): a second ambient `scope()` entered while another is
+   * open across an await (concurrent, not synchronously nested) THROWS. Use
+   * `openScope()` handles for library-internal scopes that must compose freely.
+   */
+  scope<T>(fn: () => T): T {
+    const handle = this._openScopeInternal("ambient");
+    const prevSync = this._syncRegionScope;
+    this._syncRegionScope = handle;
+    let result: T;
+    try {
+      result = fn();
+    } catch (err) {
+      this._syncRegionScope = prevSync;
+      handle.abort();
+      throw err;
+    }
+    // fn() has returned (sync return, or an async fn that hit its first await
+    // and handed back a promise): its synchronous region is over.
+    this._syncRegionScope = prevSync;
+    const maybe = result as unknown as { then?: unknown } | null;
+    if (maybe != null && typeof maybe.then === "function") {
+      return (result as unknown as Promise<unknown>).then(
+        async (value) => {
+          // Materialize pending work (like markStep does before its release)
+          // so lazy escapees — e.g. a returned view — exist as storages and
+          // their view-base rc protections are established before reclamation.
+          // Destruction stays fence-gated (deferredDestroy), so this forces
+          // but does not fence: scopes stay cheap (§10).
+          await this.runtime.forceAllPending();
+          handle.close(value);
+          return value;
+        },
+        (err) => {
+          handle.abort();
+          throw err;
+        },
+      ) as unknown as T;
+    }
+    handle.close(result);
+    return result;
+  }
+
+  /**
+   * Low-level scope handle: `const s = api.openScope(); … s.close(returnValue)`.
+   * The primitive `scope()` and the step machinery compile to. Handles are
+   * EXEMPT from single-flight overlap detection (they carry no ambient magic),
+   * so libraries can open their own scopes inside an app scope freely; they
+   * must still close in LIFO order (a mismatched close throws).
+   */
+  openScope(): ScopeHandle {
+    return this._openScopeInternal("handle");
+  }
+
+  private _openScopeInternal(kind: "ambient" | "handle"): ScopeRecord {
+    // Overlap detection (ambient scopes only): a new ambient scope while
+    // another ambient scope is open AND we are not synchronously nested inside
+    // an open scope's body means two async tasks interleaved.
+    if (
+      kind === "ambient" &&
+      this._openAmbientCount > 0 &&
+      this._syncRegionScope === null
+    ) {
+      throw new Error(
+        "overlapping async scope — serialize your compute; the engine is " +
+          "single-flight. Two api.scope(...) tasks are interleaved across an " +
+          "await; await one before starting the next, nest them synchronously, " +
+          "or use api.openScope() handles for library-internal scopes.",
+      );
+    }
+    // Capture the enclosing scope's snapshot, then install a fresh one that
+    // captures everything alive NOW as this scope's persistent baseline.
+    const parentSnapshot = storageTracker.peekSnapshot();
+    storageTracker.snapshotForStep();
+    const record = new ScopeRecord(
+      this,
+      this._nextScopeSurfaceId++,
+      kind,
+      parentSnapshot,
+    );
+    this._scopeStack.push(record);
+    if (kind === "ambient") this._openAmbientCount++;
+    return record;
+  }
+
+  /** Internal: close bookkeeping shared by ScopeRecord.close/abort. */
+  _closeScopeRecord(record: ScopeRecord, returnValue: unknown): void {
+    const top = this._scopeStack[this._scopeStack.length - 1];
+    if (top !== record) {
+      throw new Error(
+        "overlapping async scope — serialize your compute; the engine is " +
+          "single-flight. A scope closed out of order (not the innermost open " +
+          "scope); this happens when two scopes interleave across an await.",
+      );
+    }
+    this._scopeStack.pop();
+    if (record.kind === "ambient") this._openAmbientCount--;
+    // Structural escape (§3.1): re-parent returned tensors to THIS scope's
+    // snapshot so releaseStepTemps keeps them; the restore below then hands
+    // them to the parent scope's interval (they're not in the parent's older
+    // snapshot, so the parent reclaims them unless they escape it too).
+    if (returnValue !== undefined) {
+      for (const t of collectFrontendTensors(returnValue)) {
+        if (!t.disposed) storageTracker.adoptIntoSnapshot(t._unwrap());
+      }
+    }
+    // Reclaim in-scope non-escapees via the step path. Reachability escape
+    // (§3.2 — a returned view's in-scope base) is preserved by rc: the live
+    // view retains its base, so destroyUnreachable's protected-bases walk and
+    // the rc keep it. Destruction is fence-gated (deferredDestroy) so no fence
+    // is needed here — scopes stay cheap (§10).
+    storageTracker.releaseStepTemps();
+    storageTracker.destroyUnreachable();
+    // Restore the enclosing scope's snapshot.
+    storageTracker.installSnapshot(record.parentSnapshot);
+  }
+
   keep(tensor: Tensor): void {
     this._assertUsable(tensor);
+    // Tidy-escape (EngineTensor.escapes) for the synchronous tidy() path.
     this.runtime.keep(tensor._engineTensor());
+    // Scope-escape to ROOT (§3.3): survive every enclosing scope. Adopt into
+    // the active (innermost scope) snapshot AND every ancestor scope's saved
+    // snapshot, so each LIFO restore keeps it. GUARDED on an open scope: with
+    // only a step active (no scope), keep() must NOT persist the tensor into
+    // the step snapshot — the historical keep() is tidy-escape only, and
+    // callers such as forwardLoss's keep(loss) rely on the loss still being
+    // reclaimed at markStep (persisting it would leak one storage/step).
+    if (this._scopeStack.length > 0) {
+      const rt = tensor._unwrap();
+      storageTracker.adoptIntoSnapshot(rt);
+      for (const record of this._scopeStack) {
+        storageTracker.adoptIntoSnapshotToken(record.parentSnapshot, rt);
+      }
+    }
   }
 
   dispose(tensor: Tensor): void {
@@ -1976,6 +2139,65 @@ for (const op of COMPARISON_OPS) {
 }
 
 export const torch = new Torchlette();
+
+/**
+ * Public handle for a scope opened via api.openScope(). Close it exactly once,
+ * in LIFO order relative to nested scopes.
+ */
+export interface ScopeHandle {
+  readonly id: number;
+  /** Close the scope, escaping any tensors reachable from `returnValue`. */
+  close(returnValue?: unknown): void;
+}
+
+/** Concrete scope record — carries the parent snapshot to restore on close and
+ *  the close/abort bookkeeping (delegated to the owning Torchlette). */
+class ScopeRecord implements ScopeHandle {
+  private _closed = false;
+  constructor(
+    private readonly engine: Torchlette,
+    readonly id: number,
+    readonly kind: "ambient" | "handle",
+    readonly parentSnapshot: object | null,
+  ) {}
+  close(returnValue?: unknown): void {
+    if (this._closed) return;
+    this._closed = true;
+    this.engine._closeScopeRecord(this, returnValue);
+  }
+  /** Close with no escapees (error path). */
+  abort(): void {
+    if (this._closed) return;
+    this._closed = true;
+    this.engine._closeScopeRecord(this, undefined);
+  }
+}
+
+/** Walk a scope/tidy return value, collecting frontend Tensors (recursively
+ *  through arrays/plain objects) — the structural escape set (§3.1). */
+function collectFrontendTensors(value: unknown): Tensor[] {
+  const out: Tensor[] = [];
+  const seen = new Set<unknown>();
+  const visit = (current: unknown) => {
+    if (current == null) return;
+    if (current instanceof Tensor) {
+      out.push(current);
+      return;
+    }
+    if (typeof current !== "object") return;
+    if (seen.has(current)) return;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      for (const entry of current) visit(entry);
+      return;
+    }
+    for (const entry of Object.values(current as Record<string, unknown>)) {
+      visit(entry);
+    }
+  };
+  visit(value);
+  return out;
+}
 
 function collectEngineTensors(value: unknown): EngineTensor[] {
   const out: EngineTensor[] = [];

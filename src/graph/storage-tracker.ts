@@ -218,6 +218,36 @@ class StorageTracker {
     this._stepStartTensors?.add(tensor);
   }
 
+  // ── Scope-surface support (api.scope / api.openScope) ─────────────────────
+  // The async scope() surface (docs/scoped-memory-design.md §2-4) reuses the
+  // SAME persistent-snapshot reclamation the step path uses: scope entry
+  // snapshots the currently-alive tensors as this scope's "existed before"
+  // baseline; scope exit adopts escapees into that baseline then
+  // releaseStepTemps() releases everything created in-scope that didn't
+  // escape. Nesting is LIFO save/restore of the single active snapshot: a
+  // child scope steals the parent's snapshot (peekSnapshot), installs a fresh
+  // one, and restores the parent's on close. This is the ONE reclamation path
+  // — no second mechanism.
+
+  /** The active persistent snapshot (opaque token; save it across a nested
+   *  scope and restore it on the child's close). */
+  peekSnapshot(): object | null {
+    return this._stepStartTensors;
+  }
+
+  /** Install a previously-captured snapshot (restore the parent scope's on a
+   *  child scope's close). */
+  installSnapshot(snapshot: object | null): void {
+    this._stepStartTensors = (snapshot as WeakSet<object> | null) ?? null;
+  }
+
+  /** Adopt a tensor into a SPECIFIC (possibly non-active) snapshot token —
+   *  used by keep()/persist() to re-parent to an ancestor scope so a tensor
+   *  survives every enclosing scope (escape-to-root). No-op for null tokens. */
+  adoptIntoSnapshotToken(snapshot: object | null, tensor: object): void {
+    (snapshot as WeakSet<object> | null)?.add(tensor);
+  }
+
   /**
    * Drop the active step snapshot without releasing anything. Used when
    * step-scoped markStep cleanup (Torchlette.setStepScopedCleanup) is

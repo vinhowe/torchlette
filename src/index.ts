@@ -36,6 +36,7 @@ export {
 export {
   type DeviceKind,
   DisposedTensorError,
+  type ScopeHandle,
   Tensor as FrontendTensor,
   type TensorCreateOptions,
   Torchlette,
