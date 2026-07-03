@@ -23,6 +23,7 @@ const GPU_TEST_FILES = [
   "test/memory-aware-scheduler.spec.ts",
   "test/optim/grad-scaler.spec.ts",
   "test/scope-surface.spec.ts",
+  "test/scope-training.spec.ts",
   "test/optim/fused-vs-elementwise.spec.ts",
   "test/oracle/gpt2-checkpoint-parity.spec.ts",
   "test/true-segmentation-benchmark.spec.ts",

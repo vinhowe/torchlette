@@ -1830,6 +1830,13 @@ export class Torchlette {
    *   forward → backward → optimizer.step()  — cleanup is automatic.
    */
   queueStepBoundary(): void {
+    // Under an active api.scope(), the SCOPE is the reclamation boundary
+    // (docs/scoped-memory-design.md §9) — its close runs releaseStepTemps.
+    // A queued implied boundary would additionally fire a markStep-style
+    // commit at the NEXT backward (inside the next scope), duplicating the
+    // boundary work the scope already owns. No-op so the scope is the single
+    // boundary; optimizer.step() inside a scope needs no implied commit.
+    if (this._scopeStack.length > 0) return;
     this._pendingStepBoundary = storageTracker.bumpStepGen();
   }
 

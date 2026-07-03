@@ -157,6 +157,43 @@ This is a prerequisite, not an option — and it is independently valuable
 
 ## 6. Persistent state (params, optimizer state, KV caches)
 
+**Principle: optimizer patterns are first-class ENGINE capabilities, not
+special cases.** The lifetime/update patterns optimizers need — in-place
+stable-storage updates, persistent state across a step/scope boundary,
+multi-output side state (m/v) — must be GENERIC primitives any op or user
+optimizer can use, and correctness must be STRUCTURAL, not opt-in. Two
+anti-patterns this rules out:
+1. **Optimizer detection** — the engine special-casing Adam/SGD by op name or
+   shape in the executor, materialization, or liveness. (Cf. "no kernel names
+   above the dispatcher" — the same rule applied to lifetime.)
+2. **Per-optimizer plumbing** — requiring each optimizer author to hand-wire
+   `persist()`/`adopt`/`neuter` calls to avoid a UAF. A custom optimizer that
+   expresses `update = f(state)` with in-place/aliased outputs should get
+   correctness FOR FREE.
+#68 was the forcing case, and it taught the real shape of the gap. The
+NaN was NOT the hypothesized param-storage churn / in-plan liveness — it was
+`m`/`v` (Adam moment state) materializing lazily MID-scope, so they were
+absent from the scope-entry snapshot and `releaseStepTemps` demoted them at
+scope close (the documented persistence-UAF class; `markStep` survives only
+because the next `beginStep` re-snapshots them). Two outcomes:
+- The genuine special-case hack — the `neuter` trick (`oldBt.destroy = noop`)
+  — was DELETED, and it turned out redundant with the backend's own
+  execution-time neuter (fused.ts) + `retainPlanInputRefs`, not made-redundant
+  by a new primitive. So the per-optimizer buffer hack is gone: ✓ principle.
+- The RESIDUAL declaration is `runtime.persist(m/v)` — the SAME escape API any
+  code uses to keep a tensor past a scope, and the same contract the foreach
+  path already carried. This is not engine-side optimizer detection, and it
+  made the two Adam paths CONSISTENT rather than adding new special-casing.
+  It is, however, still a per-optimizer call: a *new* optimizer author must
+  know to persist their state.
+**The remaining step toward the ideal (persist-free) is a generic "registered
+persistent state" capability**: anything registered as optimizer/module state
+(m/v, momentum, module buffers) is auto-root-scoped, so persistence is free at
+the point of registration and no per-step / per-optimizer `persist` call is
+needed. That is the true fulfillment of "structural, not opt-in" — filed as a
+follow-up, larger than #68. Until then, `persist` at state creation is the
+blessed, generic (non-detection) contract.
+
 - Params: created at load, outside any scope → root-parented naturally.
 - Optimizer m/v: materialize lazily INSIDE the first step's scope. The
   existing contract already handles this (`runtime.persist()` /

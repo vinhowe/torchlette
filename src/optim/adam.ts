@@ -453,23 +453,34 @@ export class Adam {
         config,
       );
 
-      // For in-place execution: prevent the old param storage's backend tensor
-      // from releasing the GPU buffer when destroyUnreachable() runs (before
-      // the adam node executes). The adam kernel writes param in-place, so the
-      // buffer must NOT be returned to the pool.
       const paramRt = param._unwrap();
-      if (paramRt.isMaterialized()) {
-        const oldBt = paramRt.backendTensor as { destroy?: () => void };
-        if (oldBt.destroy) {
-          oldBt.destroy = () => {};
-        }
-      }
 
       // Update param (output 0), m (output 1), v (output 2) to point at
-      // the adamStep node's results. m/v are fresh output buffers.
+      // the adamStep node's results. The kernel writes param/m/v in place;
+      // the backend transfers each input buffer's ownership to the fresh
+      // output storage AT EXECUTION (neuters the old backendTensor's destroy
+      // + decRefs the buffer — src/backend/webgpu/ops/fused.ts). So no
+      // optimizer-level buffer-preservation hack is needed here: the old
+      // param storage's destroy is already a no-op by the time
+      // destroyUnreachable can run (post-force), and plan inputs are rc-held
+      // through execution (retainPlanInputRefs). The neuter trick this code
+      // used to carry was redundant with that backend step and is gone.
       paramRt._updateLazyRef(createPendingRef(adamNode, 0));
       this.expAvg[i]._updateLazyRef(createPendingRef(adamNode, 1));
       this.expAvgSq[i]._updateLazyRef(createPendingRef(adamNode, 2));
+
+      // Persist m/v (design: docs/scoped-memory-design.md §6 — "optimizer
+      // state adopts at creation"). m/v are lazily created (constructor
+      // zeros) and first MATERIALIZE mid-step/mid-scope, so they are not in
+      // the step/scope snapshot; without adoption releaseStepTemps demotes
+      // them at the boundary (buffer pooled while the optimizer still points
+      // at it → silent UAF → NaN on the next step). Under markStep the next
+      // beginStep re-snapshots them; under api.scope() the snapshot is fixed
+      // at scope entry, so the adoption is what makes scope() a real
+      // beginStep/endStep replacement. Idempotent (WeakSet add); mirrors the
+      // foreach path's runtime.persist() of its packed state.
+      runtime.persist(this.expAvg[i]);
+      runtime.persist(this.expAvgSq[i]);
 
       updated.push(param);
     }
