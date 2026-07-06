@@ -213,7 +213,8 @@ Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reus
 ## Complexity budget (the weight-norm)
 
 Keep the framework small and legible; regularize against overfit mechanisms.
-- `bash tools/weight-norm.sh --log` prints/appends the size vector (src LOC,
+- `bash tools/weight-norm.sh --log` prints/appends the size vector (src SLOC —
+  code-only, comments are free; docLOC tracked as its own positive signal;
   files, public exports, env flags). A PostToolUse hook in `.claude/settings.json`
   (untracked — recreate if absent) self-reports the vector after every
   `git commit`. Snapshot at every campaign-end commit;
