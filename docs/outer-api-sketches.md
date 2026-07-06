@@ -117,3 +117,18 @@ breakage.
    storm) + §7 escape hatches (uniform dims, thrash-demotion). The residual
    worry is STRUCTURE change (mutation/tree compute) — already named in §6
    with its revisit trigger.
+
+4. HORIZONTAL PACKING IS DERIVABLE, NO SPECIFICATION (2026-07-06): PyTorch's
+   foreach API is an artifact of EAGERNESS (no program to analyze); lazy =
+   whole step program in hand, so discovery is connected-components + the
+   existing fused-recipe structure hash. Numerics bit-identical (elementwise-
+   only; grad-norm reduction stays its own op) ⇒ ships behind a bit-exact
+   differential. Mechanics: level (a) grouped dispatches of ~8 buffers
+   (binding limits) — 100 params → ~13 dispatches ≈ hand-built Adam, zero
+   layout changes; level (b) 1-2 dispatches needs arena-suballocated params
+   + offset table — a deliberate engine-internal layout decision, made
+   safely at RECORD TIME. The step-tape is what buys the compiler its
+   budget: record-time = the once-per-program moment where expensive passes
+   are affordable and repacking is legal (before tapes bind buffers).
+   Adam's hand-built foreach = the reference implementation the derived
+   pass is differentially tested against, then deleted.
