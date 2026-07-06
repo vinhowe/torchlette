@@ -214,7 +214,9 @@ Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reus
 
 Keep the framework small and legible; regularize against overfit mechanisms.
 - `bash tools/weight-norm.sh --log` prints/appends the size vector (src LOC,
-  files, public exports, env flags). Snapshot at every campaign-end commit;
+  files, public exports, env flags). A PostToolUse hook in `.claude/settings.json`
+  (untracked — recreate if absent) self-reports the vector after every
+  `git commit`. Snapshot at every campaign-end commit;
   a campaign that grows the vector names what it deleted or why net-new
   mechanism is warranted.
 - Every generalization NAMES ITS DELETIONS in the commit message (house
