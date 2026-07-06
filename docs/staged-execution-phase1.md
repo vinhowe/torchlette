@@ -246,3 +246,32 @@ guards convert violations into loud-and-correct rather than silent-and-wrong.
 Centralization pressure accepted for phase 1 only: the fast path lives behind
 library seams; phase 2's explicit capture API is the owed counterweight —
 do not quietly drop it.
+
+## 7. The other pole is a mode, not a fork (2026-07-06 addendum)
+
+Sharpening §6 after discussion. Decompose "the floor":
+- The TAPE is ~Pareto: recording is observation, guards are integer compares;
+  never-repeating workloads pay epsilon.
+- The floor for non-loops was raised EARLIER, by the compiler-pole machinery
+  itself: every step pays fingerprint/CSE/template-lookup (~5-6ms @1.7B) —
+  pure reuse-discovery, worthless to a workload with no reuse — and novel
+  SHAPES pay pipeline compilation because kernels are shape-specialized.
+- A genuine interpreter pole exists (ggml-shaped): shape-polymorphic kernels
+  (dims as uniforms — never compile on novel shapes), no reuse-discovery,
+  streaming alloc. Flat low floor; price = 10-30% kernel peak, no cross-step
+  memory packing, hot-loop ceiling ~2-5x above ours. Irreducible novelty floor
+  exists (a new program must reach the GPU somehow; repetition-as-information
+  always wins) but ours sits well above it today.
+- KEY: because selection is data (#61) and kernels are IR, the interpreter
+  pole decomposes into ADDABLE MODES, not a rival design: (a) shape-GENERIC
+  kernel variants in the registry (uniform-driven dims; tile-IR grids half-do
+  this); (b) THRASH-TRIGGERED DEMOTION — the PAYLOAD THRASH detector routes
+  offenders to generic variants instead of just warning (same detect-and-
+  degrade shape as every guard); (c) skip-fingerprint fast path for graphs
+  learned never to match. Each lowers the non-loop floor without touching the
+  loop ceiling. Scarce resource = attention, not architecture.
+- Deepest frontier for change-a-little-constantly workloads (Menagerie
+  mutation, notebook tweaks — rarely PURE novelty): SUB-PROGRAM caching —
+  subgraph-level fingerprint/reuse instead of whole-template all-or-nothing,
+  so a 95%-unchanged program reuses 95% of its plans. Incremental-compilation
+  territory; the Menagerie-shaped optimization if that thesis leads.
