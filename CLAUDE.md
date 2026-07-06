@@ -226,3 +226,7 @@ Keep the framework small and legible; regularize against overfit mechanisms.
   opt-out dies. Flags outliving their campaign are debt.
 - One-sentence test: if a feature can't be stated as a declaration in one
   sentence of the paradigm docs, reshape it before landing.
+- Admission pressure: src/ is the diamond. Code proves itself in examples/
+  or packages/ first; it enters src/ only when it has earned generality
+  (a declaration, a registry entry, an IR primitive) — if it isn't ready,
+  hold it out until it is.
