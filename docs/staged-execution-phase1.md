@@ -212,3 +212,37 @@ One agent per sub-phase, briefed with this doc + the landmine ledger
 prerequisite (α-as-tensor suffices for phase 1) but 1c must not foreclose it.
 De-singleton (#74/engine-instance) is not a prerequisite: phase 1 is
 single-engine by scope.
+
+## 6. Tradeoffs this direction commits us to (discussed + accepted 2026-07-06)
+
+The tape is a BET THAT THE WORKLOADS THAT MATTER ARE LOOPS. It shapes the
+performance gradient, never the correctness surface (fallback is permanent and
+correct). What that gradient does to workflow shapes:
+
+- OPTIMIZED: fixed-program loops (decode, training steps, DiLoCo rounds);
+  repeated-program-varying-values (steering α, schedules, positions) — IF
+  values flow as data/declared slots (the discipline the guards enforce).
+- NEUTRAL-WITH-HICCUPS: occasional structure changes (hook toggles, layer
+  changes) — one guard-miss + re-record, then fast. UI CONSEQUENCE: warm
+  (value-knob) vs cold (structure-toggle) interactions — the UI leaks the
+  cache topology, same physics as shader-compile hitching. Mitigations owed:
+  (a) guard-miss observability exposed to apps so UIs can show "re-tracing…"
+  instead of mystery stutter (add to 1c's deliverables); (b) UI guidance:
+  scrubbed controls should be value-knobs.
+- UN-SERVED (not harmed): one-off computations (interp-notebook shape) — run
+  at today's speed; NOTHING in this campaign reduces cold-start. If the
+  thesis pivots to exploratory tooling, the right investment is the opposite
+  axis (cheaper fingerprint/incremental planning) — revisit then.
+- IMPLICITLY DISCOURAGED: structurally-dynamic programs (variable-width beam
+  search, dynamic MoE routing, speculative decoding's variable accepts,
+  per-token architecture variation, ARCHITECTURE MUTATION — the Menagerie/
+  Picbreeder and model-surgery shapes). Permanent fallback-path citizens.
+  Named risk: if mutation-playground becomes the primary thesis, this
+  campaign optimized the wrong axis — REVISIT BEFORE PHASE 2.
+
+Philosophical cost accepted: Fact 2's fine print gets heavier stakes (structure
+-as-data vs structure-as-code = 20ms vs slow), though no third fact is added;
+guards convert violations into loud-and-correct rather than silent-and-wrong.
+Centralization pressure accepted for phase 1 only: the fast path lives behind
+library seams; phase 2's explicit capture API is the owed counterweight —
+do not quietly drop it.
