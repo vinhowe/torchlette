@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The framework's size vector — the "weight norm" (CLAUDE.md: Complexity budget).
-# Append a snapshot to docs/weight-norm.log at campaign-end commits:
+# Append a snapshot to docs/weight-norm.history at campaign-end commits:
 #   bash tools/weight-norm.sh --log
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -14,6 +14,6 @@ testloc=$(find test -name '*.ts' -print0 2>/dev/null | xargs -0 cat | wc -l)
 line="$(date +%F) $(git rev-parse --short HEAD) srcLOC=$loc files=$files exports=$exports envFlags=$flags testLOC=$testloc"
 echo "$line"
 if [[ "${1:-}" == "--log" ]]; then
-  echo "$line" >> docs/weight-norm.log
-  echo "(appended to docs/weight-norm.log)"
+  echo "$line" >> docs/weight-norm.history
+  echo "(appended to docs/weight-norm.history)"
 fi
