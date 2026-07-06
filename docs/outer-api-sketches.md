@@ -86,3 +86,34 @@ Programs structurally deterministic given structure-inputs; update rules are
 tensor-state-in-place (whole SGD family); shape variance bucketable;
 repetition worth one recording step. Outside these ⇒ eager fallback, never
 breakage.
+
+## Review refinements (2026-07-06, from steelman round)
+
+1. OUTPUT SEMANTICS — "always materialized" needs teeth. The loss TENSOR is
+   free (backward root, computed anyway) and the per-step staging COPY is
+   ~free, but the handle's validity is a WINDOW: phase-2 obligations are a
+   staging RING (K slots), handles valid K steps, LOUD error past the window
+   (strict: throw "output from step i awaited after i+K" — never silently
+   hand back a later step's bytes). Not awaiting = CPU runahead (the feature;
+   training pipelines); runahead BOUNDED (~2-3 steps in flight, JAX-style);
+   awaiting every step degenerates to today's serialized behavior (= Fact 2).
+   Asymmetry: decode cannot pipeline (sampled token feeds back — per-token
+   await is inherent); training can — that's where capture wins biggest.
+2. OPTIMIZER SCORECARD — the simple definition gets TODAY: vertical fusion
+   (elementwise DAG → ~1 kernel/param via multi-output fusion + in-place fast
+   path), scalar/schedule safety (hyperparams-as-data + scalar-table),
+   chunking (dispatch-level), GradScaler/clip composition (data). HONEST GAP:
+   horizontal packing across params (foreach 100→~8 dispatches) is hand-built
+   in Adam only; naive optimizers run ~1 dispatch/param (~1ms GPU floor
+   post-tape — usable, not optimal). Closing it = generic "pack same-shape
+   elementwise groups" engine pass (the architecture-debt foreach→islands
+   stage), which retires Adam's private packing too. The historical "stuff
+   you'd never put in PyTorch" was mostly lifetime plumbing — being DELETED
+   by #66/#70, not hidden.
+3. SHAPE-CHANGE WORRY — empirically bounded: the field converged on shape-
+   stability (XLA/TPU largest-ever trainings; padding→sequence-PACKING; MoE
+   capacity factors; vLLM paged attention = stable pages). Our failure mode
+   is kinder than XLA's (graceful eager fallback + counter vs recompile
+   storm) + §7 escape hatches (uniform dims, thrash-demotion). The residual
+   worry is STRUCTURE change (mutation/tree compute) — already named in §6
+   with its revisit trigger.
