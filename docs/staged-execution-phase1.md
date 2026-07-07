@@ -445,3 +445,44 @@ bit-identical); full `npm run test` green with the seams in src/ (flags off);
 decode perf unchanged with instrumentation off (profile-decode 12 f32 static
 within the 47–57 ms/token band before and after); instrumentation-on observer
 effect ≤ ~1 ms/token (reported above).
+
+## 9. 2a findings (capture(), 2026-07-07) — rules phase 2b MUST inherit
+
+1. **The probe-unsoundness rule: never execute a captured body past
+   side-effecting ops for coverage.** 2a's first scalar-coverage design ran
+   the fn deep enough to observe closure scalars (α at layer 14) inside an
+   aborting reclamation scope. EMPIRICALLY UNSOUND: in-place ops commit
+   version bookkeeping (`_inPlace` → `_debug_baseCommit`/`nextMutId`) eagerly
+   at GRAPH BUILD, and a scope abort cannot roll them back — the steered
+   decode's KV `copy_` chain desynced tensor versions ("[lifetime] reading
+   RECLAIMED storage", token divergence). A follow-up in-place-suppressing
+   probe mode was rejected: a probe must suppress ARBITRARY user JS effects
+   (a cache-length advance, a counter), which is impossible — each fix
+   surfaces the next effect class (the torch.compile closure-guard tarpit §1
+   swore off). Consequence: a captured body runs EXACTLY ONCE per call,
+   always for real; a hit short-circuits it AT its last upload (before any
+   layer/in-place op), never after.
+2. **The arg-boundary contract** (capture()'s value coverage): everything
+   that varies crosses the ARGUMENT LIST — tensor args are warm dynamic
+   slots (values re-dressed/read-live every call), plain-value args are
+   hashed into the bucket key (cold: counted miss + re-record), and CLOSURE
+   VALUES ARE FROZEN AT RECORD TIME (jax.jit semantics; documented + tested,
+   TAPE_VERIFY as backstop). This supersedes both hand-rolled appKeys (the
+   1c caveat) and derived-scalar probing.
+3. **Frozen-upload disease found + fixed in the FUSION RECIPE cache** (the
+   third frozen-scalar cache): `isInlinableScalar` inlined 1-element pending
+   `tensorFromArray` payloads as WGSL constants; the recipe is cached by the
+   payload-excluded fingerprint, and the staleness check silently skipped
+   already-executed data-sources (`node.result` refusal) — so a
+   mid-generation α-as-tensor flip DID NOTHING under default fusion, plain
+   engine, no tape (silent wrongness, the worst class). Fixed: 1-element
+   tensorFromArray is never inlined (it is per-step USER DATA; as a runtime
+   input it rides TAG_WRITE), and the staleness read
+   (`inlinedConstantValue`) sees payloads regardless of materialization.
+   Without this, tensor-args could never be warm slots.
+4. **Upload-arg donation**: a caller-built pending tensorFromArray arg whose
+   values a replay consumed is DISPOSED by the hit (else the never-consumed
+   node is force-executed as a wasted mini-plan at every markStep).
+   Reclamation of the short-circuited partial body is by interceptor-tracked
+   wrapper disposal, not a scope (a per-token scope open/abort cost
+   ~1 ms/token; wrapper disposal is ~free).

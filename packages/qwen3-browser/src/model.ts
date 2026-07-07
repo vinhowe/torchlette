@@ -592,6 +592,15 @@ export class Qwen3 extends Module {
       // kernel and needs no mask.
       const isPrefill = posOffset === 0 && seqLen > 1;
       const bucketLen = kvBucketLen(posOffset + seqLen, cache.maxSeqLen);
+      // Advance the cache length HERE — after the per-step upload tensors that
+      // read posOffset (token/rope/scatterIdx above) and BEFORE the LAST upload
+      // (the mask, below) and the layer loop (none of which read cache.len).
+      // This position matters for capture() (2a): a taped replay short-circuits
+      // fn on its LAST upload (the mask), so any state advance AFTER the mask
+      // would be skipped on a hit, freezing the decode position. The mask reads
+      // only posOffset (a local snapshot), so advancing cache.len just before
+      // it is semantically identical for the untaped path.
+      cache.len = posOffset + seqLen;
       let mask: Tensor | null = null;
       if (!isPrefill) {
         if (seqLen !== 1)
@@ -617,7 +626,6 @@ export class Qwen3 extends Module {
         if (options?.residualHook) x = options.residualHook(x, i);
         hidden?.push(x);
       }
-      cache.len = posOffset + seqLen;
     } else {
       for (let i = 0; i < this.layers.length; i++) {
         const block = this.layers.get(i) as Qwen3Block;

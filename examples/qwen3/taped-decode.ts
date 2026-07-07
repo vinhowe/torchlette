@@ -150,6 +150,125 @@ async function tapedGenerate(
   return { tokens, walls, tapedSteps };
 }
 
+/** [capture 2a] SHARED-INSTANCE steered generation under the ARG-BOUNDARY
+ *  contract — the G3-shared harness. ONE CapturedFn serves the whole
+ *  generation while α may change MID-GENERATION (same tape, same KV):
+ *    mode "tensor"  — α enters as a fresh [1,1,1] TENSOR arg each step (the
+ *                     WARM knob): an α flip re-dresses the slot, zero misses.
+ *    mode "value"   — α enters as a PLAIN-VALUE arg (the COLD knob): a flip is
+ *                     a counted cold miss + re-record, then warm again.
+ *    mode "closure" — α is read from a closure (the DOCUMENTED-FROZEN case):
+ *                     a flip is INVISIBLE on hits; output keeps the recorded α.
+ *  `captured:false` runs the IDENTICAL body directly (the bit-exact reference —
+ *  same graph construction, no capture). */
+async function runSteerGen(
+  api: Torchlette,
+  model: Model,
+  vec: SteeringVector,
+  o: {
+    numTokens: number;
+    alphaAt: (i: number) => number;
+    mode: "tensor" | "value" | "closure";
+    captured: boolean;
+  },
+): Promise<{ tokens: number[]; hits: number; coldMisses: number }> {
+  const vocab = model.config.vocabSize;
+  const h = model.config.hiddenSize;
+  const tokens = [...PROMPT];
+  const staticKV = model.allocStaticKV(512);
+  const prev = api.setStepScopedCleanup(true);
+  try {
+    // The steering direction, hoisted ONCE: a stable-identity persistent
+    // closure tensor (per the contract, closure TENSORS are fine — it is
+    // closure VALUES that freeze; the buffer is read live by every replay).
+    const dir3d = api.persist(api.reshape(vec.direction, [1, 1, h]));
+    const state = { alpha: o.alphaAt(0) };
+
+    // The three α-delivery bodies (identical math; only the α path differs).
+    const bodyT = (idx: Tensor, alphaT: Tensor) =>
+      api.noGrad(
+        () =>
+          model.forward(idx, {
+            staticKV,
+            residualHook: (x, l) =>
+              l === STEER_LAYER ? api.add(x, api.mul(dir3d, alphaT)) : x,
+          }).logits,
+      );
+    const bodyV = (idx: Tensor, alpha: number) =>
+      api.noGrad(
+        () =>
+          model.forward(idx, {
+            staticKV,
+            residualHook: (x, l) =>
+              l === STEER_LAYER ? api.add(x, api.mul(dir3d, alpha)) : x,
+          }).logits,
+      );
+    const bodyC = (idx: Tensor) => bodyV(idx, state.alpha);
+
+    const key = () =>
+      `steer${STEER_LAYER}:bkt${kvBucketLen(staticKV.len + 1, staticKV.maxSeqLen)}`;
+    const capT = o.captured && o.mode === "tensor" ? api.capture(bodyT, { key }) : null;
+    const capV = o.captured && o.mode === "value" ? api.capture(bodyV, { key }) : null;
+    const capC = o.captured && o.mode === "closure" ? api.capture(bodyC, { key }) : null;
+
+    // Prefill (never captured — seqLen>1, distinct template). Same α-delivery
+    // shape as the decode body so captured/direct references stay bit-exact.
+    {
+      const idx = api.tensorFromArray(tokens, [1, tokens.length]);
+      const alphaT = api.tensorFromArray([state.alpha], [1, 1, 1]);
+      const logits = api.noGrad(
+        () =>
+          model.forward(idx, {
+            staticKV,
+            residualHook: (x, l) =>
+              l === STEER_LAYER
+                ? api.add(
+                    x,
+                    o.mode === "tensor"
+                      ? api.mul(dir3d, alphaT)
+                      : api.mul(dir3d, state.alpha),
+                  )
+                : x,
+          }).logits,
+      );
+      const top = await api.readTopK(logits, 8, {
+        offset: (tokens.length - 1) * vocab,
+        length: vocab,
+      });
+      logits.dispose();
+      tokens.push(top.indices[0]);
+      await api.markStep();
+    }
+
+    for (let i = 0; i < o.numTokens; i++) {
+      state.alpha = o.alphaAt(i);
+      const idx = api.tensorFromArray([tokens[tokens.length - 1]], [1, 1]);
+      let logits: Tensor;
+      if (o.mode === "tensor") {
+        const alphaT = api.tensorFromArray([state.alpha], [1, 1, 1]);
+        logits = capT ? ((await capT(idx, alphaT)) as Tensor) : bodyT(idx, alphaT);
+      } else if (o.mode === "value") {
+        logits = capV
+          ? ((await capV(idx, state.alpha)) as Tensor)
+          : bodyV(idx, state.alpha);
+      } else {
+        logits = capC ? ((await capC(idx)) as Tensor) : bodyC(idx);
+      }
+      const top = await api.readTopK(logits, 8, { length: vocab });
+      logits.dispose();
+      tokens.push(top.indices[0]);
+      await api.markStep();
+    }
+    staticKV.k.length = 0;
+    staticKV.v.length = 0;
+    await api.markStep();
+    const s = (capT ?? capV ?? capC)?.stats();
+    return { tokens, hits: s?.hits ?? 0, coldMisses: s?.coldMisses ?? 0 };
+  } finally {
+    api.setStepScopedCleanup(prev);
+  }
+}
+
 /** Untaped baseline generate (normal forward every step) for the differential
  *  / perf comparison. */
 async function untapedGenerate(
@@ -266,6 +385,148 @@ async function main() {
       console.log("[g3] !! FAIL: α=3 and α=-3 produced identical tokens (frozen-α)");
       failed = true;
     }
+  } else if (mode === "g3capture") {
+    // THE G3-SHARED-INSTANCE GATE (never waived): ONE CapturedFn, α flipped
+    // 3→−3 MID-GENERATION at token 10 (same tape, same KV — no fresh-instance
+    // masking), under the ARG-BOUNDARY contract:
+    //  (i)  α as TENSOR arg (warm): bit-exact vs the identical DIRECT run of
+    //       the same body, ZERO misses across the flip.
+    //  (ii) α as PLAIN-VALUE arg (cold): bit-exact, flip = counted cold miss.
+    //  (iii) α in a CLOSURE: the DOCUMENTED-FROZEN contract — output matches a
+    //       never-flipped α=3 run (frozen), NOT the flipped reference.
+    const vec = makeVec(api, model.config.hiddenSize);
+    await api.markStep();
+    const N = 20;
+    const flip = (i: number) => (i < 10 ? 3 : -3);
+    const const3 = () => 3;
+    const J = (t: { tokens: number[] }) => JSON.stringify(t.tokens.slice(PROMPT.length));
+
+    // Direct (never-captured) references, identical bodies.
+    const refFlipT = await runSteerGen(api, model, vec, { numTokens: N, alphaAt: flip, mode: "tensor", captured: false });
+    const refFlipV = await runSteerGen(api, model, vec, { numTokens: N, alphaAt: flip, mode: "value", captured: false });
+    const refConst3 = await runSteerGen(api, model, vec, { numTokens: N, alphaAt: const3, mode: "closure", captured: false });
+
+    // (i) warm: tensor-arg α.
+    const warm = await runSteerGen(api, model, vec, { numTokens: N, alphaAt: flip, mode: "tensor", captured: true });
+    const warmOk = J(warm) === J(refFlipT) && warm.coldMisses === 0 && warm.hits > 0;
+    console.log(`\n[g3capture:warm] captured : ${J(warm)} (hits=${warm.hits} coldMisses=${warm.coldMisses})`);
+    console.log(`[g3capture:warm] direct   : ${J(refFlipT)}`);
+    console.log(`[g3capture:warm] bit-exact across mid-gen α flip, zero misses: ${warmOk}`);
+
+    // (ii) cold: plain-value-arg α.
+    const cold = await runSteerGen(api, model, vec, { numTokens: N, alphaAt: flip, mode: "value", captured: true });
+    const coldOk = J(cold) === J(refFlipV) && cold.coldMisses > 0 && cold.hits > 0;
+    console.log(`[g3capture:cold] captured : ${J(cold)} (hits=${cold.hits} coldMisses=${cold.coldMisses})`);
+    console.log(`[g3capture:cold] direct   : ${J(refFlipV)}`);
+    console.log(`[g3capture:cold] bit-exact, flip = COUNTED cold miss: ${coldOk}`);
+
+    // (iii) frozen contract: closure α.
+    const froz = await runSteerGen(api, model, vec, { numTokens: N, alphaAt: flip, mode: "closure", captured: true });
+    const frozOk = J(froz) === J(refConst3) && J(froz) !== J(refFlipV);
+    console.log(`[g3capture:frozen] captured(closure flip): ${J(froz)} (hits=${froz.hits})`);
+    console.log(`[g3capture:frozen] direct α=3 throughout : ${J(refConst3)}`);
+    console.log(`[g3capture:frozen] closure flip FROZEN (== never-flipped, != flipped): ${frozOk}`);
+    console.log(`[g3capture] replay:`, JSON.stringify(api.getStepTapeStats().replay));
+    if (!warmOk || !coldOk || !frozOk) failed = true;
+  } else if (mode === "capperf") {
+    // capture() perf: within-noise of the direct-driver taped numbers, and the
+    // convenience overhead vs the hand-rolled driver must be < 2ms/token.
+    // INTERLEAVED D/C/D/C with min-of-runs per arm: a single sequential pair is
+    // order-biased (the second generation in a process runs ~2-6ms/token slower
+    // — template/pool pressure), which inflated the apparent overhead.
+    const n = Number(process.argv[3] ?? 24);
+    const captureRun = async (): Promise<number[]> => {
+      const walls: number[] = [];
+      const vocab = model.config.vocabSize;
+      const tokens = [...PROMPT];
+      const staticKV = model.allocStaticKV(512);
+      const prev = api.setStepScopedCleanup(true);
+      try {
+        {
+          const idx = api.tensorFromArray(tokens, [1, tokens.length]);
+          const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
+          const top = await api.readTopK(logits, 8, { offset: (tokens.length - 1) * vocab, length: vocab });
+          logits.dispose(); tokens.push(top.indices[0]); await api.markStep();
+        }
+        // ARG-BOUNDARY: token as TENSOR arg (warm slot).
+        const decode = api.capture(
+          (idx: Tensor) => api.noGrad(() => model.forward(idx, { staticKV }).logits),
+          { key: () => `stock:bkt${kvBucketLen(staticKV.len + 1, staticKV.maxSeqLen)}` },
+        );
+        for (let i = 0; i < n; i++) {
+          const t0 = performance.now();
+          const logits = (await decode(
+            api.tensorFromArray([tokens[tokens.length - 1]], [1, 1]),
+          )) as Tensor;
+          const top = await api.readTopK(logits, 8, { length: vocab });
+          logits.dispose(); tokens.push(top.indices[0]); await api.markStep();
+          walls.push(performance.now() - t0);
+        }
+        staticKV.k.length = 0; staticKV.v.length = 0; await api.markStep();
+      } finally { api.setStepScopedCleanup(prev); }
+      return walls;
+    };
+    // COUNTERBALANCED D,C,C,D: successive generations in one process slow down
+    // by ~3-5 ms/token regardless of arm (pre-existing cross-generation drift —
+    // the direct arm alone shows it between its own two runs), so arm order
+    // must cancel: position sums are equal (1+4 = 2+3) and the MEAN of each
+    // arm is unbiased under the linear drift. (Separate-process gen1-vs-gen1
+    // A/B gives the same verdict without the drift; see the 2a report.)
+    const d1 = await tapedGenerate(api, model, { vec: null, alpha: 0, verifyEvery: 0, numTokens: n });
+    const c1 = await captureRun();
+    const c2 = await captureRun();
+    const d2 = await tapedGenerate(api, model, { vec: null, alpha: 0, verifyEvery: 0, numTokens: n });
+    const direct = (steady(d1.walls) + steady(d2.walls)) / 2;
+    const cap = (steady(c1) + steady(c2)) / 2;
+    console.log(`\n[capperf] direct-driver taped steady = ${direct.toFixed(2)} ms/token (runs: ${steady(d1.walls).toFixed(2)}, ${steady(d2.walls).toFixed(2)})`);
+    console.log(`[capperf] capture() taped     steady = ${cap.toFixed(2)} ms/token (runs: ${steady(c1).toFixed(2)}, ${steady(c2).toFixed(2)})`);
+    console.log(`[capperf] convenience overhead      = ${(cap - direct).toFixed(2)} ms/token (budget < 2.0)`);
+    console.log(`[capperf] replay:`, JSON.stringify(api.getStepTapeStats().replay));
+    if (cap - direct > 2.0) { console.log("[capperf] !! OVER BUDGET"); failed = true; }
+  } else if (mode === "capg2") {
+    // Gate 4: TAPE_VERIFY=1 shadow over a 200-token CAPTURED generation
+    // crossing ≥2 KV buckets (128→256 at pos 128): 0 stream diffs; bucket
+    // transitions are counted misses (new bucket key), never diffs. Also
+    // bit-compare vs a never-captured run. Run with TORCHLETTE_TAPE_VERIFY=1.
+    const n = 200;
+    const un = await untapedGenerate(api, model, { vec: null, alpha: 0, verifyEvery: 0, numTokens: n });
+    const vocab = model.config.vocabSize;
+    const tokens = [...PROMPT];
+    const staticKV = model.allocStaticKV(512);
+    const prev = api.setStepScopedCleanup(true);
+    let capStats: { hits: number; coldMisses: number; traces: number } | null = null;
+    try {
+      {
+        const idx = api.tensorFromArray(tokens, [1, tokens.length]);
+        const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
+        const top = await api.readTopK(logits, 8, { offset: (tokens.length - 1) * vocab, length: vocab });
+        logits.dispose(); tokens.push(top.indices[0]); await api.markStep();
+      }
+      const decode = api.capture(
+        (idx: Tensor) => api.noGrad(() => model.forward(idx, { staticKV }).logits),
+        { key: () => `stock:bkt${kvBucketLen(staticKV.len + 1, staticKV.maxSeqLen)}` },
+      );
+      for (let i = 0; i < n; i++) {
+        const logits = (await decode(
+          api.tensorFromArray([tokens[tokens.length - 1]], [1, 1]),
+        )) as Tensor;
+        const top = await api.readTopK(logits, 8, { length: vocab });
+        logits.dispose(); tokens.push(top.indices[0]); await api.markStep();
+      }
+      capStats = decode.stats();
+      staticKV.k.length = 0; staticKV.v.length = 0; await api.markStep();
+    } finally { api.setStepScopedCleanup(prev); }
+    const s = api.getStepTapeStats();
+    const match = JSON.stringify(tokens) === JSON.stringify(un.tokens);
+    console.log(`\n[capg2] captured 200-token == never-captured: ${match}`);
+    console.log(`[capg2] capture stats:`, JSON.stringify(capStats));
+    console.log(`[capg2] replay:`, JSON.stringify(s.replay));
+    console.log(`[capg2] recorder refusals=${s.recorder.refusals}`);
+    if (!match || s.replay.verifyDiffs > 0 || s.recorder.refusals > 0) failed = true;
+    if (STEP_TAPE_VERIFY_N === 0 && s.replay.readyTapes < 2) {
+      console.log("[capg2] !! FAIL: expected ≥2 per-bucket tapes on a bucket crossing");
+      failed = true;
+    }
   } else if (mode === "g2") {
     // Shadow equivalence across a bucket crossing: a 200-token stock generation
     // crosses KV bucket 128→256 at posOffset 128. Run with TORCHLETTE_TAPE_VERIFY
@@ -296,6 +557,45 @@ async function main() {
       console.log("[g2] !! FAIL: expected ≥2 per-bucket tapes on a bucket crossing");
       failed = true;
     }
+  } else if (mode === "capg4") {
+    // Gate 7: STRICT_LIFETIME + STRICT_GPU clean over a CAPTURED 100-token
+    // generation; reachable-storage flat. Run with
+    // TORCHLETTE_STRICT_LIFETIME=1 TORCHLETTE_STRICT_GPU=1 externally.
+    const { storageTracker } = await import("../../src/graph/storage-tracker");
+    const vocab = model.config.vocabSize;
+    const tokens = [...PROMPT];
+    const staticKV = model.allocStaticKV(512);
+    const prev = api.setStepScopedCleanup(true);
+    const reach: number[] = [];
+    try {
+      {
+        const idx = api.tensorFromArray(tokens, [1, tokens.length]);
+        const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
+        const top = await api.readTopK(logits, 8, { offset: (tokens.length - 1) * vocab, length: vocab });
+        logits.dispose(); tokens.push(top.indices[0]); await api.markStep();
+      }
+      const decode = api.capture(
+        (idx: Tensor) => api.noGrad(() => model.forward(idx, { staticKV }).logits),
+        { key: () => `stock:bkt${kvBucketLen(staticKV.len + 1, staticKV.maxSeqLen)}` },
+      );
+      for (let i = 0; i < 100; i++) {
+        const logits = (await decode(
+          api.tensorFromArray([tokens[tokens.length - 1]], [1, 1]),
+        )) as Tensor;
+        const top = await api.readTopK(logits, 8, { length: vocab });
+        logits.dispose(); tokens.push(top.indices[0]); await api.markStep();
+        if (i % 20 === 19) {
+          const s = storageTracker.stats();
+          reach.push(s.reachableStorages);
+          console.log(`[capg4] step ${i + 1}: reachable=${s.reachableStorages} total=${s.totalStorages} (hits so far=${decode.stats().hits})`);
+        }
+      }
+      console.log(`[capg4] capture stats:`, JSON.stringify(decode.stats()));
+    } finally { api.setStepScopedCleanup(prev); }
+    // Flat = late samples equal (steady-state reachable does not grow).
+    const flat = reach.length >= 3 && reach[reach.length - 1] === reach[reach.length - 3];
+    console.log(`[capg4] reachable flat across steady state: ${flat} (${reach.join(",")})`);
+    if (!flat) failed = true;
   } else if (mode === "g4") {
     // Lifetime: reachable-storage flat across taped steps. Run with
     // TORCHLETTE_STRICT_LIFETIME=1 TORCHLETTE_STRICT_GPU=1 externally.

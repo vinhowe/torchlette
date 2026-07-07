@@ -14,7 +14,6 @@ import { Torchlette, type Tensor } from "../../src/frontend/torchlette";
 import type { KVCache } from "./model";
 import { kvBucketLen } from "./model";
 import { loadPretrainedQwen3 } from "./loader";
-import { buildDecodeUploads, staticKvId } from "./decode-uploads";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MODEL_DIR = path.join(__dirname, "../../ckpts/qwen3-1.7b");
@@ -111,23 +110,17 @@ async function main() {
     taped.push(await argmaxLast(logits, taped.length - 1));
     if (!SKIP_MARKSTEP) await api.markStep();
   }
+  // [capture 2a] the decode body as a CapturedFn — derives the appKey +
+  // upload slots itself (no buildDecodeUploads / setTapeContext / tapeReplay).
+  // ARG-BOUNDARY CONTRACT: the token enters as a TENSOR arg (warm slot).
+  const tapedDecode = api.capture(
+    (idx: Tensor) =>
+      api.noGrad(() => model.forward(idx, { staticKV: tapedKV }).logits),
+    { key: () => `kv:bkt${kvBucketLen(tapedKV.len + 1, tapedKV.maxSeqLen)}` },
+  );
   for (let i = 1; i < NUM_NEW; i++) {
-    const posOffset = tapedKV.len;
-    const bucketLen = kvBucketLen(posOffset + 1, tapedKV.maxSeqLen);
-    const appKey = `stock:kv${staticKvId(tapedKV)}:bkt${bucketLen}`;
-    api.setTapeContext(appKey, []);
-    const tok = taped[taped.length - 1];
-    let logits: Tensor | null = null;
-    if (api.tapeReadyFor(appKey)) {
-      logits = await api.tapeReplay(
-        buildDecodeUploads(model.config, posOffset, tok, bucketLen),
-      );
-      if (logits) tapedKV.len = posOffset + 1;
-    }
-    if (!logits) {
-      const idx = api.tensorFromArray([tok], [1, 1]);
-      ({ logits } = api.noGrad(() => model.forward(idx, { staticKV: tapedKV })));
-    }
+    const idx = api.tensorFromArray([taped[taped.length - 1]], [1, 1]);
+    const logits = (await tapedDecode(idx)) as Tensor;
     taped.push(await argmaxLast(logits, 0));
     if (!SKIP_MARKSTEP) await api.markStep();
   }

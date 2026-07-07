@@ -44,10 +44,12 @@ import {
   stStats,
 } from "../core/step-tape";
 import {
+  stDropSkeleton,
   stPromoteEligibleSkeleton,
   stReplayStats,
   stSetTapeContext,
   stTapeReadyFor,
+  stTapeReplayValid,
   stTryReplay,
 } from "../executor/step-tape-replay";
 import { getNextNodeId } from "../graph/node-factory";
@@ -63,6 +65,7 @@ import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 export { DisposedTensorError, Tensor } from "./tensor";
 
 import { Tensor } from "./tensor";
+import { CapturedFn, type CaptureOptions } from "./capture";
 
 // Re-export types from frontend-types
 export type {
@@ -142,6 +145,19 @@ export class Torchlette {
   readonly _backwardDispatchHooks: Array<
     (info: { output: Tensor; inputs: Tensor[]; label?: string }) => void
   > = [];
+
+  /** [capture 2a] Active upload interceptor (null = not capturing). A
+   *  CapturedFn installs it for the duration of one call so it can (a) collect
+   *  the fn's internal tensorFromArray uploads (the dynamic slots built inside
+   *  the body) and short-circuit the body on a replay hit, and (b) track every
+   *  Tensor wrapped in the window so a short-circuited partial body can be
+   *  reclaimed by disposing exactly those wrappers (cheaper than a full
+   *  reclamation scope on the per-token hot path). Single-slot by phase-1
+   *  scope (captured calls never nest). */
+  private _captureInterceptor: {
+    onUpload: (shape: number[], values: Float32Array) => void;
+    onWrap?: (t: Tensor) => void;
+  } | null = null;
 
   constructor(backendName?: DeviceKind, options?: TorchletteOptions) {
     // Configure memory limit if provided (applies to GPU memory tracker)
@@ -475,6 +491,15 @@ export class Torchlette {
     shape: number[],
     options?: TensorCreateOptions,
   ): Tensor {
+    // [capture 2a] a captured call's per-step upload — record it for skeleton
+    // re-dressing (the derived upload slots). f32 values only (the decode
+    // uploads are f32); other dtypes are not per-step decode uploads.
+    if (this._captureInterceptor) {
+      this._captureInterceptor.onUpload(
+        shape,
+        values instanceof Float32Array ? values : Float32Array.from(values),
+      );
+    }
     return this._wrap(
       this.runtime.tensorFromArray(
         values,
@@ -1445,6 +1470,9 @@ export class Torchlette {
     if (this._checkpointRecomputeTensors) {
       this._checkpointRecomputeTensors.add(tensor);
     }
+    // [capture 2a] track tensors created inside a captured call's window so a
+    // short-circuited partial body can be reclaimed by disposing exactly them.
+    this._captureInterceptor?.onWrap?.(tensor);
     return tensor;
   }
 
@@ -2022,6 +2050,136 @@ export class Torchlette {
     replay: ReturnType<typeof stReplayStats>;
   } {
     return { recorder: stStats(), replay: stReplayStats() };
+  }
+
+  // ==========================================================================
+  // capture() — phase 2a user-declared staging (docs/staged-execution-phase2a)
+  // ==========================================================================
+
+  /**
+   * Wrap an inference loop body (noGrad, no optimizer) in a CapturedFn that
+   * traces on early calls and replays via the step-tape once a skeleton is
+   * ready and every guard passes.
+   *
+   * THE ARG-BOUNDARY CONTRACT — everything that varies must cross the argument
+   * list (see src/frontend/capture.ts header + docs/staged-execution-phase2a.md
+   * §2): TENSOR args are dynamic slots (warm — fresh values every call);
+   * PLAIN-VALUE args are hashed into the bucket key (cold — a changed value is
+   * a counted miss + re-record); VALUES CAPTURED BY CLOSURE ARE FROZEN AT
+   * RECORD TIME (jax.jit semantics) — pass anything that varies as an argument
+   * (a tensor for scrubbed knobs, a plain value for occasional config).
+   *
+   * When TORCHLETTE_STEP_TAPE is off the CapturedFn is a transparent
+   * pass-through (just calls fn).
+   */
+  capture<A extends unknown[]>(
+    fn: (...args: A) => Tensor | Tensor[],
+    opts?: CaptureOptions,
+  ): {
+    (...args: A): Promise<Tensor | Tensor[]>;
+    invalidate(): void;
+    stats(): ReturnType<CapturedFn["stats_"]>;
+  } {
+    const cf = new CapturedFn(this, fn as (...a: never[]) => Tensor | Tensor[], opts);
+    const callable = ((...args: A) => cf.call(args)) as {
+      (...args: A): Promise<Tensor | Tensor[]>;
+      invalidate(): void;
+      stats(): ReturnType<CapturedFn["stats_"]>;
+    };
+    callable.invalidate = () => cf.invalidate();
+    callable.stats = () => cf.stats_();
+    return callable;
+  }
+
+  // --- CapturedFn support seams (used only by src/frontend/capture.ts) ---
+
+  _tapeActive(): boolean {
+    return STEP_TAPE_REPLAY;
+  }
+
+  _setCaptureTapeContext(appKey: string, scalars: number[]): void {
+    if (STEP_TAPE_REPLAY) {
+      stSetTapeContext(appKey, scalars, currentEpoch(), this._stepScopedCleanup);
+    }
+  }
+
+  _tapeReadyFor(appKey: string): boolean {
+    // Validity-checked readiness: capture commits to a hit only if the skeleton
+    // AND its compiled plan are valid, so a post-commit replay decline (which
+    // would strand the captured fn's already-advanced in-place state) cannot
+    // happen in steady state.
+    return STEP_TAPE_REPLAY && stTapeReplayValid(appKey);
+  }
+
+  /** Replay the phase-1 skeleton for the active appKey with fresh uploads (from
+   *  the capture interceptor). Returns the logits tensor on a hit, null on a
+   *  guard miss. */
+  async _captureReplay(
+    uploads: Array<{ shape: number[]; values: Float32Array }>,
+  ): Promise<Tensor | null> {
+    return this.tapeReplay(uploads);
+  }
+
+  /** Install the capture interceptor for the duration of one captured call.
+   *  Returns a restore fn. Not reentrant (captured calls never nest). */
+  _installCaptureInterceptor(hooks: {
+    onUpload: (shape: number[], values: Float32Array) => void;
+  }): () => void {
+    const prevHooks = this._captureInterceptor;
+    this._captureInterceptor = hooks;
+    return () => {
+      this._captureInterceptor = prevHooks;
+    };
+  }
+
+  _invalidateCapture(appKey: string): void {
+    if (STEP_TAPE_REPLAY) stDropSkeleton(appKey);
+  }
+
+  /** Fresh values of a captured call's TENSOR args that are caller-built
+   *  PENDING tensorFromArray uploads (their values read synchronously from the
+   *  un-forced node payload — no GPU roundtrip). Keyed by shape, matching the
+   *  phase-1 replay's shape-keyed re-dressing. MATERIALIZED/persistent tensor
+   *  args are skipped: they are external plan inputs whose stable buffer the
+   *  replay reads live (the warm in-place knob). Derived args (pending
+   *  compute) are skipped too — if their leaves vary, the phase-1 shape guard
+   *  misses the replay (safe fallback), never silently reuses stale data. */
+  _captureArgUploads(args: unknown[]): {
+    uploads: Array<{ shape: number[]; values: Float32Array }>;
+    /** The pending upload arg tensors themselves — DONATED on a replay hit
+     *  (disposed by capture): the replay consumed their VALUES, and the
+     *  never-consumed pending node would otherwise be force-executed as a
+     *  wasted mini-plan at every markStep. */
+    donatable: Tensor[];
+  } {
+    const uploads: Array<{ shape: number[]; values: Float32Array }> = [];
+    const donatable: Tensor[] = [];
+    for (const a of args) {
+      const t = a as Tensor;
+      if (!t || typeof t !== "object" || !Array.isArray(t.shape)) continue;
+      const ref = t._unwrap().lazyRef as {
+        kind: string;
+        node?: { op?: string; payload?: unknown };
+      };
+      if (ref.kind !== "pending" || ref.node?.op !== "tensorFromArray") continue;
+      const p = ref.node.payload as { values?: ArrayLike<number> } | undefined;
+      if (!p?.values) continue;
+      uploads.push({
+        shape: t.shape,
+        values:
+          p.values instanceof Float32Array
+            ? p.values
+            : Float32Array.from(p.values as ArrayLike<number>),
+      });
+      donatable.push(t);
+    }
+    return { uploads, donatable };
+  }
+
+  /** Mark a captured output as past its staging-ring validity window (§4). A
+   *  subsequent read (via _assertUsable) throws a LOUD error naming the step. */
+  _markCaptureExpired(t: Tensor, step: number, now: number, k: number): void {
+    t._captureExpired = { step, now, k };
   }
 
   _debug_baseCommit(baseId: number, mutId: number): void {

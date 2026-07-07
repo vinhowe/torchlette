@@ -29,6 +29,10 @@ export class Tensor {
   private gradNode: AutogradNode | null = null;
   private gradValue: Tensor | null = null;
   private retainGradValue = false;
+  /** [capture 2a] Set when this captured output has fallen out of its staging
+   *  ring's K-step validity window (§4). Any read/use after that is a LOUD,
+   *  step-naming error rather than silent stale/garbage bytes. */
+  _captureExpired: { step: number; now: number; k: number } | null = null;
 
   constructor(
     engine: Torchlette,
@@ -466,6 +470,14 @@ export class Tensor {
   }
 
   private ensureNotDisposed(): void {
+    if (this._captureExpired) {
+      const { step, now, k } = this._captureExpired;
+      throw new Error(
+        `[capture] output from step ${step} read after step ${now} ` +
+          `(staging ring depth ${k}; the handle is valid for only ${k} ` +
+          `subsequent captured calls — await it sooner or raise ringDepth)`,
+      );
+    }
     if (this.engineTensor.disposed) {
       throw new DisposedTensorError("Tensor has been disposed");
     }

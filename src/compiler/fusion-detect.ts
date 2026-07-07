@@ -1216,9 +1216,22 @@ function countNewExternals(
  * Eligible refs:
  * - Scalar LazyRef (kind: "scalar") → value is carried directly
  * - Pending refs pointing to scalar constant nodes:
- *   - tensorFromArray with totalElements === 1 → value = payload.values[0]
  *   - full with totalElements === 1 → value = payload.fillValue
  *   - zeros with totalElements === 1 → value = 0.0
+ *
+ * NOT eligible (2a frozen-upload fix): 1-element `tensorFromArray` — its
+ * payload is per-step USER DATA (a steering α, a schedule knob) that can
+ * change under an IDENTICAL fingerprint, and the cached recipe is payload-
+ * blind: inlining it baked the first-seen value into the WGSL and every
+ * later value change was SILENTLY ignored (the frozen-scalar disease,
+ * upload edition — measured: a mid-generation α-tensor flip did nothing
+ * under default fusion, while the identical math with fusion off applied
+ * it). As a runtime input it costs one binding and flows as data through
+ * the TAG_WRITE stable-upload path, which is exactly what makes it safe
+ * for compiled replay and capture() tensor-args. `full`/`zeros` stay
+ * inlinable: their values are op-construction constants, and value drift
+ * on the traced path is caught by the staleness check below (which reads
+ * the CURRENT payload via inlinedConstantValue, materialized or not).
  *
  * Materialized refs already have GPU buffers and can't be inlined without readback.
  */
@@ -1230,35 +1243,51 @@ export function isInlinableScalar(
     return { inlinable: true, value: ref.value };
   }
   if (ref.kind !== "pending") return { inlinable: false };
+  // Don't inline if the node already has a result (it's been materialized)
+  if (ref.node.result) return { inlinable: false };
+  if (ref.node.op === "tensorFromArray") return { inlinable: false };
+  const value = inlinedConstantValue(ref);
+  return value === null ? { inlinable: false } : { inlinable: true, value };
+}
+
+/**
+ * CURRENT value of a constant-valued ref, read from the payload REGARDLESS of
+ * materialization — the staleness comparison must see the fresh value even
+ * after the node executed this step. (The old check reused isInlinableScalar,
+ * whose `node.result` refusal made it silently SKIP any data-source that had
+ * already run — by staleness-check time they all have — so an inlined value
+ * change never demoted and the recipe stayed frozen.) Returns null for refs
+ * that are not 1-element constants.
+ */
+export function inlinedConstantValue(ref: LazyRef): number | null {
+  if (ref.kind === "scalar") return ref.value;
+  if (ref.kind !== "pending") return null;
   const node = ref.node;
   const totalElements = (node.shape ?? [1]).reduce(
     (a: number, b: number) => a * b,
     1,
   );
-  if (totalElements !== 1) return { inlinable: false };
-  // Don't inline if the node already has a result (it's been materialized)
-  if (node.result) return { inlinable: false };
-
+  if (totalElements !== 1) return null;
   switch (node.op) {
     case "tensorFromArray": {
-      const payload = node.payload as { values: number[] } | undefined;
+      const payload = node.payload as
+        | { values: number[] | Float32Array }
+        | undefined;
       if (payload?.values && payload.values.length === 1) {
-        return { inlinable: true, value: payload.values[0] };
+        return payload.values[0];
       }
-      return { inlinable: false };
+      return null;
     }
     case "full": {
       const payload = node.payload as { fillValue: number } | undefined;
-      if (payload && typeof payload.fillValue === "number") {
-        return { inlinable: true, value: payload.fillValue };
-      }
-      return { inlinable: false };
+      return payload && typeof payload.fillValue === "number"
+        ? payload.fillValue
+        : null;
     }
-    case "zeros": {
-      return { inlinable: true, value: 0.0 };
-    }
+    case "zeros":
+      return 0.0;
     default:
-      return { inlinable: false };
+      return null;
   }
 }
 

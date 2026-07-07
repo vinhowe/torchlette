@@ -6,8 +6,9 @@
  * transformers (Node and browser) satisfy it.
  */
 
-import type { Torchlette } from "torchlette";
+import type { Torchlette, FrontendTensor as Tensor } from "torchlette";
 import type { Qwen3, ResidualHook } from "./model";
+import { kvBucketLen } from "./model";
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
@@ -252,14 +253,34 @@ export async function generateChat(
     let tFence = 0;
     let tSample = 0;
     let tStep = 0;
+    // [capture 2a] The decode body wrapped in a CapturedFn: it traces on early
+    // tokens (the step-tape recorder observes the plan), then replays via the
+    // tape once a per-bucket skeleton is ready and every derived guard passes —
+    // skipping the ~1600-node graph build/fingerprint/CSE/rewrite each token.
+    // ARG-BOUNDARY CONTRACT: the token enters as a TENSOR arg (the warm
+    // per-step slot — its fresh value re-dresses the skeleton every call);
+    // rope/scatter/mask are built INSIDE fn from staticKV.len and derived by
+    // capture's upload interceptor. No hand-rolled appKey, no hand-built upload
+    // payloads, no manual cache.len advance. The residualHook is
+    // closure-captured and therefore FROZEN for this CapturedFn's lifetime —
+    // sound here BY CONSTRUCTION: the CapturedFn's lifetime is one generateChat
+    // call and the hook/α are fixed per generation (a new generation = a new
+    // CapturedFn = a fresh trace with the new hook). The bucket length is the
+    // one structural discriminator the arg surface can't express, so it is the
+    // key's discriminator. When TORCHLETTE_STEP_TAPE is off the CapturedFn is a
+    // transparent pass-through (identical behavior to before).
+    const decode = api.capture(
+      (idx: Tensor) =>
+        api.noGrad(() => model.forward(idx, { staticKV, residualHook }).logits),
+      { key: () => `kv:bkt${kvBucketLen(staticKV.len + 1, maxSeq)}` },
+    );
     while (count < maxNew && !QWEN3_STOP_TOKENS.has(nextTok) && !isAborted()) {
       emit(nextTok);
       count++;
       const t0 = performance.now();
-      const idx = api.tensorFromArray([nextTok], [1, 1]);
-      const { logits } = api.noGrad(() =>
-        model.forward(idx, { staticKV, residualHook }),
-      );
+      const logits = (await decode(
+        api.tensorFromArray([nextTok], [1, 1]),
+      )) as Tensor;
       const t1 = performance.now();
       // readTopK's synchronous prefix is the plan/lower/encode JS; the await is
       // the GPU fence + the 512B top-K readback.

@@ -45,7 +45,7 @@ import {
   type ExecutionSegment,
   groupToRecipe,
   isFusibleOp,
-  isInlinableScalar,
+  inlinedConstantValue,
 } from "../compiler/fusion-detect";
 import { analyzeGraph } from "../compiler/graph-compiler";
 import { runPasses, SIMPLIFICATION_PASSES } from "../compiler/graph-rewrites";
@@ -483,12 +483,11 @@ function inlinedFusionScalarsStale(
       const node = planNodes[action.coveredNodeIndices[p.nodeLocalIdx]];
       const ref = node?.inputs[p.inputIdx];
       if (!ref) continue;
-      if (ref.kind === "scalar") {
-        if (ref.value !== inp.inlinedValue) return true;
-      } else {
-        const cur = isInlinableScalar(ref);
-        if (cur.inlinable && cur.value !== inp.inlinedValue) return true;
-      }
+      // Read the CURRENT value payload-first (materialized or not): by this
+      // point data-sources may already carry results, and the old
+      // isInlinableScalar-based read silently skipped them (frozen recipe).
+      const cur = inlinedConstantValue(ref);
+      if (cur !== null && cur !== inp.inlinedValue) return true;
     }
   }
   return false;
@@ -1894,14 +1893,14 @@ export async function executeLoweredPlan(
               if (!inp?.isInlinedConstant) continue;
               const ref = extInputs[i];
               if (!ref) continue;
-              const cur =
-                ref.kind === "scalar"
-                  ? { inlinable: true as const, value: ref.value }
-                  : isInlinableScalar(ref);
-              if (cur.inlinable && cur.value !== inp.inlinedValue) {
+              // Payload-first current-value read (materialized or not) — see
+              // inlinedConstantValue: the old isInlinableScalar read refused
+              // already-executed data-sources, silently skipping the check.
+              const cur = inlinedConstantValue(ref);
+              if (cur !== null && cur !== inp.inlinedValue) {
                 if (ENV.TORCHLETTE_DEBUG_SCALARS) {
                   console.log(
-                    `[scalar-adapt] input ${i}: baked=${inp.inlinedValue} current=${cur.value}`,
+                    `[scalar-adapt] input ${i}: baked=${inp.inlinedValue} current=${cur}`,
                   );
                 }
                 (stale ??= new Set(action.runtimeScalarInputs)).add(i);

@@ -159,6 +159,21 @@ export function stTapeReadyFor(appKey: string): boolean {
   return readySkeletons.has(appKey);
 }
 
+/** [capture 2a] A skeleton exists AND its compiled plan is still valid — the
+ *  gate capture() uses before committing to a hit, so a replay decline (guard
+ *  4/5) cannot happen AFTER the captured fn's in-place state already advanced.
+ *  An invalid plan drops the skeleton here (symmetric with stTryReplay). */
+export function stTapeReplayValid(appKey: string): boolean {
+  const sk = readySkeletons.get(appKey);
+  if (!sk) return false;
+  if (!sk.loweredPlan.compiledPlan?.valid) {
+    readySkeletons.delete(appKey);
+    stats.invalidations++;
+    return false;
+  }
+  return true;
+}
+
 /**
  * Executor hook: a COMPILED normal step just ran. If the driver declared an
  * appKey for it, stash it as a candidate; if a VERIFY step, cross-check the
@@ -429,6 +444,13 @@ export function stReplayStats(): typeof stats & {
     readyTapes: readySkeletons.size,
     diffDiagnostics: diffDiagnostics.slice(),
   };
+}
+
+/** [capture 2a] Drop the ready skeleton for one appKey (the §6 cold knob:
+ *  capturedFn.invalidate()). The recorder tape is left alone — it will simply
+ *  re-promote on the next two eligible steps under the same appKey. */
+export function stDropSkeleton(appKey: string): void {
+  readySkeletons.delete(appKey);
 }
 
 export function stReplayReset(): void {
