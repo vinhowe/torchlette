@@ -45,3 +45,4 @@ __pycache__/
 /node-compile-cache/
 *.pyc
 __pycache__/
+/SESSION-SUMMARY.md
