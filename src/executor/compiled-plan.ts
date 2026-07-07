@@ -13,6 +13,13 @@
 
 import { ENV } from "../core/env";
 import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
+import {
+  STEP_TAPE_RECORD,
+  stInvalidateTemplate,
+  stMarkPlanCompiled,
+  stRecordUniform,
+  stRecordWrite,
+} from "../core/step-tape";
 import type { DType } from "../backend/types";
 import type {
   GPUBindGroup,
@@ -218,6 +225,10 @@ export interface CompiledPlan {
    *  Released at the start of the next harvest so view-base retains don't
    *  accumulate per replay (the clip+optimizer storage-handle leak). */
   _viewBaseRetains?: number[];
+  /** [step-tape 1b] Template fingerprint, stamped by the executor when
+   *  recording (TORCHLETTE_STEP_TAPE=record) so plan invalidation cascades
+   *  to tapes referencing this template (guard 4). Absent when off. */
+  tapeFp?: number;
 }
 
 // ============================================================================
@@ -618,6 +629,11 @@ export function dbgIsDestroyed(buf: GPUBuffer): boolean {
  * is invalidated or its template evicted.
  */
 export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
+  // [step-tape 1b] guard-4 stub: every compiled-plan invalidation path
+  // funnels through here — cascade to tapes referencing this template.
+  if (STEP_TAPE_RECORD && compiled.tapeFp !== undefined) {
+    stInvalidateTemplate(compiled.tapeFp);
+  }
   // Release the last replay's view-base retains (normally released at the next
   // harvest, which won't happen once the plan is gone). Safe no-op if the base
   // storages were already freed (monotonic ids, rcRelease returns -1).
@@ -1067,6 +1083,10 @@ export async function executeCompiledPlan(
   /** Lazily evaluated once per replay: registry reset since build? */
   let plannerGenStale: boolean | undefined;
 
+  // [step-tape 1b] this plan executes via compiled replay — the step is
+  // tape-eligible (lowered executions have no TAG_WRITE/TAG_UNIFORM stream).
+  if (STEP_TAPE_RECORD) stMarkPlanCompiled();
+
   if (ENV.TORCHLETTE_DEBUG_COMPILED) {
     console.log(
       `[compiled] Executing: ${compiled.commands.length} cmds, ${compiled.slots.length} slots, ${compiled.results.length} results${compiled.plannerAssignment ? " (planner)" : ""}`,
@@ -1454,6 +1474,9 @@ export async function executeCompiledPlan(
               const tpD0 = TAPE_PROFILE ? performance.now() : 0;
               device.queue.writeBuffer(sbuf, 0, f32);
               if (TAPE_PROFILE) tpAdd("replay-dawn", performance.now() - tpD0);
+              if (STEP_TAPE_RECORD) {
+                stRecordWrite(cmd.nodeIndex, writeNode, /* stable */ true);
+              }
               writeNode.result = createStorageHandle(
                 writeNode.device,
                 createTensor(
@@ -1485,6 +1508,9 @@ export async function executeCompiledPlan(
               writeNode.result = createStorageHandle(writeNode.device, result);
               if (TAPE_PROFILE)
                 tpAdd("replay-write-legacy", performance.now() - tpW0);
+              if (STEP_TAPE_RECORD) {
+                stRecordWrite(cmd.nodeIndex, writeNode, /* stable */ false);
+              }
             }
           }
           slots[cmd.slot] = gpuBuffer(writeNode.result!.backendTensor);
@@ -1521,6 +1547,7 @@ export async function executeCompiledPlan(
           const tpD0 = TAPE_PROFILE ? performance.now() : 0;
           device.queue.writeBuffer(slots[cmd.slot], 0, packed);
           if (TAPE_PROFILE) tpAdd("replay-dawn", performance.now() - tpD0);
+          if (STEP_TAPE_RECORD) stRecordUniform(cmd.nodeIndex, node);
           break;
         }
         case TAG_BARRIER: {

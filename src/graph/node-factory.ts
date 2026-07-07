@@ -14,6 +14,12 @@ export function resetNodeIdCounter(): void {
   nextNodeId = 1;
 }
 
+/** Monotonic lazy-node op-sequence counter — the step-tape's structural
+ *  generation source (guard 1): every runtime-op creation bumps it. */
+export function getNextNodeId(): number {
+  return nextNodeId;
+}
+
 export function createLazyIRNode(
   op: LazyOpCode,
   inputs: LazyRef[],

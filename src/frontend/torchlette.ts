@@ -35,6 +35,13 @@ import {
   createAutocastContext,
 } from "../compiler/amp";
 import { shapesEqual, sizeOf } from "../core/shape";
+import { currentEpoch } from "../core/epoch";
+import {
+  STEP_TAPE_RECORD,
+  stEndStep,
+  stNoteBoundary,
+} from "../core/step-tape";
+import { getNextNodeId } from "../graph/node-factory";
 import { storageTracker } from "../graph/storage-tracker";
 import {
   type EngineTensor,
@@ -190,6 +197,9 @@ export class Torchlette {
   setStepScopedCleanup(enabled: boolean): boolean {
     const prev = this._stepScopedCleanup;
     this._stepScopedCleanup = enabled;
+    if (STEP_TAPE_RECORD && prev !== enabled) {
+      stNoteBoundary("regime-toggle");
+    }
     if (prev && !enabled) {
       // Disarm: drop any implicit end-of-markStep snapshot so a later bare
       // markStep (back on historical semantics) doesn't consume it and
@@ -1884,6 +1894,9 @@ export class Torchlette {
     // must NOT be classified persistent or they'd never be cleaned up).
     storageTracker.snapshotForStep(gen);
     await this.runtime.beginStep();
+    // [step-tape 1b] implied boundaries (training loops) are a different
+    // regime than the bare-markStep decode loop — reset the comparator.
+    if (STEP_TAPE_RECORD) stNoteBoundary("implied-boundary");
   }
 
   async markStep(): Promise<void> {
@@ -1934,6 +1947,17 @@ export class Torchlette {
     if (this._stepScopedCleanup) {
       storageTracker.snapshotForStep();
     }
+
+    // [step-tape 1b] markStep IS the step delimiter: finalize the observed
+    // step record (guard-3 eligibility diff against the previous step) with
+    // the guard-1 op-sequence counter and guard-5 epoch/regime bookkeeping.
+    if (STEP_TAPE_RECORD) {
+      stEndStep({
+        opSeq: getNextNodeId(),
+        epoch: currentEpoch(),
+        stepScopedCleanup: this._stepScopedCleanup,
+      });
+    }
   }
 
   _debug_baseCommit(baseId: number, mutId: number): void {
@@ -1952,10 +1976,15 @@ export class Torchlette {
     await this.runtime.forceAllPending();
     storageTracker.snapshotForStep();
     await this.runtime.beginStep();
+    // [step-tape 1b] explicit ceremony is a different boundary regime than
+    // the bare-markStep loop — reset the consecutive-step comparator
+    // (guard 5); tapes record the regime they were captured under.
+    if (STEP_TAPE_RECORD) stNoteBoundary("beginStep");
   }
 
   endStep(): void {
     this.runtime.endStep();
+    if (STEP_TAPE_RECORD) stNoteBoundary("endStep");
   }
 
   /**

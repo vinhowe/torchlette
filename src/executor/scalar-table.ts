@@ -29,6 +29,11 @@
  */
 
 import { ENV } from "../core/env";
+import {
+  STEP_TAPE_RECORD,
+  stDeclareScalarSlots,
+  stRecordScalarWrite,
+} from "../core/step-tape";
 import type { Backend } from "../backend/types";
 import type { GPUBuffer, GPUDevice } from "../backend/webgpu/gpu-types";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
@@ -128,6 +133,13 @@ export function refreshScalarTable(
   const device = (backend as Backend & { device?: GPUDevice }).device;
   if (!device) return; // non-WebGPU backends keep the legacy full() path
 
+  // [step-tape 1b] declare the table's positions as value-level coverage
+  // (guard 3): a scalar that varies step→step at one of these positions is a
+  // DECLARED slot — the table re-dresses it as data every execution. Scalars
+  // outside the table (or with the kill switch on, where this line is never
+  // reached) correctly stay undeclared and refuse the tape.
+  if (STEP_TAPE_RECORD) stDeclareScalarSlots(slots);
+
   let table = loweredPlan.scalarTable;
   if (!table || table.destroyed) {
     const buffers: GPUBuffer[] = [];
@@ -166,7 +178,12 @@ export function refreshScalarTable(
       }
       continue; // structural mismatch — skip
     }
-    const v = ref.value;
+    // Compare in f32 space: table.values is a Float32Array MIRROR of the
+    // 4-byte GPU buffers, so a non-f32-exact scalar (e.g. 1/√128) stored as
+    // f64 never Object.is-equals its own rounded mirror — every step issued
+    // a byte-identical 4-byte writeBuffer per slot (28/token on Qwen3
+    // decode). Round first; the GPU value is f32 either way. (§8.4 item 4.)
+    const v = Math.fround(ref.value);
     if (!Object.is(table.values[i], v)) {
       // Same-template re-execution within one submission scope (e.g. shared
       // block templates) would otherwise make earlier-encoded passes read the
@@ -179,6 +196,9 @@ export function refreshScalarTable(
       scratch[0] = v;
       device.queue.writeBuffer(table.buffers[i], 0, scratch);
       table.values[i] = v;
+      if (STEP_TAPE_RECORD) {
+        stRecordScalarWrite(slots[i].nodeIndex, slots[i].inputIndex, v);
+      }
     }
     map.set(ref, table.storages[i]);
   }

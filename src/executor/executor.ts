@@ -134,6 +134,7 @@ import {
   tpAdd,
   tpRecordPlan,
 } from "../core/tape-profile";
+import { STEP_TAPE_RECORD, stBeginPlan, stEndPlan } from "../core/step-tape";
 import {
   clearActiveScalarTable,
   destroyScalarTable,
@@ -3093,9 +3094,26 @@ export async function executePlanOptimized(
     ? undefined
     : ((cachedTemplate ?? fusionAnalysisCache.get(fingerprint.primary))
         ?.bufferArena as BufferArena | undefined);
-  return executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
-    bufferArena,
-  });
+  if (!STEP_TAPE_RECORD) {
+    return executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
+      bufferArena,
+    });
+  }
+  // [step-tape 1b] pure observation: record the plan execution (template id +
+  // payload/scalar image for the guard-3 diff), and stamp the template fp on
+  // the compiled plan so its invalidation cascades to tapes (guard 4).
+  stBeginPlan(fingerprint.primary, planNodes);
+  try {
+    const r = await executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
+      bufferArena,
+    });
+    if (loweredPlan.compiledPlan) {
+      loweredPlan.compiledPlan.tapeFp = fingerprint.primary;
+    }
+    return r;
+  } finally {
+    stEndPlan();
+  }
 }
 
 // ============================================================================
