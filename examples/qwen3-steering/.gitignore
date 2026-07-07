@@ -1,0 +1,12 @@
+node_modules/
+/build
+/.svelte-kit
+/package
+.env
+.env.*
+!.env.example
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+# Licensed font (fetched from the sequence-ui repo; do not commit)
+static/Berkeley Mono Variable.woff2
+public/Berkeley Mono Variable.woff2

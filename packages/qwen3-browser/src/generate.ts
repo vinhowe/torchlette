@@ -7,7 +7,7 @@
  */
 
 import type { Torchlette } from "torchlette";
-import type { Qwen3 } from "./model";
+import type { Qwen3, ResidualHook } from "./model";
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
@@ -32,6 +32,13 @@ export type GenerateOptions = {
   topP?: number;
   maxNewTokens?: number;
   isAborted?: () => boolean;
+  /**
+   * Residual-stream steering hook, forwarded verbatim to model.forward on BOTH
+   * the prefill and every KV-decode step (the static-KV fast path threads it
+   * through unchanged). Undefined → unsteered baseline (identity), so the
+   * existing unsteered call sites keep working with no change.
+   */
+  residualHook?: ResidualHook;
 };
 
 export type GenerateStats = {
@@ -181,7 +188,7 @@ export async function generateChat(
     maxSeq - promptIds.length - 1,
   );
   const isAborted = options?.isAborted ?? (() => false);
-  const { temperature, topK, topP } = options ?? {};
+  const { temperature, topK, topP, residualHook } = options ?? {};
 
   const genIds: number[] = [];
   let prevText = "";
@@ -220,7 +227,9 @@ export async function generateChat(
     let nextTok: number;
     {
       const idx = api.tensorFromArray(promptIds, [1, promptIds.length]);
-      const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
+      const { logits } = api.noGrad(() =>
+        model.forward(idx, { staticKV, residualHook }),
+      );
       const top = await api.readTopK(logits, K_PREFILTER, {
         offset: (promptIds.length - 1) * vocab,
         length: vocab,
@@ -248,7 +257,9 @@ export async function generateChat(
       count++;
       const t0 = performance.now();
       const idx = api.tensorFromArray([nextTok], [1, 1]);
-      const { logits } = api.noGrad(() => model.forward(idx, { staticKV }));
+      const { logits } = api.noGrad(() =>
+        model.forward(idx, { staticKV, residualHook }),
+      );
       const t1 = performance.now();
       // readTopK's synchronous prefix is the plan/lower/encode JS; the await is
       // the GPU fence + the 512B top-K readback.

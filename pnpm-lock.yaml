@@ -151,7 +151,7 @@ importers:
         version: 5.46.1
       svelte-check:
         specifier: ^4.1.0
-        version: 4.6.0(picomatch@4.0.4)(svelte@5.46.1)(typescript@5.9.2)
+        version: 4.6.0(picomatch@4.0.3)(svelte@5.46.1)(typescript@5.9.2)
       tailwindcss:
         specifier: '4'
         version: 4.2.2
@@ -198,6 +198,64 @@ importers:
       tsx:
         specifier: ^4.19.0
         version: 4.22.4
+      vite:
+        specifier: ^6.0.0
+        version: 6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4)
+
+  examples/qwen3-steering:
+    dependencies:
+      '@huggingface/transformers':
+        specifier: ^3.0.0
+        version: 3.8.1
+      '@lucide/svelte':
+        specifier: ^1.23.0
+        version: 1.23.0(svelte@5.46.1)
+      katex:
+        specifier: ^0.16.11
+        version: 0.16.45
+      qwen3-browser:
+        specifier: workspace:*
+        version: link:../../packages/qwen3-browser
+      tailwind-merge:
+        specifier: ^3.0.0
+        version: 3.6.0
+      torchlette:
+        specifier: workspace:*
+        version: link:../..
+    devDependencies:
+      '@sveltejs/adapter-static':
+        specifier: ^3.0.8
+        version: 3.0.10(@sveltejs/kit@2.49.4(@sveltejs/vite-plugin-svelte@5.1.1(svelte@5.46.1)(vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4)))(svelte@5.46.1)(typescript@5.9.2)(vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4)))
+      '@sveltejs/kit':
+        specifier: ^2.16.0
+        version: 2.49.4(@sveltejs/vite-plugin-svelte@5.1.1(svelte@5.46.1)(vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4)))(svelte@5.46.1)(typescript@5.9.2)(vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4))
+      '@sveltejs/vite-plugin-svelte':
+        specifier: ^5.0.3
+        version: 5.1.1(svelte@5.46.1)(vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4))
+      '@tailwindcss/vite':
+        specifier: ^4.2.2
+        version: 4.2.2(vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4))
+      '@webgpu/types':
+        specifier: ^0.1.70
+        version: 0.1.70
+      playwright:
+        specifier: ^1.49.0
+        version: 1.57.0
+      svelte:
+        specifier: ^5.17.3
+        version: 5.46.1
+      svelte-check:
+        specifier: ^4.1.0
+        version: 4.6.0(picomatch@4.0.4)(svelte@5.46.1)(typescript@5.9.2)
+      tailwindcss:
+        specifier: ^4.0.0
+        version: 4.2.2
+      tsx:
+        specifier: ^4.19.0
+        version: 4.22.4
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.2
       vite:
         specifier: ^6.0.0
         version: 6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4)
@@ -735,7 +793,6 @@ packages:
   '@esbuild/linux-x64@0.25.9':
     resolution: {integrity: sha512-iSwByxzRe48YVkmpbgoxVzn76BXjlYFXC7NvLYq+b+kDjyyk30J0JY47DIn8z1MO3K0oSl9fZoRmZPQI4Hklzg==}
     engines: {node: '>=18'}
-    cpu: [x64]
     os: [linux]
 
   '@esbuild/linux-x64@0.28.1':
@@ -1351,7 +1408,6 @@ packages:
 
   '@rollup/rollup-linux-x64-gnu@4.59.0':
     resolution: {integrity: sha512-3AHmtQq/ppNuUspKAlvA8HtLybkDflkMuLK4DPo77DfthRb71V84/c4MlWJXixZz4uruIH4uaa07IqoAkG64fg==}
-    cpu: [x64]
     os: [linux]
 
   '@rollup/rollup-linux-x64-musl@4.50.1':
@@ -5693,6 +5749,19 @@ snapshots:
   supports-color@7.2.0:
     dependencies:
       has-flag: 4.0.0
+
+  svelte-check@4.6.0(picomatch@4.0.3)(svelte@5.46.1)(typescript@5.9.2):
+    dependencies:
+      '@jridgewell/trace-mapping': 0.3.30
+      '@sveltejs/load-config': 0.1.1
+      chokidar: 4.0.3
+      fdir: 6.5.0(picomatch@4.0.3)
+      picocolors: 1.1.1
+      sade: 1.8.1
+      svelte: 5.46.1
+      typescript: 5.9.2
+    transitivePeerDependencies:
+      - picomatch
 
   svelte-check@4.6.0(picomatch@4.0.4)(svelte@5.46.1)(typescript@5.9.2):
     dependencies:
