@@ -69,3 +69,6 @@ export {
   resetTensorDebugStats,
   setDebugTracking,
 } from "./runtime/tensor";
+
+// Step-tape observability (§6): guard-miss/hit counters for apps.
+export { stReplayStats } from "./executor/step-tape-replay";

@@ -18,12 +18,12 @@
  *   { type: "error", id?, error }
  */
 
+import "./tape-flag"; // MUST be first: sets TORCHLETTE_STEP_TAPE before torchlette evaluates
 import { AutoTokenizer } from "@huggingface/transformers";
+import { stReplayStats } from "torchlette";
 import {
-  buildChatPrompt,
+  generateChat,
   loadQwen3FromUrl,
-  QWEN3_STOP_TOKENS,
-  sampleFromTopK,
   type Qwen3,
 } from "qwen3-browser";
 import {
@@ -170,13 +170,15 @@ async function handleComputeVector(
 }
 
 /**
- * Chat generation: the prompt is wrapped in the Qwen3 chat template (user turn
- * + thinking-off assistant header) before prefill — Qwen3 is an INSTRUCT model
- * and degenerates into repetition on raw text. Then KV-decode with the static
- * cache. `alpha` builds a residualHook from the current steering vector
- * (alpha=0 or no vector → unsteered baseline). The steering VECTOR itself is
- * still derived from raw concept prompts (steering.ts) — that's the concept's
- * residual direction, independent of prompt format.
+ * Generation = ONE generateChat call (packages/qwen3-browser). The worker
+ * previously carried a hand-rolled copy of the decode loop; that copy (a)
+ * never went through capture()/the step-tape, and (b) still contained the
+ * #79 arming-baseline ratchet leak that 0000ee15 fixed in generateChat only.
+ * Delegating inherits: the chat template, capture()-taped decode (with
+ * ./tape-flag setting TORCHLETTE_STEP_TAPE=1 before module eval), the
+ * per-token phase breakdown, and the leak-free generation lifecycle.
+ * The steering hook is frozen-by-closure per call — sound, since each
+ * generateChat call captures its own fn (one generation lifetime).
  */
 async function handleGenerate(
   id: number,
@@ -185,115 +187,30 @@ async function handleGenerate(
   maxNewTokens: number,
 ) {
   if (!api || !model || !tokenizerLike) throw new Error("Model not loaded");
-  const a = api;
-  const m = model;
-  const tok = tokenizerLike;
-  const maxSeq = m.config.maxSeqLen;
-  const vocab = m.config.vocabSize;
-  const promptIds = tok.encode(
-    buildChatPrompt([{ role: "user", content: prompt }]),
-  );
-  if (promptIds.length + 8 >= maxSeq) throw new Error("Prompt too long");
-  const maxNew = Math.min(maxNewTokens, maxSeq - promptIds.length - 1);
-
-  const residualHook = makeResidualHook(a, steeringVec, alpha);
-  const temperature = 0.7;
-  const topK = 20;
-  const topP = 0.95;
-  const K_PREFILTER = 64;
-
-  const genIds: number[] = [];
-  let prevText = "";
-  const emit = (t: number) => {
-    genIds.push(t);
-    const text = tok.decode(genIds, { skip_special_tokens: true });
-    if (text.startsWith(prevText)) {
-      const delta = text.slice(prevText.length);
-      if (delta) post({ type: "delta", id, delta });
-    } else {
-      post({ type: "replace", id, text });
-    }
-    prevText = text;
-  };
-
-  const t0 = Date.now();
-  const staticKV = m.allocStaticKV(maxSeq);
-  const prevScope = a.setStepScopedCleanup(true);
-  try {
-    let nextTok: number;
+  const residualHook = makeResidualHook(api, steeringVec, alpha);
+  const tape0 = stReplayStats();
+  const stats = await generateChat(
+    api,
+    model,
+    tokenizerLike,
+    [{ role: "user", content: prompt }],
     {
-      const idx = a.tensorFromArray(promptIds, [1, promptIds.length]);
-      const { logits } = a.noGrad(() =>
-        m.forward(idx, { staticKV, residualHook }),
-      );
-      const top = await a.readTopK(logits, K_PREFILTER, {
-        offset: (promptIds.length - 1) * vocab,
-        length: vocab,
-      });
-      logits.dispose();
-      nextTok = sampleFromTopK(top.values, top.indices, temperature, topK, topP);
-      await a.markStep();
-    }
-    const prefillMs = Date.now() - t0;
-
-    // Per-token phase accounting: build = lazy graph construction (JS);
-    // lower = readTopK's synchronous prefix (plan build/encode/submit — this
-    // is where a NON-replayed plan rebuild shows up); fence = awaiting the GPU
-    // + the tiny top-K readback; sample = CPU sampling; step = markStep cleanup.
-    let tBuild = 0, tLower = 0, tFence = 0, tSample = 0, tStep = 0;
-    let count = 0;
-    while (count < maxNew && !QWEN3_STOP_TOKENS.has(nextTok)) {
-      emit(nextTok);
-      count++;
-      const b0 = performance.now();
-      const idx = a.tensorFromArray([nextTok], [1, 1]);
-      const { logits } = a.noGrad(() =>
-        m.forward(idx, { staticKV, residualHook }),
-      );
-      const b1 = performance.now();
-      const readP = a.readTopK(logits, K_PREFILTER, { length: vocab }); // sync prefix = plan/encode/submit
-      const b2 = performance.now();
-      const top = await readP; // await = GPU exec + readback
-      const b3 = performance.now();
-      logits.dispose();
-      nextTok = sampleFromTopK(top.values, top.indices, temperature, topK, topP);
-      const b4 = performance.now();
-      await a.markStep();
-      const b5 = performance.now();
-      tBuild += b1 - b0; tLower += b2 - b1; tFence += b3 - b2;
-      tSample += b4 - b3; tStep += b5 - b4;
-    }
-    staticKV.k.length = 0;
-    staticKV.v.length = 0;
-    await a.markStep();
-
-    const seconds = (Date.now() - t0) / 1000;
-    const per = (t: number) => Number((t / Math.max(count, 1)).toFixed(1));
-    post({
-      type: "done",
-      id,
-      stats: {
-        promptTokens: promptIds.length,
-        newTokens: count,
-        prefillMs,
-        seconds: Number(seconds.toFixed(2)),
-        tokPerSec: Number(
-          (count / Math.max(seconds - prefillMs / 1000, 0.001)).toFixed(1),
-        ),
-        alpha,
-        steered: residualHook !== undefined,
-        decodeBreakdown: {
-          buildMs: per(tBuild),
-          lowerMs: per(tLower),
-          fenceMs: per(tFence),
-          sampleMs: per(tSample),
-          stepMs: per(tStep),
-        },
-      },
-    });
-  } finally {
-    a.setStepScopedCleanup(prevScope);
-  }
+      onDelta: (delta) => post({ type: "delta", id, delta }),
+      onReplace: (text) => post({ type: "replace", id, text }),
+    },
+    { maxNewTokens, temperature: 0.7, topK: 20, topP: 0.95, residualHook },
+  );
+  const t = stReplayStats();
+  post({
+    type: "done",
+    id,
+    stats: {
+      ...stats,
+      alpha,
+      steered: residualHook !== undefined,
+      tape: { hits: t.hits - tape0.hits, replays: t.replays - tape0.replays },
+    },
+  });
 }
 
 self.onmessage = async (e: MessageEvent) => {

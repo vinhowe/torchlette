@@ -16,6 +16,8 @@ export type GenStats = {
   tokPerSec: number;
   alpha: number;
   steered: boolean;
+  /** Step-tape replay counters for this generation (§6 observability). */
+  tape?: { hits: number; replays: number };
   /** Per-token decode phase averages (ms): build=lazy graph, lower=plan/
    *  encode/submit, fence=GPU+readback, sample=CPU, step=markStep. */
   decodeBreakdown?: {

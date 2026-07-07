@@ -380,6 +380,9 @@
         <Statistic label="tokens">{run.stats.promptTokens}+{run.stats.newTokens}</Statistic>
         <Statistic label="prefill">{run.stats.prefillMs}ms</Statistic>
         <Statistic label="steered">{run.stats.steered ? "yes" : "no"}</Statistic>
+        {#if run.stats.tape}
+          <Statistic label="tape">{run.stats.tape.hits}/{run.stats.tape.replays} hits</Statistic>
+        {/if}
         {#if run.stats.decodeBreakdown}
           {@const d = run.stats.decodeBreakdown}
           <Statistic label="ms/tok build·lower·fence·sample·step"
