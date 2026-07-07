@@ -123,10 +123,16 @@ path never went away.**
    per-generation (position-as-data pattern, zero engine work); (b) engine —
    the #71 declared-dynamic-payload mechanism. NOTE: refusal-on-undeclared-
    variance is necessary but NOT sufficient (α constant across recording, user
-   moves slider later). Sufficiency comes from guard 1 (α-change rebuilds the
-   hook closure → new ops → structural miss) — covered by an explicit gate
-   (§3, G6). Belt and suspenders, because this exact class trained wrong for
-   weeks once.
+   moves slider later). **[CORRECTED BY 1a — §8.4]** The original claim that
+   guard 1 provides sufficiency (α-change → new ops → structural miss) is
+   EMPIRICALLY FALSE: α is a graph scalar ref resolved via the scalar table;
+   op sequence and fingerprint are byte-identical across an α change (w3
+   measured: same fp 0x16e9a591, node[959] scalar 3 vs −3). α safety rests
+   ENTIRELY on value-level coverage — α as a declared slot (4th DynamicSlot
+   source: `scalar`, a scalar-table slot) or α-as-tensor, plus guard-3's
+   byte-diff. Today's engine already catches the change via scalar-adapt
+   demote→re-record; the tape must inherit exactly that path. G3 is
+   specified against value-level coverage, not structural detection.
 4. **Plan validity.** Tapes hold no validity of their own: each referenced
    plan's existing staleness/eviction machinery stands; any invalidation
    cascades to the tape.
@@ -275,3 +281,167 @@ Sharpening §6 after discussion. Decompose "the floor":
   subgraph-level fingerprint/reuse instead of whole-template all-or-nothing,
   so a 95%-unchanged program reuses 95% of its plans. Incremental-compilation
   territory; the Menagerie-shaped optimization if that thesis leads.
+
+## 8. 1a findings (G0 measurement + empirical slot model, 2026-07-07)
+
+Measured on the V100 box (sivri, Node/Dawn), Qwen3-1.7B f32, static KV,
+maxSeqLen 512, GPU solo. Instrumentation: `src/core/tape-profile.ts`
+(`TORCHLETTE_TAPE_PROFILE=1` seam timers, `TORCHLETTE_TAPE_SLOTDIFF=1`
+per-plan payload/scalar images) + `examples/qwen3/timeline-decode.ts` G0 mode
++ `examples/qwen3-steering/tape-slot-diff.ts` (w1/w2/w3 drivers). Both flags
+and every guarded seam SUNSET when 1c lands.
+
+### 8.1 G0 table — per-token seam attribution
+
+`TORCHLETTE_TAPE_PROFILE=1 npx tsx examples/qwen3/timeline-decode.ts 18 f32`,
+12 post-warmup tokens (steps 6–17; warmup 6 because pool/arena reuse settles
+after plan cutover). The decode step is ONE 1,611-node plan (fp 0x2e67bb41;
+1,613 steered — the §0 "~1,600 nodes" claim verified) + backend-direct
+readTopK + markStep.
+
+| seam | mean ms | p50 ms |
+|---|---|---|
+| wall (ms/token) | 47.78 | 45.04 |
+| (a) lazy graph build (frontend → lazy IR) | 5.55 | 5.52 |
+| — plan-collect (buildMergedPlan topo) | 1.86 | 1.55 |
+| (b) template fingerprint | 2.12 | 2.03 |
+| (c) CSE (pass:cse) | 1.63 | 1.55 |
+| (d) rewrites (DSL rules + other passes + consumer maps) | 3.35 | 2.37 |
+| (e) plan lookup / cache-hit perm | 0.03 | 0.03 |
+| — scalar-table refresh | 0.20 | 0.20 |
+| (f) replay-loop JS (excl. Dawn, slots, harvest) | 3.11 | 2.64 |
+| — replay: slot population | 0.20 | 0.12 |
+| — replay: result harvest | 6.15 | 5.96 |
+| (g) Dawn encode+flush+submit inside replay | 9.41 | 7.93 |
+| (h) markStep sweeps (+snapshot +runtime.markStep) | 7.80 | 7.49 |
+| (i) readback (mapAsync waits) | 0.05 | 0.05 |
+| — fence waits (markStep) | 0.13 | 0.11 |
+
+(9 submits/token; createBindGroup and createBuffer are 0/token at steady
+state. `replay-total` = 18.9 = (f) 3.11 + dawn 4.63 + barrier/flush 4.78 +
+slots 0.20 + harvest 6.15. ~5 ms of `force` wall is unattributed glue:
+tagPlanOutputs/audit/retain, getInputStorage resolution, materialize loop.)
+
+Reconciliation vs the task-#60 coarse numbers: rebuild 5.5 → (a) 5.5 ✓;
+fingerprint/CSE/rewrite 5–6 → (b)+(c)+(d)+(e) = 7.1 (slightly higher; the
+coarse number didn't count the cache-hit consumer-map rebuild or plan-collect
+at all); replay-JS ~5 → 3.1 loop JS **but the harvest (6.2 ms) was invisible
+in the coarse accounting** — total non-Dawn replay JS is ~9.5; encode ~4 →
+Dawn-in-loop 4.6 ✓; sweeps ~4.5 → **7.8 measured** (the earlier number
+under-counted: it excluded the end-snapshot and runtime.markStep, and sweep
+cost scales with the ~1,560 step-scoped storages/token the harvest creates —
+see [sweep] destroy1=428 + release=1554 + destroy2=1131).
+
+### 8.2 Tape-skippable subtotal → the G7 band
+
+SKIPPABLE = (a) + plan-collect + (b) + (c) + (d) + (e)
+= **14.55 ms mean / 14.26 ms p50** of a 47.8/45.0 ms token.
+
+**f-partial = 0 in the subtotal**, and this is a spec correction to §2.3:
+"No lazy nodes" is NOT achievable while the tape calls the EXISTING
+`executeCompiledPlan` entry point — that function requires `planNodes` for
+(i) external-slot resolution (`src.kind==="external"` reads
+`planNodes[i].inputs`), (ii) TAG_WRITE payload extraction, (iii) TAG_UNIFORM
+`pack(node)`, and (iv) the result harvest (6.15 ms/token) that hangs
+StorageHandles on nodes for downstream consumers. 1b/1c must either keep a
+per-tape skeleton graph (record the planNodes array once and re-dress its
+per-step values — cheapest, keeps replay untouched) or add a slot-direct
+replay variant. Until harvest is bypassed, (h) will NOT collapse either: the
+step-scoped storages being swept ARE the harvest's handles + views. §0's
+"sweeps ~4.5" win and §2.3's "sweep cost collapses too" are therefore
+optimistic — count them as phase-1c stretch, not the G7 band.
+
+**G7 acceptance band (Node, this box, 1.7B f32 static):** taped steady-state
+decode must come in at **untaped − 11 to − 16 ms/token** (i.e. ~30–36 ms/token
+against today's ~45–48), with steady-state guard misses = 0. The band's floor
+(11 ms) allows ~3 ms of tape-side overhead + variance; anything under
+−11 ms/token means the tape is not skipping what 1a measured and the campaign
+re-evaluates per §4 (still comfortably above the §4 hard stop of 5 ms).
+Observer effect of the instrumentation itself: ≈ +0.3 ms/token, within noise
+(flag-ON G0 run mean 47.78 ms over 12 post-warmup tokens vs flag-OFF
+profile-decode 47.5 ms avg over 8 post-warmup tokens, same box, same session).
+
+### 8.3 Empirical slot model (Deliverable 2)
+
+`TORCHLETTE_TAPE_SLOTDIFF=1 npx tsx examples/qwen3-steering/tape-slot-diff.ts
+w1|w2|w3` — byte-diff of consecutive steady-state decode steps (writeBuffer
+trace + per-plan-position payload/scalar images).
+
+**Complete steady-state write set, per token (w1 stock; w2 steered is
+byte-for-byte the same shape):** 33 writeBuffer calls —
+
+| # | source | size | varies step→step? | §2.1 category | carried by TAG_WRITE stable path? |
+|---|---|---|---|---|---|
+| 0–27 | scalar-table refresh (28 slots, all = 1/√128 attn scale) | 4 B | **no** (bytes identical; see artifact below) | scalar (see 8.4) | n/a (scalar-table buffers) |
+| 28 | token id `tensorFromArray [1,1]` | 4 B | yes (when token differs) | tokenId | **yes** |
+| 29 | ropeIdx `[1,64]` (position rows) | 256 B | yes | upload | **yes** |
+| 30 | scatterIdx `[1,8,1,128]` (KV write position) | 4 KB | yes | upload | **yes** |
+| 31 | decode mask `[1,1,1,bucketLen=128]` | 512 B | yes (−1e9 boundary moves) | upload | **yes** |
+| 32 | readTopK params (topk-kernel) | 8 B | no (k, vocab fixed) | readback config | no (backend-direct dispatch, outside plan replay) |
+
+Plan-position payload diff agrees exactly: the ONLY per-step-varying payloads
+are plan nodes 0–3, all `tensorFromArray` (token id, ropeIdx, scatterIdx,
+mask). **No TAG_UNIFORM volatile configs exist in the decode plan** (those are
+optimizer-era constructs), and nothing varies that fits no category → the §4
+"undeclared variance" stop condition is NOT triggered for the stock loop.
+DynamicSlot count for w1/w2: 4 slots (1 tokenId + 3 uploads), all already
+carried by the TAG_WRITE stable-buffer path.
+
+**w2 (steered, α fixed):** identical slot set. α appears ONLY as a scalar
+value on plan node[959] (`mul`), constant within the generation — zero
+per-step writes for it. The steered plan is the same template ± 2 nodes
+(1,613 vs 1,611) under a different fingerprint than stock (hook present =
+structure), exactly as guard 2 expects.
+
+**w3 (α +3 → −3 across generations):**
+- Steady-state A.step8 vs B.step8: same fingerprint (0x16e9a591 — scalar
+  values are excluded from it), byte-diff shows `plan[0] node[959] op=mul
+  SCALAR-DIFF [3] vs [-3]` → **hazard #1 empirically confirmed: guard-3-style
+  byte/value diffing catches the α change across recordings.**
+- What the engine does TODAY: the change trips the inlined-fusion-scalar
+  staleness check → `[scalar-adapt] input 1: baked=3 current=-3` →
+  `demoting 1 inlined scalar(s) on a 2-node group` → compiled plan dropped,
+  2 lowered steps (796/795 writeBuffers — per-dispatch uniforms), re-record,
+  back to 33-write replays by step 2, with α=-3 landing in a scalar-table
+  buffer at B.step0 write[0]. Within one generation α is FIXED (w2/w3
+  B.step8 vs B.step9: no α write, no scalar diff); across generations it is
+  the one value-level variance.
+
+### 8.4 Spec corrections 1b/1c MUST inherit
+
+1. **α is a graph SCALAR REF, not an op payload** (§2.4 guard-3 text says
+   "bakes α as a payload scalar"). `api.mul(dir3d, alpha)` produces an input
+   of kind `scalar`; payload-hashing never sees it, the fingerprint excludes
+   it, and the existing machinery (inline-then-demote + scalar table) already
+   carries it as data after one adaptation. Consequence for §2.1: DynamicSlot
+   needs a 4th source category — `scalar` (a scalar-table slot) — or the tape
+   records scalar-table writes as slot writes. The mitigation ladder in §2.4
+   stands, but option (b) is closer to shipped than the spec assumed.
+2. **Guard-1 does NOT cover an α change — the sufficiency claim is false.**
+   §2.4 asserts "α-change rebuilds the hook closure → new ops → structural
+   miss." Measured: the op sequence, node count, and template fingerprint are
+   IDENTICAL for α=+3 and α=−3 (0x16e9a591 both). A new closure produces the
+   same two ops. α safety therefore rests ENTIRELY on value-level coverage
+   (declared scalar slot / α-as-tensor / guard-3 byte-diff refusal) — G3/G6
+   must be specified against that mechanism, not the structural counter.
+3. **§2.3 "No lazy nodes" / "sweep cost collapses" are overstated** — see
+   §8.2: the replay entry point consumes planNodes and its harvest generates
+   the very step-scoped storages the sweep pays for. 1c needs the skeleton-
+   graph (or slot-direct harvest) design decision made explicitly.
+4. **Scalar-table change-detection artifact (fix in 1b, one line):** the CPU
+   mirror is a `Float32Array` but the comparison is `Object.is(f32mirror, f64
+   value)` — any scalar not exactly representable in f32 (e.g. 1/√128) fails
+   the compare EVERY step → 28 redundant 4-byte writeBuffers/token, bytes
+   identical. Harmless but noisy: a tape recorder diffing writes must treat
+   byte-identical rewrites as non-slots (or fix the compare to
+   `Object.is(mirror[i], Math.fround(v))` first).
+5. **The readTopK dispatch lives OUTSIDE plan replay** (backend-direct, own
+   params write + own submit). The tape's `readback` entry must record it as
+   its own step (params buffer is constant per bucket/k), not assume every
+   GPU command is inside a compiled plan.
+
+Gates run for 1a (measurement-only): kv-differential PASS (all arms
+bit-identical); full `npm run test` green with the seams in src/ (flags off);
+decode perf unchanged with instrumentation off (profile-decode 12 f32 static
+within the 47–57 ms/token band before and after); instrumentation-on observer
+effect ≤ ~1 ms/token (reported above).

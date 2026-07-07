@@ -129,6 +129,12 @@ import {
 } from "./op-dispatch";
 import { pretunePlanMatmuls } from "./plan-builder";
 import {
+  TAPE_PROFILE,
+  TAPE_SLOTDIFF,
+  tpAdd,
+  tpRecordPlan,
+} from "../core/tape-profile";
+import {
   clearActiveScalarTable,
   destroyScalarTable,
   refreshScalarTable,
@@ -1450,7 +1456,9 @@ export async function executeLoweredPlan(
   // table buffers (getInputStorage / recorded dispatch bindings), so this
   // single refresh keeps every value-independent cache honest. See
   // scalar-table.ts.
+  const tpS0 = TAPE_PROFILE ? performance.now() : 0;
   refreshScalarTable(loweredPlan, planNodes, backend);
+  if (TAPE_PROFILE) tpAdd("scalar-refresh", performance.now() - tpS0);
 
   // Late-varying inlined scalars: a scalar whose value was constant through
   // the recording executions is INLINED in fused-recipe WGSL (and thus in the
@@ -1509,6 +1517,7 @@ export async function executeLoweredPlan(
     ) {
       destroyArena(options.bufferArena);
     }
+    const tpR0 = TAPE_PROFILE ? performance.now() : 0;
     const externalInputBuffers = collectExternalInputBuffers(planNodes);
     try {
       await executeCompiledPlan(
@@ -1521,6 +1530,7 @@ export async function executeLoweredPlan(
     } finally {
       clearActiveScalarTable();
     }
+    if (TAPE_PROFILE) tpAdd("replay-total", performance.now() - tpR0);
     return {
       result: planNodes[planNodes.length - 1].result!,
       stats: loweredPlan.cachedStats ?? stats,
@@ -1698,6 +1708,10 @@ export async function executeLoweredPlan(
   // Pre-resolve dynamic imports before the action loop so subsequent calls
   // to executeFusedSegment avoid per-call async import overhead.
   await ensureFusionImports();
+
+  // [tape-1a] time the whole lowered (non-replay) execution so any step that
+  // falls off the compiled fast path is visible in the G0 table.
+  const tpL0 = TAPE_PROFILE ? performance.now() : 0;
 
   // =========================================================================
   // Liveness analysis: free intermediate buffers as soon as their last
@@ -2661,6 +2675,7 @@ export async function executeLoweredPlan(
   // Cache stats on the lowered plan so the compiled path can return them
   loweredPlan.cachedStats = stats;
 
+  if (TAPE_PROFILE) tpAdd("lowered-exec", performance.now() - tpL0);
   return { result: lastNode.result, stats };
 }
 
@@ -2738,7 +2753,11 @@ export async function executePlanOptimized(
   // Compute 64-bit structural fingerprint (two parallel FNV-1a hashes).
   // Primary is the cache key for O(1) lookup; secondary is checked on hit
   // to detect collisions (effective collision probability: 2^-64).
+  // [tape-1a] G0 measurement seams (src/core/tape-profile.ts; sunset: 1c).
+  const tpF0 = TAPE_PROFILE ? performance.now() : 0;
   const fingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
+  if (TAPE_PROFILE) tpAdd("fingerprint", performance.now() - tpF0);
+  if (TAPE_SLOTDIFF) tpRecordPlan(fingerprint.primary, plan.nodes);
   const cachedTemplate = fusionAnalysisCache.get(fingerprint.primary);
 
   let planNodes: LazyIRNode[];
@@ -2779,13 +2798,16 @@ export async function executePlanOptimized(
     if (backend.name === "webgpu" && !validatedTemplate.bufferArena) {
       validatedTemplate.bufferArena = { resolve: [], alloc: [] };
     }
+    const tpH0 = TAPE_PROFILE ? performance.now() : 0;
     planNodes = validatedTemplate.finalPerm.map((i) => plan.nodes[i]);
+    if (TAPE_PROFILE) tpAdd("template-hit-perm", performance.now() - tpH0);
 
     // Re-apply graph rewrites to fresh nodes. The lowered plan was built from
     // rewritten refs (identity-cast bypass, sum-reshape fusion, CSE, etc.).
     // Fresh nodes from deserialization or new steps have original refs. Re-running
     // the cheap O(n) passes ensures input refs match the lowered plan's assumptions.
     {
+      const tpM0 = TAPE_PROFILE ? performance.now() : 0;
       const consumers = new Map<number, LazyIRNode[]>();
       const consumerCount = new Map<number, number>();
       for (const node of planNodes) {
@@ -2800,6 +2822,7 @@ export async function executePlanOptimized(
           }
         }
       }
+      if (TAPE_PROFILE) tpAdd("consumer-maps", performance.now() - tpM0);
       runPasses(
         { planNodes, consumers, consumerCount },
         new Set(),

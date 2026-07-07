@@ -231,6 +231,28 @@ function diffWrites(a: WriteRec[], b: WriteRec[], labelA: string, labelB: string
   console.log(`  (${same}/${n} writes byte-identical, stable buffers)`);
 }
 
+/** Print the COMPLETE write trace of one step (the §2.1 "every upload +
+ *  every config buffer" enumeration), condensed: consecutive writes with the
+ *  same src+size collapse into one line with a count. */
+function printTrace(t: WriteRec[], label: string) {
+  console.log(`\n--- full writeBuffer trace: ${label} (${t.length} writes) ---`);
+  let i = 0;
+  while (i < t.length) {
+    let j = i;
+    while (
+      j + 1 < t.length &&
+      t[j + 1].src === t[i].src &&
+      t[j + 1].bytes === t[i].bytes
+    )
+      j++;
+    const w = t[i];
+    console.log(
+      `  [${i}${j > i ? `..${j}` : ""}] ${j - i + 1}x bytes=${w.bytes} src=${w.src} head=[${w.head}]`,
+    );
+    i = j + 1;
+  }
+}
+
 function diffPlans(a: TpPlanRecord[], b: TpPlanRecord[], labelA: string, labelB: string) {
   console.log(
     `\n--- plan payload/scalar diff: ${labelA} (${a.length} plans) vs ${labelB} (${b.length} plans) ---`,
@@ -242,6 +264,9 @@ function diffPlans(a: TpPlanRecord[], b: TpPlanRecord[], labelA: string, labelB:
   for (let p = 0; p < n; p++) {
     const pa = a[p];
     const pb = b[p];
+    console.log(
+      `  plan[${p}] fp=0x${pa.fpPrimary.toString(16)} nodes=${pa.nodeCount}${pb.nodeCount !== pa.nodeCount ? `→${pb.nodeCount}` : ""}`,
+    );
     if (pa.fpPrimary !== pb.fpPrimary) {
       console.log(
         `  plan[${p}] TEMPLATE FINGERPRINT DIFFERS: 0x${pa.fpPrimary.toString(16)} (${pa.nodeCount} nodes) vs 0x${pb.fpPrimary.toString(16)} (${pb.nodeCount} nodes)`,
@@ -321,6 +346,7 @@ async function main() {
       numSteps: 11,
       captureSteps: new Set([8, 9]),
     });
+    printTrace(caps.get(8)!.writes, "w1 step8 (steady state)");
     diffWrites(caps.get(8)!.writes, caps.get(9)!.writes, "step8", "step9");
     diffPlans(caps.get(8)!.plans, caps.get(9)!.plans, "step8", "step9");
   } else if (workload === "w2") {
@@ -333,6 +359,7 @@ async function main() {
       numSteps: 11,
       captureSteps: new Set([8, 9]),
     });
+    printTrace(caps.get(8)!.writes, "w2 step8 (steady state, steered)");
     diffWrites(caps.get(8)!.writes, caps.get(9)!.writes, "step8", "step9");
     diffPlans(caps.get(8)!.plans, caps.get(9)!.plans, "step8", "step9");
   } else if (workload === "w3") {

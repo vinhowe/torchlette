@@ -36,6 +36,7 @@ import {
 } from "../executor/executor";
 import { isDataSourceOp } from "../executor/lowered-plan";
 import { buildMergedPlan, tagPlanOutputs } from "../executor/plan-builder";
+import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
 import { rewritePlan } from "../compiler/rewriter/plan-rewrite";
 import { doubleTransposeRule } from "../compiler/rewriter/rules/double-transpose";
 import { fuseMatmulSumRule } from "../compiler/rewriter/rules/fuse-matmul-sum";
@@ -720,16 +721,21 @@ export class RuntimeEngine {
    * memory savings.
    */
   async forceAllMerged(...tensors: Tensor[]): Promise<void> {
+    // [tape-1a] G0 measurement seams (src/core/tape-profile.ts; sunset: 1c).
+    const tpC0 = TAPE_PROFILE ? performance.now() : 0;
     const pendingRoots = collectPendingRoots(tensors);
     if (pendingRoots.length === 0) return;
 
     const plan = buildMergedPlan(pendingRoots);
     if (plan.nodes.length === 0) return;
+    if (TAPE_PROFILE) tpAdd("plan-collect", performance.now() - tpC0);
 
     // Apply DSL rewrites (node-insertion rules) before the template cache
     // sees the plan. Runs every step but is cheap (few patterns, <1ms).
     const pendingIds = getPendingNodeIds();
+    const tpR0 = TAPE_PROFILE ? performance.now() : 0;
     rewritePlan(plan, DSL_RULES, pendingIds);
+    if (TAPE_PROFILE) tpAdd("dsl-rewrite", performance.now() - tpR0);
 
     // Tag plan outputs: nodes with LIVE pending RuntimeTensors only.
     // The disposed pending IDs (kept for fusion analysis) must NOT be
@@ -840,15 +846,20 @@ export class RuntimeEngine {
       return;
     }
 
+    // [tape-1a] G0 measurement seams (src/core/tape-profile.ts; sunset: 1c).
+    const tpC0 = TAPE_PROFILE ? performance.now() : 0;
     const pendingRoots = collectPendingRoots(pendingTensors);
     if (pendingRoots.length === 0) return;
 
     const plan = buildMergedPlan(pendingRoots, /* skipExecuted */ true);
     if (plan.nodes.length === 0) return;
+    if (TAPE_PROFILE) tpAdd("plan-collect", performance.now() - tpC0);
 
     // Apply DSL rewrites before template cache
     const pendingIds = getPendingNodeIds();
+    const tpR0 = TAPE_PROFILE ? performance.now() : 0;
     rewritePlan(plan, DSL_RULES, pendingIds);
+    if (TAPE_PROFILE) tpAdd("dsl-rewrite", performance.now() - tpR0);
 
     // Tag plan outputs: live pending only (see forceAllMerged comment).
     tagPlanOutputs(plan, getLivePendingNodeIds());

@@ -12,6 +12,7 @@
  */
 
 import { ENV } from "../core/env";
+import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
 import type { DType } from "../backend/types";
 import type {
   GPUBindGroup,
@@ -1097,7 +1098,13 @@ export async function executeCompiledPlan(
     }
   };
 
+  // [tape-1a] G0 replay-loop attribution (src/core/tape-profile.ts; sunset:
+  // 1c): Dawn API time inside the loop accumulates into "replay-dawn" /
+  // "replay-bindgroup" / "replay-barrier"; slot population and result harvest
+  // get their own keys so the pure JS iteration cost is derivable as
+  // replay-total minus these.
   try {
+    const tpP0 = TAPE_PROFILE ? performance.now() : 0;
     // Phase 1: Pre-populate external + persistent slots
     const dbgSlots = ENV.TORCHLETTE_DEBUG_SLOTS
       ? ENV.TORCHLETTE_DEBUG_SLOTS.split(",").map(Number)
@@ -1152,6 +1159,8 @@ export async function executeCompiledPlan(
         }
       }
     }
+
+    if (TAPE_PROFILE) tpAdd("replay-slots", performance.now() - tpP0);
 
     // Phase 2: Execute GPU commands
     const cmds = compiled.commands;
@@ -1298,6 +1307,7 @@ export async function executeCompiledPlan(
             if (!match) bg = undefined;
           }
           if (!bg) {
+            const tpB0 = TAPE_PROFILE ? performance.now() : 0;
             const entries: Array<{
               binding: number;
               resource: { buffer: GPUBuffer; offset?: number; size?: number };
@@ -1317,9 +1327,11 @@ export async function executeCompiledPlan(
             });
             cmd.cachedBindGroup = bg;
             cmd.cachedBuffers = bufs.slice();
+            if (TAPE_PROFILE) tpAdd("replay-bindgroup", performance.now() - tpB0);
           }
           if (cmd.module !== undefined) setProfileModule(cmd.module);
           const enc = getSharedEncoderInstance();
+          const tpD0 = TAPE_PROFILE ? performance.now() : 0;
           if (!enc || gpuTimestampsActive()) {
             // Timestamp collection needs per-pass timestampWrites; no shared
             // encoder means dispatchComputePass manages its own encoder.
@@ -1343,6 +1355,7 @@ export async function executeCompiledPlan(
             openPass.dispatchWorkgroups(cmd.gx, cmd.gy, cmd.gz);
             incrementSharedEncoderPassCount();
           }
+          if (TAPE_PROFILE) tpAdd("replay-dawn", performance.now() - tpD0);
           break;
         }
         case TAG_COPY: {
@@ -1354,6 +1367,7 @@ export async function executeCompiledPlan(
             );
           }
           if (encoder) {
+            const tpD0 = TAPE_PROFILE ? performance.now() : 0;
             encoder.copyBufferToBuffer(
               slots[cmd.src],
               cmd.srcOffset,
@@ -1361,6 +1375,7 @@ export async function executeCompiledPlan(
               cmd.dstOffset,
               cmd.bytes,
             );
+            if (TAPE_PROFILE) tpAdd("replay-dawn", performance.now() - tpD0);
           }
           break;
         }
@@ -1436,7 +1451,9 @@ export async function executeCompiledPlan(
                   };
                 }
               }
+              const tpD0 = TAPE_PROFILE ? performance.now() : 0;
               device.queue.writeBuffer(sbuf, 0, f32);
+              if (TAPE_PROFILE) tpAdd("replay-dawn", performance.now() - tpD0);
               writeNode.result = createStorageHandle(
                 writeNode.device,
                 createTensor(
@@ -1450,6 +1467,7 @@ export async function executeCompiledPlan(
               );
             } else {
               // Legacy path may encode its own passes / flush (chunked ops).
+              const tpW0 = TAPE_PROFILE ? performance.now() : 0;
               closeOpenPass();
               const inputs = writeNode.inputs.map((ref) =>
                 getInputStorage(ref, backend),
@@ -1465,6 +1483,8 @@ export async function executeCompiledPlan(
                   ? await resultOrPromise
                   : resultOrPromise;
               writeNode.result = createStorageHandle(writeNode.device, result);
+              if (TAPE_PROFILE)
+                tpAdd("replay-write-legacy", performance.now() - tpW0);
             }
           }
           slots[cmd.slot] = gpuBuffer(writeNode.result!.backendTensor);
@@ -1479,7 +1499,9 @@ export async function executeCompiledPlan(
           closeOpenPass(); // clearBuffer is an encoder-level command
           const encoder = getSharedEncoderInstance();
           if (encoder) {
+            const tpD0 = TAPE_PROFILE ? performance.now() : 0;
             encoder.clearBuffer(slots[cmd.slot], 0, cmd.bytes);
+            if (TAPE_PROFILE) tpAdd("replay-dawn", performance.now() - tpD0);
           }
           break;
         }
@@ -1495,13 +1517,18 @@ export async function executeCompiledPlan(
               `[compiled] TAG_UNIFORM nodeIndex ${cmd.nodeIndex} out of range (plan has ${planNodes.length} nodes)`,
             );
           }
-          device.queue.writeBuffer(slots[cmd.slot], 0, cmd.pack(node));
+          const packed = cmd.pack(node);
+          const tpD0 = TAPE_PROFILE ? performance.now() : 0;
+          device.queue.writeBuffer(slots[cmd.slot], 0, packed);
+          if (TAPE_PROFILE) tpAdd("replay-dawn", performance.now() - tpD0);
           break;
         }
         case TAG_BARRIER: {
           closeOpenPass(); // encoder.finish() requires no open pass
+          const tpD0 = TAPE_PROFILE ? performance.now() : 0;
           flushSharedEncoder();
           flushBufferPool();
+          if (TAPE_PROFILE) tpAdd("replay-barrier", performance.now() - tpD0);
           break;
         }
       }
@@ -1533,6 +1560,7 @@ export async function executeCompiledPlan(
     //    the plan's teardown disposes it.
     //  - Otherwise (default-arena buffers, dynamic fallback allocs): owning,
     //    as before (arena buffers are shielded by arenaBufferSet anyway).
+    const tpH0 = TAPE_PROFILE ? performance.now() : 0;
     let dbgHarvestSkipped = 0;
     // Release the PRIOR replay's view-base retains before creating this
     // replay's (see the rationale where they're pushed below). First replay:
@@ -1646,6 +1674,7 @@ export async function executeCompiledPlan(
     // harvest start. Storage ids are monotonic (never reused), so releasing a
     // since-freed base id next replay is a safe no-op (rcRelease returns -1).
     compiled._viewBaseRetains = viewBaseRetains;
+    if (TAPE_PROFILE) tpAdd("replay-harvest", performance.now() - tpH0);
     if (ENV.TORCHLETTE_DEBUG_HARVEST && dbgHarvestSkipped > 0) {
       console.log(
         `[harvest-skip] ${dbgHarvestSkipped}/${compiled.results.length} results NOT assigned (node.result already set); planNodes[0].id=${planNodes[0]?.id} planNodes[last].id=${planNodes[planNodes.length - 1]?.id}`,

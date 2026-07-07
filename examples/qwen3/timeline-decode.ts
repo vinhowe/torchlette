@@ -11,6 +11,14 @@
  *
  * Run (repo root, GPU otherwise quiet):
  *   npx tsx examples/qwen3/timeline-decode.ts [numSteps=12] [dtype=f32]
+ *
+ * G0 mode (step-tape phase 1a, docs/staged-execution-phase1.md §3):
+ *   TORCHLETTE_TAPE_PROFILE=1 npx tsx examples/qwen3/timeline-decode.ts 16 f32
+ * Attributes every post-warmup token (steps 4..N-1) at the engine seams
+ * (src/core/tape-profile.ts) and prints a mean+p50 table over those tokens:
+ * lazy build / fingerprint / CSE / rewrites / plan lookup / replay JS vs Dawn
+ * / sweeps / readback — plus the tape-skippable subtotal. The seams (and this
+ * mode) SUNSET when step-tape phase 1c lands.
  */
 
 import * as path from "node:path";
@@ -24,6 +32,7 @@ import {
   awaitDeferredFence,
   issueDeferredFence,
 } from "../../src/backend/webgpu/buffer-pool";
+import { TAPE_PROFILE, tpGet, tpReset } from "../../src/core/tape-profile";
 import { Torchlette } from "../../src/frontend/torchlette";
 import { storageTracker } from "../../src/graph/storage-tracker";
 import { loadPretrainedQwen3 } from "./loader";
@@ -48,11 +57,13 @@ type SubmitRec = {
 
 let stepT0 = 0;
 let recording = false;
+let detailed = false; // full per-submit timeline print (subset of recording)
 let submits: SubmitRec[] = [];
 let bindGroupCount = 0;
 let bindGroupMs = 0;
 let bufferCount = 0;
 let bufferMs = 0;
+let readbackMs = 0; // mapAsync wait accumulated this step
 let pendingDone: Promise<void>[] = [];
 
 function now(): number {
@@ -128,12 +139,13 @@ function installHooks() {
   };
   const origCB = device.createBuffer.bind(device);
   device.createBuffer = (d: unknown) => {
-    if (!recording) return origCB(d);
     const t0 = now();
     // biome-ignore lint/suspicious/noExplicitAny: harness
     const r = origCB(d) as any;
-    bufferMs += now() - t0;
-    bufferCount++;
+    if (recording) {
+      bufferMs += now() - t0;
+      bufferCount++;
+    }
     // Wrap mapAsync to time readback waits
     if (typeof r?.mapAsync === "function") {
       const origMap = r.mapAsync.bind(r);
@@ -141,9 +153,11 @@ function installHooks() {
         const m0 = now();
         const p = origMap(mode);
         p.then(() => {
-          if (recording)
+          const wait = now() - m0;
+          if (recording) readbackMs += wait;
+          if (detailed)
             console.log(
-              `  [mapAsync] size=${r.size} wait=${(now() - m0).toFixed(2)}ms @${(m0 - stepT0).toFixed(2)}ms`,
+              `  [mapAsync] size=${r.size} wait=${wait.toFixed(2)}ms @${(m0 - stepT0).toFixed(2)}ms`,
             );
         });
         return p;
@@ -164,7 +178,7 @@ function installHooks() {
       const isHarness = fromHarness;
       const d0 = now();
       const p = origDone();
-      if (recording && !isHarness) {
+      if (detailed && !isHarness) {
         p.then(() => {
           console.log(
             `  [workDone] wait=${(now() - d0).toFixed(2)}ms @${(d0 - stepT0).toFixed(2)}ms`,
@@ -219,8 +233,13 @@ async function main() {
   api.setStepScopedCleanup(true);
 
   const MEASURE = new Set([numSteps - 3, numSteps - 2]); // two steady-state steps
+  // G0 mode: measure EVERY post-warmup step and aggregate (mean+p50).
+  // Warmup 6: plan cutover happens on exec 2-3, but pool/arena reuse keeps
+  // settling through ~step 5 (step 4 measured 2x steady wall).
+  const WARMUP = 6;
+  const g0Rows: Record<string, number>[] = [];
   for (let i = 0; i < numSteps; i++) {
-    const measured = MEASURE.has(i);
+    const measured = TAPE_PROFILE ? i >= WARMUP : MEASURE.has(i);
     const marks: [string, number][] = [];
     const mark = (name: string) => marks.push([name, now() - stepT0]);
 
@@ -231,7 +250,10 @@ async function main() {
     bindGroupMs = 0;
     bufferCount = 0;
     bufferMs = 0;
+    readbackMs = 0;
     recording = measured;
+    detailed = MEASURE.has(i);
+    tpReset();
 
     const last = tokens[tokens.length - 1];
     const idx = api.tensorFromArray([last], [1, 1]);
@@ -273,7 +295,7 @@ async function main() {
     const d2 = storageTracker.destroyUnreachable();
     const sw3 = now();
     mark("markStep: storage sweeps");
-    if (measured) {
+    if (detailed) {
       console.log(
         `  [sweep] storages=${swStats.totalStorages} (reach=${swStats.reachableStorages}) destroy1=${d1} (${(sw1 - sw0).toFixed(2)}ms) release=${rel} (${(sw2 - sw1).toFixed(2)}ms) destroy2=${d2} (${(sw3 - sw2).toFixed(2)}ms)`,
       );
@@ -291,7 +313,27 @@ async function main() {
     const wall = now() - stepT0;
     console.log(`decode step ${i}: ${wall.toFixed(1)}ms`);
 
-    if (measured) {
+    if (measured && TAPE_PROFILE) {
+      // Collect one G0 row: harness phase durations + engine seam accumulators.
+      const row: Record<string, number> = { wall };
+      let prev = 0;
+      for (const [name, t] of marks) {
+        row[`ph:${name}`] = t - prev;
+        prev = t;
+      }
+      const tp = tpGet();
+      for (const [k, v] of Object.entries(tp.ms)) row[`tp:${k}`] = v;
+      row.readbackMs = readbackMs;
+      row.submitCpu = submits.reduce((s, r) => s + r.cpuMs, 0);
+      row.submitCount = submits.length;
+      row.bindGroupMs = bindGroupMs;
+      row.bindGroupCount = bindGroupCount;
+      row.bufferMs = bufferMs;
+      row.bufferCount = bufferCount;
+      g0Rows.push(row);
+    }
+
+    if (detailed) {
       await Promise.all(pendingDone);
       console.log(
         `\n===== TIMELINE step ${i} (wall ${wall.toFixed(2)}ms) =====`,
@@ -316,8 +358,103 @@ async function main() {
       console.log("");
     }
   }
+  if (TAPE_PROFILE && g0Rows.length > 0) printG0Table(g0Rows);
   console.log(`tokens: ${tokens.join(",")}`);
   process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// G0 aggregate table (step-tape phase 1a)
+// ---------------------------------------------------------------------------
+
+function printG0Table(rows: Record<string, number>[]): void {
+  const get = (row: Record<string, number>, k: string) => row[k] ?? 0;
+  const derive = (row: Record<string, number>) => {
+    const passOther = Object.keys(row)
+      .filter((k) => k.startsWith("tp:pass:") && k !== "tp:pass:cse")
+      .reduce((s, k) => s + row[k], 0);
+    const replayNonJs =
+      get(row, "tp:replay-dawn") +
+      get(row, "tp:replay-bindgroup") +
+      get(row, "tp:replay-barrier") +
+      get(row, "tp:replay-slots") +
+      get(row, "tp:replay-harvest") +
+      get(row, "tp:replay-write-legacy");
+    const d: Record<string, number> = {
+      "wall (ms/token)": row.wall,
+      "(a) lazy graph build": get(row, "ph:tensorFromArray(idx)") + get(row, "ph:forward graph build"),
+      "    plan-collect (buildMergedPlan)": get(row, "tp:plan-collect"),
+      "(b) fingerprint": get(row, "tp:fingerprint"),
+      "(c) CSE (pass:cse)": get(row, "tp:pass:cse"),
+      "(d) rewrites (dsl+passes+maps)":
+        get(row, "tp:dsl-rewrite") + get(row, "tp:consumer-maps") + passOther,
+      "(e) plan lookup/hit (perm)": get(row, "tp:template-hit-perm"),
+      "    scalar-table refresh": get(row, "tp:scalar-refresh"),
+      "(f) replay-loop JS (excl Dawn)":
+        get(row, "tp:replay-total") - replayNonJs,
+      "    replay: slot population": get(row, "tp:replay-slots"),
+      "    replay: result harvest": get(row, "tp:replay-harvest"),
+      "(g) Dawn encode+submit (in replay)":
+        get(row, "tp:replay-dawn") +
+        get(row, "tp:replay-bindgroup") +
+        get(row, "tp:replay-barrier"),
+      "    submit CPU (all, harness)": get(row, "submitCpu"),
+      "    lowered-exec (fallback path)": get(row, "tp:lowered-exec"),
+      "(h) markStep sweeps (+snapshot)":
+        get(row, "ph:markStep: storage sweeps") +
+        get(row, "ph:markStep: end snapshot") +
+        get(row, "ph:markStep: runtime.markStep"),
+      "(i) readback (mapAsync waits)": get(row, "readbackMs"),
+      "    fence waits (markStep)":
+        get(row, "ph:markStep: await prior fence") + get(row, "ph:markStep: fence"),
+      "    force wall (whole)": get(row, "ph:force (replay+encode+submit)"),
+      "    readTopK wall (whole)":
+        get(row, "ph:readTopK (2 dispatches+flush+mapAsync)"),
+      "    markStep forceAllPending wall": get(row, "ph:markStep: forceAllPending"),
+    };
+    d["TAPE-SKIPPABLE (a+collect+b+c+d+e)"] =
+      d["(a) lazy graph build"] +
+      d["    plan-collect (buildMergedPlan)"] +
+      d["(b) fingerprint"] +
+      d["(c) CSE (pass:cse)"] +
+      d["(d) rewrites (dsl+passes+maps)"] +
+      d["(e) plan lookup/hit (perm)"];
+    return d;
+  };
+  const derived = rows.map(derive);
+  const keys = Object.keys(derived[0]);
+  const mean = (k: string) =>
+    derived.reduce((s, d) => s + (d[k] ?? 0), 0) / derived.length;
+  const p50 = (k: string) => {
+    const v = derived.map((d) => d[k] ?? 0).sort((a, b) => a - b);
+    const m = Math.floor(v.length / 2);
+    return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
+  };
+  console.log(
+    `\n===== G0 TABLE: per-token seam attribution over ${rows.length} post-warmup tokens =====`,
+  );
+  console.log(`  ${"seam".padEnd(42)} ${"mean".padStart(8)} ${"p50".padStart(8)}`);
+  for (const k of keys) {
+    console.log(
+      `  ${k.padEnd(42)} ${mean(k).toFixed(2).padStart(8)} ${p50(k).toFixed(2).padStart(8)}`,
+    );
+  }
+  // Raw seam keys (everything the tp module saw), for reconciliation.
+  const rawKeys = [
+    ...new Set(rows.flatMap((r) => Object.keys(r))),
+  ].filter((k) => k.startsWith("tp:") || k.startsWith("ph:"));
+  rawKeys.sort();
+  console.log("\n  --- raw seams (mean over rows) ---");
+  for (const k of rawKeys) {
+    const m = rows.reduce((s, r) => s + (r[k] ?? 0), 0) / rows.length;
+    if (m >= 0.005) console.log(`  ${k.padEnd(46)} ${m.toFixed(3).padStart(9)}`);
+  }
+  const mSubmits = rows.reduce((s, r) => s + (r.submitCount ?? 0), 0) / rows.length;
+  const mBG = rows.reduce((s, r) => s + (r.bindGroupCount ?? 0), 0) / rows.length;
+  const mBuf = rows.reduce((s, r) => s + (r.bufferCount ?? 0), 0) / rows.length;
+  console.log(
+    `\n  submits/token=${mSubmits.toFixed(1)} createBindGroup/token=${mBG.toFixed(1)} createBuffer/token=${mBuf.toFixed(1)}`,
+  );
 }
 
 main().catch((e) => {
