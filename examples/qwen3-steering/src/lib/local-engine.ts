@@ -17,7 +17,11 @@ export type GenStats = {
   alpha: number;
   steered: boolean;
   /** Step-tape replay counters for this generation (§6 observability). */
-  tape?: { hits: number; replays: number };
+  tape?: {
+    hits: number; calls: number; traces: number; coldMisses: number;
+    invalidations: number; ready: boolean;
+    recorder?: { eligiblePairs: number; refusals: number; structureMisses: number; loweredPairs: number; boundaryResets: number; boundaryReasons?: Record<string, number>; lastRefusal: string };
+  };
   /** Per-token decode phase averages (ms): build=lazy graph, lower=plan/
    *  encode/submit, fence=GPU+readback, sample=CPU, step=markStep. */
   decodeBreakdown?: {
@@ -47,6 +51,9 @@ export type ModelInfo = {
   weightDtype: "f16" | "f32";
   numLayers: number;
   hiddenSize: number;
+  /** Step-tape ground truth from the worker (diagnostics). */
+  tapeFlagSet?: boolean;
+  tapeOn?: boolean;
 };
 
 export type LoadProgress = (
@@ -108,6 +115,8 @@ export async function createSteeringEngine(
           weightDtype: msg.weightDtype,
           numLayers: msg.numLayers,
           hiddenSize: msg.hiddenSize,
+          tapeFlagSet: msg.tapeFlagSet,
+          tapeOn: msg.tapeOn,
         });
       else if (msg.type === "error") reject(new Error(msg.error));
     };

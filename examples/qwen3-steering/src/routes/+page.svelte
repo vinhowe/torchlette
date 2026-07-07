@@ -171,6 +171,8 @@
     <div class="flex items-center gap-2">
       {#if info}
         <span class="type-value text-success">{info.modelId} · {info.weightDtype} · resident</span>
+        <span class="type-value {info.tapeOn ? 'text-success' : 'text-destructive'}"
+          >tape {info.tapeOn ? "on" : info.tapeFlagSet ? "flag set, const OFF" : "flag missing"}</span>
       {/if}
       <ThemeToggle />
     </div>
@@ -381,7 +383,8 @@
         <Statistic label="prefill">{run.stats.prefillMs}ms</Statistic>
         <Statistic label="steered">{run.stats.steered ? "yes" : "no"}</Statistic>
         {#if run.stats.tape}
-          <Statistic label="tape">{run.stats.tape.hits}/{run.stats.tape.replays} hits</Statistic>
+          <Statistic label="tape">{run.stats.tape.hits}h/{run.stats.tape.traces}t of {run.stats.tape.calls} · {run.stats.tape.ready ? "ready" : "NOT READY"}{#if run.stats.tape.recorder}{@const r = run.stats.tape.recorder}
+            · elig {r.eligiblePairs} ref {r.refusals} struct {r.structureMisses} lowered {r.loweredPairs} bnd {r.boundaryResets} {JSON.stringify(r.boundaryReasons ?? {})}{#if r.lastRefusal} · {r.lastRefusal}{/if}{/if}</Statistic>
         {/if}
         {#if run.stats.decodeBreakdown}
           {@const d = run.stats.decodeBreakdown}

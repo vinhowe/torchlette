@@ -20,7 +20,7 @@
 
 import "./tape-flag"; // MUST be first: sets TORCHLETTE_STEP_TAPE before torchlette evaluates
 import { AutoTokenizer } from "@huggingface/transformers";
-import { stReplayStats } from "torchlette";
+import { STEP_TAPE_REPLAY } from "torchlette";
 import {
   generateChat,
   loadQwen3FromUrl,
@@ -141,6 +141,10 @@ async function handleLoad(modelId: string, requestedDtype?: "f16" | "f32") {
     weightDtype,
     numLayers: model.config.numLayers,
     hiddenSize: model.config.hiddenSize,
+    // Tape ground truth: did ./tape-flag run, and did torchlette's
+    // module-load const actually see the flag?
+    tapeFlagSet: !!(globalThis as { __TORCHLETTE_ENV__?: unknown }).__TORCHLETTE_ENV__,
+    tapeOn: STEP_TAPE_REPLAY,
   });
 }
 
@@ -188,7 +192,6 @@ async function handleGenerate(
 ) {
   if (!api || !model || !tokenizerLike) throw new Error("Model not loaded");
   const residualHook = makeResidualHook(api, steeringVec, alpha);
-  const tape0 = stReplayStats();
   const stats = await generateChat(
     api,
     model,
@@ -200,7 +203,6 @@ async function handleGenerate(
     },
     { maxNewTokens, temperature: 0.7, topK: 20, topP: 0.95, residualHook },
   );
-  const t = stReplayStats();
   post({
     type: "done",
     id,
@@ -208,7 +210,7 @@ async function handleGenerate(
       ...stats,
       alpha,
       steered: residualHook !== undefined,
-      tape: { hits: t.hits - tape0.hits, replays: t.replays - tape0.replays },
+
     },
   });
 }

@@ -7,6 +7,7 @@
  */
 
 import type { Torchlette, FrontendTensor as Tensor } from "torchlette";
+import { stStats } from "torchlette";
 import type { Qwen3, ResidualHook } from "./model";
 import { kvBucketLen } from "./model";
 
@@ -60,6 +61,17 @@ export type GenerateStats = {
     fenceMs: number;
     sampleMs: number;
     stepMs: number;
+  };
+  /** Step-tape counters from THIS generation's CapturedFn (same module
+   *  instance as the capture — immune to bundler duplication). traces/
+   *  coldMisses/ready discriminate WHY a tape isn't hitting. */
+  tape?: {
+    hits: number;
+    calls: number;
+    traces: number;
+    coldMisses: number;
+    invalidations: number;
+    ready: boolean;
   };
 };
 
@@ -311,7 +323,12 @@ export async function generateChat(
         topP,
       );
       const t4 = performance.now();
-      api.endStep();
+      // markStep alone is the boundary: under setStepScopedCleanup its
+      // end-snapshot handles reclamation, and the tape's guard-5 treats an
+      // explicit endStep() as a REGIME PERTURBATION (comparator reset) — a
+      // per-token endStep here kept the tape permanently ineligible in the
+      // browser (the ceremony remnant f651365 missed; found via the
+      // boundary-reason counters: {"endStep": 80}).
       await api.markStep();
       const t5 = performance.now();
       tBuild += t1 - t0;
@@ -345,6 +362,27 @@ export async function generateChat(
       tokPerSec: Number(
         (count / Math.max(seconds - prefillMs / 1000, 0.001)).toFixed(1),
       ),
+      tape: (() => {
+        const c = decode.stats();
+        const r = stStats();
+        return {
+          hits: c.hits,
+          calls: c.calls,
+          traces: c.traces,
+          coldMisses: c.coldMisses,
+          invalidations: c.invalidations,
+          ready: c.ready,
+          recorder: {
+            eligiblePairs: r.eligiblePairs,
+            refusals: r.refusals,
+            structureMisses: r.structureMisses,
+            loweredPairs: r.loweredPairs,
+            boundaryResets: r.boundaryResets,
+            boundaryReasons: r.boundaryReasons,
+            lastRefusal: r.refusalDiagnostics[r.refusalDiagnostics.length - 1] ?? "",
+          },
+        };
+      })(),
       decodeBreakdown: {
         buildMs: per(tBuild),
         lowerMs: per(tLower),

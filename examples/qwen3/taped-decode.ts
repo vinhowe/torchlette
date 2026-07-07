@@ -21,6 +21,7 @@
  */
 
 import * as path from "node:path";
+import { stStats } from "../../src/core/step-tape";
 import { fileURLToPath } from "node:url";
 import { getWebGPUInitError, initWebGPU } from "../../src/backend/webgpu";
 import { Torchlette, type Tensor } from "../../src/frontend/torchlette";
@@ -103,7 +104,7 @@ async function tapedGenerate(
 ): Promise<{ tokens: number[]; walls: number[]; tapedSteps: number }> {
   const vocab = model.config.vocabSize;
   const tokens = [...PROMPT];
-  const staticKV = model.allocStaticKV(512);
+  const staticKV = model.allocStaticKV(Number(process.env.QWEN3_MAXSEQ ?? 512));
   const prev = api.setStepScopedCleanup(true);
   const walls: number[] = [];
   let tapedSteps = 0;
@@ -175,7 +176,7 @@ async function runSteerGen(
   const vocab = model.config.vocabSize;
   const h = model.config.hiddenSize;
   const tokens = [...PROMPT];
-  const staticKV = model.allocStaticKV(512);
+  const staticKV = model.allocStaticKV(Number(process.env.QWEN3_MAXSEQ ?? 512));
   const prev = api.setStepScopedCleanup(true);
   try {
     // The steering direction, hoisted ONCE: a stable-identity persistent
@@ -278,7 +279,7 @@ async function untapedGenerate(
 ): Promise<{ tokens: number[]; walls: number[] }> {
   const vocab = model.config.vocabSize;
   const tokens = [...PROMPT];
-  const staticKV = model.allocStaticKV(512);
+  const staticKV = model.allocStaticKV(Number(process.env.QWEN3_MAXSEQ ?? 512));
   const prev = api.setStepScopedCleanup(true);
   const walls: number[] = [];
   try {
@@ -341,8 +342,8 @@ async function main() {
   if (!ok) throw new Error(getWebGPUInitError() || "WebGPU init failed");
   const api = new Torchlette("webgpu", { enableFusion: true });
   const model = await loadPretrainedQwen3(api, MODEL_DIR, {
-    maxSeqLen: 512,
-    weightDtype: "f32",
+    maxSeqLen: Number(process.env.QWEN3_MAXSEQ ?? 512),
+    weightDtype: (process.env.QWEN3_DTYPE === "f16" ? "f16" : "f32") as "f16" | "f32",
   });
   let failed = false;
 
@@ -363,7 +364,8 @@ async function main() {
     const s = api.getStepTapeStats();
     console.log(`\n[perf] untaped steady = ${steady(un.walls).toFixed(2)} ms/token`);
     console.log(`[perf] taped   steady = ${steady(tp.walls).toFixed(2)} ms/token (${tp.tapedSteps}/${n} steps replayed)`);
-    console.log(`[perf] replay stats:`, JSON.stringify(s.replay));
+    console.log("[perf] recorder:", JSON.stringify(stStats()));
+  console.log(`[perf] replay stats:`, JSON.stringify(s.replay));
     console.log(`[perf] tokens match: ${JSON.stringify(un.tokens) === JSON.stringify(tp.tokens)}`);
     if (JSON.stringify(un.tokens) !== JSON.stringify(tp.tokens)) failed = true;
   } else if (mode === "g3") {
@@ -439,7 +441,7 @@ async function main() {
       const walls: number[] = [];
       const vocab = model.config.vocabSize;
       const tokens = [...PROMPT];
-      const staticKV = model.allocStaticKV(512);
+      const staticKV = model.allocStaticKV(Number(process.env.QWEN3_MAXSEQ ?? 512));
       const prev = api.setStepScopedCleanup(true);
       try {
         {
@@ -492,7 +494,7 @@ async function main() {
     const un = await untapedGenerate(api, model, { vec: null, alpha: 0, verifyEvery: 0, numTokens: n });
     const vocab = model.config.vocabSize;
     const tokens = [...PROMPT];
-    const staticKV = model.allocStaticKV(512);
+    const staticKV = model.allocStaticKV(Number(process.env.QWEN3_MAXSEQ ?? 512));
     const prev = api.setStepScopedCleanup(true);
     let capStats: { hits: number; coldMisses: number; traces: number } | null = null;
     try {
@@ -564,7 +566,7 @@ async function main() {
     const { storageTracker } = await import("../../src/graph/storage-tracker");
     const vocab = model.config.vocabSize;
     const tokens = [...PROMPT];
-    const staticKV = model.allocStaticKV(512);
+    const staticKV = model.allocStaticKV(Number(process.env.QWEN3_MAXSEQ ?? 512));
     const prev = api.setStepScopedCleanup(true);
     const reach: number[] = [];
     try {

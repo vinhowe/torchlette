@@ -690,9 +690,11 @@ export function stInvalidateTemplate(fp: number): void {
 /** Boundary-regime perturbation (explicit beginStep/endStep, stepScoped
  *  toggle): the consecutive-step comparator resets — the next tape must be
  *  re-established from two fresh steps under the new regime (guard 5). */
-export function stNoteBoundary(_reason: string): void {
+const boundaryReasons: Record<string, number> = {};
+export function stNoteBoundary(reason: string): void {
   if (cur.entries.length === 0 && prev === null) return;
   boundaryResets++;
+  boundaryReasons[reason] = (boundaryReasons[reason] ?? 0) + 1;
   prev = null;
   cur = { entries: [], plans: [] };
   activePlan = null;
@@ -713,6 +715,7 @@ export function stStats(): {
   structureMisses: number;
   loweredPairs: number;
   boundaryResets: number;
+  boundaryReasons: Record<string, number>;
   planInvalidations: number;
   tapeCount: number;
   refusalDiagnostics: string[];
@@ -724,6 +727,7 @@ export function stStats(): {
     structureMisses,
     loweredPairs,
     boundaryResets,
+    boundaryReasons: { ...boundaryReasons },
     planInvalidations,
     tapeCount: tapes.size,
     refusalDiagnostics: refusalDiagnostics.slice(),
