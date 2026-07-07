@@ -938,6 +938,103 @@ input mistaken for an internal producer are all the same class of bug (the
 recorder's `data.slice()`, volatile uniform, and pre-execution external
 pre-assignment, respectively).
 
+## Phase-4 RECONCILIATION (2026-07-07, task #43 stage-A pass)
+
+Re-audited the tree at `006e4245` against this doc's Phase-4 narrative. Two
+findings; **no code landed** (the stage-A objectives were already satisfied,
+and the one remaining lever is blocked by a committed engineering result, not a
+bug — so per the campaign's "STOP rather than improvise" rule it was not
+forced).
+
+**A1 (expose attention `logsumexp` oi=1 + the harvest bail rule) is ALREADY
+LANDED — verified, not re-done.**
+- `logsumexp` oi=1 is exposed by the generator: `generateAttention` returns
+  `outputs:[{oi:0,outSlot},{oi:1,lseSlot}]` (`stream-generate.ts:1981`), and the
+  walker maps forward-attention non-primary outputs into `nodeSlotExtra`
+  (`stream-generate.ts:~360`). The `SequentialGen.extraOutputs` channel
+  (`:411`, used for layernorm-bwd grad_bias at `:2180`) is the same mechanism
+  for the sequential-op case. So the checkpoint-recompute attention plan carries
+  its oi=1 result and does not bail on that account.
+- The bail rule is landed, factored across two functions rather than as the
+  doc's single "primary-miss=skip / non-primary-miss=bail" predicate:
+  the *pair selection* encodes the skip (`liveResultHarvestPairs` for the
+  cutover harvests only nodes that HAVE a live result; a non-surviving/leaf/
+  recomputed primary is simply never in the set), and `harvestGenResults`
+  hard-bails (`genOk=false`) on ANY harvested-pair whose slot is missing — which
+  is strictly safer than the designed rule (it also bails a *surviving* primary
+  miss). Net effect == the design: a real generator gap (a non-primary the
+  optimizer consumes) forces the plan back to the recorded/lowered path; it
+  never silently replays stale.
+
+**A2 (no-record production default) = the already-implemented, already-opt-in
+`TORCHLETTE_BUILD_FROM_IR` path — NOT flipped, for two independent reasons:**
+1. The committed over-harvest scaling result (`b9c99153`/`2008b713`/`22ca85d3`/
+   `e01d9adf`) proves the over-harvest is FUNDAMENTAL (build-from-IR must harvest
+   the full action-output set; a survivor-prune provably crashes on cross-plan
+   shared nodes under incremental forcing). It costs +34% at small model/batch,
+   falling to single-digit % at scale — a real memory/cold-start tradeoff, so it
+   stays a viable OPT-IN, never a free default. Flipping it would fail the
+   memory-flat gate on non-checkpointed configs.
+2. **NEW / the decisive reframe: `b66ead78` (checkpoint: run arena-free) made
+   the entire compiled-plan path DORMANT in the production checkpointed
+   trainer.** `WebGPUGPT2Trainer.initialize()` calls
+   `setBufferArenaDisabled(true)` under checkpointing (the production default);
+   the compiled plan requires the arena, so plans run the NORMAL lowered path —
+   `hasCompiledPlan=false hasArena=false` on every plan (703/602/388/364-node),
+   confirmed live on `diloco-regression-check.ts`. In this mode there is NO
+   recorder, NO cutover, NO build-from-IR: liveness early-release alone gives
+   flat bounded memory. The compiled/generated/recorder machinery is now
+   exercised ONLY by non-checkpointed configs and the in-suite gates
+   (`compiled-plan-parity.spec.ts`). So "demote the recorder in production" is
+   partly already true — the recorder does not run in the checkpointed
+   production path — and build-from-IR-as-default would change nothing there
+   while regressing the non-checkpointed path. This is why A2 was not flipped.
+
+**Stage-A gate results (default path, this pass, sivri V100 solo):** `npm run
+build` ✓; `npm run test:gates` 4/4 ✓ (the compiled/generated path IS exercised
+here, arena on); production regression baseline-EXACT
+(`9.8089/5.9222/5.1532/4.6402` vs `9.81/5.92/5.15/4.64`), peak flat 2087.6 MB
+(8M default config), zero leak — via the NORMAL lowered path. build-from-IR A/B
+was memory-neutral only because it does not engage under checkpointing
+(precondition `options.bufferArena` is false); it is not an A/B of the
+over-harvest, which the committed scaling tables already characterize.
+
+**Consequence for the 4.4/4.5 deletions:** the value of deleting the recorder /
+per-position arena / params-sequence cache is now bounded to the NON-checkpointed
+compiled path + the gates, because the checkpointed production trainer already
+bypasses all of it. Any deletion campaign must first decide whether the
+compiled-plan path is retained at all for non-checkpointed training, or whether
+the arena-free-lowered path (which already serves production) should subsume it —
+a strategy question above the mechanical deletion inventory.
+
+**STRATEGY RESOLUTION (2026-07-07): the compiled path STAYS — unification, not
+deletion.** Direction: the memory planner learns REMATERIALIZATION (checkpointing
+expressed as liveness edges + recompute in the plan set), so checkpointed
+training eventually runs compiled like everything else, and the arena-free
+checkpoint mode of `b66ead78` dies by unification rather than by deletion. The
+compiled path serves inference today (the plan-replay decode stack) and training
+post-unification. The B1–B4 deletions remain gated exactly per the phase-4
+inventory (B2/B3/B4 on the build-from-IR default flip; B1 on generated-only
+build). Sequencing: stage 1 = solve the over-harvest via plan-set-level liveness
+(design first), stage 2 = build-from-IR default + the ~800–1200-SLOC recorder
+deletion harvest, stage 3 = rematerialization edges in the same lifetime
+machinery.
+
+### Flag sunsets (named, per the complexity-budget policy)
+- **`TORCHLETTE_GENERATED_PLAN`** (opt-out, default-on cutover) — dies when B1
+  (the recorded-stream replay path) is deleted after stage 1/2: with no recorded
+  replay to opt back into, the flag has no meaning.
+- **`TORCHLETTE_BUILD_FROM_IR`** (opt-in, build-without-execution) — dies when
+  build-from-IR becomes the SOLE default build source (stage 2, unblocked by the
+  stage-1 over-harvest fix): the opt-in becomes the only path and the flag goes
+  with the lowered-first-exec build it toggles against.
+- **`TORCHLETTE_ARENA_LIVENESS=0`** (legacy unbudgeted arena opt-out) — sunsets
+  at the REMATERIALIZATION UNIFICATION (stage 3): once checkpointed training
+  runs on the planner (liveness edges + recompute), the legacy arena's last
+  role as a planner-bug fallback is subsumed by the planner being the only
+  memory authority. This is the named product decision from the phase-4
+  inventory, now adopted into the roadmap.
+
 ## Risks and mitigations
 - **Imperative-op long tail** (phase 3): mitigated by per-op fallback — no
   cutover moment; coverage counters make progress visible.
