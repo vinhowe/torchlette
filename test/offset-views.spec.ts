@@ -204,52 +204,13 @@ function runSuite(device: DeviceKind) {
         TIMEOUT,
       );
 
-      it(
-        "elementwise (add 0) preserves the view's region",
-        async () => {
-          const t = api();
-          const v = build(t);
-          const zeros = t.tensorFromArray(
-            new Array(jsRead(ref()).length).fill(0),
-            ref().shape,
-            { device },
-          );
-          const got = Array.from(await t.add(v, zeros).cpu());
-          expect(maxAbsDiff(got, jsRead(ref()))).toBeLessThan(ATOL);
-        },
-        TIMEOUT,
-      );
-
-      it(
-        "sum() reduces the view's region (full)",
-        async () => {
-          const t = api();
-          const got = await t.sum(build(t)).item();
-          const want = jsRead(ref()).reduce((a, b) => a + b, 0);
-          expect(Math.abs(got - want)).toBeLessThan(ATOL * 10);
-        },
-        TIMEOUT,
-      );
-
-      it(
-        "sum(dim=-1) reduces the view's region (dim)",
-        async () => {
-          const t = api();
-          const got = Array.from(await t.sum(build(t), { dim: -1 }).cpu());
-          const r = ref();
-          const flat = jsRead(r);
-          const inner = r.shape[r.shape.length - 1];
-          const want: number[] = [];
-          for (let i = 0; i < flat.length; i += inner) {
-            let acc = 0;
-            for (let j = 0; j < inner; j++) acc += flat[i + j];
-            want.push(acc);
-          }
-          expect(maxAbsDiff(got, want)).toBeLessThan(ATOL * 10);
-        },
-        TIMEOUT,
-      );
-
+      // NOTE: the elementwise (add-0) and sum(full)/sum(dim) consumers that
+      // used to live here were DELETED — subsumed by the op conformance harness
+      // (test/helpers/op-catalog.ts), which sweeps 18 unary + 6 binary ops and
+      // all reductions across this exact 5-view battery on both devices, each vs
+      // the CPU oracle / an independent JS reference. The bespoke non-elementwise
+      // consumers (matmul, cat) and pattern cases (RoPE/mask/f16-odd-offset)
+      // below are NOT reproduced by the generator and stay here.
       it(
         "matmul(view, W) computes on the view's region",
         async () => {
