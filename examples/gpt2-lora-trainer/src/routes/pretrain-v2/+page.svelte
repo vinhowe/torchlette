@@ -10,8 +10,8 @@ import {
   setGPUMemoryLimit,
   Torchlette,
 } from "torchlette";
-import { GPT2Tokenizer } from "$lib/torchlette/tokenizer";
-import { fetchTokenizer } from "$lib/torchlette/weights";
+import { GPT2Tokenizer } from "gpt2-browser";
+import { fetchTokenizer } from "gpt2-browser";
 
 // v2 stack (browser-safe modules)
 import { WebGPUGPT2Trainer } from "../../../../../src/distributed/protocol/webgpu-gpt2-trainer";

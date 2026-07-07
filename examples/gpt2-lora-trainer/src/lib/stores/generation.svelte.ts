@@ -5,7 +5,7 @@
 import {
   type GenerateOptions,
   generateTokens,
-} from "$lib/torchlette/inference";
+} from "gpt2-browser";
 import { modelStore } from "./model.svelte";
 
 let prompt = $state("Once upon a time");

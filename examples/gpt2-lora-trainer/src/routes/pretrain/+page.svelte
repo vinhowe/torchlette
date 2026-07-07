@@ -835,7 +835,7 @@ async function generate() {
     return;
   generating = true;
   genOutput = "";
-  const { generateTokens } = await import("$lib/torchlette/inference");
+  const { generateTokens } = await import("gpt2-browser");
   const model = modelStore.model;
   model.train(false);
   for await (const token of generateTokens(

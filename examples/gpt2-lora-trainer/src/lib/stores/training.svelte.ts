@@ -7,7 +7,7 @@ import {
   type StepPhaseTimings,
   type TrainingConfig,
 } from "$lib/torchlette/trainer";
-import { serializeLoRAToSafetensors } from "$lib/torchlette/weights";
+import { serializeLoRAToSafetensors } from "gpt2-browser";
 import { modelStore } from "./model.svelte";
 
 // ============================================================================

@@ -8,9 +8,15 @@
  */
 
 import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
-import { nn } from "torchlette";
-
-const { checkpoint, crossEntropy, Embedding, LayerNorm, Linear } = nn;
+// Named imports from the typed subpath — each is both a value and a type, so
+// Linear/Embedding/LayerNorm work in the type positions below.
+import {
+  checkpoint,
+  crossEntropy,
+  Embedding,
+  LayerNorm,
+  Linear,
+} from "torchlette/nn";
 
 import { type LoRAConfig, LoRALinear } from "./lora";
 
@@ -425,6 +431,71 @@ export class GPT2WithLoRA {
   }
 
   /**
+   * Base GPT-2 parameters only (no LoRA). Used for Menagerie full-model
+   * training, where LoRA is disabled and only base weights are optimized so the
+   * snapshot (which serializes base weights only) round-trips exactly.
+   */
+  getBaseParameters(): Tensor[] {
+    const params: Tensor[] = [];
+    params.push(this.wte.weight, this.wpe.weight);
+    for (const block of this.h) {
+      params.push(block.ln1.weight!, block.ln1.bias!);
+      params.push(block.ln2.weight!, block.ln2.bias!);
+      params.push(block.attn.cAttn.baseWeight);
+      if (block.attn.cAttn.baseBias) params.push(block.attn.cAttn.baseBias);
+      params.push(block.attn.cProj.weight);
+      if (block.attn.cProj.bias) params.push(block.attn.cProj.bias);
+      params.push(block.mlp.cFc.baseWeight);
+      if (block.mlp.cFc.baseBias) params.push(block.mlp.cFc.baseBias);
+      params.push(block.mlp.cProj.weight);
+      if (block.mlp.cProj.bias) params.push(block.mlp.cProj.bias);
+    }
+    params.push(this.lnF.weight!, this.lnF.bias!);
+    return params;
+  }
+
+  /** Disable LoRA on every wrapped projection (forward becomes pure base GPT-2). */
+  disableAllLora(): void {
+    for (const block of this.h) {
+      block.attn.cAttn.disableLora = true;
+      block.mlp.cFc.disableLora = true;
+    }
+  }
+
+  /**
+   * (Re)initialize all base weights GPT-2 / nanoGPT style: embeddings and linear
+   * weights ~ N(0, std), residual projections (attn/MLP c_proj) scaled by
+   * 1/sqrt(2*numLayers), biases zeroed; LayerNorms keep their default (weight 1,
+   * bias 0). Use for from-scratch models — torchlette's nn.Embedding default is
+   * N(0,1), which gives a huge initial loss for the tied LM head.
+   */
+  initWeightsGPT2(std = 0.02): void {
+    const runtime = this.api._runtime();
+    const resid = std / Math.sqrt(2 * this.config.numLayers);
+    const normal = (t: Tensor, s: number) => {
+      const tmp = this.api.mul(this.api.randn(t.shape), s);
+      runtime.copy_(t._unwrap(), tmp._unwrap());
+    };
+    const zero = (t: Tensor) => {
+      const tmp = this.api.zeros(t.shape);
+      runtime.copy_(t._unwrap(), tmp._unwrap());
+    };
+
+    normal(this.wte.weight, std);
+    normal(this.wpe.weight, std);
+    for (const b of this.h) {
+      normal(b.attn.cAttn.baseWeight, std);
+      if (b.attn.cAttn.baseBias) zero(b.attn.cAttn.baseBias);
+      normal(b.attn.cProj.weight, resid); // residual projection: scaled
+      if (b.attn.cProj.bias) zero(b.attn.cProj.bias);
+      normal(b.mlp.cFc.baseWeight, std);
+      if (b.mlp.cFc.baseBias) zero(b.mlp.cFc.baseBias);
+      normal(b.mlp.cProj.weight, resid); // residual projection: scaled
+      if (b.mlp.cProj.bias) zero(b.mlp.cProj.bias);
+    }
+  }
+
+  /**
    * Enable or disable full finetuning (make all base weights trainable).
    */
   setFullFinetuning(enabled: boolean): void {
@@ -576,5 +647,57 @@ export class GPT2WithLoRA {
       }
     }
     return { data: transposed, shape: [cols, rows] };
+  }
+
+  /**
+   * Inverse of {@link loadBaseWeights}: export base weights in HuggingFace
+   * safetensors layout — keys prefixed `transformer.`, Conv1D `weight` tensors
+   * transposed back [out,in]→[in,out]. LoRA params are intentionally OMITTED:
+   * under full-finetuning LoRA is disabled and doesn't affect the forward pass,
+   * so the result is a clean HF-compatible GPT-2 that round-trips through
+   * parseSafetensors + loadBaseWeights. Async — reads each tensor off the GPU.
+   */
+  async exportBaseWeights(): Promise<
+    Map<string, { data: Float32Array; shape: number[] }>
+  > {
+    const out = new Map<string, { data: Float32Array; shape: number[] }>();
+    const read = async (t: Tensor) => ({
+      data: new Float32Array(await t.cpu()),
+      shape: t.shape.slice(),
+    });
+    // model stores Conv1D weight as [out,in]; HF wants [in,out]
+    const readT = async (t: Tensor) => {
+      const r = await read(t);
+      return this.transposeWeight(r.data, r.shape);
+    };
+
+    out.set("transformer.wte.weight", await read(this.wte.weight));
+    out.set("transformer.wpe.weight", await read(this.wpe.weight));
+    out.set("transformer.ln_f.weight", await read(this.lnF.weight!));
+    out.set("transformer.ln_f.bias", await read(this.lnF.bias!));
+
+    for (let i = 0; i < this.h.length; i++) {
+      const b = this.h[i];
+      const p = `transformer.h.${i}`;
+      out.set(`${p}.ln_1.weight`, await read(b.ln1.weight!));
+      out.set(`${p}.ln_1.bias`, await read(b.ln1.bias!));
+      out.set(`${p}.ln_2.weight`, await read(b.ln2.weight!));
+      out.set(`${p}.ln_2.bias`, await read(b.ln2.bias!));
+
+      out.set(`${p}.attn.c_attn.weight`, await readT(b.attn.cAttn.baseWeight));
+      if (b.attn.cAttn.baseBias)
+        out.set(`${p}.attn.c_attn.bias`, await read(b.attn.cAttn.baseBias));
+      out.set(`${p}.attn.c_proj.weight`, await readT(b.attn.cProj.weight));
+      if (b.attn.cProj.bias)
+        out.set(`${p}.attn.c_proj.bias`, await read(b.attn.cProj.bias));
+
+      out.set(`${p}.mlp.c_fc.weight`, await readT(b.mlp.cFc.baseWeight));
+      if (b.mlp.cFc.baseBias)
+        out.set(`${p}.mlp.c_fc.bias`, await read(b.mlp.cFc.baseBias));
+      out.set(`${p}.mlp.c_proj.weight`, await readT(b.mlp.cProj.weight));
+      if (b.mlp.cProj.bias)
+        out.set(`${p}.mlp.c_proj.bias`, await read(b.mlp.cProj.bias));
+    }
+    return out;
   }
 }

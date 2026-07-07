@@ -9,8 +9,8 @@
 
 import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
 import { Adam, GradScaler, nn, setProfilePhase } from "torchlette";
-import type { GPT2WithLoRA } from "./gpt2-lora";
-import type { GPT2Tokenizer } from "./tokenizer";
+import type { GPT2WithLoRA } from "gpt2-browser";
+import type { GPT2Tokenizer } from "gpt2-browser";
 
 export type TrainingConfig = {
   maxSteps: number;

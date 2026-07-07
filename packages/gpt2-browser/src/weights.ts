@@ -163,7 +163,7 @@ export async function fetchTokenizer(
 /**
  * Parse safetensors binary format.
  */
-function parseSafetensors(
+export function parseSafetensors(
   buffer: ArrayBuffer,
   onProgress?: ProgressCallback,
 ): Map<string, WeightData> {

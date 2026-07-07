@@ -8,10 +8,10 @@ import {
   setGPUMemoryLimit,
   Torchlette,
 } from "torchlette";
-import { GPT2_SMALL_CONFIG, GPT2WithLoRA } from "$lib/torchlette/gpt2-lora";
-import { createLoRAConfig } from "$lib/torchlette/lora";
-import { GPT2Tokenizer } from "$lib/torchlette/tokenizer";
-import { fetchGPT2Weights, fetchTokenizer } from "$lib/torchlette/weights";
+import { GPT2_SMALL_CONFIG, GPT2WithLoRA } from "gpt2-browser";
+import { createLoRAConfig } from "gpt2-browser";
+import { GPT2Tokenizer } from "gpt2-browser";
+import { fetchGPT2Weights, fetchTokenizer } from "gpt2-browser";
 
 type Status = "idle" | "loading" | "ready" | "error";
 
