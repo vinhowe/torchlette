@@ -10,9 +10,11 @@
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getWebGPUInitError, initWebGPU } from "../../src/backend/webgpu";
-import { Torchlette } from "../../src/frontend/torchlette";
+import { Torchlette, type Tensor } from "../../src/frontend/torchlette";
 import type { KVCache } from "./model";
+import { kvBucketLen } from "./model";
 import { loadPretrainedQwen3 } from "./loader";
+import { buildDecodeUploads, staticKvId } from "./decode-uploads";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MODEL_DIR = path.join(__dirname, "../../ckpts/qwen3-1.7b");
@@ -95,14 +97,54 @@ async function main() {
     if (!SKIP_MARKSTEP) await api.markStep();
   }
 
+  // --- FOURTH ARM: TAPED static cache (step-tape phase 1c). With
+  // TORCHLETTE_STEP_TAPE=1 the steady-state decode steps REPLAY the recorded
+  // step program (skeleton graph + compiled-plan replay). With the flag off,
+  // tapeReadyFor is always false → this arm degenerates to the static arm
+  // (still a valid differential). The KV buffers are updated INSIDE the
+  // replayed plan (scatterAdd→copy_); the driver only advances cache.len.
+  const taped = [...PROMPT];
+  const tapedKV = model.allocStaticKV(256);
+  {
+    const idx = api.tensorFromArray(taped, [1, taped.length]);
+    const { logits } = api.noGrad(() => model.forward(idx, { staticKV: tapedKV }));
+    taped.push(await argmaxLast(logits, taped.length - 1));
+    if (!SKIP_MARKSTEP) await api.markStep();
+  }
+  for (let i = 1; i < NUM_NEW; i++) {
+    const posOffset = tapedKV.len;
+    const bucketLen = kvBucketLen(posOffset + 1, tapedKV.maxSeqLen);
+    const appKey = `stock:kv${staticKvId(tapedKV)}:bkt${bucketLen}`;
+    api.setTapeContext(appKey, []);
+    const tok = taped[taped.length - 1];
+    let logits: Tensor | null = null;
+    if (api.tapeReadyFor(appKey)) {
+      logits = await api.tapeReplay(
+        buildDecodeUploads(model.config, posOffset, tok, bucketLen),
+      );
+      if (logits) tapedKV.len = posOffset + 1;
+    }
+    if (!logits) {
+      const idx = api.tensorFromArray([tok], [1, 1]);
+      ({ logits } = api.noGrad(() => model.forward(idx, { staticKV: tapedKV })));
+    }
+    taped.push(await argmaxLast(logits, 0));
+    if (!SKIP_MARKSTEP) await api.markStep();
+  }
+
   console.log("no-cache:", JSON.stringify(noCache));
   console.log("cached:  ", JSON.stringify(cached));
   console.log("static:  ", JSON.stringify(stat));
+  console.log("taped:   ", JSON.stringify(taped));
+  console.log("[taped] replay stats:", JSON.stringify(api.getStepTapeStats().replay));
   const match =
     JSON.stringify(noCache) === JSON.stringify(cached) &&
-    JSON.stringify(noCache) === JSON.stringify(stat);
+    JSON.stringify(noCache) === JSON.stringify(stat) &&
+    JSON.stringify(noCache) === JSON.stringify(taped);
   console.log(
-    match ? "KV DIFFERENTIAL PASS (cat + static)" : "KV DIFFERENTIAL FAIL",
+    match
+      ? "KV DIFFERENTIAL PASS (cat + static + taped)"
+      : "KV DIFFERENTIAL FAIL",
   );
   process.exit(match ? 0 : 1);
 }

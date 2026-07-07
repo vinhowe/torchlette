@@ -38,9 +38,18 @@ import { shapesEqual, sizeOf } from "../core/shape";
 import { currentEpoch } from "../core/epoch";
 import {
   STEP_TAPE_RECORD,
+  STEP_TAPE_REPLAY,
   stEndStep,
   stNoteBoundary,
+  stStats,
 } from "../core/step-tape";
+import {
+  stPromoteEligibleSkeleton,
+  stReplayStats,
+  stSetTapeContext,
+  stTapeReadyFor,
+  stTryReplay,
+} from "../executor/step-tape-replay";
 import { getNextNodeId } from "../graph/node-factory";
 import { storageTracker } from "../graph/storage-tracker";
 import {
@@ -1957,7 +1966,62 @@ export class Torchlette {
         epoch: currentEpoch(),
         stepScopedCleanup: this._stepScopedCleanup,
       });
+      // [step-tape 1c] promote a captured skeleton if the just-ended step
+      // became eligible (two consecutive structurally-identical compiled
+      // steps under one appKey).
+      if (STEP_TAPE_REPLAY) stPromoteEligibleSkeleton();
     }
+  }
+
+  // ==========================================================================
+  // Step-tape (phase 1c program-level replay) — docs/staged-execution-phase1.md
+  // ==========================================================================
+
+  /** Declare the app-level bucket key + scalar-slot values (α) for the
+   *  UPCOMING decode step. The appKey is the structural declaration (guards
+   *  1/2); scalarValues carry guard-3's value-level coverage. No-op unless
+   *  TORCHLETTE_STEP_TAPE=1. */
+  setTapeContext(appKey: string, scalarValues: number[] = []): void {
+    if (!STEP_TAPE_REPLAY) return;
+    stSetTapeContext(
+      appKey,
+      scalarValues,
+      currentEpoch(),
+      this._stepScopedCleanup,
+    );
+  }
+
+  /** Whether a replayable skeleton exists for `appKey`. */
+  tapeReadyFor(appKey: string): boolean {
+    return STEP_TAPE_REPLAY && stTapeReadyFor(appKey);
+  }
+
+  /** Replay the current step's tape (all guards enforced inside). Returns the
+   *  logits tensor on a hit, or null on ANY guard miss (the caller then runs
+   *  the normal path, which re-records). `uploads` are the fresh per-token
+   *  payloads keyed by shape (unique per bucket). */
+  async tapeReplay(
+    uploads: Array<{ shape: number[]; values: Float32Array }>,
+  ): Promise<Tensor | null> {
+    if (!STEP_TAPE_REPLAY) return null;
+    const backend = this.runtime.getBackend("webgpu");
+    const r = await stTryReplay(uploads, backend);
+    if (!r.hit || !r.resultHandle) return null;
+    const rt = this.runtime.createFromStorageHandle(
+      r.resultHandle,
+      r.shape ?? [],
+      r.device ?? "webgpu",
+      r.dtype ?? "f32",
+    );
+    return this._wrap(rt);
+  }
+
+  /** Guard-miss observability (§6): merged recorder + replay counters. */
+  getStepTapeStats(): {
+    recorder: ReturnType<typeof stStats>;
+    replay: ReturnType<typeof stReplayStats>;
+  } {
+    return { recorder: stStats(), replay: stReplayStats() };
   }
 
   _debug_baseCommit(baseId: number, mutId: number): void {

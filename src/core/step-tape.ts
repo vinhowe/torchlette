@@ -47,7 +47,30 @@
 
 import { ENV } from "./env";
 
-export const STEP_TAPE_RECORD: boolean = ENV.TORCHLETTE_STEP_TAPE === "record";
+/**
+ * `TORCHLETTE_STEP_TAPE`:
+ *   "record" — 1b mode: pure observation, no replay.
+ *   "1"      — 1c mode: observe AND replay (recording stays on so skeletons
+ *              can be captured and re-recorded after a guard miss).
+ * Recording fires for BOTH (replay needs the recorder's eligibility diff to
+ * decide which skeletons are replayable — guard 3 is enforced at record time).
+ */
+export const STEP_TAPE_REPLAY: boolean = ENV.TORCHLETTE_STEP_TAPE === "1";
+export const STEP_TAPE_RECORD: boolean =
+  ENV.TORCHLETTE_STEP_TAPE === "record" || STEP_TAPE_REPLAY;
+
+/** TAPE_VERIFY=N: every Nth replay-eligible step runs the normal path instead
+ *  and cross-checks the skeleton it WOULD have replayed against the freshly
+ *  built template (fp + command-stream diff). 0 = off. SUNSET: rides the
+ *  TORCHLETTE_STEP_TAPE campaign — dies with it at the default-flip. */
+export const STEP_TAPE_VERIFY_N: number = (() => {
+  const v = Number(ENV.TORCHLETTE_TAPE_VERIFY ?? "0");
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
+})();
+
+/** STRICT_TAPE=1: throw on any guard miss (steady state) or verify diff — the
+ *  CI paranoia mode (§2.4 guard 6). SUNSET: rides TORCHLETTE_STEP_TAPE. */
+export const STEP_TAPE_STRICT: boolean = ENV.TORCHLETTE_STRICT_TAPE === "1";
 
 // ---------------------------------------------------------------------------
 // Tape schema (§2.1 as amended by §8.4: 4th DynamicSlot source `scalar`)
@@ -243,6 +266,13 @@ let cur: { entries: TapeEntry[]; plans: PlanExecRecord[] } = {
 let activePlan: PlanExecRecord | null = null;
 let prev: StepRecord | null = null;
 let stepOrdinal = 0;
+/** Set by the 1c replay layer for the duration of a REPLAY step: the recorder
+ *  must stay blind to it (a replay executes a compiled plan via the tape, not
+ *  the observed normal path — its readback would append a plan-less interval
+ *  and corrupt the consecutive-step comparator). Reset when the step's
+ *  markStep finalizes, leaving `prev` untouched so the next NORMAL step
+ *  resumes eligibility cleanly. */
+let replaying = false;
 
 // Tape store — in-memory, keyed by bucketKey (engine-scoped; see header).
 const tapes = new Map<string, StepTape>();
@@ -250,6 +280,13 @@ const tapes = new Map<string, StepTape>();
 // Counters + diagnostics
 let refusals = 0;
 let structureMisses = 0;
+/** Set in stEndStep when the just-finalized step produced an eligible tape;
+ *  consumed once by the replay layer (1c) to promote a captured skeleton. */
+let lastEligible: {
+  bucketKey: string;
+  fps: number[];
+  scalarSlots: Array<{ pos: number; inputIndex: number }>;
+} | null = null;
 let loweredPairs = 0;
 let eligiblePairs = 0;
 let stepsObserved = 0;
@@ -377,7 +414,13 @@ export function stRecordReadback(
   which: "topk" | "read" | "item",
   params?: Record<string, number>,
 ): void {
+  if (replaying) return; // replay steps are invisible to the recorder
   cur.entries.push({ kind: "readback", which, params });
+}
+
+/** The 1c replay layer marks a hit replay so the recorder ignores the step. */
+export function stMarkReplayStep(): void {
+  replaying = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +589,14 @@ export function stEndStep(info: {
   epoch: number;
   stepScopedCleanup: boolean;
 }): void {
+  if (replaying) {
+    // A replay step: discard whatever leaked into `cur` and leave `prev`
+    // (the last real recorded step) intact for the next normal step.
+    replaying = false;
+    cur = { entries: [], plans: [] };
+    activePlan = null;
+    return;
+  }
   if (cur.entries.length === 0) return; // empty interval — not a step
   stepsObserved++;
   stepOrdinal++;
@@ -596,6 +647,27 @@ export function stEndStep(info: {
     templateIds,
     recordedAtStep: stepOrdinal,
   });
+  lastEligible = {
+    bucketKey,
+    fps: [...templateIds],
+    scalarSlots: diff.scalarVarying.map((s) => ({
+      pos: s.pos,
+      inputIndex: s.inputIndex,
+    })),
+  };
+}
+
+/** Consume the just-finalized step's eligibility (1c skeleton promotion).
+ *  Returns null unless the LAST stEndStep produced an eligible tape; clears
+ *  the flag so each eligible step promotes at most one skeleton. */
+export function stConsumeLastEligible(): {
+  bucketKey: string;
+  fps: number[];
+  scalarSlots: Array<{ pos: number; inputIndex: number }>;
+} | null {
+  const e = lastEligible;
+  lastEligible = null;
+  return e;
 }
 
 // ---------------------------------------------------------------------------
@@ -673,4 +745,6 @@ export function stResetAll(): void {
   boundaryResets = 0;
   planInvalidations = 0;
   refusalDiagnostics.length = 0;
+  lastEligible = null;
+  replaying = false;
 }

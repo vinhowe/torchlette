@@ -128,13 +128,14 @@ import {
   withProfileContext,
 } from "./op-dispatch";
 import { pretunePlanMatmuls } from "./plan-builder";
+import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
 import {
-  TAPE_PROFILE,
-  TAPE_SLOTDIFF,
-  tpAdd,
-  tpRecordPlan,
-} from "../core/tape-profile";
-import { STEP_TAPE_RECORD, stBeginPlan, stEndPlan } from "../core/step-tape";
+  STEP_TAPE_RECORD,
+  STEP_TAPE_REPLAY,
+  stBeginPlan,
+  stEndPlan,
+} from "../core/step-tape";
+import { stCaptureCompiledStep } from "./step-tape-replay";
 import {
   clearActiveScalarTable,
   destroyScalarTable,
@@ -2758,7 +2759,6 @@ export async function executePlanOptimized(
   const tpF0 = TAPE_PROFILE ? performance.now() : 0;
   const fingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
   if (TAPE_PROFILE) tpAdd("fingerprint", performance.now() - tpF0);
-  if (TAPE_SLOTDIFF) tpRecordPlan(fingerprint.primary, plan.nodes);
   const cachedTemplate = fusionAnalysisCache.get(fingerprint.primary);
 
   let planNodes: LazyIRNode[];
@@ -3109,6 +3109,18 @@ export async function executePlanOptimized(
     });
     if (loweredPlan.compiledPlan) {
       loweredPlan.compiledPlan.tapeFp = fingerprint.primary;
+    }
+    // [step-tape 1c] capture this NORMAL compiled step as a replay-skeleton
+    // candidate (promoted iff the recorder deems it eligible at markStep) and,
+    // under TAPE_VERIFY, cross-check the skeleton we would have replayed.
+    if (STEP_TAPE_REPLAY && loweredPlan.compiledPlan?.valid && bufferArena) {
+      stCaptureCompiledStep(
+        fingerprint.primary,
+        planNodes,
+        loweredPlan,
+        bufferArena as BufferArena,
+        loweredPlan.compiledPlan.commands,
+      );
     }
     return r;
   } finally {
