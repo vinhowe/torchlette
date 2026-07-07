@@ -335,6 +335,40 @@ class StorageTracker {
     };
   }
 
+  /**
+   * Debug: snapshot the REACHABLE (rc>0) storage set for cross-boundary
+   * leak diffs (task #79). Returns per-storage id/shape/dtype/view info so a
+   * caller can diff two snapshots and histogram the delta by shape. Pure read;
+   * cheap enough to call between generations, not on a hot path.
+   */
+  debugLiveSet(): Array<{
+    id: number;
+    shape: readonly number[];
+    dtype: string;
+    view: boolean;
+    base?: number;
+  }> {
+    const out: Array<{
+      id: number;
+      shape: readonly number[];
+      dtype: string;
+      view: boolean;
+      base?: number;
+    }> = [];
+    for (const [id, storage] of this.allStorages) {
+      if (rcGet(id) <= 0) continue;
+      const bt = storage.backendTensor;
+      out.push({
+        id,
+        shape: bt.shape ?? [],
+        dtype: bt.dtype ?? "?",
+        view: bt.ownsBuffer === false,
+        base: storage.baseStorageId,
+      });
+    }
+    return out;
+  }
+
   debugCounters(): { destroyed: number } {
     const d = this._debugDestroyCount;
     this._debugDestroyCount = 0;

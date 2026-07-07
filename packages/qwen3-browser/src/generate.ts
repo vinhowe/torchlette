@@ -220,6 +220,20 @@ export async function generateChat(
   // tensors across steps) keeps default markStep semantics.
   const prevStepScope = api.setStepScopedCleanup(true);
   try {
+    // BASELINE BOUNDARY (task #79). The first markStep after arming
+    // step-scoped cleanup snapshots the tensors alive at that moment as
+    // "persistent". Take it HERE — before prefill — so the baseline captures
+    // ONLY genuinely-persistent state (params + the just-materialized KV
+    // slots; forceAllPending inside markStep realizes the lazy `zeros`), NOT
+    // the prefill forward's transient activations. Without this the prefill's
+    // full working set (~1900 storages) was alive at the prefill markStep and
+    // got frozen into the baseline, exempt from reclamation forever — and
+    // re-absorbed by every subsequent generation's baseline (a linear
+    // cross-generation ratchet: +~1900 reachable storages/generation, growing
+    // the markStep sweep unboundedly). With the baseline established first,
+    // the prefill markStep becomes a RECLAIMING boundary that releases those
+    // transients.
+    await api.markStep();
     // Top-K prefilter readback: K=64 covers any sensible sampling topK and the
     // GPU kernel reduces the per-token readback from the full vocab row (600KB)
     // to 64 (value, index) pairs (512B). Greedy = indices[0], bit-identical to
@@ -306,7 +320,17 @@ export async function generateChat(
       tSample += t4 - t3;
       tStep += t5 - t4;
     }
-    // Drop KV cache refs, then flush so the buffers get reclaimed.
+    // End the per-generation KV lifetime DETERMINISTICALLY (task #79). The KV
+    // slots are baseline-persistent (§6 static KV: root-scoped for the
+    // generation), so merely dropping JS refs leaves them rc>0 until GC — and
+    // under step-scoped cleanup they'd be re-snapshotted persistent, leaking
+    // 56 [1,H,maxSeq,D] buffers (+ their views) per generation. generateChat
+    // owns the KV cache, so it declares its death: dispose releases each
+    // slot's rc; the markStep below then reclaims them (destruction is
+    // fence-gated, so no UAF — any live view retains its base until it too is
+    // released this boundary).
+    for (const t of staticKV.k) t.dispose();
+    for (const t of staticKV.v) t.dispose();
     staticKV.k.length = 0;
     staticKV.v.length = 0;
     await api.markStep();
