@@ -1035,6 +1035,135 @@ machinery.
   memory authority. This is the named product decision from the phase-4
   inventory, now adopted into the roadmap.
 
+## Stage-1 DESIGN (PROPOSED 2026-07-07, pending review — do not implement yet):
+## observed cross-plan liveness kills the over-harvest
+
+### (a) Why per-plan survivor-pruning breaks — the crash class, characterized
+
+The committed proof (2008b713, trace in the 4.4 section) plus a code-level
+re-derivation of the mechanics this pass:
+
+1. Plans are forced INCREMENTALLY. When plan P builds (build-from-IR: before
+   any execution), a future consumer plan Q's graph **does not exist yet** —
+   not as pending nodes, not as live roots. The sharing that later materializes
+   (node 2675, a narrow in both the 388- and 364-node sibling plans) arises at
+   Q's CONSTRUCTION time (structural reuse/CSE maps Q's subgraph onto the
+   existing node). So at P's build, a complete walk of the entire live pending
+   graph — the maximum information available — reports the node NOT
+   cross-plan-consumed and NOT tensor-held. No build-time analysis can do
+   better; the information does not exist yet.
+2. Q consumes P's output as a LEAF (a plan node with no producing action whose
+   value is its `node.result` — the prior-plan-result-threaded-in class from
+   cutover fix #5). Prune P's harvest and the result never exists →
+   `Input not ready` when Q forces. Note the failure is **structurally loud**
+   (a missing storage crashes; it can never silently read stale) — a property
+   the design below preserves.
+3. The lowered/cutover path escapes only via its **after-the-fact signal**:
+   every result is materialized, then pruned by ACTUAL refcount at markStep.
+   Answering the charter's sub-questions: it is *consumers in not-yet-built
+   plans* (under incremental forcing); partial forcing is the enabling
+   condition, not a separate cause; readbacks are not implicated (loss `item()`
+   holds a live rc → its node is a survivor in every variant).
+
+### (b) The fix: survivors are OBSERVED across the plan set, then the plan
+### is REBUILT with pruned results
+
+The thesis, made concrete: the step-scoped PlannerRegistry (which already has
+the cross-plan view for temp packing) additionally learns, from the first
+executed step(s), WHICH harvested results the plan set actually consumes — the
+same after-the-fact signal the lowered path uses, captured one step later at
+template granularity. Recurring templates have stable structural fingerprints
+and deterministic node indexing, so step N's observation predicts step N+1.
+
+- **Identity.** Each harvested result is stamped `(templateFp, nodeIndex, oi)`
+  on its storage at harvest (the replay-harvest chokepoint,
+  `compiled-plan.ts` ~1576, already knows all three).
+- **Observation (two seams, both existing chokepoints).**
+  (i) *Cross-plan consumption*: when a later plan's build/replay resolves an
+  external input whose storage carries a stamp, record the stamp into the
+  registry's `consumed: Map<templateFp, Set<"nodeIndex:oi">>`.
+  (ii) *Step survival*: at markStep, any stamped storage still alive (user rc /
+  snapshot) records into `survived`. Params/optimizer state/user-held tensors
+  land here.
+- **Rebuild.** Once a template has one fully-observed step (executed + a
+  markStep with no new template created that step; optionally K-step
+  hysteresis), invalidate its compiled plan and rebuild-with-pruned-results:
+  re-run the existing harvest with `harvestPairs` = consumed ∪ survived (both
+  functions are ALREADY parameterized on the result set — `harvestGenResults`
+  takes `harvestPairs`, `planMemory` takes `resultSlots`; the mechanism slots
+  in with no planner surgery). Everything else becomes an interval-bounded
+  temp → packed → the +34% over-harvest collapses to the default cutover's
+  survivor memory. Binary result/temp suffices for parity: the observed
+  needed-set converges to exactly the default's live-result survivor set
+  (survivor = held by rc = consumed later or user-held). Step-global
+  multi-segment intervals are NOT needed in stage 1 (they are stage 3's
+  structure).
+- **New plan appearing mid-step (guard/invalidate, tape-guard spirit).**
+  A new template whose inputs resolve against *stamped live* storages simply
+  records consumption (conservative direction, no hazard). A new template
+  referencing a *pruned* producer output hits the structurally-loud missing
+  result. The executor keeps a step-scoped `prunedExecuted:
+  Map<nodeId, {templateFp, nodeIndex, oi}>` (populated as pruned plans
+  replay); the `Input not ready` path consults it and (1) permanently adds the
+  pair to the producer template's needed-set + invalidates its pruned build
+  (next step rebuilds conservative-then-re-pruned), (2) fails the CURRENT step
+  with a diagnostic naming the producer — recovery of the already-overwritten
+  value within the step is exactly stage-3 rematerialization (see (d)) and is
+  deliberately out of scope; until then this residual class is a
+  loud-once-self-healing event. In practice the recurring-sibling class (the
+  actual observed crash) is covered by observation, and late-appearing
+  consumers (eval/logging plans) overwhelmingly read params/grads, which are
+  in `survived`/`consumed` from step 0.
+- **Gates.** (1) Set-parity assert at the seam: on a recurring template, the
+  pruned build-from-IR result set == the default cutover's live-result harvest
+  set (single source, assert agreement). (2) Trajectory differential:
+  build-from-IR-pruned vs default over 30 steps to fp noise, crossing the
+  rebuild threshold (2+ observed steps). (3) Memory: 124M regression
+  build-from-IR-pruned peak within noise of default (kills the +18-42%
+  scaling table). (4) A crafted late-consumer test that exercises the guard
+  path (new template reads a pruned intermediate → loud diagnostic +
+  invalidation, next step conservative). (5) The existing ladder (gates 4/4,
+  fullstack, suites).
+
+### (c) Cost / unblocks
+
+- **Cost:** ~250-400 src SLOC (stamping ~30; registry observation maps + two
+  record calls ~80; rebuild-with-pruned-results trigger ~120, mostly reusing
+  the existing build path; guard + diagnostics ~100). No new env flags (the
+  mechanism lives behind `TORCHLETTE_BUILD_FROM_IR`, whose named sunset —
+  becoming the sole default build source — is stage 2's flip).
+- **Unblocks (stage 2, the deletion harvest — named per weight-norm):**
+  build-from-IR default → the lowered-first-execution build source dies →
+  delete the `record*` hook surface (~105 refs across ~15 backend files),
+  `compilationRecording` + the recorded-stream build in `compiled-plan.ts`,
+  the params-sequence cache (~38 refs; compiled plans already self-contain
+  their params buffers), `liveResultHarvestPairs` (merges into the pruned
+  action-output harvest), and the `TORCHLETTE_GENERATED_PLAN` flag (its named
+  sunset). Estimated −800-1200 SLOC against stage 1's +250-400: **net
+  negative after stage 2**, plus serializable plans / ~700 ms cold-start.
+
+### (d) Extension point: rematerialization (stage 3 — designed for, NOT built)
+
+The stamped identity `(templateFp, nodeIndex, oi)` is the cross-plan name of a
+VALUE, independent of any live buffer — exactly what a remat edge must name.
+Three planned reuses, zero speculative code now:
+1. A checkpointed activation becomes a result whose lifetime is
+   **multi-segment**: dead after forward's last read, re-created by a recompute
+   sub-stream before backward's first read. `planMemory`'s release-queue model
+   already expresses release-and-reclaim; the entry gains segments, and the
+   recompute program is a `generateStream` over the producing subgraph — which
+   build-from-IR already does without execution (generating a stream from IR
+   with no recorded trace IS the remat primitive).
+2. The guard-miss recovery in (b) upgrades from fail-the-step to
+   remat-on-demand: same recompute emission, triggered lazily.
+3. `b66ead78`'s arena-free checkpoint mode then dies by unification: the
+   planner expresses "checkpointing" as liveness edges + recompute programs,
+   and checkpointed training runs compiled like everything else — the named
+   sunset for `TORCHLETTE_ARENA_LIVENESS=0`.
+Design constraint honored now: keep `harvestGenResults`/`planMemory`
+parameterized on the result set (already true) and route ALL cross-plan value
+identity through the stamp — no second identity scheme.
+
 ## Risks and mitigations
 - **Imperative-op long tail** (phase 3): mitigated by per-op fallback — no
   cutover moment; coverage counters make progress visible.
