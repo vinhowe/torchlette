@@ -1645,12 +1645,28 @@ export async function executeLoweredPlan(
   // the cached template; the NEXT execution rebuilds from IR with the scalar
   // demoted to a runtime input.
   let scalarAdaptPending = false;
-  if (
-    loweredPlan.compiledPlan?.valid &&
-    inlinedFusionScalarsStale(loweredPlan, planNodes)
-  ) {
-    destroyCompiledPlanBuffers(loweredPlan.compiledPlan);
-    loweredPlan.compiledPlan = undefined;
+  if (inlinedFusionScalarsStale(loweredPlan, planNodes)) {
+    // A cached fused recipe baked an inlined scalar VALUE (scheduled LR, a
+    // per-step bias-correction coefficient) that has since changed. Force ONE
+    // lowered execution: the fused-segment loop adapts the recipe (demotes the
+    // scalar to a runtime input delivered through the scalar table), and the
+    // NEXT execution rebuilds from IR adapted.
+    //
+    // This must fire whether or not a compiled plan currently exists. Under
+    // build-from-IR a recurring fused template's FIRST occurrence builds the
+    // recipe on the lowered path but records NO compiled plan, so its SECOND
+    // occurrence has no compiled plan to trip the old compiledPlan-gated check
+    // — build-from-IR would then bake the already-stale recipe and silently
+    // corrupt optimizer state for that step (the Adam-elementwise late-LR /
+    // frozen per-step bc1/bc2 wrongness the stage-2 flip surfaced: state
+    // corrupted at step 2, ~constant trajectory offset thereafter). The
+    // compiled-plan invalidation is conditional; scalarAdaptPending gates the
+    // build-from-IR block only, so the recorded path (which always holds a
+    // compiled plan when stale) is unaffected.
+    if (loweredPlan.compiledPlan) {
+      destroyCompiledPlanBuffers(loweredPlan.compiledPlan);
+      loweredPlan.compiledPlan = undefined;
+    }
     scalarAdaptPending = true;
   }
 
