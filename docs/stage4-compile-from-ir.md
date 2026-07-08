@@ -1164,6 +1164,57 @@ Design constraint honored now: keep `harvestGenResults`/`planMemory`
 parameterized on the result set (already true) and route ALL cross-plan value
 identity through the stamp — no second identity scheme.
 
+### ADDENDUM (2026-07-08, design refinement — guard-miss recovery, bind-time
+### feasibility): the crash mechanism corrected, and the soundness boundary
+
+Re-deriving the crash against the template cache corrects one detail of (a)
+and sharpens the guard design:
+
+**The consumer's plan SHAPE is frozen by the template cache in a world where
+the value existed.** The consumer template (the 364 plan) was collected during
+warmup, when the producer's lowered execution HAD materialized the shared
+node's `node.result` — so the collection treats it as a LEAF (external input,
+no producing action, upstream subgraph excluded from the plan). A later pruned
+replay of the producer stops producing that result, and the CACHED consumer
+plan's external resolution finds nothing. The miss is therefore detectable at
+the CONSUMER's bind time — external slot pre-population (`compiled-plan.ts`
+phase 1, `kind: "external"`) or `collectExternalInputBuffers` — **before any
+of the consumer's side effects commit.**
+
+**But "fall back to lowered execution for that step" is NOT sufficient as
+stated.** The cached plan's leaf input has no value on ANY execution path —
+lowered execution of the same frozen plan shape hits the same missing input.
+The sound fallback is **template invalidation + fresh plan RE-COLLECTION**:
+plan collection is graph-driven (given current materialization state, it
+builds a plan computing what's needed from what exists), the missing node's
+`.inputs` chain is intact (IR nodes are held by the producer's template), and
+under pruning its un-harvested ancestors also lack results — so a fresh
+collection naturally includes the whole recompute slice down to surviving
+storages (params, consumed/surviving results) and executes it lowered.
+User-invisible, loud in telemetry, and the needed-set grows so the next step
+replays with the value harvested.
+
+**The soundness boundary (the residual STOP sub-case): recompute reads
+CURRENT storages.** If any in-place mutation committed between the producer's
+pruned replay and the miss — the optimizer's `copy_`/`adamStep` updating
+params, in the SAME step (backward+optimizer is one plan) — the recompute
+slice re-executes against NEW param values and silently produces a DIFFERENT
+value than the one pruned. That is the silent-wrongness class this campaign
+exists to kill, and **the tree has NO version-counter substrate to detect it
+per-storage** (grep: no `bumpVersion`/`_version` anywhere; the spec's version
+mechanism was never landed). The minimal sound rule is therefore a
+step-scoped IN-PLACE-COMMITTED counter: recompute-fallback is taken only when
+zero in-place ops committed since the producer's replay; otherwise the miss is
+unrecoverable-in-step and must fail loudly (the fail-the-step sub-case,
+flagged per protocol rather than papered over). With K=3 observation
+hysteresis + a rebuild limit (needed-set growth capped — a template whose
+needed-set grows more than ~2× pins to the conservative full harvest
+permanently, no specialize/invalidate churn), the miss itself should be rare;
+the in-place-committed refinement bounds what the rare miss can do.
+
+Status: design refinement only — implementation remains gated on direct
+sign-off.
+
 ## Risks and mitigations
 - **Imperative-op long tail** (phase 3): mitigated by per-op fallback — no
   cutover moment; coverage counters make progress visible.
