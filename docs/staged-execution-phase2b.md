@@ -1,7 +1,13 @@
 # Staged Execution, Phase 2b: `capture()` of a whole training step
 
-**Status:** PROPOSED (design-only, 2026-07-08). Review → hardening → separate
-implementation go (the stage-1/stage-3 protocol). NOTHING here is built.
+**Status:** APPROVED (2026-07-08, coordinator review — all six per-section
+rulings as proposed; dispositions: G-cover = TAG_UNIFORM/recorder-coverage
+extension, NOT generated-stream forcing; NO ceremony bridging — minimal/implied
+loop is the API constraint, the #81 starvation warning lands with inc-2;
+TAPE_VERIFY-excludes-volatile-bytes is a numbered implementation gate; K is a
+capture OPTION, default 2, no pressure-reactive automation, K=1==K=2 bit-parity
+gated). Implementation staged: inc-1 G-cover → inc-2 whole-step capture →
+inc-3 ring. **INCREMENT 1 LANDED — see the INC-1 section at the end.**
 **Builds on:** phase 1 (`docs/staged-execution-phase1.md`, esp. §9 — the
 probe-unsoundness rule and the arg-boundary contract), phase 2a
 (`docs/staged-execution-phase2a.md` — the `capture()` API + staging ring),
@@ -498,3 +504,71 @@ where 2b eventually PAYS DOWN the weight-norm (retiring observation predicates o
 the captured path) — named, not built. If G-cover cannot be closed without net-
 new mechanism, that mechanism must name its deletions (the frozen-scalar caches
 it subsumes) per house tradition.
+
+---
+
+## INC-1 LANDED (2026-07-08): G-cover — the recorder forms an eligible
+## training tape; two coverage rules + one liveness seam; a pre-existing
+## tape-starvation bug found and fixed en route
+
+**Gate result (`tools/t-train-tape-probe.ts`, the falsification probe made a
+permanent gate — minimal implied-boundary loop, varying batch, autocast +
+checkpoint + GradScaler + clip + AdamW, distilgpt2@512, 18 steps):**
+- FUSED adam (default): eligiblePairs=7, refusals=0, tapeCount=1 → PASS
+- FOREACH adam (`TORCHLETTE_FUSED_ADAM=0`): eligiblePairs=4, refusals=0,
+  tapeCount=1 → PASS (no extra work needed — the foreach program's per-step
+  scalars already flow through covered channels; only the fused kernel's
+  batch configs needed the new rule)
+
+**The two coverage rules (both in `src/core/step-tape.ts` diffImages, both
+verified-at-use so staleness degrades to a loud refusal, never a wrong replay):**
+1. **Dead-payload/external** — a node whose result PRE-EXISTED this plan's
+   execution (`hadResult` captured at stBeginPlan; the shared-node/external
+   class: batch x/y appearing in backward/optimizer plans of the multi-plan
+   checkpointed step) never has its payload read by this plan's replay —
+   consumers resolve the producer plan's current result buffer per replay.
+   Covered iff hadResult in BOTH compared steps.
+2. **Batch-representative** — `adam-batch` (executor seam, `stDeclareBatchCover`)
+   declares its member node positions + the representative whose TAG_UNIFORM
+   repack carries the per-step config (bias-corrected step_size). Member payload
+   variance is covered iff the representative is TAG_UNIFORM-covered in both
+   steps AND the member's payloadHash EQUALS the representative's within each
+   step — the agreement assert that makes a member with a DIVERGENT config
+   (per-group hyperparams drifting from the representative) a LOUD refusal
+   instead of a silent wrong-config replay. The declaration persists across
+   template invalidation (build-from-IR rebuilds never re-run executor actions,
+   so it cannot re-declare; measured: the optimizer template rebuilt ~step 11
+   and every later pair refused until persistence).
+
+**Pre-existing bug found and fixed (the capture-starvation class):** since the
+build-from-IR default flip (c374d60a) activated observed-liveness, EVERY warm
+capture/tape died after ~K_IDLE steady boundaries: tape replays bypass the
+normal execution path, so the actively-replayed template accrued idleSteps and
+was IDLE-RETIRED — destroying the compiled plan under the live skeleton
+(`test/capture.spec.ts` warm-slot + closure-frozen tests were failing on main
+under `TORCHLETTE_STEP_TAPE=1`; bisected to c374d60a). FIX: `noteTemplateReplayed`
+(observed-liveness) resets ONLY the idle-retire clock on each tape replay —
+deliberately NOT `noteTemplateExecuted`, so replays stay invisible to the
+convergence/steady machinery (marking them executed lets convergence invalidate
+and rebuild the plan mid-tape, forcing a spurious re-trace per convergence).
+
+**Method note (honesty):** an intermediate attribution blamed the broader
+noteTemplateExecuted routing for ~9k invalid-buffer submits in kv-differential;
+that experiment was CONFOUNDED — the errors were `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+from foreign jobs on the shared V100 box, AND Dawn ignores CUDA_VISIBLE_DEVICES
+(every "GPU-selected" run had used the same Vulkan default adapter; runs must
+pin via `VULKAN_DEVICE_INDEX` + the `tools/vk-shim` LD_LIBRARY_PATH filter, the
+launch-diloco mechanism). The narrow-reset choice stands on the convergence-
+invisibility argument, not on that measurement.
+
+**Ladder (all at final code, GPU-pinned):** probe PASS fused+foreach; suite
+default 90+63 green (2 contention/network flakes green on rerun: relay,
+pytorch-oracle); suite `TORCHLETTE_STEP_TAPE=1` 90+63 green (capture.spec 8/8 —
+the two main-broken tests now pass); gates 4/4; kv-differential PASS clean
+(0 OOM, 0 GPU errors, 4 arms bit-identical, taped 13/13 hits); fullstack
+compiled-vs-lowered maxΔ 7.6e-6/30 steps; fullstack STRICT (LIFETIME+GPU) clean,
+maxΔ 5.7e-6 vs compiled; production 124M regression PASS baseline-exact
+(9.8089/5.9226/5.1516/4.6383 vs {9.81,5.92,5.15,4.64}), peak flat 2087.6 MB,
+zero growth. Zero new env flags; no deletions (coverage extension of existing
+seams: 2 recorder rules + 1 executor declaration + 1 liveness seam + 1 gate
+probe).

@@ -58,6 +58,7 @@ import {
   stMarkReplayStep,
 } from "../core/step-tape";
 import { executeLoweredPlan } from "./executor";
+import { noteTemplateReplayed } from "./observed-liveness";
 
 // ---------------------------------------------------------------------------
 // Skeleton store (§8.2 option i)
@@ -394,6 +395,18 @@ export async function stTryReplay(
     n._executed = undefined;
     n._inputsRetained = undefined;
   }
+
+  // Pin the template against idle-retire for this step: a replay does not
+  // execute through the normal path, so observed-liveness would see the
+  // actively-replayed template as IDLE and retire it after K_IDLE steady
+  // boundaries — destroying the compiled plan under this skeleton (every warm
+  // capture died at ~3 boundaries once build-from-IR became the default;
+  // found by capture.spec). Deliberately NOT noteTemplateExecuted: replays
+  // stay invisible to the convergence/steady machinery (today's semantics —
+  // marking them executed would let convergence invalidate + rebuild the plan
+  // mid-tape, forcing a spurious re-trace per convergence). Smallest delta
+  // that stops the retire.
+  noteTemplateReplayed(sk.fp);
 
   await executeLoweredPlan(
     { nodes: sk.planNodes },

@@ -164,6 +164,7 @@ import {
   STEP_TAPE_RECORD,
   STEP_TAPE_REPLAY,
   stBeginPlan,
+  stDeclareBatchCover,
   stEndPlan,
 } from "../core/step-tape";
 import { stCaptureCompiledStep } from "./step-tape-replay";
@@ -2538,10 +2539,12 @@ export async function executeLoweredPlan(
             const inputStorages: StorageHandle[][] = [];
             const items: import("../backend/types").AdamBatchItem[] = [];
             let firstNodeIdx = -1;
+            const executedIdx: number[] = [];
             for (const nodeIdx of action.nodeIndices) {
               const node = planNodes[nodeIdx];
               if (node.result) continue;
               if (firstNodeIdx < 0) firstNodeIdx = nodeIdx;
+              executedIdx.push(nodeIdx);
               const inputs = node.inputs.map((ref) =>
                 getInputStorage(ref, adamBackend),
               );
@@ -2561,6 +2564,13 @@ export async function executeLoweredPlan(
             // adamStep node — all items in a batch share hyperparameters by
             // construction, so any node is a valid replay-time config source.
             if (compilationRecording) setRecordingNodeIndex(firstNodeIdx);
+            // [step-tape 2b G-cover] declare the batch members' payload
+            // variance as carried by the representative's TAG_UNIFORM repack.
+            // The recorder additionally asserts member↔representative payload
+            // AGREEMENT per compared step, so a member whose config diverges
+            // (per-group hyperparams) refuses loudly instead of replaying the
+            // representative's config silently.
+            if (STEP_TAPE_RECORD) stDeclareBatchCover(executedIdx, firstNodeIdx);
             const results = adamStepBatch(items);
             for (let i = 0; i < nodes.length; i++) {
               const r = results[i];

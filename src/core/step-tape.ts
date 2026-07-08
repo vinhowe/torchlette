@@ -202,6 +202,9 @@ interface NodeLike {
   dtype: string;
   payload?: unknown;
   inputs: ReadonlyArray<{ kind: string; value?: unknown }>;
+  /** Primary result (derived view of results[0]); defined ⇒ the node's value
+   *  pre-exists this plan's execution (produced by an earlier plan). */
+  result?: unknown;
 }
 
 /** One node's payload/scalar image (only nodes with payload or scalar refs). */
@@ -211,6 +214,13 @@ interface NodeImage {
   payloadHash: number; // 0 = no payload
   /** Flat [inputIndex, value, ...] pairs for scalar-kind refs. */
   scalars: number[] | null;
+  /** The node's result PRE-EXISTED at plan begin (shared-node/external class:
+   *  this plan never executes it — consumers resolve its CURRENT result buffer
+   *  per replay, so its payload is dead HERE; the plan that executes it
+   *  carries the payload as a TAG_WRITE and is diffed on its own). Payload
+   *  variance at a hadResult position (in BOTH compared steps) is therefore
+   *  carried-as-data, not undeclared. [2b G-cover, upload class] */
+  hadResult: boolean;
 }
 
 interface WriteObs {
@@ -258,6 +268,18 @@ interface StepRecord {
 
 /** Declared scalar-table coverage per template fp: "pos:inputIndex" set. */
 const declaredScalarSlots = new Map<number, Set<string>>();
+
+/** Declared batch-representative coverage per template fp: member node
+ *  position → representative node position. A batched op (adam-batch) packs
+ *  many nodes into dispatches whose per-step-varying config is TAG_UNIFORM-
+ *  repacked from ONE representative node's payload; the member nodes'
+ *  payloads are dead at replay. Member payload variance is covered IFF the
+ *  representative is TAG_UNIFORM-covered in both compared steps AND the
+ *  member's payloadHash EQUALS the representative's within each step — the
+ *  agreement assert that makes a batch member with a DIVERGENT config (a
+ *  per-group LR that stopped matching the representative) a LOUD refusal
+ *  instead of a silent wrong-config replay. [2b G-cover, optimizer class] */
+const declaredBatchCover = new Map<number, Map<number, number>>();
 
 let cur: { entries: TapeEntry[]; plans: PlanExecRecord[] } = {
   entries: [],
@@ -322,7 +344,13 @@ export function stBeginPlan(fp: number, planNodes: readonly NodeLike[]): void {
       n.payload === undefined
         ? 0
         : hashValue(0x811c9dc5, n.payload, 0) >>> 0 || 1;
-    image.push({ pos: i, op: n.op, payloadHash, scalars });
+    image.push({
+      pos: i,
+      op: n.op,
+      payloadHash,
+      scalars,
+      hadResult: n.result !== undefined,
+    });
   }
   const rec: PlanExecRecord = {
     fp,
@@ -387,6 +415,25 @@ export function stDeclareScalarSlots(
   const set = new Set<string>();
   for (const s of slots) set.add(`${s.nodeIndex}:${s.inputIndex}`);
   declaredScalarSlots.set(p.fp, set);
+}
+
+/** Batched-op representative coverage (executor adam-batch seam): the batch's
+ *  per-step-varying configs are TAG_UNIFORM-repacked from `rep`'s payload at
+ *  replay; `members` are the node positions the batch executed. Re-declared
+ *  (overwritten) on every lowered/recording execution of the plan — the
+ *  declaration persists per fp so the compiled-pair diff (which never runs
+ *  the action) can consult it. */
+export function stDeclareBatchCover(members: number[], rep: number): void {
+  const p = activePlan;
+  if (!p) return;
+  let m = declaredBatchCover.get(p.fp);
+  if (!m) {
+    m = new Map();
+    declaredBatchCover.set(p.fp, m);
+  } else {
+    m.clear();
+  }
+  for (const pos of members) m.set(pos, rep);
 }
 
 /** A scalar-table buffer was actually written (value changed). Recorded as a
@@ -460,6 +507,21 @@ function refuse(diag: string): void {
   }
 }
 
+/** Image entry at a node position (entries are in increasing-pos order). */
+function imageAt(p: PlanExecRecord, pos: number): NodeImage | undefined {
+  const img = p.image;
+  let lo = 0;
+  let hi = img.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const v = img[mid].pos;
+    if (v === pos) return img[mid];
+    if (v < pos) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return undefined;
+}
+
 /** Diff prev vs cur images. Returns the varying DECLARED scalar slots, or
  *  null if any undeclared variance was found (tape refused). */
 function diffImages(
@@ -494,15 +556,43 @@ function diffImages(
       }
       if (ia.payloadHash !== ib.payloadHash) {
         // Payload variance is declared iff this node position is carried as
-        // data in BOTH recording steps: a TAG_WRITE upload or a TAG_UNIFORM
-        // volatile repack (§2.1 sources "upload"/"payload").
+        // data in BOTH recording steps, by one of (§2.1 + 2b G-cover):
+        //  1. TAG_WRITE upload or TAG_UNIFORM volatile repack at the position
+        //     itself (sources "upload"/"payload");
+        //  2. dead payload — the node's result PRE-EXISTED this plan in BOTH
+        //     steps (shared-node/external class): this plan never reads the
+        //     payload; consumers resolve the producer plan's current result
+        //     buffer per replay, and the producer plan's own diff covers the
+        //     payload as its TAG_WRITE;
+        //  3. batch-representative — a declared batch member whose config is
+        //     repacked from the representative's payload at replay, with the
+        //     member↔representative payloadHash agreement assert per step.
         const coveredB = b.writtenPos.has(ib.pos) || b.uniformPos.has(ib.pos);
         const coveredA = a.writtenPos.has(ia.pos) || a.uniformPos.has(ia.pos);
         if (!(coveredA && coveredB)) {
-          refuse(
-            `plan[${k}] fp=0x${hex(b.fp)} node[${ib.pos}] op=${ib.op}: PAYLOAD varies step→step but position is not TAG_WRITE-covered (undeclared variance — the PAYLOAD-THRASH sibling)`,
-          );
-          clean = false;
+          if (ia.hadResult && ib.hadResult) {
+            // Rule 2: dead payload in this plan (both steps) — covered.
+          } else {
+            const rep = declaredBatchCover.get(b.fp)?.get(ib.pos);
+            const repA = rep !== undefined ? imageAt(a, rep) : undefined;
+            const repB = rep !== undefined ? imageAt(b, rep) : undefined;
+            const batchCovered =
+              rep !== undefined &&
+              repA !== undefined &&
+              repB !== undefined &&
+              a.uniformPos.has(rep) &&
+              b.uniformPos.has(rep) &&
+              repA.payloadHash === ia.payloadHash &&
+              repB.payloadHash === ib.payloadHash;
+            if (!batchCovered) {
+              refuse(
+                rep !== undefined
+                  ? `plan[${k}] fp=0x${hex(b.fp)} node[${ib.pos}] op=${ib.op}: PAYLOAD varies and batch-representative coverage failed (rep=${rep} uniform-covered=${a.uniformPos.has(rep) && b.uniformPos.has(rep)}, payload agreement=${repA?.payloadHash === ia.payloadHash && repB?.payloadHash === ib.payloadHash}) — a batch member whose config diverged from its representative would replay WRONG; refusing`
+                  : `plan[${k}] fp=0x${hex(b.fp)} node[${ib.pos}] op=${ib.op}: PAYLOAD varies step→step but position is not TAG_WRITE-covered (undeclared variance — the PAYLOAD-THRASH sibling)`,
+              );
+              clean = false;
+            }
+          }
         }
         // NO continue: a node can carry BOTH a payload and scalar refs — the
         // scalar comparison below must still run.
@@ -684,6 +774,15 @@ export function stInvalidateTemplate(fp: number): void {
     }
   }
   declaredScalarSlots.delete(fp);
+  // declaredBatchCover deliberately SURVIVES template invalidation: a
+  // build-from-IR rebuild (staleness → invalidate → rebuild) never re-runs
+  // the executor actions, so the adam-batch seam cannot re-declare — deleting
+  // here would starve the rebuilt template's coverage forever (measured: the
+  // optimizer template rebuilt ~step 11 and every later pair refused). Safe
+  // because the declaration is a HINT verified at every use: the diff requires
+  // the representative to be TAG_UNIFORM-covered in both compared steps AND
+  // member↔representative payload agreement per step — a stale entry fails
+  // those checks and refuses loudly, never replays wrong.
   if (prev?.plans.some((p) => p.fp === fp)) prev = null;
 }
 
@@ -737,6 +836,7 @@ export function stStats(): {
 export function stResetAll(): void {
   tapes.clear();
   declaredScalarSlots.clear();
+  declaredBatchCover.clear();
   cur = { entries: [], plans: [] };
   activePlan = null;
   prev = null;

@@ -284,6 +284,18 @@ export function noteTemplateExecuted(fp: number): void {
   if (enabled) obs(fp).executedThisStep = true;
 }
 
+/** Step-tape replay: this template was REPLAYED via a tape skeleton. Resets
+ *  ONLY the idle-retire clock — a template actively serving replays must not
+ *  be idle-retired (retire destroys the compiled plan under the live skeleton;
+ *  every warm capture died at ~K_IDLE steady boundaries). Deliberately does
+ *  NOT set executedThisStep: replays stay invisible to the convergence/steady
+ *  machinery (today's semantics) — marking them executed would let
+ *  convergence invalidate + rebuild the plan mid-tape, forcing a spurious
+ *  re-trace per convergence. Smallest delta that stops the retire. */
+export function noteTemplateReplayed(fp: number): void {
+  if (enabled) obs(fp).idleSteps = 0;
+}
+
 /** Executor: a plan that commits in-place mutations (adam / copy_ to persistent
  *  state) just executed — advances the step-scoped in-place-committed counter
  *  the guard's soundness rule reads. */
