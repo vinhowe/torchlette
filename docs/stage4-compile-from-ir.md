@@ -1020,20 +1020,40 @@ build). Sequencing: stage 1 = solve the over-harvest via plan-set-level liveness
 deletion harvest, stage 3 = rematerialization edges in the same lifetime
 machinery.
 
+**B-inventory status after stage-2 increment 3 (2026-07-08):**
+- **B1 — PARTIAL (the separable core, inc-3a):** the cutover swap
+  (recorded→generated) + `liveResultHarvestPairs` DELETED (−61 lines,
+  executor.ts). The recorded BUILD itself (`buildCompiledPlan` + recording)
+  SURVIVES — load-bearing for the uncovered-plan census fallback, the
+  `BUILD_FROM_IR=0` opt-out, and the verify modes. The remaining bulk of the
+  original −800–1200 estimate is coupled to sunsetting that opt-out/fallback:
+  a product decision, reported not forced.
+- **B2 — split named (inc-3a, no code):** all 80 record*-hook refs across 19
+  files survive (they serve the surviving recorded build); the cutover swap
+  was the only recording consumer with no other master.
+- **B5 — DONE (inc-3c):** `TORCHLETTE_GENERATED_PLAN` deleted (twin of
+  `BUILD_FROM_IR=0` after inc-3a).
+- **B3 — DEFERRED (did not fall out naturally):** the params-sequence cache
+  serves the surviving lowered/recorded executions; it dies with the recorded
+  build, not before.
+- **B4/B7 — out of scope (B7 sunsets at stage-3 remat), unchanged.**
+
 ### Flag sunsets (named, per the complexity-budget policy)
-- **`TORCHLETTE_GENERATED_PLAN`** (opt-out, default-on cutover) — dies when B1
-  (the recorded-stream replay path) is deleted after stage 1/2: with no recorded
-  replay to opt back into, the flag has no meaning.
+- **`TORCHLETTE_GENERATED_PLAN` — DEAD (stage-2 inc-3c, 2026-07-08, sunset
+  EXECUTED).** After inc-3a deleted the cutover swap, the flag was an exact
+  behavioral twin of `BUILD_FROM_IR=0` (both = recorded replay everywhere); a
+  flag with an identical twin is debt. The recorded-replay reference arm is
+  now `TORCHLETTE_BUILD_FROM_IR=0` everywhere (gates, parity ladders, tools).
 - **`TORCHLETTE_BUILD_FROM_IR`** — **stage-2 increment 2 (2026-07-08): FLIPPED
   to opt-out default-on** (`!== "0"`, house convention). The opt-in form is
-  dead; the surviving `=0` opt-out toggles back to the record-then-cutover
-  build and dies WITH that build source at B1's deletion (increment 3), the
-  same moment as `TORCHLETTE_GENERATED_PLAN`. Recording now engages only for:
-  verify modes (`TORCHLETTE_STREAM_GENERATE=1`; the determinism gate pins
-  `=0`), plans the generator cannot fully cover (per-plan census-driven
-  fallback), and the opt-outs (`BUILD_FROM_IR=0` / `GENERATED_PLAN=0` /
-  `COMPILED_PLAN=0`) — the single predicate is `buildFromIRActive()`
-  (executor.ts).
+  dead; the surviving `=0` opt-out toggles back to the recorded build and dies
+  WITH that build source when the recorded build sunsets (a product decision —
+  see inc-3a's coupling note; the uncovered-plan fallback and the verify modes
+  are its remaining masters). Recording now engages only for: verify modes
+  (`TORCHLETTE_STREAM_GENERATE=1`; the determinism gate pins `=0`), plans the
+  generator cannot fully cover (per-plan census-driven fallback), and the
+  opt-outs (`BUILD_FROM_IR=0` / `COMPILED_PLAN=0`) — the single predicate is
+  `buildFromIRActive()` (executor.ts).
 - **`TORCHLETTE_ARENA_LIVENESS=0`** (legacy unbudgeted arena opt-out) — sunsets
   at the REMATERIALIZATION UNIFICATION (stage 3): once checkpointed training
   runs on the planner (liveness edges + recompute), the legacy arena's last

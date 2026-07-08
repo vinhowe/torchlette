@@ -471,16 +471,17 @@ export function debugTemplatePlanMemory(): Record<
  *   - uncovered plans (census-driven, per-plan): when generateStream cannot
  *     fully cover a plan the build-from-IR block falls through with zero
  *     residue and the plan records on its next execution (recorded cutover);
- *   - the opt-outs: BUILD_FROM_IR=0 (this flag's sunset form — dies when the
- *     recorded build source is deleted), GENERATED_PLAN=0 / COMPILED_PLAN=0
- *     (the legacy recorded-replay / lowered references, which must disable
- *     build-from-IR too or they'd measure nothing).
+ *   - the opt-outs: BUILD_FROM_IR=0 (the recorded-replay reference; dies when
+ *     the recorded build source is deleted) / COMPILED_PLAN=0 (the lowered
+ *     reference), which must disable build-from-IR too or they'd measure
+ *     nothing. (The GENERATED_PLAN flag died at stage-2 inc-3c, 2026-07-08:
+ *     after inc-3a deleted the cutover swap it was an exact behavioral twin
+ *     of BUILD_FROM_IR=0 — the named B5 sunset, executed.)
  *  Single predicate so the observation enable below and the build block can
  *  never disagree. */
 function buildFromIRActive(): boolean {
   return (
     ENV.TORCHLETTE_BUILD_FROM_IR !== "0" &&
-    ENV.TORCHLETTE_GENERATED_PLAN !== "0" &&
     ENV.TORCHLETTE_COMPILED_PLAN !== "0" &&
     ENV.TORCHLETTE_STREAM_GENERATE !== "1"
   );

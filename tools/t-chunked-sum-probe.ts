@@ -7,7 +7,7 @@
  *
  * Run: VULKAN_DEVICE_INDEX=0 LD_LIBRARY_PATH=tools/vk-shim \
  *        npx tsx tools/t-chunked-sum-probe.ts
- * Add TORCHLETTE_GENERATED_PLAN=0 to force the recorded path.
+ * Add TORCHLETTE_BUILD_FROM_IR=0 to force the recorded path.
  */
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
 import { Torchlette } from "../src/frontend/torchlette";
