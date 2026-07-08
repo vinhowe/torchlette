@@ -1863,3 +1863,67 @@ never reuse a buffer whose queued reader hasn't dispatched).
    SHOULD have been recomputed by the frontend but was read as an external)? §2
    argues no, but this is the correctness lynchpin and deserves an explicit
    instrumented check in S3.2.
+
+### S3.0 RESULT (2026-07-08, measured): the consumed-only overlay premise is
+### FALSIFIED — the gap decomposes differently. STOPPED for re-approval.
+
+S3.0 landed as designed (observation-only): `observeConsumed` gains the
+consumer fp; per-pair last-reader tracking with K-step stability + an
+`everSurvived` record (neededSrc keeps only the FIRST source, so survival of a
+consumed pair was invisible); harvested-result → planner-entry registration at
+build (cleared on invalidate/retire); releasability classification + telemetry
+(`releasableLastReader`, `debugReleasableSummary`, `debugTopHeldPairs`,
+releasable counters on `getObservedLivenessStats`); probe tool
+`tools/t-remat-instrument.ts`. Zero behavior change.
+
+**The measurement (124M-class, checkpointed, compiled via CHECKPOINT_ARENA=1,
+5 rounds, entry-deduped attribution — pairs aliasing one entry counted once):**
+
+Step-globally releasable under the approved rule (consumed-only ∧ never
+survived ∧ stable last reader ∧ not mandatory): **2.2 MB** — not the ~2.9 GB
+gap. The design section's §1 assumption ("cross-plan-consumed activations…
+pinned per-template rather than released at their last cross-plan read" as the
+bulk) is FALSIFIED at this config: under selective checkpointing the
+cross-plan activation class (attention O/L) is only ~2 MB.
+
+**Where the live 3501 MB of exclusive result entries actually sit** (cur 5587
+vs arena-free-lowered 2638; registry materialized 4471 = 3501 results + 970
+temps; +1116 non-registry externals):
+| class | MB | physically | freeable by |
+|---|---:|---|---|
+| src=s true survivors | 1674 | packed m/v state chain, f16 weight-cast cache, scaler-deferred-readback-held unscaled grads (the lowered path holds equivalents — its 2638 cur includes ~500 MB of the same scaler-held grads) | nothing (correctly held) — EXCEPT ~260 MB of f16 casts DUPLICATED across two forward template variants (each template's build harvests its own exclusive copy of the same cached cast) |
+| mandatory-CONSUMED, dead at boundary | ~1100 | the scaled grads (backward outputs read by clip/optimizer, disposed by zeroGrad before the boundary): wte.grad add 167.8, 24× MLP grads 16.8 each; + forward's f16 wte cast 134.2 + logits cast 67.1 read by backward | boundary-cyclic release (B below) |
+| mandatory-NEVER-OBSERVED (src=none) | ~700 | DEAD grad-chain intermediates: the tied-wte grad's matmul (167.8) and scatterAdd (167.8) pieces read only INTRA-plan by the final add — harvested solely because the template's frozen `plan.outputIndices` (grad-accumulation roots captured at collection) marks them mandatory | mandatory-set pruning (A below) |
+| temps (materialized) | 970 | planner temp entries; the lowered path holds the analogous bytes as POOL-IDLE buffers, which `cur` does NOT count — a metric asymmetry to resolve before holding the bar to `cur` | boundary temp release / metric fix (C) |
+
+`crossPlanPersistentBindings` probe: EMPTY — the persistent-slot consumption
+hole hypothesis is also falsified; the src=none class is frozen-mandatory
+over-declaration, not invisible reads.
+
+**Reshaped S3.1 (NOT built — stopped for re-approval), in impact order:**
+- **(A) Mandatory-set pruning, ~700 MB:** extend stage-1 pruning to mandatory
+  pairs observed dead (never consumed, never survived, K steps) — they become
+  temps; the existing guard covers late readers. REQUIRES a readback
+  observation seam first (`item()`/`cpu()` → observeConsumed with a
+  READBACK sentinel that pins the pair permanently): the loss IS a mandatory
+  pair whose only reader is a readback, invisible to observation today —
+  pruning it without the seam would break `loss.item()`.
+- **(B) Boundary-cyclic release, ~1100 MB:** a mandatory-consumed pair that
+  NEVER survives the boundary and has a K-stable last reader is dead from its
+  last read until the producer re-writes it next step. Its entry becomes
+  claimable by plans positioned AFTER the last reader or BEFORE the producer
+  (cyclically). Soundness: survival observation plays the role the lowered
+  path's rc plays — any tensor alive at the boundary marks its pair
+  unreleasable, so cross-step readers imply survival and are never overlaid;
+  within-step readbacks are safe because claims only take effect in the next
+  cycle. Needs step-position tracking (deferred from the original design),
+  planMemory claim events, the loud clear-at-release seam, and the readback
+  seam from (A).
+- **(C) Temp/metric parity, ~970 MB + rounding:** decide whether the bar's
+  `cur` should count pool-idle bytes (physical parity) or whether registry
+  temp entries should release-to-pool at the boundary; measure A+B first.
+
+A+B ≈ 1.8 GB of the 2.9 GB gap; whether that clears the bar depends on (C)'s
+metric ruling. The dirty-miss and view-survival rulings are unaffected. The
+S3.0 mechanism (stamps, last-reader, everSurvived, registration) is exactly
+the substrate A and B need — nothing built is wasted.

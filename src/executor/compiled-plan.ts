@@ -597,6 +597,27 @@ export function resetPlannerRegistry(): void {
   }
 }
 
+/** [stage-3] Byte size of one registry entry (0 for an unknown index) — the
+ *  executor registers harvested-result → entry mappings for the step-global
+ *  release observation through this. */
+export function plannerEntryBytes(idx: number): number {
+  return plannerRegistry.entries[idx]?.bytes ?? 0;
+}
+
+/** [stage-3 S3.0 probe] buffer → registry entry index for every MATERIALIZED
+ *  entry. Debug-only (linear build per call): lets the executor detect
+ *  cross-plan PERSISTENT-slot bindings of another plan's result entries — a
+ *  consumption channel the observeConsumed seam never sees (persistent slots
+ *  resolve once at build, not per replay). */
+export function debugEntryBufferIndex(): Map<GPUBuffer, number> {
+  const out = new Map<GPUBuffer, number>();
+  for (let i = 0; i < plannerRegistry.entries.length; i++) {
+    const b = plannerRegistry.entries[i].buffer;
+    if (b) out.set(b, i);
+  }
+  return out;
+}
+
 /** Test/debug: snapshot of the shared planner registry — entry count and byte
  *  totals split result-holder vs shareable temp (the stage-1 residual
  *  attribution axis: result bytes are the harvest's footprint). */
@@ -1265,7 +1286,7 @@ export async function executeCompiledPlan(
           }
           throw e;
         }
-        observeConsumed(storage);
+        observeConsumed(storage, compiled.templateFp);
         slots[i] = gpuBuffer(storage.backendTensor);
         if (dbgSlots?.includes(i)) {
           const refDesc =

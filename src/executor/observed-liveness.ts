@@ -98,6 +98,38 @@ interface TemplateObs {
   grewThisStep: boolean;
   executedThisStep: boolean;
   idleSteps: number; // consecutive boundaries without execution (retire clock)
+  // ── Stage-3 remat unification (S3.0 observation; docs §Stage 3) ────────────
+  /** pair → template fp of its LAST cross-plan reader within the step (the
+   *  consumer whose read carried the highest step-scoped consumption order).
+   *  The step-global release seam frees a consumed-only pair's registry entry
+   *  INTO its last reader's build: the reader's temps overlay the dead
+   *  activation after its final read (safe under strictly-sequential plans —
+   *  the producer re-writes the entry before any next-step consumer reads). */
+  lastReader: Map<string, number>;
+  /** pair → consecutive fully-observed steps with the SAME single lastReader.
+   *  Releasable only after K_HYSTERESIS stable steps (same activation
+   *  condition as pruning: warmup order instability never releases). */
+  lastReaderStable: Map<string, number>;
+  /** pair → step-global release REVOKED permanently (a guard miss proved a
+   *  consumer observation didn't see; never trust its last-reader again). */
+  releaseRevoked: Set<string>;
+  /** pairs that EVER survived a step boundary (directly or via view base).
+   *  Distinct from neededSrc (which keeps the FIRST source — a pair consumed
+   *  before it was seen surviving stays "c" there): releasability must know
+   *  about ANY survival, ever, since a surviving value is user-visible and
+   *  must never be overlaid. */
+  everSurvived: Set<string>;
+  /** pair → planner registry entry backing the harvested result in the
+   *  CURRENT build (bytes for telemetry; mandatory pairs are terminal/declared
+   *  outputs — never releasable). `op` is the producing node's op label
+   *  (debug attribution only). Re-registered wholesale at every build. */
+  resultEntries: Map<
+    string,
+    { entryIdx: number; bytes: number; mandatory: boolean; op?: string }
+  >;
+  /** Registry generation resultEntries was registered against (a registry
+   *  reset invalidates entry indices — identity-compared, epoch-keyed). */
+  resultEntriesGen: number;
 }
 
 const key = (ni: number, oi: number): string => `${ni}:${oi}`;
@@ -111,6 +143,11 @@ let newTemplateThisStep = 0;
 /** nodeId → { producer stamp, in-place-commit count at its pruned replay }. */
 let prunedExecuted = new Map<number, { stamp: ResultStamp; mark: number }>();
 let inPlaceCommits = 0;
+/** [stage-3] Step-scoped consumption order: "fp|ni:oi" → the consumer fp of
+ *  the HIGHEST-order read this step (last-write-wins as reads are observed in
+ *  execution order — plans are strictly sequential, so observation order IS
+ *  queue order). Cleared at the boundary after merging into lastReader. */
+let stepLastReader = new Map<string, number>();
 
 // ── Telemetry (folded onto getPayloadThrashStats) ────────────────────────────
 let cleanMisses = 0;
@@ -151,6 +188,7 @@ export function resetObservedLiveness(): void {
   newTemplateThisStep = 0;
   prunedExecuted = new Map();
   inPlaceCommits = 0;
+  stepLastReader = new Map();
   cleanMisses = 0;
   dirtyMisses = 0;
   pinnedTemplates = 0;
@@ -171,6 +209,12 @@ function obs(fp: number): TemplateObs {
       grewThisStep: false,
       executedThisStep: false,
       idleSteps: 0,
+      lastReader: new Map(),
+      lastReaderStable: new Map(),
+      releaseRevoked: new Set(),
+      everSurvived: new Set(),
+      resultEntries: new Map(),
+      resultEntriesGen: -1,
     };
     templates.set(fp, t);
   }
@@ -231,11 +275,23 @@ export function stampResult(
   stepStamped.push({ shId: sh.id, checkId: sh.baseStorageId ?? sh.id, stamp });
 }
 
-/** Record cross-plan consumption of a resolved external input, if stamped. */
-export function observeConsumed(storage: StorageHandle): void {
+/** Record cross-plan consumption of a resolved external input, if stamped.
+ *  consumerFp (the READING template) feeds the stage-3 last-reader
+ *  observation; undefined (lowered/legacy read sites) leaves it untracked —
+ *  conservative: a pair without a stable observed last reader never releases. */
+export function observeConsumed(
+  storage: StorageHandle,
+  consumerFp?: number,
+): void {
   if (!enabled) return;
   const stamp = storage.stamp;
-  if (stamp) addNeeded(stamp.fp, stamp.ni, stamp.oi, "c");
+  if (!stamp) return;
+  addNeeded(stamp.fp, stamp.ni, stamp.oi, "c");
+  if (consumerFp !== undefined) {
+    // Last-write-wins: observation order is queue order (strictly-sequential
+    // plans), so the final write for a pair this step IS its last reader.
+    stepLastReader.set(`${stamp.fp}|${key(stamp.ni, stamp.oi)}`, consumerFp);
+  }
 }
 
 /** Register the pairs a pruned plan EXCLUDED from its harvest, so a later
@@ -265,6 +321,10 @@ export function guardMiss(nodeId: number, oi: number): boolean {
   // Grow the producer's needed-set and invalidate its pruned build so next
   // step re-harvests the value (conservative-then-re-pruned).
   addNeeded(stamp.fp, stamp.ni, stamp.oi, "g");
+  // [stage-3] A miss proves a consumer observation didn't see — the pair's
+  // observed last-reader is untrustworthy forever. Idempotent for pruned-pair
+  // misses (which were never releasable).
+  revokeRelease(stamp.fp, stamp.ni, stamp.oi);
   invalidateTemplateCompiled?.(stamp.fp);
   // Soundness boundary: recompute reads CURRENT storages. If any in-place op
   // committed since the producer's replay, the recompute would silently differ.
@@ -292,6 +352,32 @@ export function observeStepBoundary(): void {
     if (!storageTracker.isDestroyed(checkId)) {
       const direct = shId === checkId || !storageTracker.isDestroyed(shId);
       addNeeded(stamp.fp, stamp.ni, stamp.oi, direct ? "s" : "b");
+      // [stage-3] Survival is recorded unconditionally (addNeeded keeps only
+      // the FIRST source): a pair that ever survives is user-visible and must
+      // never be step-globally released.
+      obs(stamp.fp).everSurvived.add(key(stamp.ni, stamp.oi));
+    }
+  }
+  // [stage-3] Merge this step's observed last readers into per-pair stability.
+  // A pair keeps its stability streak only while the SAME consumer stays its
+  // last reader across fully-observed steps; any change (including "consumed
+  // in prior steps but not this one" while the producer executed) resets it.
+  for (const [k, consumerFp] of stepLastReader) {
+    const bar = k.indexOf("|");
+    const fp = Number(k.slice(0, bar));
+    const pair = k.slice(bar + 1);
+    const t = obs(fp);
+    if (t.lastReader.get(pair) === consumerFp) {
+      t.lastReaderStable.set(pair, (t.lastReaderStable.get(pair) ?? 0) + 1);
+    } else {
+      t.lastReader.set(pair, consumerFp);
+      t.lastReaderStable.set(pair, 1);
+    }
+  }
+  for (const [fp, t] of templates) {
+    if (!t.executedThisStep || t.lastReader.size === 0) continue;
+    for (const pair of t.lastReader.keys()) {
+      if (!stepLastReader.has(`${fp}|${pair}`)) t.lastReaderStable.set(pair, 0);
     }
   }
   const noNew = newTemplateThisStep === 0;
@@ -339,6 +425,7 @@ export function observeStepBoundary(): void {
   prunedExecuted = new Map();
   newTemplateThisStep = 0;
   inPlaceCommits = 0;
+  stepLastReader = new Map();
 }
 
 // ── Pruning application (build-from-IR harvest) ───────────────────────────────
@@ -369,6 +456,259 @@ export function prunedHarvest(
   }
   prunedPairsRemoved += excluded.length;
   return { kept, excluded };
+}
+
+// ── Stage-3 remat unification: result-entry registration + releasability ─────
+
+/**
+ * Register the planner registry entries backing a template's harvested results
+ * (called by the executor after every build-from-IR build; wholesale-replaces
+ * the previous build's registrations — entries are per-build). `gen` is the
+ * registry generation the indices are valid for.
+ */
+export function registerResultEntries(
+  fp: number,
+  gen: number,
+  entries: Array<{
+    ni: number;
+    oi: number;
+    entryIdx: number;
+    bytes: number;
+    mandatory: boolean;
+    op?: string;
+  }>,
+): void {
+  if (!enabled) return;
+  const t = obs(fp);
+  t.resultEntries = new Map();
+  t.resultEntriesGen = gen;
+  for (const e of entries) {
+    t.resultEntries.set(key(e.ni, e.oi), {
+      entryIdx: e.entryIdx,
+      bytes: e.bytes,
+      mandatory: e.mandatory,
+      op: e.op,
+    });
+  }
+}
+
+/** S3.0 attribution: the top-N registered result entries per template by
+ *  bytes, with class + op + last reader — identifies WHAT the held classes
+ *  physically are. Debug-only. */
+export function debugTopHeldPairs(topN = 10): Record<
+  string,
+  Array<{
+    pair: string;
+    op?: string;
+    MB: number;
+    cls: string;
+    lastReader?: string;
+  }>
+> {
+  const out: Record<
+    string,
+    Array<{
+      pair: string;
+      op?: string;
+      MB: number;
+      cls: string;
+      lastReader?: string;
+    }>
+  > = {};
+  for (const [fp, t] of templates) {
+    const seen = new Set<number>();
+    const rows: Array<{
+      pair: string;
+      op?: string;
+      MB: number;
+      cls: string;
+      lastReader?: string;
+    }> = [];
+    for (const [pair, e] of t.resultEntries) {
+      if (seen.has(e.entryIdx)) continue;
+      seen.add(e.entryIdx);
+      const bar = pair.indexOf(":");
+      const ni = Number(pair.slice(0, bar));
+      const oi = Number(pair.slice(bar + 1));
+      let cls: string;
+      if (releasableLastReader(fp, ni, oi) !== undefined) cls = "rel";
+      else if (!t.converged || t.pinned) cls = "unconverged";
+      else if (t.releaseRevoked.has(pair)) cls = "revoked";
+      else if (t.neededSrc.get(pair) !== "c")
+        cls = `src=${t.neededSrc.get(pair) ?? "none"}`;
+      else if (t.everSurvived.has(pair)) cls = "survived";
+      else if (e.mandatory) cls = "mandatory";
+      else if (t.lastReader.get(pair) === undefined) cls = "noReader";
+      else cls = "unstable";
+      const lr = t.lastReader.get(pair);
+      rows.push({
+        pair,
+        op: e.op,
+        MB: +(e.bytes / 1e6).toFixed(1),
+        cls,
+        lastReader: lr !== undefined ? `0x${lr.toString(16)}` : undefined,
+      });
+    }
+    rows.sort((a, b) => b.MB - a.MB);
+    if (rows.length > 0) out[`0x${fp.toString(16)}`] = rows.slice(0, topN);
+  }
+  return out;
+}
+
+/**
+ * Step-global releasability of one producer pair (the stage-3 seam): a
+ * consumed-ONLY pair ("c" — never survived a step, never guard-grown, not
+ * mandatory, not revoked) of a CONVERGED template, whose last cross-plan
+ * reader has been the SAME template for >= K_HYSTERESIS fully-observed steps.
+ * Such a pair's registry entry is dead after that reader's final read of it —
+ * the reader's build may overlay its own temps onto the entry from that point
+ * (the producer re-writes the entry before any next-step consumer reads).
+ * Returns the stable last-reader fp, or undefined if not releasable.
+ */
+export function releasableLastReader(
+  fp: number,
+  ni: number,
+  oi: number,
+): number | undefined {
+  if (!enabled) return undefined;
+  const t = templates.get(fp);
+  if (!t || !t.converged || t.pinned) return undefined;
+  const k = key(ni, oi);
+  if (t.releaseRevoked.has(k)) return undefined;
+  if (t.neededSrc.get(k) !== "c") return undefined;
+  if (t.everSurvived.has(k)) return undefined;
+  const entry = t.resultEntries.get(k);
+  if (!entry || entry.mandatory) return undefined;
+  if ((t.lastReaderStable.get(k) ?? 0) < K_HYSTERESIS) return undefined;
+  return t.lastReader.get(k);
+}
+
+/** The registry entry registered for a pair (with the generation it is valid
+ *  for) — the claim seam resolves stamps to entries through this. */
+export function resultEntryFor(
+  fp: number,
+  ni: number,
+  oi: number,
+): { entryIdx: number; bytes: number; gen: number } | undefined {
+  const t = templates.get(fp);
+  const e = t?.resultEntries.get(key(ni, oi));
+  return e
+    ? { entryIdx: e.entryIdx, bytes: e.bytes, gen: t!.resultEntriesGen }
+    : undefined;
+}
+
+/** Permanently revoke a pair's step-global releasability (guard miss proved an
+ *  unobserved consumer). Idempotent. */
+export function revokeRelease(fp: number, ni: number, oi: number): void {
+  const t = templates.get(fp);
+  if (t) t.releaseRevoked.add(key(ni, oi));
+}
+
+/** Drop a template's result-entry registrations (its compiled plan was
+ *  invalidated or retired — the entries no longer back live results). The
+ *  next build re-registers. Observation state (needed/lastReader) is kept. */
+export function clearResultEntries(fp: number): void {
+  const t = templates.get(fp);
+  if (t) {
+    t.resultEntries = new Map();
+    t.resultEntriesGen = -1;
+  }
+}
+
+/**
+ * S3.0 instrumentation: per-producer-template summary of step-globally
+ * RELEASABLE result bytes (what S3.1's overlay would free), grouped by the
+ * stable last reader. Pure query — no behavior change.
+ */
+export function debugReleasableSummary(): Record<
+  string,
+  {
+    releasablePairs: number;
+    releasableMB: number;
+    resultMB: number;
+    byLastReader: Record<string, number>;
+    /** Disqualifier attribution: why registered result bytes are NOT
+     *  releasable — MB by first-failing check, in check order. */
+    heldMB: Record<string, number>;
+  }
+> {
+  const out: Record<
+    string,
+    {
+      releasablePairs: number;
+      releasableMB: number;
+      resultMB: number;
+      byLastReader: Record<string, number>;
+      heldMB: Record<string, number>;
+    }
+  > = {};
+  const mb = (b: number) => +(b / 1e6).toFixed(1);
+  for (const [fp, t] of templates) {
+    let resultBytes = 0;
+    let relBytes = 0;
+    let relPairs = 0;
+    const byReader: Record<string, number> = {};
+    const held: Record<string, number> = {};
+    const hold = (why: string, bytes: number) => {
+      held[why] = +((held[why] ?? 0) + bytes / 1e6).toFixed(1);
+    };
+    // Attribute each ENTRY once (multiple pairs can alias one entry — e.g. a
+    // harvested view of an in-place state output; per-pair byte sums would
+    // double-count). An entry is releasable only if EVERY pair on it is; its
+    // held class is the strongest holder among its pairs.
+    const strength = (c: string): number =>
+      c === "rel"
+        ? 0
+        : c === "unstable"
+          ? 1
+          : c === "noReader"
+            ? 2
+            : c === "mandatory"
+              ? 3
+              : c === "survived"
+                ? 4
+                : 5; // src=*/revoked/unconverged
+    const entryClass = new Map<number, { cls: string; bytes: number }>();
+    for (const [pair, e] of t.resultEntries) {
+      const bar = pair.indexOf(":");
+      const ni = Number(pair.slice(0, bar));
+      const oi = Number(pair.slice(bar + 1));
+      const reader = releasableLastReader(fp, ni, oi);
+      let cls: string;
+      if (reader !== undefined) {
+        cls = "rel";
+        relPairs++;
+        const rk = `0x${reader.toString(16)}`;
+        byReader[rk] = +((byReader[rk] ?? 0) + e.bytes / 1e6).toFixed(1);
+      } else if (!t.converged || t.pinned) cls = "unconverged";
+      else if (t.releaseRevoked.has(pair)) cls = "revoked";
+      else if (t.neededSrc.get(pair) !== "c")
+        cls = `src=${t.neededSrc.get(pair) ?? "none"}`;
+      else if (t.everSurvived.has(pair)) cls = "survived";
+      else if (e.mandatory) cls = "mandatory";
+      else if (t.lastReader.get(pair) === undefined) cls = "noReader";
+      else cls = "unstable";
+      const prev = entryClass.get(e.entryIdx);
+      if (!prev || strength(cls) > strength(prev.cls)) {
+        entryClass.set(e.entryIdx, { cls, bytes: e.bytes });
+      }
+    }
+    for (const { cls, bytes } of entryClass.values()) {
+      resultBytes += bytes;
+      if (cls === "rel") relBytes += bytes;
+      else hold(cls, bytes);
+    }
+    if (t.resultEntries.size > 0) {
+      out[`0x${fp.toString(16)}`] = {
+        releasablePairs: relPairs,
+        releasableMB: mb(relBytes),
+        resultMB: mb(resultBytes),
+        byLastReader: byReader,
+        heldMB: held,
+      };
+    }
+  }
+  return out;
 }
 
 /** Test/telemetry: per-template observed needed-set (sorted "ni:oi"). */
@@ -422,9 +762,30 @@ export function getObservedLivenessStats(): {
   convergedTemplates: number;
   prunedPairsRemoved: number;
   retiredTemplates: number;
+  /** [stage-3] Pairs currently classified step-globally releasable / their
+   *  registry bytes (S3.0 instrumentation; S3.1 turns these into overlays). */
+  releasablePairs: number;
+  releasableMB: number;
 } {
   let converged = 0;
   for (const t of templates.values()) if (t.converged && !t.pinned) converged++;
+  let releasablePairs = 0;
+  let releasableBytes = 0;
+  for (const [fp, t] of templates) {
+    for (const [pair, e] of t.resultEntries) {
+      const bar = pair.indexOf(":");
+      if (
+        releasableLastReader(
+          fp,
+          Number(pair.slice(0, bar)),
+          Number(pair.slice(bar + 1)),
+        ) !== undefined
+      ) {
+        releasablePairs++;
+        releasableBytes += e.bytes;
+      }
+    }
+  }
   return {
     cleanMisses,
     dirtyMisses,
@@ -432,5 +793,7 @@ export function getObservedLivenessStats(): {
     convergedTemplates: converged,
     prunedPairsRemoved,
     retiredTemplates,
+    releasablePairs,
+    releasableMB: +(releasableBytes / 1e6).toFixed(1),
   };
 }

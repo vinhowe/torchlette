@@ -109,8 +109,10 @@ import {
   debugCompiledPlanEntryBytes,
   destroyCompiledPlanBuffers,
   executeCompiledPlan,
+  debugEntryBufferIndex,
   isCompilationRecordingActive,
   type NodeResult,
+  plannerEntryBytes,
   recordBarrier,
   recordWrite,
   resetPlannerRegistry,
@@ -129,7 +131,9 @@ import {
   noteInPlaceCommit,
   noteNewTemplate,
   noteTemplateExecuted,
+  clearResultEntries,
   prunedHarvest,
+  registerResultEntries,
   resetObservedLiveness,
   setObservedLivenessEnabled,
   setTemplateCompiledInvalidator,
@@ -462,6 +466,43 @@ export function debugTemplatePlanMemory(): Record<
   return out;
 }
 
+/** [stage-3 S3.0 probe] Cross-plan PERSISTENT-slot bindings: for each valid
+ *  compiled plan, the registry entries of OTHER plans that its `persistent`
+ *  slots bind. Such reads resolve once at build (never per replay), so the
+ *  observeConsumed seam is blind to them — a producer pair consumed only this
+ *  way looks unconsumed forever. Debug-only. */
+export function debugCrossPlanPersistentBindings(): Record<
+  string,
+  { count: number; MB: number; entries: number[] }
+> {
+  const bufIndex = debugEntryBufferIndex();
+  const out: Record<string, { count: number; MB: number; entries: number[] }> =
+    {};
+  for (const [fp, template] of fusionAnalysisCache) {
+    const cp = template.loweredPlan?.compiledPlan;
+    if (!cp?.valid) continue;
+    const own = new Set(cp.plannerEntries ?? []);
+    let bytes = 0;
+    const hit: number[] = [];
+    for (const src of cp.slots) {
+      if (src.kind !== "persistent") continue;
+      const idx = bufIndex.get(src.buffer);
+      if (idx !== undefined && !own.has(idx)) {
+        hit.push(idx);
+        bytes += plannerEntryBytes(idx);
+      }
+    }
+    if (hit.length > 0) {
+      out[`0x${fp.toString(16)}`] = {
+        count: hit.length,
+        MB: +(bytes / 1e6).toFixed(1),
+        entries: hit.slice(0, 12),
+      };
+    }
+  }
+  return out;
+}
+
 /** Stage-2 FLIP (2026-07-08): build-from-IR is THE default build source —
  *  plans compile from IR on their FIRST execution, no recording. RECORDING
  *  survives only for:
@@ -500,6 +541,7 @@ setTemplateCompiledInvalidator((fp: number) => {
     destroyCompiledPlanBuffers(t.loweredPlan.compiledPlan);
     t.loweredPlan.compiledPlan = undefined;
   }
+  clearResultEntries(fp);
 });
 // Idle-retire (observed-liveness step boundary): release the compiled plan of
 // a template that stopped executing — one-shot warmup templates otherwise pin
@@ -517,6 +559,7 @@ setTemplateIdleRetirer((fp: number) => {
   }
   destroyCompiledPlanBuffers(cp);
   t!.loweredPlan!.compiledPlan = undefined;
+  clearResultEntries(fp);
   return "retired";
 });
 
@@ -1782,6 +1825,7 @@ export async function executeLoweredPlan(
       const fp = options.templateFp;
       let harvestPairs = actionPairs;
       let prunedPairs: Array<{ ni: number; oi: number }> | undefined;
+      let mandatoryKeys: Set<string> | undefined;
       if (fp !== undefined) {
         const outIds = new Set<number>();
         outIds.add(planNodes[planNodes.length - 1].id);
@@ -1792,6 +1836,7 @@ export async function executeLoweredPlan(
         for (let i = 0; i < planNodes.length; i++) {
           if (outIds.has(planNodes[i].id)) mandatory.add(`${i}:0`);
         }
+        mandatoryKeys = mandatory;
         const pr = prunedHarvest(fp, actionPairs, mandatory);
         if (pr) {
           harvestPairs = pr.kept;
@@ -1813,6 +1858,34 @@ export async function executeLoweredPlan(
         if (built.valid) {
           built.templateFp = fp;
           built._prunedPairs = prunedPairs;
+          // [stage-3 S3.0] Register harvested-result → planner-entry mappings
+          // for the step-global release observation (which result bytes an
+          // overlay could free, and into whose build). Pure observation.
+          if (fp !== undefined && built.plannerAssignment) {
+            const regEntries: Array<{
+              ni: number;
+              oi: number;
+              entryIdx: number;
+              bytes: number;
+              mandatory: boolean;
+            }> = [];
+            for (const r of genResults) {
+              const entryIdx = built.plannerAssignment.get(r.slot);
+              if (entryIdx !== undefined) {
+                regEntries.push({
+                  ni: r.nodeIndex,
+                  oi: r.outputIndex,
+                  entryIdx,
+                  bytes: plannerEntryBytes(entryIdx),
+                  mandatory:
+                    mandatoryKeys?.has(`${r.nodeIndex}:${r.outputIndex}`) ??
+                    false,
+                  op: `${planNodes[r.nodeIndex]?.op}[${JSON.stringify(planNodes[r.nodeIndex]?.shape)}]`,
+                });
+              }
+            }
+            registerResultEntries(fp, built.plannerGen ?? -1, regEntries);
+          }
           loweredPlan.compiledPlan = genPlan = built;
           if (ENV.TORCHLETTE_DEBUG_COMPILED) {
             console.log(
