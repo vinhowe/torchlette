@@ -137,6 +137,10 @@ interface TemplateObs {
   /** Registry generation resultEntries was registered against (a registry
    *  reset invalidates entry indices — identity-compared, epoch-keyed). */
   resultEntriesGen: number;
+  /** entryIdx → pairs registered on it (an in-place output and its harvested
+   *  view can share one entry; release requires EVERY pair on the entry to be
+   *  independently releasable with the SAME last reader). */
+  entryToPairs: Map<number, string[]>;
 }
 
 const key = (ni: number, oi: number): string => `${ni}:${oi}`;
@@ -147,8 +151,13 @@ const templates = new Map<number, TemplateObs>();
 let stepStamped: Array<{ shId: number; checkId: number; stamp: ResultStamp }> =
   [];
 let newTemplateThisStep = 0;
-/** nodeId → { producer stamp, in-place-commit count at its pruned replay }. */
-let prunedExecuted = new Map<number, { stamp: ResultStamp; mark: number }>();
+/** nodeId → { producer stamp, in-place-commit count at its pruned replay,
+ *  released: the pair was step-globally RELEASED (stage-3 B — its buffer may
+ *  be overlaid by the claimant's temps) rather than pruned-unharvested. } */
+let prunedExecuted = new Map<
+  number,
+  { stamp: ResultStamp; mark: number; released?: boolean }
+>();
 let inPlaceCommits = 0;
 /** [stage-3] Step-scoped consumption order: "fp|ni:oi" → the consumer fp of
  *  the HIGHEST-order read this step (last-write-wins as reads are observed in
@@ -161,6 +170,7 @@ let cleanMisses = 0;
 let dirtyMisses = 0;
 let readbackMisses = 0;
 let convergenceInvalidations = 0;
+let claimMisses = 0;
 let pinnedTemplates = 0;
 let prunedPairsRemoved = 0;
 let retiredTemplates = 0;
@@ -211,6 +221,7 @@ export function resetObservedLiveness(): void {
   dirtyMisses = 0;
   readbackMisses = 0;
   convergenceInvalidations = 0;
+  claimMisses = 0;
   pinnedTemplates = 0;
   prunedPairsRemoved = 0;
   retiredTemplates = 0;
@@ -234,8 +245,10 @@ function obs(fp: number): TemplateObs {
       releaseRevoked: new Set(),
       everSurvived: new Set(),
       everReadback: new Set(),
+      everAliased: new Set(),
       resultEntries: new Map(),
       resultEntriesGen: -1,
+      entryToPairs: new Map(),
     };
     templates.set(fp, t);
   }
@@ -354,6 +367,15 @@ export function readbackMiss(nodeId: number, oi: number): ResultStamp | undefine
   return stamp;
 }
 
+/** [stage-3 B] A harvested view result chained to a STAMPED base — the
+ *  base pair's buffer is now readable through the view's stamp, so the base
+ *  pair is permanently excluded from step-global release. Called from the
+ *  replay-harvest chokepoint (every alias flows through it). */
+export function noteAliasedBase(stamp: ResultStamp): void {
+  if (!enabled) return;
+  obs(stamp.fp).everAliased.add(key(stamp.ni, stamp.oi));
+}
+
 /** Register the pairs a pruned plan EXCLUDED from its harvest, so a later
  *  guard-miss can name the culprit and decide clean/dirty. Called at the
  *  pruned plan's replay-harvest with the current step's node ids. */
@@ -362,9 +384,14 @@ export function registerPrunedExecution(
   ni: number,
   oi: number,
   nodeId: number,
+  released?: boolean,
 ): void {
   if (!enabled) return;
-  prunedExecuted.set(nodeId, { stamp: { fp, ni, oi }, mark: inPlaceCommits });
+  prunedExecuted.set(nodeId, {
+    stamp: { fp, ni, oi },
+    mark: inPlaceCommits,
+    released,
+  });
 }
 
 /**
@@ -378,6 +405,10 @@ export function guardMiss(nodeId: number, oi: number): boolean {
   const hit = prunedExecuted.get(nodeId);
   if (!hit || hit.stamp.oi !== oi) return false;
   const { stamp, mark } = hit;
+  // [stage-3 B] Attribution: a miss on a RELEASED pair means the claim's
+  // last-reader observation was wrong once — revoke pins it (below), and the
+  // counter makes claim churn visible.
+  if (hit.released) claimMisses++;
   // Grow the producer's needed-set and invalidate its pruned build so next
   // step re-harvests the value (conservative-then-re-pruned).
   addNeeded(stamp.fp, stamp.ni, stamp.oi, "g");
@@ -559,14 +590,47 @@ export function registerResultEntries(
   const t = obs(fp);
   t.resultEntries = new Map();
   t.resultEntriesGen = gen;
+  t.entryToPairs = new Map();
   for (const e of entries) {
-    t.resultEntries.set(key(e.ni, e.oi), {
+    const k = key(e.ni, e.oi);
+    t.resultEntries.set(k, {
       entryIdx: e.entryIdx,
       bytes: e.bytes,
       mandatory: e.mandatory,
       op: e.op,
     });
+    let l = t.entryToPairs.get(e.entryIdx);
+    if (!l) t.entryToPairs.set(e.entryIdx, (l = []));
+    l.push(k);
   }
+}
+
+/**
+ * [stage-3 B] Entry-level releasability: the stable last reader of ALL pairs
+ * registered on the entry — undefined unless every pair is independently
+ * releasable AND they agree on the reader (an entry is a single buffer; one
+ * unreleasable alias poisons it).
+ */
+export function releasableEntryReader(
+  fp: number,
+  entryIdx: number,
+): number | undefined {
+  const t = templates.get(fp);
+  const pairs = t?.entryToPairs.get(entryIdx);
+  if (!pairs || pairs.length === 0) return undefined;
+  let reader: number | undefined;
+  for (const pk of pairs) {
+    const bar = pk.indexOf(":");
+    const r = releasableLastReader(
+      fp,
+      Number(pk.slice(0, bar)),
+      Number(pk.slice(bar + 1)),
+    );
+    if (r === undefined) return undefined;
+    if (reader === undefined) reader = r;
+    else if (reader !== r) return undefined;
+  }
+  return reader;
 }
 
 /** S3.0 attribution: the top-N registered result entries per template by
@@ -655,8 +719,15 @@ export function releasableLastReader(
   if (t.neededSrc.get(k) !== "c") return undefined;
   if (t.everSurvived.has(k)) return undefined;
   if (t.everReadback.has(k)) return undefined;
+  if (t.everAliased.has(k)) return undefined;
   const entry = t.resultEntries.get(k);
-  if (!entry || entry.mandatory) return undefined;
+  // [stage-3 B] entry.mandatory is NOT an exclusion: the boundary-dead
+  // mandatory-consumed class (grads read by the optimizer, forward casts
+  // read by backward) IS the release target. The safety the flag used to
+  // proxy is carried by observation: survival (everSurvived), readbacks
+  // (everReadback — the seam that closed the epistemic hole), consumption
+  // stability, and the loud clear-at-release guard.
+  if (!entry) return undefined;
   if ((t.lastReaderStable.get(k) ?? 0) < K_HYSTERESIS) return undefined;
   return t.lastReader.get(k);
 }
@@ -852,6 +923,7 @@ export function getObservedLivenessStats(): {
   releasableMB: number;
   readbackMisses: number;
   convergenceInvalidations: number;
+  claimMisses: number;
 } {
   let converged = 0;
   for (const t of templates.values()) if (t.converged && !t.pinned) converged++;
@@ -883,5 +955,6 @@ export function getObservedLivenessStats(): {
     releasableMB: +(releasableBytes / 1e6).toFixed(1),
     readbackMisses,
     convergenceInvalidations,
+    claimMisses,
   };
 }

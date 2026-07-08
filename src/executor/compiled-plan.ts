@@ -243,6 +243,21 @@ export interface CompiledPlan {
    *  idle-retire gate releases this plan's registry entries only when ALL of
    *  them are destroyed — no live reader can dangle. */
   _lastHarvestIds?: number[];
+  /** [stage-3 B] Released-external registry entries this plan's temps
+   *  claimed (co-owned with the producer plan; telemetry + teardown rides
+   *  plannerEntries). */
+  _claimedEntries?: number[];
+  /** [stage-3 B] Released external inputs this plan is the observed LAST
+   *  READER of. After each replay the producer's node results for these
+   *  pairs are CLEARED and the pairs registered into prunedExecuted — the
+   *  value may be overlaid by this plan's temps, so any later read must hit
+   *  the loud guard, never silently see clobbered bytes. */
+  _claimedExternal?: Array<{
+    slot: number;
+    fp: number;
+    ni: number;
+    oi: number;
+  }>;
 }
 
 // ============================================================================
@@ -285,6 +300,7 @@ import { getInputStorage } from "./op-dispatch";
 import { planMemory, PlannerRegistry } from "./memory-planner";
 import {
   guardMiss,
+  noteAliasedBase,
   observeConsumed,
   registerPrunedExecution,
   setSteadyBoundaryTrimmer,
@@ -505,8 +521,16 @@ export function buildCompiledPlanFromGenerated(input: {
   commands: GpuCommand[];
   slots: SlotSource[];
   nodeResults: NodeResult[];
+  /** [stage-3 B] Released external inputs (this plan is the observed last
+   *  reader) — see planMemory's externalReleases. */
+  externalReleases?: Array<{ slot: number; entryIdx: number }>;
 }): CompiledPlan {
-  return finalizeCompiledPlan(input.commands, input.slots, input.nodeResults);
+  return finalizeCompiledPlan(
+    input.commands,
+    input.slots,
+    input.nodeResults,
+    input.externalReleases,
+  );
 }
 
 /**
@@ -523,6 +547,7 @@ function finalizeCompiledPlan(
   commands: GpuCommand[],
   slotSources: SlotSource[],
   nodeResults: NodeResult[],
+  externalReleases?: Array<{ slot: number; entryIdx: number }>,
 ): CompiledPlan {
   const usePlanner = compiledPlannedEnabled();
 
@@ -545,14 +570,21 @@ function finalizeCompiledPlan(
 
   let plannerAssignment: Map<number, number> | undefined;
   let plannerEntries: number[] | undefined;
+  let claimedEntries: number[] | undefined;
   if (usePlanner) {
     const resultSlots = new Set<number>(nodeResults.map((r) => r.slot));
-    const memPlan = planMemory(commands, plannerRegistry, resultSlots);
+    const memPlan = planMemory(
+      commands,
+      plannerRegistry,
+      resultSlots,
+      externalReleases,
+    );
     plannerAssignment = memPlan.assignment;
     plannerEntries = memPlan.entries;
+    claimedEntries = memPlan.claimedEntries;
     if (ENV.TORCHLETTE_DEBUG_COMPILED) {
       console.log(
-        `[memory-planner] ${memPlan.assignment.size} alloc slots → ${memPlan.entries.length} entries (${(memPlan.newBytes / 1e6).toFixed(1)}MB new, ${(memPlan.reusedBytes / 1e6).toFixed(1)}MB shared cross-plan)`,
+        `[memory-planner] ${memPlan.assignment.size} alloc slots → ${memPlan.entries.length} entries (${(memPlan.newBytes / 1e6).toFixed(1)}MB new, ${(memPlan.reusedBytes / 1e6).toFixed(1)}MB shared cross-plan${memPlan.claimedEntries.length ? `, ${memPlan.claimedEntries.length} released-external claimed` : ""})`,
       );
     }
   }
@@ -565,6 +597,7 @@ function finalizeCompiledPlan(
     plannerAssignment,
     plannerEntries,
     plannerGen: plannerEntries ? plannerRegistry.generation : undefined,
+    _claimedEntries: claimedEntries?.length ? claimedEntries : undefined,
   };
   if (plannerEntries) {
     for (const idx of plannerEntries) {
@@ -611,6 +644,18 @@ export function resetPlannerRegistry(): void {
  *  release observation through this. */
 export function plannerEntryBytes(idx: number): number {
   return plannerRegistry.entries[idx]?.bytes ?? 0;
+}
+
+/** [stage-3 B] Claim-seam assertion: a released pair's entry is claimable
+ *  only while it is STILL the producer's exclusive result entry
+ *  (resultHolder && !listed). If the producer was invalidated/rebuilt since
+ *  registration, the entry was relisted (or reassigned) — the stale claim is
+ *  skipped. Entry roles are monotonic within a generation (results never
+ *  come from free lists), so this check is sufficient. */
+export function plannerEntryClaimable(idx: number, gen: number): boolean {
+  if (gen !== plannerRegistry.generation) return false;
+  const e = plannerRegistry.entries[idx];
+  return !!e && e.resultHolder && !e.listed;
 }
 
 /** [stage-3 S3.0 probe] buffer → registry entry index for every MATERIALIZED
@@ -1903,6 +1948,9 @@ export async function executeCompiledPlan(
       );
       const sh = createStorageHandle(node.device, tensor);
       if (base) {
+        // [stage-3 B] The base pair's buffer is now readable through THIS
+        // result's stamp — permanently unreleasable (alias hole).
+        if (base.stamp) noteAliasedBase(base.stamp);
         sh.baseStorageId = base.id;
         rcRetain(base.id, "view.baseStorageId");
         // The harvest re-creates VIEW result handles every replay and rcRetains
@@ -1946,6 +1994,33 @@ export async function executeCompiledPlan(
       for (const p of compiled._prunedPairs) {
         const n = planNodes[p.ni];
         if (n) registerPrunedExecution(compiled.templateFp, p.ni, p.oi, n.id);
+      }
+    }
+    // [stage-3 B] Clear-at-release: this replay's temps overlaid the claimed
+    // released externals — no later read may silently see the clobbered
+    // bytes. Pending refs: clear the producer node's results (readers crash
+    // "Input not ready" → the bind-time guard, registered released=true so
+    // the miss is attributed + revocable). All: mark the storage handle
+    // releasedOverlay so materialized-ref reads and readbacks hit the
+    // [lifetime] warn / STRICT throw.
+    if (compiled._claimedExternal) {
+      for (const c of compiled._claimedExternal) {
+        const src = compiled.slots[c.slot];
+        if (src?.kind !== "external") continue;
+        const ref = planNodes[src.planNodeIndex]?.inputs[src.inputIndex];
+        if (!ref) continue;
+        if (ref.kind === "pending") {
+          const node = ref.node;
+          const sh = node.results?.[c.oi] ?? (c.oi === 0 ? node.result : undefined);
+          if (sh) sh.releasedOverlay = true;
+          registerPrunedExecution(c.fp, c.ni, c.oi, node.id, true);
+          if (node.results) {
+            node.results[c.oi] = undefined as unknown as StorageHandle;
+          }
+          if (c.oi === 0) node.result = undefined;
+        } else if (ref.kind === "materialized") {
+          ref.storage.releasedOverlay = true;
+        }
       }
     }
     // Commit this replay's view-base retains; the prior set was released at

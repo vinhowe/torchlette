@@ -2044,3 +2044,73 @@ on rerun); suite `=0` modulo the env-inheriting obs-spec arm; gates 4/4; obs
 spec 5/5; checkpoint oracle 4/4; fullstack default/`=0`/STRICT maxΔ 8.6e-6 /
 30 steps; production regression baseline-exact flat 2087.6 MB; kv-diff PASS;
 gen-tape PASS.
+
+### Stage-3 (B) LANDED (2026-07-08): boundary-dead release + last-reader
+### temp overlay; the ALIAS HOLE found by the set-parity gate and closed
+
+**(B) as ruled** — mandatory-consumed ∧ never-survived ∧ never-read-back ∧
+K-stable-last-reader pairs release their registry entry INTO the last
+reader's build: `planMemory` gains `externalReleases` (the entry joins the
+free lists at the claiming plan's FINAL READ of the slot; a phantom-lifetime
+audit asserts no claiming temp starts before that), the claim seam asserts
+`plannerEntryClaimable` (still the producer's exclusive result entry, same
+generation), claimed entries are co-owned (teardown/idle-retire invariant:
+buffer dies with the LAST owner — unchanged `owners` semantics). Loudness —
+never silent: after each claiming replay the producer's value is overlaid, so
+pending-ref readers get node.results CLEARED (crash → the bind-time guard,
+registered `released=true` → `claimMisses` attribution + per-pair revoke) and
+every released storage is flagged `releasedOverlay` (materialized-ref reads
+and readbacks hit the [lifetime] warn / STRICT throw; readbacks additionally
+throw + pin the pair). Smallest-sufficient: NO step-position tracking — the
+form-1 overlay (the last reader's own temps, after its final read) covers the
+whole measured class; the producer re-writes the entry before any next-step
+consumer reads (strictly-sequential queue order).
+
+**THE ALIAS HOLE (a real silent-wrongness bug the set-parity gate caught
+before it ever shipped):** the first cut released pairs whose BUFFER was
+readable through OTHER stamps — a harvested VIEW of the released value (the
+"b" class; e.g. clip's in-place write making a later harvest wrap a view of a
+grad buffer) records its readers on the VIEW's stamp, so the base pair's
+last-reader observation cannot bound the buffer's readers. Result: 2.4e-3
+trajectory divergence in `test/observed-liveness.spec.ts` set-parity — silent
+(zero misses, zero warns), exactly the class this campaign exists to kill,
+and exactly what the differential-gates-cross-the-activation-threshold rule
+is for. FIX (two levels, both through the one identity scheme): (i)
+`everAliased` — the replay-harvest chokepoint marks a stamped base pair
+permanently unreleasable when any harvested view chains to it (every alias
+flows through that chokepoint, same- or cross-template); (ii)
+`releasableEntryReader` — an entry carrying MULTIPLE registered pairs (an
+in-place output and its view sharing one entry) releases only if every pair
+is independently releasable with the SAME reader. After the fix: set-parity
+5/5, trainer numbers unchanged (the trainer's claims were alias-free).
+
+**Measured (124M-class checkpointed, both arms, both meters):**
+| arm | peak | cur | phys (pool-held) | ms/step |
+|---|---:|---:|---:|---:|
+| (a′+trim) arena-free lowered — BAR | 7659 | 2638 | **6209** (3570) | ~655 |
+| (d′+A+trim+B) compiled | 9358 | **5089** | **6712** (1623) | ~305 |
+
+181 claims across 3 plans (releasable 883.6 MB post-alias-exclusion; the
+optimizer's temp entries collapsed 863→136 MB — the designed overlay), net
+**cur −452 MB, phys −452 MB**, claimMisses=0, dirtyMisses=0, loss
+baseline-exact. **Remaining gap to the physical bar: +503 MB**, of which
+~260 MB is item (4)'s duplicated f16 casts (next in queue) and the rest is
+size-class rounding + the sibling-variant plan + releasable-but-unclaimed
+entries (no size-class-matched temp demand after their release point).
+
+Ladder (all green): suite default 90+63; suite `=0` modulo the
+env-inheriting obs-spec arm; gates 4/4; set-parity 5/5; checkpoint oracle
+4/4; fullstack default/`=0`/STRICT within same-config run-to-run noise
+(6.7e-6–9.5e-6 measured across repeat runs); production regression
+baseline-exact flat; kv-diff PASS; gen-tape PASS.
+
+**Stage-3 completion sequencing (coordinator peak ruling, recorded):**
+peak-parity is DEFERRED to 4.4-coverage (round-0 warmup transient, not
+steady-state) BUT it GATES S3.4's deletions — the `b66ead78` arena-free
+bypass and the `ARENA_LIVENESS=0` sunset may NOT be executed while compiled's
+peak exceeds the arena-free peak (deleting the lower-peak path would regress
+peak-constrained users). Stage 3 therefore completes as: (B) landed → steady
+phys within ~8% of the bar (closing via item 4) → mechanism COMPLETE and the
+unification VALIDATED; the deletions queue behind 4.4-coverage or a
+peak-acceptability measurement at target scales.
+

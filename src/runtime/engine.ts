@@ -1543,6 +1543,16 @@ export class RuntimeEngine {
   private _observeReadbackSeam(a: Tensor): void {
     const ref = a.lazyRef;
     if (ref.kind === "materialized") {
+      // [stage-3 B] Reading back a step-globally released value: its bytes
+      // may be overlaid by the claimant's temps — loud, never silent.
+      if (ref.storage.releasedOverlay) {
+        const msg = `[observed-liveness] readback of a step-globally RELEASED value (storage id=${ref.storage.id}): its registry entry was overlaid by the last observed reader's temps. The value is unrecoverable this step; the pair is pinned unreleasable for future steps.`;
+        const stamp = ref.storage.stamp;
+        if (stamp) {
+          obsReadback(ref.storage); // pins via everReadback
+        }
+        throw new Error(msg);
+      }
       obsReadback(ref.storage);
       return;
     }

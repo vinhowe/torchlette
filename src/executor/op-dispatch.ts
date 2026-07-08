@@ -26,6 +26,7 @@ import { lookupScalarStorage } from "./scalar-table";
 
 /** One-shot flag for the reclaimed-storage-read warning. */
 let _warnedReclaimedRead = false;
+let _warnedReleasedRead = false;
 
 // ---------------------------------------------------------------------------
 // Multi-output op protocol
@@ -136,6 +137,18 @@ export function getInputStorage(
     // step-scoped demotion reclaiming a mid-step-created tensor that user
     // code still holds; the buffer is back in the pool and may carry another
     // op's data). Warn by default; TORCHLETTE_STRICT_LIFETIME=1 throws.
+    if (ref.storage.releasedOverlay) {
+      const msg =
+        `[lifetime] reading step-globally RELEASED storage id=${ref.storage.id} ` +
+        `(shape=${JSON.stringify(ref.storage.backendTensor.shape)}). Its registry entry was ` +
+        `overlaid by the last observed reader's temps (stage-3 B); the bytes ` +
+        `may be garbage. This read was invisible to observation — report it.`;
+      if (ENV.TORCHLETTE_STRICT_LIFETIME === "1") throw new Error(msg);
+      if (!_warnedReleasedRead) {
+        _warnedReleasedRead = true;
+        console.warn(msg);
+      }
+    }
     if (storageTracker.isDestroyed(ref.storage.id)) {
       const msg =
         `[lifetime] reading RECLAIMED storage id=${ref.storage.id} ` +
@@ -177,7 +190,17 @@ export function getInputStorage(
   // through node.results handles both primary and side outputs uniformly.
   const idx = ref.outputIndex ?? 0;
   const sh = ref.node.results?.[idx];
-  if (sh) return sh;
+  if (sh) {
+    if (sh.releasedOverlay) {
+      const msg = `[lifetime] reading step-globally RELEASED result node=${ref.node.id} op=${ref.node.op}[${idx}] — overlaid by the last observed reader's temps (stage-3 B).`;
+      if (ENV.TORCHLETTE_STRICT_LIFETIME === "1") throw new Error(msg);
+      if (!_warnedReleasedRead) {
+        _warnedReleasedRead = true;
+        console.warn(msg);
+      }
+    }
+    return sh;
+  }
   throw new Error(
     `Input not ready: node id=${ref.node.id} op=${ref.node.op}[${idx}] shape=${JSON.stringify(ref.node.shape)} caller=${new Error().stack?.split("\n")[2]?.trim()}`,
   );

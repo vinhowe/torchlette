@@ -133,6 +133,9 @@ export interface MemoryPlan {
   newBytes: number;
   /** Bytes of pre-existing shared entries reused by this plan. */
   reusedBytes: number;
+  /** [stage-3 B] Released-external entries this plan's temps actually
+   *  claimed (subset of `entries`; co-owned with the producer plan). */
+  claimedEntries: number[];
 }
 
 /**
@@ -155,13 +158,28 @@ export function planMemory(
    *  lifetime is the plan's lifetime: never recycled within the stream,
    *  never assigned to a shared entry. */
   resultSlots?: Set<number>,
+  /** [stage-3 B] Step-globally RELEASED external inputs: this plan is the
+   *  OBSERVED LAST READER of another plan's result (a boundary-dead pair —
+   *  consumed-only, never survived, never read back, K-stable last reader).
+   *  The producer's registry entry is dead after this plan's final read of
+   *  the slot, so it joins the free lists AT that point and this plan's own
+   *  temps overlay it (the producer re-writes it before any next-step
+   *  consumer reads — strictly-sequential queue order). The claimed entry is
+   *  co-owned via `entries`. */
+  externalReleases?: Array<{ slot: number; entryIdx: number }>,
 ): MemoryPlan {
-  // 1. Lifetimes: per alloc-slot [allocIdx, lastUseIdx] + bytes.
+  // 1. Lifetimes: per alloc-slot [allocIdx, lastUseIdx] + bytes. External
+  //    slots listed in externalReleases are also lastUse-tracked (they have
+  //    no alloc; their release point is their final read).
   const allocIdx = new Map<number, number>();
   const lastUse = new Map<number, number>();
   const bytes = new Map<number, number>();
+  const watchedExternal = new Set<number>();
+  if (externalReleases) {
+    for (const r of externalReleases) watchedExternal.add(r.slot);
+  }
   const touch = (slot: number, i: number) => {
-    if (allocIdx.has(slot)) lastUse.set(slot, i);
+    if (allocIdx.has(slot) || watchedExternal.has(slot)) lastUse.set(slot, i);
   };
   for (let i = 0; i < commands.length; i++) {
     const cmd = commands[i];
@@ -217,6 +235,23 @@ export function planMemory(
       list.push(entryIdx);
     }
   };
+  // [stage-3 B] Released external entries enter the free lists after their
+  // final read. Dedupe by entry (two slots can resolve to one stamp/entry:
+  // release at the MAX last use). An unused watched slot releases nothing.
+  // The claimed entry is recorded as used (co-ownership) only when a temp
+  // actually claims it — releasing without a claimant costs nothing.
+  const extPhantom = new Map<number, number>(); // entryIdx → lastUse
+  if (externalReleases) {
+    for (const r of externalReleases) {
+      const lu = lastUse.get(r.slot);
+      if (lu === undefined) continue;
+      const prev = extPhantom.get(r.entryIdx);
+      if (prev === undefined || lu > prev) extPhantom.set(r.entryIdx, lu);
+    }
+    for (const [entryIdx, lu] of extPhantom) {
+      releases.push({ at: lu + 1, entryIdx });
+    }
+  }
   for (const slot of slots) {
     const at = allocIdx.get(slot) as number;
     processReleases(at - 1);
@@ -273,6 +308,24 @@ export function planMemory(
         `[memory-planner] RESULT-SHARED: entry ${entryIdx} hosts a result slot alongside other lifetimes (slots ${slotList.join(",")})`,
       );
     }
+    // [stage-3 B] Phantom audit: a claimed released-external entry carries a
+    // phantom lifetime [0 .. lastRead] (the producer's value, read by this
+    // plan). Every temp lifetime assigned to it must start strictly after.
+    const phantomLu = extPhantom.get(entryIdx);
+    if (phantomLu !== undefined) {
+      for (const s of slotList) {
+        if ((allocIdx.get(s) as number) <= phantomLu) {
+          throw new Error(
+            `[memory-planner] CLAIM-OVERLAP: entry ${entryIdx} (released external, read until ${phantomLu}) claimed by slot ${s} allocated at ${allocIdx.get(s)}`,
+          );
+        }
+      }
+    }
+  }
+  // Claimed = released external entries a temp actually landed on.
+  const claimedEntries: number[] = [];
+  for (const entryIdx of extPhantom.keys()) {
+    if (usedEntries.has(entryIdx)) claimedEntries.push(entryIdx);
   }
 
   return {
@@ -280,5 +333,6 @@ export function planMemory(
     entries: [...usedEntries],
     newBytes,
     reusedBytes,
+    claimedEntries,
   };
 }

@@ -113,6 +113,7 @@ import {
   isCompilationRecordingActive,
   type NodeResult,
   plannerEntryBytes,
+  plannerEntryClaimable,
   recordBarrier,
   recordWrite,
   resetPlannerRegistry,
@@ -134,6 +135,9 @@ import {
   clearResultEntries,
   prunedHarvest,
   registerResultEntries,
+  releasableEntryReader,
+  releasableLastReader,
+  resultEntryFor,
   resetObservedLiveness,
   setObservedLivenessEnabled,
   setTemplateCompiledInvalidator,
@@ -1858,6 +1862,55 @@ export async function executeLoweredPlan(
           prunedPairs = pr.excluded.map((p) => ({ ni: p.i, oi: p.oi }));
         }
       }
+      // [stage-3 B] Released-external claims: for each external input whose
+      // stamped pair is step-globally releasable WITH THIS TEMPLATE as its
+      // K-stable last reader, hand the producer's registry entry to the
+      // memory planner as a release event at the slot's final read — this
+      // plan's temps overlay the boundary-dead value (grads after the
+      // optimizer's reads, forward casts after backward's). Claim-seam
+      // assertion: plannerEntryClaimable (the entry must still be the
+      // producer's exclusive result entry, same registry generation).
+      let externalReleases:
+        | Array<{ slot: number; entryIdx: number }>
+        | undefined;
+      let claimedExternal:
+        | Array<{ slot: number; fp: number; ni: number; oi: number }>
+        | undefined;
+      if (fp !== undefined) {
+        for (let si = 0; si < gen.slots.length; si++) {
+          const src = gen.slots[si];
+          if (src.kind !== "external") continue;
+          const ref = planNodes[src.planNodeIndex]?.inputs[src.inputIndex];
+          if (!ref || (ref.kind !== "pending" && ref.kind !== "materialized"))
+            continue;
+          let storage: StorageHandle;
+          try {
+            storage = getInputStorage(ref, backend);
+          } catch {
+            continue;
+          }
+          const stamp = storage.stamp;
+          if (!stamp) continue;
+          if (releasableLastReader(stamp.fp, stamp.ni, stamp.oi) !== fp)
+            continue;
+          const entry = resultEntryFor(stamp.fp, stamp.ni, stamp.oi);
+          if (!entry || !plannerEntryClaimable(entry.entryIdx, entry.gen))
+            continue;
+          // Entry-level gate: every pair aliasing this entry must be
+          // releasable with THIS template as the reader (one buffer).
+          if (releasableEntryReader(stamp.fp, entry.entryIdx) !== fp) continue;
+          (externalReleases ??= []).push({
+            slot: si,
+            entryIdx: entry.entryIdx,
+          });
+          (claimedExternal ??= []).push({
+            slot: si,
+            fp: stamp.fp,
+            ni: stamp.ni,
+            oi: stamp.oi,
+          });
+        }
+      }
       const { genResults, genOk } = harvestGenResults(
         planNodes,
         gen,
@@ -1869,10 +1922,23 @@ export async function executeLoweredPlan(
           commands: gen.commands,
           slots: gen.slots,
           nodeResults: genResults,
+          externalReleases,
         });
         if (built.valid) {
           built.templateFp = fp;
           built._prunedPairs = prunedPairs;
+          // [stage-3 B] Only entries the planner ACTUALLY overlaid need the
+          // loud clear-at-release; released-but-unclaimed values stay intact.
+          if (claimedExternal && built._claimedEntries && externalReleases) {
+            const claimedSet = new Set(built._claimedEntries);
+            const slotToEntry = new Map(
+              externalReleases.map((r) => [r.slot, r.entryIdx]),
+            );
+            const active = claimedExternal.filter((c) =>
+              claimedSet.has(slotToEntry.get(c.slot) as number),
+            );
+            if (active.length > 0) built._claimedExternal = active;
+          }
           // [stage-3 S3.0] Register harvested-result → planner-entry mappings
           // for the step-global release observation (which result bytes an
           // overlay could free, and into whose build). Pure observation.
