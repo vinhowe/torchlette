@@ -1465,24 +1465,6 @@ function computeLivenessOutputIds(
   return outputIds;
 }
 
-/** Build the live-result harvest pairs (cutover): every materialized result, in plan order. */
-function liveResultHarvestPairs(
-  planNodes: LazyIRNode[],
-): Array<{ i: number; oi: number }> {
-  const pairs: Array<{ i: number; oi: number }> = [];
-  for (let i = 0; i < planNodes.length; i++) {
-    const node = planNodes[i];
-    if (node.results && node.results.length > 0) {
-      for (let oi = 0; oi < node.results.length; oi++) {
-        if (node.results[oi]) pairs.push({ i, oi });
-      }
-    } else if (node.result) {
-      pairs.push({ i, oi: 0 });
-    }
-  }
-  return pairs;
-}
-
 /**
  * Build the harvest pairs for build-without-execution: the ACTION-OUTPUT set —
  * the structural superset of the cutover's live-result survivors.
@@ -2742,20 +2724,16 @@ export async function executeLoweredPlan(
         compiled.endCounters = getDispatchSequenceCounters();
         loweredPlan.compiledPlan = compiled;
       }
-      // Stage-4: generate the command stream from the lowered plan, once, if
-      // either consumer wants it — the cross-check gate or the phase-4 cutover.
+      // Stage-4: generate the command stream from the lowered plan for the
+      // VERIFY mode only (stage-2 B1 deletion, 2026-07-08: the recorded→
+      // generated cutover swap is DELETED — build-from-IR builds generated
+      // plans directly on first execution, so a plan that reaches this
+      // recording path is an uncovered/opt-out plan whose replay source IS the
+      // recorded plan just built; swapping it for a generated one was the
+      // pre-flip default's job and is dead weight after the flip).
       const wantStreamGen = ENV.TORCHLETTE_STREAM_GENERATE === "1";
-      // Phase-4.1 (2026-06-14): the cutover is DEFAULT-ON. The generated
-      // stream is the replay source for every fully-covered plan; only plans
-      // the generator cannot fully cover (transient warmup plans that never
-      // recur, chunked ops >128MB that bail) stay on the recorded replay —
-      // per-plan, coverage-gated. TORCHLETTE_GENERATED_PLAN=0 opts back into
-      // the recorded replay everywhere (the legacy path). The first execution
-      // of any plan ALWAYS runs lowered + records regardless; this flag only
-      // swaps the REPLAY source on 2nd+ executions.
-      const wantCutover = ENV.TORCHLETTE_GENERATED_PLAN !== "0";
       const gen =
-        (wantStreamGen || wantCutover) && compiled.valid
+        wantStreamGen && compiled.valid
           ? generateStream(loweredPlan, planNodes, backend)
           : undefined;
 
@@ -2828,45 +2806,6 @@ export async function executeLoweredPlan(
         }
       }
 
-      // Stage-4 phase-4 CUTOVER (default-on; TORCHLETTE_GENERATED_PLAN=0 to
-      // opt out): when the generated stream fully covers the plan, build the
-      // compiled plan FROM IT and use it as the execution source — the
-      // recording stays only as the gate's reference (the recorded plan we
-      // just built is discarded, its planner entries released so the registry
-      // doesn't leak). The streams are proven byte-identical (modulo slot
-      // bijection) by the gate, so the generated plan is equivalent. The
-      // harvest (harvestGenResults — SINGLE SOURCE with build-without-
-      // execution) derives the NodeResult metadata from the IR and asserts it
-      // against the live result here (post-execution).
-      if (wantCutover && gen?.fullyCovered && compiled.valid) {
-        const { genResults, genOk } = harvestGenResults(
-          planNodes,
-          gen,
-          makeMetaDeriver(),
-          liveResultHarvestPairs(planNodes),
-        );
-        if (genOk) {
-          const genPlan = buildCompiledPlanFromGenerated({
-            commands: gen.commands,
-            slots: gen.slots,
-            nodeResults: genResults,
-          });
-          if (genPlan.valid) {
-            // Release the just-built recorded plan's planner entries (it's
-            // being discarded) AFTER the generated plan is confirmed valid —
-            // if it weren't, loweredPlan.compiledPlan would still need the
-            // recorded entries to replay.
-            destroyCompiledPlanBuffers(compiled);
-            genPlan.endCounters = getDispatchSequenceCounters();
-            loweredPlan.compiledPlan = genPlan;
-            if (ENV.TORCHLETTE_DEBUG_COMPILED) {
-              console.log(
-                `[compiled] phase-4 cutover: GENERATED plan is the execution source (${gen.commands.length} cmds, ${genResults.length} results)`,
-              );
-            }
-          }
-        }
-      }
       compilationRecording = null;
     }
 
