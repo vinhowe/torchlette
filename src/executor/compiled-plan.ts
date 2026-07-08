@@ -229,6 +229,15 @@ export interface CompiledPlan {
    *  recording (TORCHLETTE_STEP_TAPE=record) so plan invalidation cascades
    *  to tapes referencing this template (guard 4). Absent when off. */
   tapeFp?: number;
+  /** [observed-liveness] Template fingerprint, stamped by the executor whenever
+   *  a compiled plan is built. The replay-harvest chokepoint stamps each
+   *  harvested result (templateFp, nodeIndex, oi) for cross-plan liveness
+   *  observation. Absent when build-from-IR is off. */
+  templateFp?: number;
+  /** [observed-liveness] Pairs a PRUNED build-from-IR plan excluded from its
+   *  harvest. Registered into the step-scoped prunedExecuted map at replay so a
+   *  late consumer's bind-time miss can name the culprit and decide recovery. */
+  _prunedPairs?: Array<{ ni: number; oi: number }>;
 }
 
 // ============================================================================
@@ -269,6 +278,12 @@ export interface RecordedDispatch {
 import type { LazyIRNode, StorageHandle } from "../graph/types";
 import { getInputStorage } from "./op-dispatch";
 import { planMemory, PlannerRegistry } from "./memory-planner";
+import {
+  guardMiss,
+  observeConsumed,
+  registerPrunedExecution,
+  stampResult,
+} from "./observed-liveness";
 
 /** Recorded buffer copy for compilation. */
 export interface RecordedCopy {
@@ -1133,7 +1148,21 @@ export async function executeCompiledPlan(
       const src = compiled.slots[i];
       if (src.kind === "external") {
         const ref = planNodes[src.planNodeIndex].inputs[src.inputIndex];
-        const storage = getInputStorage(ref, backend);
+        // [observed-liveness] Bind-time guard: this external LEAF is a later
+        // plan's view of a producer result. If pruning dropped that result the
+        // resolution misses HERE — before any of this plan's side effects
+        // commit. guardMiss decides clean-recover (throws RecoverableGuardMiss)
+        // vs loud-fail; a miss it doesn't recognise rethrows the original.
+        let storage: StorageHandle;
+        try {
+          storage = getInputStorage(ref, backend);
+        } catch (e) {
+          if (ref.kind === "pending") {
+            guardMiss(ref.node.id, ref.outputIndex ?? 0);
+          }
+          throw e;
+        }
+        observeConsumed(storage);
         slots[i] = gpuBuffer(storage.backendTensor);
         if (dbgSlots?.includes(i)) {
           const refDesc =
@@ -1695,6 +1724,21 @@ export async function executeCompiledPlan(
           node.results = [node.result!];
         }
         node.results[r.outputIndex] = sh;
+      }
+      // [observed-liveness] Stamp the harvested value's cross-plan identity so
+      // a later plan resolving it as an external input records consumption.
+      if (compiled.templateFp !== undefined) {
+        stampResult(sh, compiled.templateFp, r.nodeIndex, r.outputIndex);
+      }
+    }
+    // [observed-liveness] Register the pairs this pruned plan EXCLUDED from its
+    // harvest, keyed by THIS step's node ids, so a late consumer's bind-time
+    // miss (compiled phase 1) can name the culprit and gate recovery on the
+    // in-place-committed counter.
+    if (compiled._prunedPairs && compiled.templateFp !== undefined) {
+      for (const p of compiled._prunedPairs) {
+        const n = planNodes[p.ni];
+        if (n) registerPrunedExecution(compiled.templateFp, p.ni, p.oi, n.id);
       }
     }
     // Commit this replay's view-base retains; the prior set was released at

@@ -22,6 +22,7 @@ const GPU_TEST_FILES = [
   "test/frontend-dtype.spec.ts",
   "test/implied-step-boundary.spec.ts",
   "test/memory-aware-scheduler.spec.ts",
+  "test/observed-liveness.spec.ts",
   "test/offset-views.spec.ts",
   "test/optim/grad-scaler.spec.ts",
   "test/scope-surface.spec.ts",

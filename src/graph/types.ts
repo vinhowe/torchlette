@@ -81,6 +81,14 @@ export interface StorageHandle {
    * (which may be destroyed at markStep OR leak-retained across replays).
    */
   planOwnedBaseRetain?: boolean;
+  /**
+   * Stage-1 observed cross-plan liveness stamp (executor/observed-liveness.ts):
+   * the cross-plan identity of the harvested VALUE this handle carries
+   * (templateFp, plan nodeIndex, outputIndex). Set by the replay-harvest
+   * chokepoint under TORCHLETTE_BUILD_FROM_IR; read at the external-input
+   * resolution seam to record cross-plan consumption. Absent otherwise.
+   */
+  stamp?: { fp: number; ni: number; oi: number };
 }
 
 /**

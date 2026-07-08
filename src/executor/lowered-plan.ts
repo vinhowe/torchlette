@@ -265,6 +265,11 @@ export interface LoweredPlan {
   scalarSlots?: import("./scalar-table").ScalarSlot[];
   /** Per-template scalar buffers (created lazily by the executor). */
   scalarTable?: import("./scalar-table").PlanScalarTable;
+  /** [observed-liveness] Memoized: does this plan commit in-place mutations to
+   *  persistent state (adam / copy_)? Advances the guard's in-place-committed
+   *  counter so a pruned-producer recompute that would read mutated storages
+   *  fails loudly instead of silently diverging. */
+  _hasInPlaceCommit?: boolean;
 }
 
 // ============================================================================

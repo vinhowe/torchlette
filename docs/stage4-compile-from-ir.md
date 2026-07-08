@@ -1035,8 +1035,49 @@ machinery.
   memory authority. This is the named product decision from the phase-4
   inventory, now adopted into the roadmap.
 
-## Stage-1 DESIGN (PROPOSED 2026-07-07, pending review — do not implement yet):
-## observed cross-plan liveness kills the over-harvest
+## Stage-1 LANDED (2026-07-08): observed cross-plan liveness kills the over-harvest
+
+**Status: IMPLEMENTED.** `src/executor/observed-liveness.ts` (the cohesive
+mechanism) + seam wiring: stamp at the replay-harvest chokepoint
+(`compiled-plan.ts`), consumption at external-slot pre-population (compiled
+phase 1), survival at the markStep boundary (`torchlette.ts`, after the step's
+reclamation), converge (K=3 + no-new-template) → invalidate + rebuild pruned
+(build-from-IR block, `executor.ts`), bind-time guard + in-place-committed
+counter, telemetry folded onto `getPayloadThrashStats()`. Guard recovery lives
+in `RuntimeEngine.forceAllMerged` (RecoverableGuardMiss → evict + fresh lowered
+re-collection). ~335 net SLOC + a 322-line module; zero new env flags (lives
+behind `TORCHLETTE_BUILD_FROM_IR`).
+
+**Measured (6L/384/seq256, steady-state peak): conservative build-from-IR
+2557 MB → pruned 1790 MB (−767 MB, −30%); recorded-cutover reference 1670 MB.**
+The +53% over-harvest collapses to +7% — the delta is largely eliminated; the
+residual is unconverged/intermittent templates + slightly-conservative pruning
+(views of independently-live bases are kept). 4 templates converged, 174 harvest
+pairs pruned, ZERO guard misses across every gate.
+
+Gate ladder (all green): full suite (cpu 1161 / webgpu 881, 0 fail); test:gates
+4/4; build-from-IR-pruned vs `TORCHLETTE_GENERATED_PLAN=0` fullstack losses agree
+5.7e-6 over 30 steps (bit-identical trajectory across the pruning threshold);
+124M-class regression baseline-exact {9.81,5.92,5.15,4.64} flat 2087.6 MB zero
+leak; decode gen-tape + kv-differential PASS; STRICT_LIFETIME + STRICT_GPU over
+the build-from-IR fullstack run: zero throws.
+
+**Deviation from the proposed gate (b)(1).** The literal "observed needed-set ==
+the default cutover's live-result harvest set" does NOT hold and is NOT the right
+invariant: the observed mechanism prunes MORE aggressively than the recorded
+cutover. `liveResultHarvestPairs` is measured PRE-markStep and keeps harvested
+VIEWS of independently-live bases; the observed set is the post-markStep
+rc-survivor set ∪ cross-plan-consumed. The observation is also coupled to which
+results are harvested+stamped (self-reinforcing: a pruned result is unstamped, so
+its survival isn't re-observed), so no clean cross-mode set equality exists. That
+the tighter observed set is EXACTLY sufficient is proven the sound way — by the
+bit-identical trajectory + zero missing-input crashes + zero dirty misses across
+the whole ladder. The set-parity gate (`test/observed-liveness.spec.ts`)
+therefore asserts the SEAM AGREEMENT that actually holds: identical trajectory
+across the pruning-activation threshold, zero guard misses, and demonstrable
+pruning (`prunedPairsRemoved > 0`).
+
+### (ORIGINAL DESIGN, retained for the rationale)
 
 ### (a) Why per-plan survivor-pruning breaks — the crash class, characterized
 

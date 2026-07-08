@@ -122,6 +122,26 @@ import {
   type LoweredPlan,
 } from "./lowered-plan";
 import {
+  getObservedLivenessStats,
+  isObservedLivenessEnabled,
+  noteInPlaceCommit,
+  noteNewTemplate,
+  noteTemplateExecuted,
+  prunedHarvest,
+  resetObservedLiveness,
+  setObservedLivenessEnabled,
+  setTemplateCompiledInvalidator,
+} from "./observed-liveness";
+
+/** [observed-liveness] Node ops that commit in-place mutations to persistent
+ *  state. A plan containing any advances the guard's in-place-committed counter
+ *  so a pruned-producer recompute against mutated storages fails loudly. */
+const IN_PLACE_COMMIT_OPS: ReadonlySet<string> = new Set([
+  "adamStep",
+  "stridedScatterCopy",
+  "stridedScatterAdd",
+]);
+import {
   assignNodeResult,
   executeOpSync,
   getInputStorage,
@@ -168,6 +188,13 @@ interface OptimizedExecutionOptions {
    * the engine for checkpointed training (see RuntimeEngine.setBufferArenaDisabled).
    */
   arenaDisabled?: boolean;
+  /**
+   * [observed-liveness] Guard recovery: force the whole execution LOWERED (no
+   * compiled fast-path, no build-from-IR) so a fresh collection recomputes a
+   * pruned producer's value against surviving storages. Set by forceAllMerged's
+   * one-shot retry after a RecoverableGuardMiss.
+   */
+  forceLowered?: boolean;
 }
 
 /**
@@ -339,12 +366,27 @@ function notePayloadThrash(
   );
 }
 
-/** Test/debug: distinct-payload template misses per structural hash. */
-export function getPayloadThrashStats(): { structures: number; worst: number } {
+/** Test/debug: distinct-payload template misses per structural hash, plus the
+ *  observed-liveness guard telemetry (folded here per the telemetry disposition
+ *  — no new export). `dirtyMisses` is THE measurement deciding whether stage-3
+ *  rematerialization ever needs to serve the build-from-IR pruning path. */
+export function getPayloadThrashStats(): {
+  structures: number;
+  worst: number;
+  cleanMisses: number;
+  dirtyMisses: number;
+  pinnedTemplates: number;
+  convergedTemplates: number;
+  prunedPairsRemoved: number;
+} {
   let worst = 0;
   for (const v of structuralMissCounts.values())
     if (v.size > worst) worst = v.size;
-  return { structures: structuralMissCounts.size, worst };
+  return {
+    structures: structuralMissCounts.size,
+    worst,
+    ...getObservedLivenessStats(),
+  };
 }
 
 /** Get a cached fusion analysis template by fingerprint. */
@@ -353,6 +395,39 @@ export function getFusionAnalysisTemplate(
 ): FusionAnalysisTemplate | undefined {
   return fusionAnalysisCache.get(fingerprint);
 }
+
+/** Test/debug: for every cached template with a valid compiled plan, the SET of
+ *  harvested result identities ("nodeIndex:outputIndex"), keyed by fingerprint
+ *  hex. The observed-liveness set-parity gate compares this map across the
+ *  build-from-IR-pruned run and the recorded-cutover run — the pruned result set
+ *  must equal the cutover's live-result survivor set for every recurring
+ *  template (single source at the seam, assert agreement). */
+export function debugTemplateResultSets(): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const [fp, template] of fusionAnalysisCache) {
+    const cp = template.loweredPlan?.compiledPlan;
+    if (!cp?.valid) continue;
+    out[`0x${fp.toString(16)}`] = cp.results
+      .map((r) => `${r.nodeIndex}:${r.outputIndex}`)
+      .sort();
+  }
+  return out;
+}
+
+// [observed-liveness] The module observes cross-plan liveness only when
+// build-from-IR is active (the over-harvest it fixes exists only there). Set
+// once at module load; the flag also gates every observation hook to a no-op.
+setObservedLivenessEnabled(ENV.TORCHLETTE_BUILD_FROM_IR === "1");
+// The guard invalidates a producer template's compiled plan when a late
+// consumer misses its pruned output; route it through the cache here (the
+// module can't import this file — circular).
+setTemplateCompiledInvalidator((fp: number) => {
+  const t = fusionAnalysisCache.get(fp);
+  if (t?.loweredPlan?.compiledPlan) {
+    destroyCompiledPlanBuffers(t.loweredPlan.compiledPlan);
+    t.loweredPlan.compiledPlan = undefined;
+  }
+});
 
 /**
  * Destroy all buffer arenas across cached templates, freeing GPU memory.
@@ -386,6 +461,9 @@ export function clearTemplateCacheForNewEngine(): void {
   // buffers are already torn down cleanly); the reset bumps the generation
   // as a backstop for any plan object that escaped the cache walk.
   resetPlannerRegistry();
+  // [observed-liveness] The per-template observation state keys by fingerprint;
+  // a new instance's fingerprints could collide with the dead one's — drop it.
+  resetObservedLiveness();
 }
 
 export function evictAllArenas(force = false): void {
@@ -1424,6 +1502,14 @@ export async function executeLoweredPlan(
   backend: Backend,
   options: {
     bufferArena?: BufferArena;
+    /** [observed-liveness] Structural fingerprint of the template this plan
+     *  belongs to. Stamped on any compiled plan built here so the harvest can
+     *  tag results with their cross-plan identity. */
+    templateFp?: number;
+    /** [observed-liveness] Guard recovery: run this execution LOWERED (no
+     *  compiled fast-path, no build-from-IR, no cutover) so a fresh collection
+     *  recomputes a pruned producer's value against surviving storages. */
+    forceLowered?: boolean;
   } = {},
 ): Promise<OptimizedExecutionResult> {
   // Validate plan node count matches
@@ -1431,6 +1517,23 @@ export async function executeLoweredPlan(
     throw new Error(
       `Lowered plan node count mismatch: plan has ${planNodes.length}, lowered expects ${loweredPlan.planNodeCount}`,
     );
+  }
+
+  // [observed-liveness] Record that this template executed this step, and
+  // advance the guard's in-place-committed counter if this plan mutates
+  // persistent state (adam / copy_ / add_). Both no-op unless build-from-IR is
+  // active. The counter must advance for THIS plan before any LATER consumer
+  // plan's bind-time miss reads it, so note here at the single entry point.
+  if (options.templateFp !== undefined) {
+    noteTemplateExecuted(options.templateFp);
+  }
+  if (isObservedLivenessEnabled()) {
+    if (loweredPlan._hasInPlaceCommit === undefined) {
+      loweredPlan._hasInPlaceCommit = planNodes.some((n) =>
+        IN_PLACE_COMMIT_OPS.has(n.op),
+      );
+    }
+    if (loweredPlan._hasInPlaceCommit) noteInPlaceCommit();
   }
 
   // Pre-tune matmul shapes (same as normal path)
@@ -1485,6 +1588,7 @@ export async function executeLoweredPlan(
   // copy, write, barrier) with abstract slot indices instead of concrete buffers.
   // Compiled plan: enabled by default. Disable with TORCHLETTE_COMPILED_PLAN=0.
   if (
+    !options.forceLowered &&
     loweredPlan.compiledPlan?.valid &&
     useTopLevelSharedEncoder &&
     options.bufferArena &&
@@ -1551,6 +1655,7 @@ export async function executeLoweredPlan(
   // through to the lowered path with zero residue — so flag-off behaviour and
   // the fallback are byte-identical to the unmodified normal path.
   if (
+    !options.forceLowered &&
     ENV.TORCHLETTE_BUILD_FROM_IR === "1" &&
     backend.name === "webgpu" &&
     useTopLevelSharedEncoder &&
@@ -1569,11 +1674,37 @@ export async function executeLoweredPlan(
     let genPlan: CompiledPlan | undefined;
     const gen = generateStream(loweredPlan, planNodes, backend);
     if (gen?.fullyCovered) {
+      // [observed-liveness] The conservative full action-output harvest is the
+      // safe default (see the proof above); once observation has converged a
+      // recurring template, prune it to the observed needed-set (consumed ∪
+      // survived) ∪ mandatory (terminal + declared outputs, which the executor
+      // returns unconditionally). The EXCLUDED pairs are recorded on the plan so
+      // a late consumer's bind-time miss can name the culprit and gate recovery.
+      const actionPairs = actionOutputHarvestPairs(loweredPlan, planNodes, gen);
+      const fp = options.templateFp;
+      let harvestPairs = actionPairs;
+      let prunedPairs: Array<{ ni: number; oi: number }> | undefined;
+      if (fp !== undefined) {
+        const outIds = new Set<number>();
+        outIds.add(planNodes[planNodes.length - 1].id);
+        if (plan.outputIndices) {
+          for (const idx of plan.outputIndices) outIds.add(plan.nodes[idx].id);
+        }
+        const mandatory = new Set<string>();
+        for (let i = 0; i < planNodes.length; i++) {
+          if (outIds.has(planNodes[i].id)) mandatory.add(`${i}:0`);
+        }
+        const pr = prunedHarvest(fp, actionPairs, mandatory);
+        if (pr) {
+          harvestPairs = pr.kept;
+          prunedPairs = pr.excluded.map((p) => ({ ni: p.i, oi: p.oi }));
+        }
+      }
       const { genResults, genOk } = harvestGenResults(
         planNodes,
         gen,
         makeMetaDeriver(),
-        actionOutputHarvestPairs(loweredPlan, planNodes, gen),
+        harvestPairs,
       );
       if (genOk) {
         const built = buildCompiledPlanFromGenerated({
@@ -1582,10 +1713,12 @@ export async function executeLoweredPlan(
           nodeResults: genResults,
         });
         if (built.valid) {
+          built.templateFp = fp;
+          built._prunedPairs = prunedPairs;
           loweredPlan.compiledPlan = genPlan = built;
           if (ENV.TORCHLETTE_DEBUG_COMPILED) {
             console.log(
-              `[compiled] phase-4.4 BUILD-FROM-IR: ${gen.commands.length} cmds, ${genResults.length} results — no lowered execution`,
+              `[compiled] phase-4.4 BUILD-FROM-IR: ${gen.commands.length} cmds, ${genResults.length} results${prunedPairs ? ` (pruned ${prunedPairs.length})` : ""} — no lowered execution`,
             );
           }
         }
@@ -2853,6 +2986,11 @@ export async function executePlanOptimized(
   } else {
     // ── Cache miss: run full analysis + build lowered plan ──
 
+    // [observed-liveness] A new template appeared this step — defers the
+    // no-new-template-this-step pruning condition (a step that grows the plan
+    // set is not yet a stable observation).
+    noteNewTemplate();
+
     const analysis = analyzeGraph(
       plan.nodes,
       externalNodeIds,
@@ -3094,9 +3232,18 @@ export async function executePlanOptimized(
     : ((cachedTemplate ?? fusionAnalysisCache.get(fingerprint.primary))
         ?.bufferArena as BufferArena | undefined);
   if (!STEP_TAPE_RECORD) {
-    return executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
+    const r = await executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
       bufferArena,
+      templateFp: fingerprint.primary,
+      forceLowered: options.forceLowered,
     });
+    // [observed-liveness] Tag any compiled plan built this call with its
+    // template fp so future replays stamp harvested results with their
+    // cross-plan identity. No-op unless build-from-IR is active.
+    if (loweredPlan.compiledPlan) {
+      loweredPlan.compiledPlan.templateFp = fingerprint.primary;
+    }
+    return r;
   }
   // [step-tape 1b] pure observation: record the plan execution (template id +
   // payload/scalar image for the guard-3 diff), and stamp the template fp on
@@ -3105,9 +3252,12 @@ export async function executePlanOptimized(
   try {
     const r = await executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
       bufferArena,
+      templateFp: fingerprint.primary,
+      forceLowered: options.forceLowered,
     });
     if (loweredPlan.compiledPlan) {
       loweredPlan.compiledPlan.tapeFp = fingerprint.primary;
+      loweredPlan.compiledPlan.templateFp = fingerprint.primary;
     }
     // [step-tape 1c] capture this NORMAL compiled step as a replay-skeleton
     // candidate (promoted iff the recorder deems it eligible at markStep) and,

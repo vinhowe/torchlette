@@ -54,6 +54,7 @@ import {
 } from "../executor/step-tape-replay";
 import { getNextNodeId } from "../graph/node-factory";
 import { storageTracker } from "../graph/storage-tracker";
+import { observeStepBoundary } from "../executor/observed-liveness";
 import {
   type EngineTensor,
   RuntimeEngine,
@@ -1925,6 +1926,11 @@ export class Torchlette {
     storageTracker.destroyUnreachable();
     storageTracker.releaseStepTemps(gen);
     storageTracker.destroyUnreachable();
+    // [observed-liveness] Step boundary AFTER reclamation: a stamped result
+    // still registered here survived the step (params / user-held); record it,
+    // advance hysteresis, converge + rebuild templates. No-op unless
+    // build-from-IR is active.
+    observeStepBoundary();
     this.runtime.resetCumulativeFusionStats();
     // beginStep equivalent: residue is already forced above; snapshot the
     // persistents (gen-scoped: the next iteration's lazily-built tensors
@@ -1962,6 +1968,10 @@ export class Torchlette {
 
     // Step 3.6: Final cleanup after releasing step-scoped refs.
     storageTracker.destroyUnreachable();
+
+    // [observed-liveness] Step boundary AFTER reclamation (see the implied-
+    // boundary path for the rationale). No-op unless build-from-IR is active.
+    observeStepBoundary();
 
     // Step 4: Reset cumulative fusion stats for the next step
     this.runtime.resetCumulativeFusionStats();

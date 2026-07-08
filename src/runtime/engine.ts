@@ -35,6 +35,7 @@ import {
   type OptimizedExecutionStats,
 } from "../executor/executor";
 import { isDataSourceOp } from "../executor/lowered-plan";
+import { RecoverableGuardMiss } from "../executor/observed-liveness";
 import { buildMergedPlan, tagPlanOutputs } from "../executor/plan-builder";
 import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
 import { STEP_TAPE_RECORD, stRecordReadback } from "../core/step-tape";
@@ -727,77 +728,71 @@ export class RuntimeEngine {
     const pendingRoots = collectPendingRoots(tensors);
     if (pendingRoots.length === 0) return;
 
-    const plan = buildMergedPlan(pendingRoots);
-    if (plan.nodes.length === 0) return;
-    if (TAPE_PROFILE) tpAdd("plan-collect", performance.now() - tpC0);
+    // [observed-liveness] Guard recovery loop: a late consumer reading a PRUNED
+    // build-from-IR producer output misses at bind time (RecoverableGuardMiss,
+    // thrown before any side effect). The sound recovery is a FRESH plan
+    // re-collection run lowered: buildMergedPlan now walks the resultless
+    // producer's .inputs chain and pulls the whole recompute slice down to
+    // surviving storages. One retry suffices (a fresh lowered plan never prunes).
+    let plan!: ReturnType<typeof buildMergedPlan>;
+    let forceLowered = false;
+    for (let attempt = 0; ; attempt++) {
+      plan = buildMergedPlan(pendingRoots);
+      if (plan.nodes.length === 0) return;
+      if (TAPE_PROFILE && attempt === 0)
+        tpAdd("plan-collect", performance.now() - tpC0);
 
-    // Apply DSL rewrites (node-insertion rules) before the template cache
-    // sees the plan. Runs every step but is cheap (few patterns, <1ms).
-    const pendingIds = getPendingNodeIds();
-    const tpR0 = TAPE_PROFILE ? performance.now() : 0;
-    rewritePlan(plan, DSL_RULES, pendingIds);
-    if (TAPE_PROFILE) tpAdd("dsl-rewrite", performance.now() - tpR0);
+      // Apply DSL rewrites (node-insertion rules) before the template cache
+      // sees the plan. Runs every step but is cheap (few patterns, <1ms).
+      const pendingIds = getPendingNodeIds();
+      const tpR0 = TAPE_PROFILE ? performance.now() : 0;
+      rewritePlan(plan, DSL_RULES, pendingIds);
+      if (TAPE_PROFILE) tpAdd("dsl-rewrite", performance.now() - tpR0);
 
-    // Tag plan outputs: nodes with LIVE pending RuntimeTensors only.
-    // The disposed pending IDs (kept for fusion analysis) must NOT be
-    // protected here — their tensors are gone and their buffers should be
-    // releasable. Including them inflates outputIndices and pins memory.
-    tagPlanOutputs(plan, getLivePendingNodeIds());
+      // Tag plan outputs: nodes with LIVE pending RuntimeTensors only.
+      // The disposed pending IDs (kept for fusion analysis) must NOT be
+      // protected here — their tensors are gone and their buffers should be
+      // releasable. Including them inflates outputIndices and pins memory.
+      tagPlanOutputs(plan, getLivePendingNodeIds());
 
-    // Scheduler audit (no-op unless TORCHLETTE_SCHEDULER_AUDIT=1).
-    auditPlan(plan, pendingIds);
+      // Scheduler audit (no-op unless TORCHLETTE_SCHEDULER_AUDIT=1).
+      auditPlan(plan, pendingIds);
 
-    // Retain rc on all materialized inputs used by the plan. Keeps storages
-    // alive through execution even if owning tensors are disposed mid-step.
-    retainPlanInputRefs(plan.nodes);
+      // Retain rc on all materialized inputs used by the plan. Keeps storages
+      // alive through execution even if owning tensors are disposed mid-step.
+      retainPlanInputRefs(plan.nodes);
 
-    const device = resolveDeviceFromTensors(tensors);
+      const device = resolveDeviceFromTensors(tensors);
 
-    // Data-source-only plans skip the template/arena/lowered-plan path.
-    const allDataSource = plan.nodes.every((n) => isDataSourceOp(n.op));
+      // Data-source-only plans skip the template/arena/lowered-plan path.
+      const allDataSource = plan.nodes.every((n) => isDataSourceOp(n.op));
 
-    const backend = this.getBackend(device);
+      const backend = this.getBackend(device);
 
-    // Check if plan has checkpoint boundaries - only segment if checkpointing is used
-    const hasCheckpointBoundaries = plan.nodes.some(
-      (n) => n.isCheckpointBoundary,
-    );
+      // Check if plan has checkpoint boundaries - only segment if checkpointing is used
+      const hasCheckpointBoundaries = plan.nodes.some(
+        (n) => n.isCheckpointBoundary,
+      );
 
-    // Execution hook: replace local execution with a custom path (e.g., remote).
-    if (this._executionHook) {
-      await this._executionHook(plan, backend);
-    } else if (this.fusionEnabled && !allDataSource) {
-      const optimizedResult = await executePlanOptimized(plan, backend, {
-        enableFusion: true,
-        enableVectorization: this.vectorizationEnabled,
-        enableEarlyRelease: this.earlyReleaseEnabled,
-        arenaDisabled: this.bufferArenaDisabled,
-      });
-      this.lastFusionStats = optimizedResult.stats;
-      this.accumulateFusionStats(optimizedResult.stats);
-    } else if (
-      this.trueSegmentationEnabled &&
-      hasCheckpointBoundaries &&
-      device === "webgpu"
-    ) {
-      // True segmentation with GPU sync between segments
-      await executePlanSegmented(plan, backend, {
-        enableEarlyRelease: this.earlyReleaseEnabled,
-        gpuSync: true,
-      });
-    } else if (this.checkpointSegmentationEnabled && hasCheckpointBoundaries) {
-      // Checkpoint segmentation (buffer pool flush only, no GPU sync)
-      await executePlanSegmented(plan, backend, {
-        enableEarlyRelease: this.earlyReleaseEnabled,
-        flushBufferPoolFn: this.getBufferPoolFlushFn(device),
-      });
-    } else {
-      // Standard execution - no segmentation overhead
-      await executePlanSequential(plan, backend, {
-        enableEarlyRelease: this.earlyReleaseEnabled,
-      });
+      try {
+        await this._dispatchForcePlan(plan, backend, device, {
+          allDataSource,
+          hasCheckpointBoundaries,
+          forceLowered,
+        });
+        break;
+      } catch (e) {
+        if (e instanceof RecoverableGuardMiss && attempt === 0) {
+          // Release this failed attempt's input-ref retains before rebuilding —
+          // the fresh plan retains its own (the miss threw before any side
+          // effect, so nothing else needs unwinding).
+          for (const node of plan.nodes) releaseNodeInputRefs(node);
+          forceLowered = true;
+          continue;
+        }
+        throw e;
+      }
     }
-
     // Materialize ALL tensors that were pending on executed nodes.
     // This ensures all user-held tensors get their storages marked as externally reachable.
     const { materializePendingTensors, clearDisposedPendingNodeIds } =
@@ -825,6 +820,59 @@ export class RuntimeEngine {
     for (const node of skippedNodes) {
       releaseNodeInputRefs(node);
       node._executed = true;
+    }
+  }
+
+  /** Dispatch a collected force plan through the appropriate execution path.
+   *  Extracted so forceAllMerged can retry it under forceLowered after an
+   *  observed-liveness guard miss (see the recovery loop). */
+  private async _dispatchForcePlan(
+    plan: ReturnType<typeof buildMergedPlan>,
+    backend: ReturnType<RuntimeEngine["getBackend"]>,
+    device: DeviceKind,
+    opts: {
+      allDataSource: boolean;
+      hasCheckpointBoundaries: boolean;
+      forceLowered: boolean;
+    },
+  ): Promise<void> {
+    // Execution hook: replace local execution with a custom path (e.g., remote).
+    if (this._executionHook) {
+      await this._executionHook(plan, backend);
+    } else if (this.fusionEnabled && !opts.allDataSource) {
+      const optimizedResult = await executePlanOptimized(plan, backend, {
+        enableFusion: true,
+        enableVectorization: this.vectorizationEnabled,
+        enableEarlyRelease: this.earlyReleaseEnabled,
+        arenaDisabled: this.bufferArenaDisabled,
+        forceLowered: opts.forceLowered,
+      });
+      this.lastFusionStats = optimizedResult.stats;
+      this.accumulateFusionStats(optimizedResult.stats);
+    } else if (
+      this.trueSegmentationEnabled &&
+      opts.hasCheckpointBoundaries &&
+      device === "webgpu"
+    ) {
+      // True segmentation with GPU sync between segments
+      await executePlanSegmented(plan, backend, {
+        enableEarlyRelease: this.earlyReleaseEnabled,
+        gpuSync: true,
+      });
+    } else if (
+      this.checkpointSegmentationEnabled &&
+      opts.hasCheckpointBoundaries
+    ) {
+      // Checkpoint segmentation (buffer pool flush only, no GPU sync)
+      await executePlanSegmented(plan, backend, {
+        enableEarlyRelease: this.earlyReleaseEnabled,
+        flushBufferPoolFn: this.getBufferPoolFlushFn(device),
+      });
+    } else {
+      // Standard execution - no segmentation overhead
+      await executePlanSequential(plan, backend, {
+        enableEarlyRelease: this.earlyReleaseEnabled,
+      });
     }
   }
 
