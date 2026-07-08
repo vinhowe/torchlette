@@ -1468,3 +1468,398 @@ kernels as data or fingerprint-guarded payloads (d822be9/2809588); WAR +
 barrier + affinity scheduling (98eea29/b791d72); instance boundaries are
 cache boundaries (4d94ff4); every new optimized path lands with a
 cross-threshold differential.
+
+## Stage 3 (PROPOSED, 2026-07-08): rematerialization unification
+
+**Status: DESIGN ONLY. Not built. Awaiting review → hardening → separate build
+go (the stage-1 protocol).** This section is the §(d) extension point made
+concrete, grounded in the G0 measurements below. The prior work it stands on:
+stage-1 observed cross-plan liveness (the stamp + needed-set + guard substrate,
+`src/executor/observed-liveness.ts`); the memory planner + PlannerRegistry
+(per-plan interval allocation, `src/executor/memory-planner.ts`); the frontend
+checkpoint recompute (`src/nn/checkpoint.ts`); and `b66ead78` (the arena-free
+checkpoint bypass this stage dies-by-unifying).
+
+### G0 — measured first (the bar the design must clear)
+
+Production `WebGPUGPT2Trainer` via `tools/diloco-regression-check.ts`, V100
+(sivri, solo), losses baseline-EXACT in every row (checkpointing is numerically
+transparent — confirmed, not assumed). `cur` = steady-state CURRENT bytes
+(round-flat); `peak` = cumulative peak; ms/step = round dt / 20 inner steps.
+
+**Regression config (8L/embed128/H4/b8/seq256 — vocab-dominated, activations
+small):**
+| config | peak MB | cur MB | ms/step |
+|--------|--------:|-------:|--------:|
+| (a) arena-free lowered checkpointed — **the current production path** | 2087.6 | **353.8** | ~281 |
+| (b) build-from-IR **compiled** checkpointed (`CHECKPOINT_ARENA=1`) | 3637.3 | **2589.0** | ~78 |
+
+**124M-class (12L/embed768/H12/b1/seq256 — activations dominate; where the
+`b66ead78` 6.6→2.6 GB win lives, and where remat matters):**
+| config | peak MB | cur MB | ms/step |
+|--------|--------:|-------:|--------:|
+| (a′) arena-free lowered checkpointed — **BASELINE-TO-BEAT** | 7659.1 | **2638.2** | ~653 |
+| (d′) compiled checkpointed (`CHECKPOINT_ARENA=1`) | 9357.9 | **5587.0** | ~275 |
+| (b′) compiled NON-checkpointed (`CHECKPOINTING=0`) | 9270.8 | **5601.2** | ~274 |
+
+**Two facts the bar rests on:**
+1. **Checkpointing saves NOTHING under the compiled path today.** (d′) 5587 MB ≈
+   (b′) 5601 MB — compiled-checkpointed ≈ compiled-non-checkpointed. The
+   forward-activation savings checkpointing is supposed to deliver are entirely
+   defeated. This is `b66ead78`'s disease (the retained buffers keep every
+   activation resident) reproduced in the compiled path — the compiled
+   registry's RESULT-HOLDER buffers are materialized once and rebound every
+   replay (persistent across steps, `compiled-plan.ts:1848` + `memory-planner.ts`
+   `resultHolder`), so a forward activation that any later plan reads is held for
+   the template's whole life. Checkpointing's recompute plans then ADD persistent
+   buffers on top (d′ peak 9358 > b′ 9271), making it marginally worse.
+2. **Unification is a large SPEED win and, today, a large MEMORY regression.**
+   Compiled is **2.4× faster** (275 vs 653 ms/step at 124M; 3.6× at small) —
+   the prize, and why `b66ead78`'s lowered bypass is worth killing (step-tape 2b
+   / taped training needs compiled steps, which the bypass forbids). But compiled
+   checkpointed is **+2.9 GB current / +1.7 GB peak** over the arena-free
+   baseline at 124M. **The design's central problem is MEMORY, not speed.**
+
+**The bar (stated at 124M-class):** compiled-with-remat must reach **cur ≤ 2638
+MB, peak ≤ 7659 MB** (match the arena-free checkpointed baseline — that is WHY
+the bypass exists) at **≥ its current ~275 ms/step** (already ≥ the 653 ms
+baseline with 2.4× margin), trajectory == fp noise. The win if achieved: the
+`b66ead78` memory AND 2.4× the speed, one lifetime story.
+
+**G0(c) — the segment set remat must free+recompute.** Selective checkpointing
+(`model.ts:452`, default `selectiveCheckpoint=true`): per layer, ATTENTION runs
+OUTSIDE checkpoint (its O and logsumexp L are saved → forward-plan results
+consumed cross-plan by backward), MLP runs INSIDE checkpoint. So the segment set
+= **`numLayers` MLP segments** (8 small / 12 at 124M), each recomputing
+`ln2 → up-proj(d→4d) → gelu → down-proj(4d→d) → residual add`. Dropped per
+segment ≈ up-proj + gelu outputs `[tokens, 4·embed]` ×2 + ln2/down `[tokens,
+embed]` ×2 ≈ ~8 MB fp32 / ~4 MB f16 at 124M/b1/seq256 (×12 ≈ ~50–96 MB); kept
+per segment = the segment input `h` `[tokens, embed]` (~0.8 MB, held by
+`api.keep`). The MLP-internal activations are NOT forward-plan results (disposed
+by `tidy` under the pack hook); the recompute re-creates them at backward.
+
+### 1. The lifetime model — step-global multi-segment intervals
+
+The root cause the G0 data isolates: **the memory planner today allocates
+intervals PER PLAN, but a checkpointed/cross-plan activation's true lifetime
+spans the plan set.** A forward activation consumed by backward is a RESULT
+(exclusive registry entry, `resultHolder`), materialized once and held for the
+template's entire multi-step life. The arena-free LOWERED path reaches 354 MB /
+2638 MB precisely because it frees each activation at its last read WITHIN the
+single fused execution and re-allocates it next step from the pool; the compiled
+path pins it forever for rebind stability.
+
+**The model: lift interval allocation from per-plan to STEP-GLOBAL, over the
+plan set, using the stamp identity as the cross-plan lifetime coordinate.** A
+value `(templateFp, nodeIndex, oi)` (the stamp already minted at the
+replay-harvest chokepoint) gets a lifetime that is a set of `[produce, lastRead]`
+SEGMENTS in step-global command order across all the step's plans:
+
+- **Ordinary cross-plan activation** (attention O/L, residual stream x): ONE
+  segment `[produced @ forward-plan ... last cross-plan read @ backward-plan]`.
+  Its registry entry is RELEASED after the last read (relisted → reused by a
+  later plan's temps / next step's allocations) instead of pinned for the
+  template's life. This alone converts the bulk of the 2589/5587 MB persistent
+  result set into step-scoped, packable memory — the arena-free path's behavior,
+  reached WITHOUT giving up the compiled dispatch stream.
+- **Checkpointed activation** (MLP internals): its stamp's lifetime is naturally
+  MULTI-SEGMENT — `[produced @ forward ... last read @ forward]` (dies at the
+  forward residual add; never read cross-plan because backward recomputes) then a
+  DISJOINT `[re-produced @ recompute-plan ... last read @ backward]`. The gap
+  between forward-death and recompute-revival is a FREE region the planner packs.
+  Crucially, the two segments are produced by DIFFERENT node identities (the
+  recompute is a fresh forward — see §2), so the planner does not need to "resume"
+  one entry; it sees two independent short-lived intervals that its existing
+  release-and-reclaim (`memory-planner.ts` release queue) already packs — the
+  multi-segment lifetime is EMERGENT from cooperating with the frontend recompute,
+  not a new allocator primitive.
+
+**Where segment boundaries are known at plan/build time.** They are already
+structured: `markAsCheckpointBoundary` (`plan-builder.ts:11`) stamps the last
+recomputed node of each segment, and the forward pack hook / backward unpack hook
+delimit the forward-death and recompute-revival points at the FRONTEND. The seam
+the planner reads is the STAMP: an activation whose stamp is never recorded as
+`consumed` (no cross-plan external-input read) and never `survived` (disposed by
+tidy, not user-held) is — by the stage-1 observation — pruned to a temp with an
+intra-plan `[produce, lastRead]` interval. **Checkpointed forward activations are
+exactly this class** (pack-hooked → disposed → not cross-plan-read). So stage-1's
+`prunedHarvest` ALREADY classifies them as freeable; what is missing is that (i)
+under the arena gate they never reach build-from-IR (§5), and (ii) the
+cross-plan-CONSUMED activations (attention O/L, residual x) are NOT pruned (they
+ARE read by backward) yet are still pinned per-template rather than released at
+their last cross-plan read. **The step-global interval is the mechanism that
+frees THOSE** — the ones stage-1 correctly keeps as needed but the planner holds
+too long.
+
+**Packing the freed region.** The step-scoped shared `PlannerRegistry` already
+packs temps across plans (phase 1.5). The extension: a released cross-plan result
+entry is `relist()`ed at its last-read command (step-global order), not at
+template teardown, so a later plan in the same step — including a recompute plan —
+draws it from `seedFreeLists`. The `planMemory` release-queue model
+(`releaseAt = lastUse + 1`) already expresses "reusable from the next command";
+step-global lifting makes `lastUse` a cross-plan coordinate rather than a
+within-stream index. **This is the "the entry gains segments … release-and-reclaim
+already expresses it" of §(d), now concrete: the release point moves from
+per-template to step-global-last-cross-plan-read.**
+
+### 2. The recompute mechanism — COOPERATE with the frontend recompute; do NOT
+### re-emit it
+
+**Ruling: the planner COOPERATES with the existing frontend checkpoint recompute.
+It does NOT subsume or replace it, and it emits NO recompute sub-stream of its
+own.** This is the load-bearing precision the charter demands (double-recompute
+and missed-recompute are the failure modes), and the reasoning is decisive:
+
+- The existing recompute (`checkpoint.ts` unpack hook) already re-runs `fn` at
+  backward, creating FRESH lazy IR nodes that are forced into their own
+  plan(s) → compiled build-from-IR like any other plan. **`generateStream` over a
+  producing subgraph — the §(d) "remat primitive" — is therefore ALREADY HAPPENING**:
+  the frontend hands the planner a fresh subgraph, and build-from-IR generates
+  its stream with no execution or trace. The primitive is not missing; it is
+  driven from the frontend.
+- If stage 3 ALSO had the planner emit a recompute stream for the same
+  checkpointed value, the value would be computed TWICE at backward (frontend
+  re-run AND planner re-emit) — the double-recompute failure mode, and a
+  correctness hazard (two producers writing one stamp). So the planner MUST NOT
+  emit its own recompute program while the frontend recompute exists.
+- **What the planner does instead:** nothing new at recompute TIME — it simply
+  (i) frees the forward activation's registry region at forward-death (via the
+  step-global lifetime, §1), and (ii) lets the recompute plan's fresh temps draw
+  from that freed region. The recompute plan is built from IR (no execution, no
+  trace) at first backward, exactly as build-from-IR already builds every plan;
+  its outputs land in planner slots the backward plan reads, exactly as today.
+  The `[re-produced ... last read]` segment is just that plan's ordinary
+  interval.
+- **When is the recompute plan built?** On first backward (when the unpack hook
+  first fires and forces the fresh subgraph) — the same first-execution build
+  every template gets. What it binds: SURVIVING storages only — params (root
+  persistent) + the segment input `h` (held by `api.keep`, so `survived` in the
+  needed-set). It never binds a freed forward activation (that is the invariant
+  that makes the free safe — §3).
+
+The one-sentence declaration: **checkpointing is expressed as liveness (the
+forward activation dies at its segment boundary) + a recompute plan (frontend-
+driven, build-from-IR); the planner's only new job is a step-global lifetime so
+the dead region is freed and the recompute packs into it.** No planner-side
+recompute emission; no second recompute; no missed recompute (the frontend still
+owns the trigger, unchanged).
+
+### 3. Guard / invalidation story (loud, bind-time, never silent)
+
+The step-global free introduces exactly one new hazard class, handled by the
+stage-1 guard already in place, extended minimally:
+
+- **A value freed early (at its observed last cross-plan read) that a LATER plan
+  reads.** This is the stage-1 guard-miss verbatim: the consumer's external-slot
+  pre-population (`compiled-plan.ts` phase 1, `observeConsumed` seam) finds no
+  storage. Recovery = `RecoverableGuardMiss` → evict the consumer template +
+  fresh lowered re-collection (which recomputes the slice from surviving
+  storages). Already implemented; the step-global model changes only WHICH values
+  can be freed early, not the miss mechanism.
+- **Interaction with observed-liveness pruning + idle-retire.** A recomputed
+  value is BY DEFINITION not surviving and not cross-plan-consumed — so the
+  needed-set classifies it (correctly) as PRUNED (a temp), which is what lets its
+  region be freed. This is not a conflict: it is the same classifier doing the
+  same thing, now with the step-global release point actually realizing the free.
+  Idle-retire is unaffected (it retires whole idle templates; recompute plans are
+  active every backward).
+- **The needed-set gains ONE distinction:** a cross-plan-consumed activation
+  (attention O/L) is `needed` (kept) but its lifetime ENDS at the last consuming
+  plan — so "kept" must mean "kept until last cross-plan read," not "pinned for
+  the template's life." Concretely: `prunedHarvest` still keeps the pair (it IS
+  consumed), but the planner assigns it a step-global-released entry rather than
+  an exclusive `resultHolder`. The stamp's `consumed` observation already records
+  WHICH later template reads it (`consumed: Map<fp, Set<ni:oi>>`); the step-global
+  lifetime's last-read coordinate is derivable from that same observation (the
+  last consuming plan's position in step order).
+- **Structural loudness preserved.** A freed-too-early value is a MISSING storage
+  (crash / guard), never a silently-stale read — the property (a) and the ADDENDUM
+  guarantee. `TORCHLETTE_STRICT_GPU` / `STRICT_LIFETIME` remain the backstops.
+
+### 4. The dirty-miss ruling, and the view-survival ruling
+
+**DIRTY-MISS RULING: stage 3 does NOT upgrade the guard to remat-on-demand. The
+guard stays exactly as-is (clean-miss → lowered re-collection; dirty-miss → loud
+fail). Smallest-sufficient, and the data + structure both say so.** Reasoning:
+- The stage-1 telemetry mandate ("dirtyMisses is THE measurement deciding whether
+  stage-3 remat ever needs to serve this path") reads ZERO dirty misses across
+  every gate landed so far, and zero guard misses at all on the recurring
+  training templates.
+- **Structural argument the checkpoint case cannot dirty-miss:** the checkpoint
+  recompute reads ONLY surviving storages (params + kept segment input `h`), never
+  a freed forward activation — that is the §2 invariant. And backward (with its
+  recompute) runs BEFORE the optimizer's in-place param update within the step, so
+  the recompute reads pre-update params. So the checkpoint path — the entire point
+  of stage 3 — never routes through the pruned-producer guard, let alone its
+  dirty sub-case. The guard serves only the residual general late-consumer class
+  (eval/logging plans), which stage-1 shows is empirically zero and which reads
+  params/grads (survivors), not freed activations.
+- Therefore §(d) point 2 (upgrade guard-miss recovery to remat-on-demand) is
+  **DECLINED as speculative** — do NOT build it. It is re-openable IFF the stage-3
+  gate ladder ever records `dirtyMisses > 0` or a non-recoverable clean miss on a
+  real workload; the counter is the trigger, wired to fail the ladder loudly.
+  (This is the "if the data says the guard path never needs remat, say so and
+  don't build it" branch of the charter, taken.)
+
+**VIEW-SURVIVAL RULING: adopt the PERSISTENT pruned-pair→stamp map + view
+reconstruction on miss; drop the conservative view-keeping ("b"-source pairs).
+NOT full remat.** This is the resolution the lifetime model makes natural:
+- The open question (stage-2 inc-1): a harvested VIEW whose handle died but whose
+  base survives is kept conservatively (+155 MB small-scale; b=3 at 124M) because
+  `prunedExecuted` is STEP-SCOPED, so a LATER-step consumer of a pruned view would
+  raw-crash ("Input not ready"), unguarded.
+- Under the step-global lifetime model, a view of a surviving base is the CHEAPEST
+  possible reconstruction: re-running the view op (narrow/permute/reshape) on the
+  live base is O(1) metadata, no kernel, no recompute sub-stream. So the natural
+  fix is to make `prunedExecuted` PERSISTENT across steps (a `Map<stamp, viewOp +
+  baseStamp>`), so a cross-step view reader hits the guard, and recovery
+  RECONSTRUCTS the view from the (surviving) base rather than failing or
+  conservatively keeping. Full remat (recompute sub-stream) is overkill: a view
+  has no compute to redo.
+- Why not "just keep the conservatism": it is a real cost at small scale and,
+  more importantly, it is a SECOND lifetime rule (keep-view-because-base-alive)
+  outside the one stamp-identity model — the design constraint is ONE identity
+  scheme. The persistent pruned-pair map routes view survival through the SAME
+  stamp + guard machinery. At 124M its memory value is small (b=3), so it is not
+  urgent — but it is the RIGHT shape and removes a special case, so it lands with
+  stage 3 rather than as separate debt.
+
+### 5. What dies (unification, with ref counts)
+
+- **`b66ead78`'s arena-free checkpoint bypass** — the whole reason stage 3
+  exists. Deletions: `WebGPUGPT2Trainer.initialize()`'s
+  `if (checkpointing && CHECKPOINT_ARENA!=="1") setBufferArenaDisabled(true)` +
+  the log line (`webgpu-gpt2-trainer.ts:150–161`); the `arenaDisabled` option in
+  `OptimizedExecutionOptions` + its `executePlanOptimized` OR-term
+  (`executor.ts:146–152, 3016–3026`); `RuntimeEngine.bufferArenaDisabled` field +
+  `setBufferArenaDisabled` + the two threadings (`engine.ts:382, 518–..., 764,
+  887`). **~49 lines across 3 files** (the exact `b66ead78` diff, reverted).
+  GATED ON: compiled checkpointed reaching the G0 bar (else the bypass is still
+  the only path that frees activations).
+- **`TORCHLETTE_CHECKPOINT_ARENA`** flag (13 refs) — born with the bypass, dies
+  with it. Named sunset, executed.
+- **`TORCHLETTE_ARENA_LIVENESS=0`** (legacy unbudgeted arena opt-out; ~13 refs
+  across `adam.ts`, `webgpu/index.ts`, `buffer-arena.ts`, `executor.ts`,
+  `compiled-plan.ts`) — its last role was a planner-bug fallback; once the planner
+  is the sole memory authority for checkpointed AND non-checkpointed training, it
+  is subsumed. **This is the phase-4-inventory named sunset, now with its
+  precondition met.**
+- **The old checkpoint SEGMENTATION path** — `enableCheckpointSegmentation` /
+  `enableTrueSegmentation` / `segmentPlanAtCheckpoints` / `executePlanSegmented`
+  (`plan-builder.ts:20`, `sequential.ts:163`, `engine.ts:857–872`,
+  `frontend/torchlette.ts:171`, `types.ts:109`). `b66ead78`'s message already
+  records that this branch is UNREACHABLE under fusion (the default); it is dead
+  code the unification obsoletes. Verify-then-delete (grep confirms only
+  option-plumbing + spec callers). **~est. 120–180 SLOC.**
+- **`options.bufferArena` gate on the build-from-IR block** (`executor.ts:1762`) —
+  not deleted but INVERTED in meaning: build-from-IR must run arena-free, so this
+  gate is replaced by "planner owns buffers, no arena needed" (the arena becomes
+  purely a lowered-first-exec concept, itself on the phase-4.5 chopping block).
+
+**Expected net SLOC:** mechanism ADDED ≈ 200–350 (step-global lifetime in
+`memory-planner.ts` + `observed-liveness.ts`: cross-plan last-read coordinate,
+release-at-last-cross-plan-read, persistent pruned-pair map, view reconstruction
+in the guard recovery). Deletions ≈ 220–280 (bypass 49 + segmentation 120–180 +
+two flags' plumbing). **Net roughly FLAT to slightly negative**, plus the strategic
+payoff (compiled checkpointed training → step-tape 2b unblocked).
+
+### 6. Cost / risk / staging / gate ladder
+
+**SLOC:** ~200–350 added (§5), net ~flat. No new env flag (the mechanism lives
+behind `TORCHLETTE_BUILD_FROM_IR`, already default-on; the campaign's flag budget
+is spent on SUNSETS here, not new flags).
+
+**Hardest correctness risk (the prior, confirmed as the real one): the
+step-global free reads/reuses a region whose value a not-yet-observed consumer
+still needs — the stage-1 dirty-miss class, now with a larger free surface.** The
+soundness guarantee is the same one the ADDENDUM established and stage 3 must NOT
+weaken: a value is freed early ONLY at its OBSERVED last cross-plan read, after
+K=3 convergence, and a miss is STRUCTURALLY LOUD (missing storage → guard, never
+silent stale). The specific in-place hazard — the optimizer's `copy_`/`adamStep`
+mutating params between a free and a recompute — is bounded by the existing
+step-scoped in-place-committed counter (`noteInPlaceCommit`,
+`_hasInPlaceCommit`): recompute-recovery is taken only when zero in-place ops
+committed since the freed producer's replay; else loud fail. **The checkpoint
+path provably avoids this** (recompute reads survivors, pre-optimizer — §4), so
+the hazard is confined to the general late-consumer residual the guard already
+covers with dirtyMisses=0. The design adds NO new silent path: every new free is
+gated by observation + guarded by the loud miss.
+
+Secondary risks: (i) step-global interval overlap bugs — mitigated by extending
+`memory-planner.ts`'s existing always-on structural audit (no overlapping
+lifetimes on one entry) to the cross-plan coordinate; (ii) fence/reuse safety of a
+cross-plan-released buffer — must honor `canRecycle` (in-flight encoder claims) at
+the step-global release point exactly as the pool does (the buffer-pool invariant:
+never reuse a buffer whose queued reader hasn't dispatched).
+
+**Staging (gated increments, each independently shippable):**
+1. **S3.0 — instrument (no behavior change).** Add a step-global-lifetime
+   ANALYSIS pass that COMPUTES the cross-plan last-read of every stamped result
+   and reports how much memory an early release WOULD reclaim, diffed against the
+   arena-free-lowered `cur`. Confirms the model predicts the 2589→354 / 5587→2638
+   gap before any buffer moves. (Mirrors the phase-4 `[ir-derive]` differential
+   discipline.)
+2. **S3.1 — release ordinary cross-plan activations early** (attention O/L,
+   residual x): relist their registry entries at last cross-plan read. Gated on
+   NON-checkpointed compiled memory dropping toward the arena-free line with
+   bit-identical trajectory. (This alone recovers most of the gap; it is
+   checkpoint-independent.)
+3. **S3.2 — run build-from-IR under checkpointing** (drop the `options.bufferArena`
+   gate for the arena-free case; let the frontend recompute's plans build from
+   IR). Gated on (d′) reaching the G0 bar.
+4. **S3.3 — persistent pruned-pair map + view reconstruction** (§4 view ruling),
+   dropping the "b"-conservatism.
+5. **S3.4 — the deletions** (§5), each gated on the bar holding.
+
+**Gate ladder (for eventual implementation — MUST include):**
+- `test/oracle/gpt2-checkpoint-parity.spec.ts` + all `test/checkpoint-*.spec.ts`
+  green (checkpoint numerics unchanged).
+- **Checkpointed-compiled vs arena-free-lowered trajectory ~1e-5** over ≥30 steps
+  (the new cross-path differential this stage owns — must cross the convergence
+  threshold, K≥3).
+- **Memory: 124M-class compiled checkpointed `peak ≤ 7659 MB`, `cur ≤ 2638 MB`**
+  (the G0 bar); small-config `cur ≤ ~354 MB`.
+- Production regression (`diloco-regression-check.ts`) baseline-EXACT
+  {9.81,5.92,5.15,4.64}, flat memory, zero leak — in the checkpointed default.
+- Full suite green in BOTH flag states (`BUILD_FROM_IR` default-on and `=0`), CPU
+  + webgpu.
+- Decode stack (gen-tape + kv-differential) PASS — the compiled path serves
+  inference; must not regress.
+- `TORCHLETTE_STRICT_LIFETIME=1` + `TORCHLETTE_STRICT_GPU=1` over the checkpointed
+  build-from-IR run: zero throws, zero uncaptured GPU errors.
+- `test:gates` 4/4; `observed-liveness.spec.ts` extended with a cross-plan
+  early-release + late-consumer-guard case; **`dirtyMisses === 0` asserted across
+  the whole ladder** (the ruling's live tripwire).
+
+### Open review questions (for the hardening pass)
+1. **Step-global last-read vs plan re-ordering.** The cross-plan last-read
+   coordinate assumes a stable step-global plan ORDER. Plans force incrementally
+   and the order can vary (warmup vs steady). Is "last read observed in the K
+   convergence steps" a sound upper bound, or can a steady-state step reorder a
+   consumer LATER than observed → early free → guard-miss churn? (Prior: the
+   recurring templates have deterministic order; needs confirming the CROSS-plan
+   order is equally stable.)
+2. **Rebind identity of a released-then-reused result buffer.** Compiled replay
+   rebinds recorded buffers for speed. If a cross-plan result entry is released
+   and a later plan reuses it, the next step's replay must rebind the SAME
+   assignment deterministically (the registry's epoch-scoped determinism should
+   give this, but the result→temp reclassification is new — does it interact with
+   `_lastHarvestIds` / idle-retire's destroyed-storage gate?).
+3. **Is S3.1 (release ordinary cross-plan activations) alone enough at 124M**, or
+   is the residual after it still activation-recompute-bound such that S3.2
+   (checkpointing under compiled) is load-bearing for the bar? The G0 (b′)≈(d′)
+   equality suggests the persistent-result release dominates and checkpointing is
+   secondary at THIS config — but at longer seq / bigger batch the activation
+   fraction grows (the over-harvest scaling table). Worth measuring S3.1 alone
+   before committing to the full stack.
+4. **Interaction with the scoped-memory epoch migration** (`scoped-memory-design.md`):
+   the step-global lifetime is keyed on the step/markStep boundary
+   (`observeStepBoundary`). Under the epoch model, "step-global" becomes
+   "epoch-global." Should stage 3 key on the epoch id from the start (per §8 of
+   scoped-memory) to avoid a third migration?
+5. **Double-recompute audit.** The COOPERATE ruling forbids a planner-emitted
+   recompute. Is there any path where the harvest/guard could ALSO force the
+   pruned forward subgraph (e.g. a guard-miss on a checkpointed activation that
+   SHOULD have been recomputed by the frontend but was read as an external)? §2
+   argues no, but this is the correctness lynchpin and deserves an explicit
+   instrumented check in S3.2.
