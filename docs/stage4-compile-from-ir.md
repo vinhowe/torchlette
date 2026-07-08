@@ -2114,3 +2114,20 @@ phys within ~8% of the bar (closing via item 4) → mechanism COMPLETE and the
 unification VALIDATED; the deletions queue behind 4.4-coverage or a
 peak-acceptability measurement at target scales.
 
+**Item (4) — duplicated f16 casts (~260 MB): DEFERRED WITH A NOTE (the
+pre-authorized hairy case).** The duplication is NOT a stamp-keyed
+entry-sharing problem: `f16WeightCache` is populated by the Adam kernel's
+DUAL-WRITE (`gpu-context.ts:47`) and consulted only by the lowered `cast()`
+path (`ops/views.ts:69`, explicitly bypassed while recording). Generated
+plans never consult it — each sibling forward template's generated cast
+dispatches into its own exclusive result entry, hence one duplicate set per
+template variant. A sound fix must let the GENERATED cast path bind the
+dual-write f16 buffer as a persistent slot with staleness tied to the
+in-place param update — a cross-seam change (optimizer kernel ↔ cast op ↔
+generated slot kinds ↔ cache invalidation), not a mechanism-work close-out.
+It naturally folds into 4.4-coverage/phase-3-style capture work (where
+op-consulted caches become planner-visible), alongside the deferred peak
+work. Stage-3 mechanism work closes here: phys 6712 vs bar 6209 (+8%),
+with the residual named (dup-casts ~260, size-class rounding, sibling
+variant, unclaimed releasables).
+
