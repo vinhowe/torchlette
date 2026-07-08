@@ -1637,13 +1637,21 @@ export async function executeLoweredPlan(
   // value and the lowered-path adaptation could never fire (the fast path
   // bypasses the fused actions). Detect it here and drop the compiled plan;
   // the lowered execution below adapts the recipe (demotes the scalar to a
-  // runtime input) and re-records.
+  // runtime input) and re-records. The build-from-IR rebuild must ALSO be
+  // skipped for THIS execution: it generates from the un-adapted recipe, so an
+  // immediate rebuild re-bakes the stale value forever (the late-LR silent
+  // wrongness the stage-2 flip surfaced — invalidate → rebuild-stale →
+  // invalidate, never adapting). One lowered execution adapts the recipe on
+  // the cached template; the NEXT execution rebuilds from IR with the scalar
+  // demoted to a runtime input.
+  let scalarAdaptPending = false;
   if (
     loweredPlan.compiledPlan?.valid &&
     inlinedFusionScalarsStale(loweredPlan, planNodes)
   ) {
     destroyCompiledPlanBuffers(loweredPlan.compiledPlan);
     loweredPlan.compiledPlan = undefined;
+    scalarAdaptPending = true;
   }
 
   // =========================================================================
@@ -1722,6 +1730,7 @@ export async function executeLoweredPlan(
   // the fallback are byte-identical to the unmodified normal path.
   if (
     !options.forceLowered &&
+    !scalarAdaptPending &&
     ENV.TORCHLETTE_BUILD_FROM_IR === "1" &&
     backend.name === "webgpu" &&
     useTopLevelSharedEncoder &&

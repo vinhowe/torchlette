@@ -1162,6 +1162,68 @@ both scales; the trajectory is bit-identical; zero guard misses anywhere. The
 known caveat carried into increment 2: the flip's own gate ladder (suite,
 regression baseline-exact, decode, memory A/B at the flipped default) decides.
 
+## Stage-2 increment 2 (2026-07-08): flip ATTEMPTED → STOPPED at the suite
+## gate; three pre-existing build-from-IR correctness gaps surfaced
+
+The flip was implemented (`buildFromIRActive()` opt-out predicate: BUILD_FROM_IR
+!== "0" ∧ GENERATED_PLAN !== "0" ∧ COMPILED_PLAN !== "0" ∧ STREAM_GENERATE !==
+"1"; determinism gate pinned to `=0`; spec/tool arms updated) and its ladder run.
+Green: test:gates 4/4; observed-liveness spec 5/5 (flipped arms); fullstack
+parity default-vs-GENERATED_PLAN=0 maxΔ 9.5e-6 / 30 steps; STRICT_LIFETIME +
+STRICT_GPU zero throws; memory A/B reproduced increment 1's promise exactly
+(small 1522.6 vs ref 1670.1; 124M-class 2914.8 vs ref 5066.1); production
+regression baseline-exact flat. **RED: the full suite — 4 failures, so per the
+stop rule the flip is UNCOMMITTED** (patch preserved; the tree keeps only the
+first fix below). All failure classes REPRODUCE at the stage-1 commit
+(3b0f21ea) under opt-in `TORCHLETTE_BUILD_FROM_IR=1` and pass at `=0` on the
+flip tree — they are pre-existing build-from-IR gaps the flip EXPOSED, not
+flip/inc-1 regressions (the earlier "stage-1 passes lifetime" read was a
+vacuous vitest `-t` skip — `+` in the pattern is a regex quantifier):
+
+1. **`test/optim/fused-vs-elementwise.spec.ts` — "SGD: late LR change is
+   honored" (Δ 0.284) and "late LR change is honored" (Adam elementwise,
+   Δ 0.089) vs 1e-5.** Root cause (SGD class, FIXED this increment): the
+   inlined-scalar staleness gate (`inlinedFusionScalarsStale`) drops the stale
+   compiled plan, but the build-from-IR block then rebuilds IMMEDIATELY from
+   the UN-ADAPTED fused recipe — re-baking the stale scalar forever
+   (invalidate → rebuild-stale → invalidate, every step; the lowered path's
+   scalar-adapt at the fused-action loop never runs because build-from-IR
+   skips lowered execution). Fix: `scalarAdaptPending` — a staleness
+   invalidation forces ONE lowered execution (recipe adapts, scalar demoted to
+   runtime input), the next execution rebuilds from IR adapted. SGD late-LR
+   passes under `=1` with this. **The Adam-ELEMENTWISE late-LR still fails: a
+   SECOND staleness channel** — its LR reaches a sequential-op uniform/scalar
+   path not covered by the fused-recipe gate (the recorded path is guarded by
+   `getConfigBuffer`'s byte-compare across executions; generated plans have no
+   equivalent for this delivery). OPEN.
+2. **`test/lifetime-natural-usage.spec.ts` — "mid-loop markStep+dispose+
+   beginStep" (WebGPU): param0 reads param20's data** (actual 0.0021 vs
+   expected 0.0001 — cross-replay data leak). Shape: a 40-zeros plan's results
+   (the params) + a 20-upload/20-copy_ chunk template built from IR at chunk 1
+   and REPLAYED at chunk 2 with rotated externals; some write lands in
+   param0's buffer. Training loops never rotate externals this way, which is
+   why every trajectory gate passes. Reproduces ONLY under the vitest worker
+   (standalone identical-flow repros PASS — plan granularity differs: vitest
+   merges 40-node plans, standalone forces per-param 3-node chains), so the
+   trigger is the merged-plan shape. OPEN — deep planner/replay aliasing
+   class, needs dedicated investigation.
+3. **`test/distilgpt2-full-finetuning.spec.ts` — "zero steady-state growth":
+   storages rate 156/step vs ≤1** (reachable=0, allocs=0, trackerMB=0 — a
+   handle-churn rate gate, no byte leak). Likely the conservative per-replay
+   harvest creating ~156 result handles/step (the recorded path's live-result
+   harvest is far smaller) and/or staleness-rebuild churn; possibly shrinks
+   with class-1 fully fixed. OPEN (may be a benign-but-gated proxy metric —
+   needs a decision, not just a fix).
+
+**Consequence: increments 2 and 3 are BLOCKED** until classes 1 (Adam channel)
+and 2 are fixed (class 3 may fall out or need a measured verdict). The flip
+patch is ready and its non-suite ladder is green — the remaining work is
+correctness of the build-from-IR path itself, exactly the kind of pre-existing
+silent-wrongness this campaign exists to surface. LESSON (test-shaped): the
+stage-1 ladder never ran the FULL SUITE under `BUILD_FROM_IR=1` — the flip's
+first casualty was discovering that gap; any future opt-in path claiming
+flip-readiness must run the whole suite under the opt-in first.
+
 ### (ORIGINAL DESIGN, retained for the rationale)
 
 ### (a) Why per-plan survivor-pruning breaks — the crash class, characterized
