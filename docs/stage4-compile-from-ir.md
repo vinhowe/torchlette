@@ -1215,6 +1215,15 @@ the in-place-committed refinement bounds what the rare miss can do.
 Status: design refinement only — implementation remains gated on direct
 sign-off.
 
+**Telemetry (relayed disposition, 2026-07-08):** the dirty-miss counter is not
+just a guard — it is THE measurement deciding whether stage-3 remat ever needs
+to serve this path. It must be queryable. Existing surfaces to fold into (no
+new export if one fits): the executor stats precedent is
+`getPayloadThrashStats()` (`executor.ts:343`); the loud-counter precedent is
+`getGpuUncapturedErrorCount()` (`gpu-context.ts:364`). The guard-miss stats
+(clean-miss recoveries, dirty-miss fails, pinned-conservative templates from
+the rebuild limit) belong on ONE such surface, chosen at implementation time.
+
 ## Risks and mitigations
 - **Imperative-op long tail** (phase 3): mitigated by per-op fallback — no
   cutover moment; coverage counters make progress visible.
