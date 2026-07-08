@@ -790,10 +790,26 @@ export function stInvalidateTemplate(fp: number): void {
  *  toggle): the consecutive-step comparator resets — the next tape must be
  *  re-established from two fresh steps under the new regime (guard 5). */
 const boundaryReasons: Record<string, number> = {};
+let ceremonyWarned = false;
+let ceremonyResetsWhileWarm = 0;
 export function stNoteBoundary(reason: string): void {
   if (cur.entries.length === 0 && prev === null) return;
   boundaryResets++;
   boundaryReasons[reason] = (boundaryReasons[reason] ?? 0) + 1;
+  // [#81] Ceremony-starvation diagnostic (task #81, canonical trigger): a
+  // WARM tape store hit by an explicit-ceremony comparator reset means the
+  // loop mixes beginStep/endStep with a captured/taped region — the tape will
+  // re-trace forever (silent perf starvation, the endStep-remnant class).
+  // One-time, loud, names the reason; counted for tests/telemetry.
+  if ((reason === "beginStep" || reason === "endStep") && tapes.size > 0) {
+    ceremonyResetsWhileWarm++;
+    if (!ceremonyWarned) {
+      ceremonyWarned = true;
+      console.warn(
+        `[step-tape] STARVATION: explicit ${reason}() reset the step comparator while ${tapes.size} tape(s) were warm — captured regions will re-trace every call and never replay. Remove beginStep/endStep ceremony from the captured loop (minimal implied-boundary loops are the captured regime; docs/staged-execution-phase2b.md).`,
+      );
+    }
+  }
   prev = null;
   cur = { entries: [], plans: [] };
   activePlan = null;
@@ -817,6 +833,8 @@ export function stStats(): {
   boundaryReasons: Record<string, number>;
   planInvalidations: number;
   tapeCount: number;
+  /** [#81] ceremony resets that hit a WARM tape store (starvation trigger). */
+  ceremonyResetsWhileWarm: number;
   refusalDiagnostics: string[];
 } {
   return {
@@ -829,6 +847,7 @@ export function stStats(): {
     boundaryReasons: { ...boundaryReasons },
     planInvalidations,
     tapeCount: tapes.size,
+    ceremonyResetsWhileWarm,
     refusalDiagnostics: refusalDiagnostics.slice(),
   };
 }
@@ -851,4 +870,6 @@ export function stResetAll(): void {
   refusalDiagnostics.length = 0;
   lastEligible = null;
   replaying = false;
+  ceremonyWarned = false;
+  ceremonyResetsWhileWarm = 0;
 }

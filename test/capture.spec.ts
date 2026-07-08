@@ -251,5 +251,29 @@ describe("capture() — flag-independent surface", () => {
       expect(s.traces + s.hits).toBeLessThanOrEqual(s.calls + 1);
       expect(s.hits).toBeGreaterThan(0);
     });
+
+    it("[#81] explicit ceremony against a WARM tape emits the one-time starvation diagnostic", async () => {
+      if (!hasGPU) return;
+      const { stStats } = await import("../src/core/step-tape");
+      const api = makeApi();
+      const w = api.persist(api.tensorFromArray([1, 0, 0, 1], [2, 2]));
+      const f = api.capture((x: import("../src/frontend/tensor").Tensor) =>
+        api.matmul(x, w),
+      );
+      // Warm the tape (skeleton ready, hits accrue).
+      await drive(api, f, [[1, 1], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1]]);
+      expect(f.stats().hits).toBeGreaterThan(0);
+      const before = stStats().ceremonyResetsWhileWarm;
+      // The anti-pattern: explicit beginStep/endStep ceremony around the
+      // captured region. Each fires stNoteBoundary, resetting the comparator
+      // while the tape store is warm — the canonical #81 starvation trigger.
+      await api.beginStep();
+      const x = api.tensorFromArray([1, 1], [1, 2]);
+      const out = (await f(x)) as import("../src/frontend/tensor").Tensor;
+      expect(Array.from(await api.cpu(out))).toEqual([1, 1]); // still correct
+      api.endStep();
+      await api.markStep();
+      expect(stStats().ceremonyResetsWhileWarm).toBeGreaterThan(before);
+    });
   },
 );

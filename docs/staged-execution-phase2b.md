@@ -572,3 +572,67 @@ maxΔ 5.7e-6 vs compiled; production 124M regression PASS baseline-exact
 zero growth. Zero new env flags; no deletions (coverage extension of existing
 seams: 2 recorder rules + 1 executor declaration + 1 liveness seam + 1 gate
 probe).
+
+---
+
+## INC-2 PARTIAL (2026-07-08): #81 warning + gen-tape hardening LANDED;
+## whole-step hit path STOPPED — §1's premise is FALSIFIED for today's
+## optimizer/scaler (the S3.0 protocol: measured, stopped, re-approval)
+
+**Landed:**
+- **#81 ceremony-starvation diagnostic** at its canonical trigger
+  (`stNoteBoundary`): an explicit `beginStep()`/`endStep()` comparator reset
+  while the tape store is WARM warns once (loud, names the reason) and counts
+  `ceremonyResetsWhileWarm` (on `stStats`). Test: `test/capture.spec.ts`
+  "[#81] explicit ceremony against a WARM tape…" (flag-on, 9/9).
+- **gen-tape-gate hardening** (the coordinator's addition): a third 64-token
+  generation crossing ≫K_IDLE steady boundaries, asserting ≥85% hits + zero
+  replay invalidations/missValidity. HONESTY: the differential (fix toggled
+  off) shows decode still PASSES pre-fix — the decode template dodges the
+  reaper by luck (live KV harvests rest the retire clock); the true
+  regression cover for the reaper×replay class is capture.spec flag-on. The
+  hardened gate makes the warm-across-the-window invariant EXECUTABLE for the
+  decode shape so the luck eroding cannot ship silently. Measured post-fix:
+  gen3 62/64 hits, invalidations=0.
+
+**STOPPED — the §1 premise correction.** §1 asserts a training step "has NO
+in-body JS side effects that the replay must reproduce: all state lives in
+in-place tensor ops INSIDE the recorded plans." Verified against the code,
+this is FALSE today; the body-never-runs hit would freeze (frozen-scalar
+instance #8, structural, all confirmed by reading the step path):
+1. **Adam `this.steps[i]`** advances in JS per step (`_advanceStep`);
+   `stepSize = lr*sqrt(1−β2^t)/(1−β1^t)` and `lrTimesWd` are computed in JS
+   and baked into the fused `adamStep` node PAYLOAD (adam.ts `_stepFused`) /
+   the foreach-and-elementwise paths' graph scalars. The skeleton's
+   TAG_UNIFORM repack reads the RETAINED node's payload — frozen at
+   recording if the body never runs. The inc-1 batch-cover rule declares
+   these as data ACROSS RECORDING STEPS (body ran both); it cannot conjure
+   fresh values for a replay whose body never ran.
+2. **GradScaler `_scale` is a JS NUMBER** (CPU mirror; `scale(loss)` bakes it
+   as a graph scalar), `_growthTracker`/`_foundInfThisStep` are JS.
+3. **`api.queueStepBoundary()`** fires inside `opt.step()` (mechanical — the
+   hit path can queue it itself; listed for completeness).
+
+**The prerequisite this names: the capturable-optimizer contract**
+(sketch-3/#70, hyperparams-as-data) — before ANY body-never-runs training
+hit: `t` on-device (persistent tensor advanced IN-PLAN), bias correction
+derived in-graph/in-kernel from `t`, `lr` a persistent tensor written by the
+scheduler at DRIVER level (`opt.lr =` setter → tensor write, outside the
+body), scaler `scale`/`inv_scale` persistent tensors updated in-plan
+(where-select already is). This is the SGD-alpha retirement template applied
+to Adam+scaler — a self-contained sub-campaign with its own differential
+gates (fused==foreach==elementwise trajectory; LR-schedule exactness), and it
+is exactly §4's ruling made load-bearing. Proposed re-staging:
+- **inc-2a (optimizer-scalars-as-data):** capturable Adam (t/lr/scale as
+  data) behind `test/optim/fused-vs-elementwise.spec.ts` + fullstack
+  LR-schedule differentials — no capture machinery involved; pays down
+  frozen-scalar family permanently.
+- **inc-2b (whole-step capture):** multi-plan skeletons (the 2a layer is
+  single-plan by construction: `stCaptureCompiledStep` keeps ONE candidate),
+  async captured bodies (`await loss.backward()`), output-node mapping
+  (fn's returned tensor → plan k/pos), hit-path boundary queueing,
+  micro/apply split, the chartered parity gates.
+
+Landed-scope ladder (this commit): build green; capture.spec flag-on 9/9
+(new #81 test); hardened gen-tape-gate PASS (62/64, 0 invalidations, 0 OOM,
+GPU-pinned); differential-without-fix measured and recorded above.
