@@ -2924,10 +2924,12 @@ function generateAdamBatch(
   const device = (backend as { device?: GPUDevice }).device;
   if (!device) return "no-device";
 
-  // Resolve each adamStep node's [grad, param, m, v]: buffer, slot, size.
+  // Resolve each adamStep node's [grad, param, m, v, t, lr]: buffer, slot, size.
+  // inc-2a: t (slot 4) and lr (slot 5) are 1-element persistent tensor DATA
+  // inputs (NOT scatter/gathered — they are shared bindings bound once).
   interface Item {
     nodeIndex: number;
-    bufSlots: [Slot, Slot, Slot, Slot];
+    bufSlots: [Slot, Slot, Slot, Slot, Slot, Slot];
     numElements: number;
     config: import("../backend/types").AdamStepConfig;
   }
@@ -2940,7 +2942,7 @@ function generateAdamBatch(
   const firstNodeIndex = action.nodeIndices[0];
   for (const nodeIdx of action.nodeIndices) {
     const node = planNodes[nodeIdx];
-    if (node.inputs.length !== 4) return "arity";
+    if (node.inputs.length !== 6) return "arity";
     // adam-batch needs only the input SLOTS + element count — never the
     // input buffers (planAdamStepDispatch reads neither, the scatter/gather
     // copies key on slots). So resolve slots LOGICALLY (resolveRefSlot
@@ -2958,7 +2960,7 @@ function generateAdamBatch(
     }
     itemList.push({
       nodeIndex: nodeIdx,
-      bufSlots: bufSlots as [Slot, Slot, Slot, Slot],
+      bufSlots: bufSlots as [Slot, Slot, Slot, Slot, Slot, Slot],
       numElements: sizeOf(node.shape),
       config: node.payload as import("../backend/types").AdamStepConfig,
     });
@@ -2993,9 +2995,10 @@ function generateAdamBatch(
 
   // PACKED groups (planPackedGroups mirrors dispatchPackedOptimizer's
   // element-count grouping + memory sub-batching), then per-item fallback.
-  // planPackedGroups reads only numElements + buffers.length (4 for Adam).
+  // planPackedGroups reads only numElements + buffers.length (4 for Adam —
+  // grad/param/m/v; t/lr are 1-element shared bindings, NOT packed).
   const packItems = itemList.map((it) => ({
-    buffers: it.bufSlots as unknown as GPUBuffer[],
+    buffers: it.bufSlots.slice(0, 4) as unknown as GPUBuffer[],
     numElements: it.numElements,
   }));
   const groups = planPackedGroups(packItems);
@@ -3058,6 +3061,10 @@ function generateAdamBatch(
       false,
     );
     if (!planned) return "adam-plan-null";
+    // inc-2a: t/lr are the group representative's 1-element persistent slots
+    // (bound ONCE for the packed dispatch — the grouping key guarantees every
+    // item in this group shares the same t/lr tensors).
+    const repItem = itemList[g.indices[0]];
     const bindings = adamBinding(
       planned.plan,
       {
@@ -3065,17 +3072,15 @@ function generateAdamBatch(
         param: packedSlots[1],
         m: packedSlots[2],
         v: packedSlots[3],
+        t: repItem.bufSlots[4],
+        lr: repItem.bufSlots[5],
       },
       infFlag,
     );
     if (!bindings) return "adam-bind-null";
-    const configSlot = bufferSlot(planned.plan.configBuffer, "persistent");
-    commands.push({
-      tag: TAG_UNIFORM,
-      slot: configSlot,
-      nodeIndex: -1,
-      pack: planned.volatilePack,
-    });
+    // inc-2a: config is STATIC (bias correction derived in-kernel from t/lr) —
+    // NO TAG_UNIFORM repack. The config buffer is bound once via adamBinding
+    // (name === null → planned.plan.configBuffer, baked at plan() time).
     commands.push({
       tag: TAG_DISPATCH,
       pipeline: planned.plan.pipeline,
@@ -3122,6 +3127,8 @@ function generateAdamBatch(
       param: it.bufSlots[1],
       m: it.bufSlots[2],
       v: it.bufSlots[3],
+      t: it.bufSlots[4], // inc-2a: persistent step counter
+      lr: it.bufSlots[5], // inc-2a: persistent learning rate
     };
     // f16 weight output: allocateOutputBuffer(numElements*2) = allocKind 1.
     if (planned.doF16) {
@@ -3138,13 +3145,7 @@ function generateAdamBatch(
     }
     const bindings = adamBinding(planned.plan, named, infFlag);
     if (!bindings) return "adam-bind-null";
-    const configSlot = bufferSlot(planned.plan.configBuffer, "persistent");
-    commands.push({
-      tag: TAG_UNIFORM,
-      slot: configSlot,
-      nodeIndex: -1,
-      pack: planned.volatilePack,
-    });
+    // inc-2a: STATIC config — no TAG_UNIFORM repack (see packed path above).
     commands.push({
       tag: TAG_DISPATCH,
       pipeline: planned.plan.pipeline,

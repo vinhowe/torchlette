@@ -13,6 +13,68 @@ spec — read the spec first, then this.
 
 ---
 
+## PROGRESS MAP (updated: mechanism landed on branch, Gates 1–5 GREEN)
+
+**The core capturable-optimizer mechanism for Adam is IMPLEMENTED and committed
+to this branch.** t/lr flow as persistent on-device f32[1] tensor DATA inputs
+(6-input adamStep node `[grad,param,m,v,t,lr]`); the fused kernel derives the
+bias correction in-kernel via the LOCKED expm1 form; the foreach and elementwise
+graph paths use ONE shared `_biasCorrection` subgraph; the config is FULLY
+STATIC. The packed grouping-key hazard is fixed via a generic
+`horizontalPackKey` (lowered-plan.ts, exported single source).
+
+**Gates PASSED (device 2, vk-shim):**
+- Gate 1 build — GREEN.
+- Gate 2 formula spec (`adam-biascorrection-formula.spec.ts`) — GREEN (2/2, cpu).
+- Gate 3 fused==foreach==elementwise (`fused-vs-elementwise.spec.ts`) — GREEN
+  (11/11), re-confirmed after the cache-key fix below.
+- Gate 4 (NEW, test-first) MULTI-GROUP (`test/optim/adam-multigroup.spec.ts`,
+  added to vitest.config webgpu allowlist) — GREEN (2/2). 2 AdamParamGroups,
+  diff lr+wd, EQUAL element counts, packed fused vs sequential reference AND
+  pure-JS 2-group ground truth over 24 steps. This gate CAUGHT a real latent
+  bug (see below) and fails ~8.3e-3 without the fix.
+- Gate 5 core: fullstack compiled==lowered (`parity-fullstack-tl.ts`, autocast+
+  checkpoint+GradScaler+clip+AdamW, 30 steps) — **max|lowered−compiled|=8.6e-6**.
+  Late-LR-change tests (Gate 3 #6, SGD #1) GREEN.
+
+**LATENT BUG FOUND + FIXED by Gate 4 (`uniformCacheKey`, tile-dispatch.ts):** the
+config-buffer cache key EXCLUDED f32 uniform fields (historically safe because
+per-step f32s rode a TAG_UNIFORM volatile repack that rewrote the shared buffer
+every dispatch). inc-2a made `weight_decay` a STATIC f32 uniform, so two param
+groups differing only in wd (0.1 vs 0.0) SHARED one config buffer; the compiled
+replay bound it by identity with the last-written (wd=0) contents → group 0 lost
+its weight decay silently. FIX: key on ALL uniform values (u32/i32 AND f32).
+Volatile kernels unaffected (distinct buffers still rewritten per dispatch).
+
+**WART + EXIT (named per review):** the executor's batched-op plumbing is
+adam-named (`adam-batch`, `horizontalPackKey`'s `node.op === "adamStep"`
+switch). This is a PRE-inc-2a wart; `horizontalPackKey`'s derivation is written
+GENERICALLY (shared-operand identity + static-config equality, driven by
+`sharedOperandInputIndices`), so the exit is MECHANICAL: replace the op-name
+switch with an op-metadata lookup once horizontal packing generalizes. Home:
+#78/#83. inc-2a's static config is what makes the generic predicate sufficient.
+
+**REMAINING (not yet done this session):**
+- Gate 5 CosineAnnealingLR fullstack digit-exactness arm (scheduler funnels
+  through `setLR`, which now writes the lr tensor — mechanism in place; the
+  explicit fullstack-scheduler differential still to run).
+- Gate 6 GradScaler trajectory parity vs main (the fullstack run above already
+  exercises GradScaler; the standalone `grad-scaler.spec.ts` + a scaler arm
+  still to run). GradScaler `_scale`→persistent-tensor RETIREMENT (#5) NOT done.
+- Gate 7 t-train-tape-probe (eligiblePairs>0/refusals=0 both paths WITHOUT the
+  adam batch-cover rule firing).
+- Gate 8 full suite BOTH flag states + test:gates 4/4 + observed-liveness 5/5.
+- Gate 9 124M regression baseline {9.81,5.92,5.15,4.64}.
+- Gate 10 gen-tape-gate + kv-differential.
+- Gate 11 STRICT_LIFETIME+STRICT_GPU fullstack.
+- RETIREMENTS (execute LAST): the step-tape batch-cover rule for adam is now
+  MOOT (static payload → no variance branch entered) but not yet DELETED;
+  `AdamStepConfig.stepSize/lrTimesWd/invScale` fields removed (stepSize/lrTimesWd
+  done; invScale kept for the fused-unscale path); adam volatileRepack retired in
+  adam-kernel.ts + stream-generate (both TAG_UNIFORM sites removed).
+
+---
+
 ## What is DONE (committed, verified)
 
 1. **The riskiest assumption is retired (Gate 2).** The in-kernel bias-correction

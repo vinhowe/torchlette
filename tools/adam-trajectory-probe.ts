@@ -15,6 +15,16 @@
  *      LR2 + LR2_AT (switch LR to LR2 from step LR2_AT — late-varying
  *      schedule probe: exercises inlined-scalar staleness detection after
  *      the compiled plan has already recorded).
+ *
+ *      TWO_GROUPS=1 (inc-2a Gate 4, MULTI-GROUP): build the optimizer with
+ *      TWO AdamParamGroups. Params 0..k-1 in group 0 (lr=LR, wd=WD); params
+ *      k.. in group 1 (lr=LR_G1, wd=WD_G1). Requires NPARAMS >= 2. The two
+ *      groups have DIFFERENT lr (and wd) so the packed grouping key — which
+ *      must key on lr-tensor identity — is exercised: if group 0's lr were
+ *      silently applied to group 1's params (wrong key), this trajectory
+ *      diverges from the sequential per-group reference. All params are the
+ *      SAME element count on purpose (so a numElements-only packing key would
+ *      wrongly merge the two groups).
  */
 
 import { initWebGPU } from "../src/backend/webgpu";
@@ -55,10 +65,21 @@ async function main() {
   // The CONCATENATED trajectory is identical to the single-param run, so
   // outputs are comparable across NPARAMS settings.
   const nParams = parseInt(process.env.NPARAMS ?? "1", 10);
+  const twoGroups = process.env.TWO_GROUPS === "1";
   const pData = initData(7);
   const tData = initData(99);
   const splits: number[] = [];
-  {
+  if (twoGroups) {
+    // Equal-sized params (same element count) so a numElements-only packing
+    // key would WRONGLY merge the two groups — the Gate-4 failure mode.
+    const per = Math.floor(N / nParams);
+    let rest = N;
+    for (let i = 0; i < nParams; i++) {
+      const take = i === nParams - 1 ? rest : per;
+      splits.push(take);
+      rest -= take;
+    }
+  } else {
     let rest = N;
     for (let i = 0; i < nParams; i++) {
       const take = i === nParams - 1 ? rest : Math.floor(rest / 2) || 1;
@@ -85,18 +106,34 @@ async function main() {
   }
   // SGD=1: drive SGD instead of Adam (MOMENTUM env, default 0.9) — same
   // trajectory contract, same LR2/LR2_AT schedule knobs.
-  const opt =
-    process.env.SGD === "1"
-      ? new SGD(
-          params,
-          {
-            lr: LR,
-            weightDecay: WD,
-            momentum: parseFloat(process.env.MOMENTUM ?? "0.9"),
-          },
-          api,
-        )
-      : new Adam(params, { lr: LR, weightDecay: WD, adamW: ADAMW }, api);
+  let opt: Adam | SGD;
+  if (process.env.SGD === "1") {
+    opt = new SGD(
+      params,
+      {
+        lr: LR,
+        weightDecay: WD,
+        momentum: parseFloat(process.env.MOMENTUM ?? "0.9"),
+      },
+      api,
+    );
+  } else if (twoGroups) {
+    // inc-2a Gate 4: TWO param groups with different LR + wd. Split the params
+    // roughly in half between the groups.
+    const lrG1 = parseFloat(process.env.LR_G1 ?? "1e-3");
+    const wdG1 = parseFloat(process.env.WD_G1 ?? "0");
+    const half = Math.ceil(params.length / 2);
+    opt = new Adam(
+      [
+        { params: params.slice(0, half), lr: LR, weightDecay: WD },
+        { params: params.slice(half), lr: lrG1, weightDecay: wdG1 },
+      ],
+      { lr: LR, weightDecay: WD, adamW: ADAMW },
+      api,
+    );
+  } else {
+    opt = new Adam(params, { lr: LR, weightDecay: WD, adamW: ADAMW }, api);
+  }
 
   const lr2 = process.env.LR2 ? parseFloat(process.env.LR2) : null;
   const lr2At = parseInt(process.env.LR2_AT ?? "4", 10);
