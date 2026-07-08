@@ -1131,13 +1131,55 @@ import {
 import { gpuTimestampsActive } from "../backend/webgpu/profiler";
 import { createTensor } from "../backend/webgpu/tensor";
 import {
+  getSubmitCount,
   paramsBufferSizeClass,
   requireContext,
+  sharedEncoderActive,
   trackSharedEncoderWrite,
 } from "../backend/webgpu/webgpu-state";
 import { createStorageHandle } from "../graph/node-factory";
 import { rcRelease, rcRetain } from "../graph/refcount";
 import { executeOpSync } from "./op-dispatch";
+
+// ────────────────────────────────────────────────────────────────────────────
+// Volatile-rewrite ordering guard (the cross-replay stale-read class).
+//
+// Replay delivers per-step host values as DATA via `queue.writeBuffer` into
+// buffers REUSED across replays (TAG_WRITE's `cmd.stableBuf`, TAG_UNIFORM's
+// persistent config buffers). queue.writeBuffer executes ahead of any
+// encoded-but-unsubmitted command — so if a PRIOR replay of the same command
+// encoded readers of this buffer into a still-open shared-encoder scope (the
+// beginStep step-level scope spans markStep when endStep isn't called; two
+// replays of one plan then share a single submit window), rewriting the buffer
+// now would make those pending readers observe the NEW bytes: silent
+// cross-replay data corruption (params[0..19] receiving params[20..39]'s
+// upload in the lifetime mid-loop scenario). Single source at the seam: every
+// volatile rewrite records the submit window it wrote in; a rewrite landing in
+// the SAME window must first flush (submit) the scope so the pending readers
+// are queue-ordered BEFORE the new bytes. Same contract the scalar table
+// enforces for its buffers (refreshScalarTable's flush-on-change).
+const volatileWriteWindow = new WeakMap<GPUBuffer, number>();
+let volatileRewriteFlushes = 0;
+
+/** Diagnostic: how many volatile rewrites required a mid-scope flush. */
+export function getVolatileRewriteFlushCount(): number {
+  return volatileRewriteFlushes;
+}
+
+/** Call BEFORE queue.writeBuffer to a replay-persistent buffer. Returns true
+ *  when the caller must close its open pass and flush the shared encoder
+ *  first (pending encoded readers from a prior replay in this same submit
+ *  window). Always records the write's window. */
+function volatileRewriteNeedsFlush(buf: GPUBuffer): boolean {
+  const needsFlush =
+    sharedEncoderActive && volatileWriteWindow.get(buf) === getSubmitCount();
+  if (needsFlush) volatileRewriteFlushes++;
+  return needsFlush;
+}
+
+function noteVolatileWrite(buf: GPUBuffer): void {
+  volatileWriteWindow.set(buf, getSubmitCount());
+}
 
 /**
  * Execute a compiled plan — the tight GPU command loop.
@@ -1560,6 +1602,20 @@ export async function executeCompiledPlan(
                   };
                 }
               }
+              // [volatile-rewrite guard] A prior replay of this command in
+              // the SAME submit window has encoded-unsubmitted readers of
+              // sbuf — submit them before overwriting (see the guard's
+              // header comment).
+              if (volatileRewriteNeedsFlush(sbuf)) {
+                closeOpenPass();
+                flushSharedEncoder();
+                if (ENV.TORCHLETTE_DEBUG_COMPILED) {
+                  console.log(
+                    `[compiled] volatile-rewrite flush: TAG_WRITE stable buf re-written within one submit window (cmd=${ci}, node=${writeNode.id})`,
+                  );
+                }
+              }
+              noteVolatileWrite(sbuf);
               const tpD0 = TAPE_PROFILE ? performance.now() : 0;
               device.queue.writeBuffer(sbuf, 0, f32);
               if (TAPE_PROFILE) tpAdd("replay-dawn", performance.now() - tpD0);
@@ -1633,6 +1689,19 @@ export async function executeCompiledPlan(
             );
           }
           const packed = cmd.pack(node);
+          // [volatile-rewrite guard] same class as the TAG_WRITE stable
+          // path: a prior replay's dispatches reading this config are still
+          // encoded-unsubmitted in this submit window — submit them first.
+          if (volatileRewriteNeedsFlush(slots[cmd.slot])) {
+            closeOpenPass();
+            flushSharedEncoder();
+            if (ENV.TORCHLETTE_DEBUG_COMPILED) {
+              console.log(
+                `[compiled] volatile-rewrite flush: TAG_UNIFORM config re-written within one submit window (cmd=${ci}, node=${node.id})`,
+              );
+            }
+          }
+          noteVolatileWrite(slots[cmd.slot]);
           const tpD0 = TAPE_PROFILE ? performance.now() : 0;
           device.queue.writeBuffer(slots[cmd.slot], 0, packed);
           if (TAPE_PROFILE) tpAdd("replay-dawn", performance.now() - tpD0);
