@@ -80,6 +80,7 @@ import {
 import {
   canSafelyRelease,
   releaseBufferImmediate,
+  storageTracker,
 } from "../graph/storage-tracker";
 import type {
   ExecutionPlan,
@@ -105,6 +106,7 @@ import {
   buildCompiledPlan,
   buildCompiledPlanFromGenerated,
   type CompiledPlan,
+  debugCompiledPlanEntryBytes,
   destroyCompiledPlanBuffers,
   executeCompiledPlan,
   isCompilationRecordingActive,
@@ -131,6 +133,7 @@ import {
   resetObservedLiveness,
   setObservedLivenessEnabled,
   setTemplateCompiledInvalidator,
+  setTemplateIdleRetirer,
 } from "./observed-liveness";
 
 /** [observed-liveness] Node ops that commit in-place mutations to persistent
@@ -378,6 +381,7 @@ export function getPayloadThrashStats(): {
   pinnedTemplates: number;
   convergedTemplates: number;
   prunedPairsRemoved: number;
+  retiredTemplates: number;
 } {
   let worst = 0;
   for (const v of structuralMissCounts.values())
@@ -414,6 +418,50 @@ export function debugTemplateResultSets(): Record<string, string[]> {
   return out;
 }
 
+/** Test/debug: per-cached-template compiled-plan memory footprint (planner
+ *  registry entry bytes split result/temp) + harvest shape (results kept,
+ *  pairs pruned). The stage-1 residual attribution instrument: comparing the
+ *  per-template resultMB across pruned/cutover arms names which templates hold
+ *  the residual. */
+export function debugTemplatePlanMemory(): Record<
+  string,
+  {
+    nodes: number;
+    valid: boolean;
+    results: number;
+    pruned: number;
+    resultMB: number;
+    tempMB: number;
+  }
+> {
+  const out: Record<
+    string,
+    {
+      nodes: number;
+      valid: boolean;
+      results: number;
+      pruned: number;
+      resultMB: number;
+      tempMB: number;
+    }
+  > = {};
+  for (const [fp, template] of fusionAnalysisCache) {
+    const cp = template.loweredPlan?.compiledPlan;
+    const mem = cp
+      ? debugCompiledPlanEntryBytes(cp)
+      : { resultMB: 0, tempMB: 0, entries: 0 };
+    out[`0x${fp.toString(16)}`] = {
+      nodes: template.finalPerm.length,
+      valid: !!cp?.valid,
+      results: cp?.results.length ?? 0,
+      pruned: cp?._prunedPairs?.length ?? 0,
+      resultMB: mem.resultMB,
+      tempMB: mem.tempMB,
+    };
+  }
+  return out;
+}
+
 // [observed-liveness] The module observes cross-plan liveness only when
 // build-from-IR is active (the over-harvest it fixes exists only there). Set
 // once at module load; the flag also gates every observation hook to a no-op.
@@ -427,6 +475,24 @@ setTemplateCompiledInvalidator((fp: number) => {
     destroyCompiledPlanBuffers(t.loweredPlan.compiledPlan);
     t.loweredPlan.compiledPlan = undefined;
   }
+});
+// Idle-retire (observed-liveness step boundary): release the compiled plan of
+// a template that stopped executing — one-shot warmup templates otherwise pin
+// their conservative harvest's registry buffers forever. Gated on every
+// storage the last replay's harvest exposed being ALREADY DESTROYED, so no
+// live reader dangles; buffer destruction stays fence-gated
+// (destroyCompiledPlanBuffers → deferredDestroy). A retired template that
+// re-executes rebuilds from IR.
+setTemplateIdleRetirer((fp: number) => {
+  const t = fusionAnalysisCache.get(fp);
+  const cp = t?.loweredPlan?.compiledPlan;
+  if (!cp) return "none";
+  if (cp._lastHarvestIds?.some((id) => !storageTracker.isDestroyed(id))) {
+    return "live";
+  }
+  destroyCompiledPlanBuffers(cp);
+  t!.loweredPlan!.compiledPlan = undefined;
+  return "retired";
 });
 
 /**

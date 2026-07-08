@@ -65,15 +65,39 @@ export class RecoverableGuardMiss extends Error {
 
 const K_HYSTERESIS = 3;
 const REBUILD_GROWTH_LIMIT = 2;
+/** Steps a template may sit idle (not executed) before its compiled plan is
+ *  RETIRED — invalidated so its planner result entries are released. One-shot
+ *  warmup templates (step-0/1 graph variants that never recur) otherwise pin
+ *  their full conservative harvest forever: they can never converge (no
+ *  re-execution to observe), and at 124M-class configs their harvested results
+ *  are ~2.2 GB of dead registry buffers — THE residual over the recorded
+ *  cutover, which never compiles a plan that doesn't recur. Retire is gated on
+ *  every storage the plan's last replay harvested being ALREADY DESTROYED
+ *  (storageTracker), so no live reader can dangle — strictly more conservative
+ *  than the convergence invalidation (which rebuilds with live survivors). A
+ *  retired template that re-executes simply rebuilds from IR (no lowered
+ *  re-execution needed); with K_IDLE=3 an every-other-step template never
+ *  thrashes. */
+const K_IDLE = 3;
+
+/** Why a pair entered the needed-set (attribution telemetry): "c" cross-plan
+ *  consumed, "s" survived the step directly, "b" survived only VIA ITS VIEW
+ *  BASE (the handle died but baseStorageId is alive — the deliberately-
+ *  conservative view class), "g" guard-miss. First observation wins except a
+ *  later "c"/"s" upgrades a "b" (a pair both consumed and base-alive is not a
+ *  view-conservatism cost). */
+type NeededSource = "c" | "s" | "b" | "g";
 
 interface TemplateObs {
   needed: Set<string>; // union of observed needed "ni:oi"
+  neededSrc: Map<string, NeededSource>; // pair → first/strongest source
   stableSteps: number; // consecutive fully-observed no-growth steps
   converged: boolean; // reached K → pruning active
   convergedSize: number; // needed.size at convergence (rebuild-limit base)
   pinned: boolean; // conservative full-harvest, permanently
   grewThisStep: boolean;
   executedThisStep: boolean;
+  idleSteps: number; // consecutive boundaries without execution (retire clock)
 }
 
 const key = (ni: number, oi: number): string => `${ni}:${oi}`;
@@ -81,7 +105,8 @@ const key = (ni: number, oi: number): string => `${ni}:${oi}`;
 // ── Module state (step-scoped structures cleared at observeStepBoundary) ──────
 let enabled = false;
 const templates = new Map<number, TemplateObs>();
-let stepStamped: Array<{ checkId: number; stamp: ResultStamp }> = [];
+let stepStamped: Array<{ shId: number; checkId: number; stamp: ResultStamp }> =
+  [];
 let newTemplateThisStep = 0;
 /** nodeId → { producer stamp, in-place-commit count at its pruned replay }. */
 let prunedExecuted = new Map<number, { stamp: ResultStamp; mark: number }>();
@@ -92,12 +117,25 @@ let cleanMisses = 0;
 let dirtyMisses = 0;
 let pinnedTemplates = 0;
 let prunedPairsRemoved = 0;
+let retiredTemplates = 0;
 
 /** Executor callback: invalidate a template's compiled plan by fingerprint
  *  (the module can't import executor.ts — circular). */
 let invalidateTemplateCompiled: ((fp: number) => void) | undefined;
 export function setTemplateCompiledInvalidator(fn: (fp: number) => void): void {
   invalidateTemplateCompiled = fn;
+}
+
+/** Executor callback for idle-retire: attempt to release an idle template's
+ *  compiled plan. "retired" = plan destroyed now; "none" = no plan to retire;
+ *  "live" = blocked — some storage its last replay harvested is still alive
+ *  (retry at a later boundary). */
+export type RetireResult = "retired" | "none" | "live";
+let retireIdleTemplate: ((fp: number) => RetireResult) | undefined;
+export function setTemplateIdleRetirer(
+  fn: (fp: number) => RetireResult,
+): void {
+  retireIdleTemplate = fn;
 }
 
 export function setObservedLivenessEnabled(on: boolean): void {
@@ -117,6 +155,7 @@ export function resetObservedLiveness(): void {
   dirtyMisses = 0;
   pinnedTemplates = 0;
   prunedPairsRemoved = 0;
+  retiredTemplates = 0;
 }
 
 function obs(fp: number): TemplateObs {
@@ -124,24 +163,36 @@ function obs(fp: number): TemplateObs {
   if (!t) {
     t = {
       needed: new Set(),
+      neededSrc: new Map(),
       stableSteps: 0,
       converged: false,
       convergedSize: 0,
       pinned: false,
       grewThisStep: false,
       executedThisStep: false,
+      idleSteps: 0,
     };
     templates.set(fp, t);
   }
   return t;
 }
 
-function addNeeded(fp: number, ni: number, oi: number): void {
+function addNeeded(
+  fp: number,
+  ni: number,
+  oi: number,
+  src: NeededSource,
+): void {
   const t = obs(fp);
   const k = key(ni, oi);
   if (!t.needed.has(k)) {
     t.needed.add(k);
+    t.neededSrc.set(k, src);
     t.grewThisStep = true;
+  } else if (t.neededSrc.get(k) === "b" && src !== "b") {
+    // A pair kept for a stronger reason than base-survival is not a
+    // view-conservatism cost — upgrade the attribution.
+    t.neededSrc.set(k, src);
   }
 }
 
@@ -177,14 +228,14 @@ export function stampResult(
   if (!enabled) return;
   const stamp: ResultStamp = { fp, ni, oi };
   sh.stamp = stamp;
-  stepStamped.push({ checkId: sh.baseStorageId ?? sh.id, stamp });
+  stepStamped.push({ shId: sh.id, checkId: sh.baseStorageId ?? sh.id, stamp });
 }
 
 /** Record cross-plan consumption of a resolved external input, if stamped. */
 export function observeConsumed(storage: StorageHandle): void {
   if (!enabled) return;
   const stamp = storage.stamp;
-  if (stamp) addNeeded(stamp.fp, stamp.ni, stamp.oi);
+  if (stamp) addNeeded(stamp.fp, stamp.ni, stamp.oi, "c");
 }
 
 /** Register the pairs a pruned plan EXCLUDED from its harvest, so a later
@@ -213,7 +264,7 @@ export function guardMiss(nodeId: number, oi: number): boolean {
   const { stamp, mark } = hit;
   // Grow the producer's needed-set and invalidate its pruned build so next
   // step re-harvests the value (conservative-then-re-pruned).
-  addNeeded(stamp.fp, stamp.ni, stamp.oi);
+  addNeeded(stamp.fp, stamp.ni, stamp.oi, "g");
   invalidateTemplateCompiled?.(stamp.fp);
   // Soundness boundary: recompute reads CURRENT storages. If any in-place op
   // committed since the producer's replay, the recompute would silently differ.
@@ -235,14 +286,28 @@ export function guardMiss(nodeId: number, oi: number): boolean {
 export function observeStepBoundary(): void {
   if (!enabled) return;
   // Survival: a stamped result whose storage survived reclamation is needed.
-  for (const { checkId, stamp } of stepStamped) {
+  // Attribution: "s" = the handle itself survived; "b" = only its view BASE
+  // survived (the deliberately-conservative view class).
+  for (const { shId, checkId, stamp } of stepStamped) {
     if (!storageTracker.isDestroyed(checkId)) {
-      addNeeded(stamp.fp, stamp.ni, stamp.oi);
+      const direct = shId === checkId || !storageTracker.isDestroyed(shId);
+      addNeeded(stamp.fp, stamp.ni, stamp.oi, direct ? "s" : "b");
     }
   }
   const noNew = newTemplateThisStep === 0;
   for (const [fp, t] of templates) {
-    if (!t.executedThisStep) continue;
+    if (!t.executedThisStep) {
+      // Idle-retire clock: a template that stops executing (one-shot warmup
+      // variants — they can never converge) releases its compiled plan once
+      // idle K_IDLE boundaries AND none of its harvested storages is alive.
+      if (++t.idleSteps >= K_IDLE && retireIdleTemplate) {
+        const r = retireIdleTemplate(fp);
+        if (r === "retired") retiredTemplates++;
+        if (r !== "live") t.idleSteps = 0; // nothing left to retire — rest the clock
+      }
+      continue;
+    }
+    t.idleSteps = 0;
     if (t.pinned) {
       t.grewThisStep = false;
       t.executedThisStep = false;
@@ -320,17 +385,31 @@ export function debugNeededSet(fp: number): string[] | undefined {
  *  every recurring template — the single-source seam-agreement assertion. */
 export function debugAllNeededSets(): Record<
   string,
-  { needed: string[]; converged: boolean; pinned: boolean }
+  {
+    needed: string[];
+    converged: boolean;
+    pinned: boolean;
+    /** Needed-pair counts by source: consumed / survived / base-only / guard. */
+    srcCounts: Record<NeededSource, number>;
+  }
 > {
   const out: Record<
     string,
-    { needed: string[]; converged: boolean; pinned: boolean }
+    {
+      needed: string[];
+      converged: boolean;
+      pinned: boolean;
+      srcCounts: Record<NeededSource, number>;
+    }
   > = {};
   for (const [fp, t] of templates) {
+    const srcCounts: Record<NeededSource, number> = { c: 0, s: 0, b: 0, g: 0 };
+    for (const src of t.neededSrc.values()) srcCounts[src]++;
     out[`0x${fp.toString(16)}`] = {
       needed: [...t.needed].sort(),
       converged: t.converged,
       pinned: t.pinned,
+      srcCounts,
     };
   }
   return out;
@@ -342,6 +421,7 @@ export function getObservedLivenessStats(): {
   pinnedTemplates: number;
   convergedTemplates: number;
   prunedPairsRemoved: number;
+  retiredTemplates: number;
 } {
   let converged = 0;
   for (const t of templates.values()) if (t.converged && !t.pinned) converged++;
@@ -351,5 +431,6 @@ export function getObservedLivenessStats(): {
     pinnedTemplates,
     convergedTemplates: converged,
     prunedPairsRemoved,
+    retiredTemplates,
   };
 }

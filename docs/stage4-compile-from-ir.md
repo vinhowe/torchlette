@@ -1077,6 +1077,91 @@ therefore asserts the SEAM AGREEMENT that actually holds: identical trajectory
 across the pruning-activation threshold, zero guard misses, and demonstrable
 pruning (`prunedPairsRemoved > 0`).
 
+## Stage-2 increment 1 (2026-07-08): residual analysis → the residual was
+## one-shot templates; idle-retire closes it (and then some)
+
+**The flip-gating question — "does the +7% residual shrink at scale?" — had a
+surprising answer: NO, it GREW (+14.6%), and the attribution found a different
+culprit than stage-1 guessed.** Measured (t-observed-liveness-mem.ts, V100
+sivri solo, steady-state peak MB, post-step-12 reset):
+
+| config | cutover ref | conservative | pruned (stage-1) | residual |
+|--------|------------:|-------------:|-----------------:|---------:|
+| small 6L/384/H6/b4/seq256 (stage-1's) | 1670.1 | 2557.1 (+53.1%) | 1790.6 | **+7.2%** |
+| 124M-class 12L/768/H12/vocab50257/b1/seq256 | 5066.1 | 5926.6 (+17.0%) | 5807.0 | **+14.6%** |
+
+At the 124M-class config pruning removed only 45 pairs (vs 174 at small) and
+recovered just 14% of the over-harvest. A STEPS=40/RESET_AT=30 run is
+byte-identical (5807.0) — **more hysteresis converges nothing**.
+
+**Attribution (per-template registry footprint, `debugTemplatePlanMemory` +
+needed-source counts on `debugAllNeededSets`):**
+- **ONE-SHOT WARMUP TEMPLATES dominate — they are ~the entire 124M residual.**
+  Two 296-node step-0/1 graph variants execute once, never recur. The recorded
+  cutover NEVER compiles them (recording→replay needs recurrence), so they cost
+  it nothing at steady state. Build-from-IR compiles every template on FIRST
+  execution and harvests its full action-output set into exclusive planner
+  result entries — and a template that never re-executes can NEVER converge
+  (observation needs re-execution), so the conservative harvest is pinned
+  forever: **+723.2 and +1446.3 MB of dead registry results at 124M-class**
+  (+71.0 and +141.9 MB at small). "Unconverged" ≠ intermittent: they are
+  structurally one-shot.
+- **Converged recurring templates are near-parity or BETTER than cutover.** The
+  optimizer template prunes to 2.1 MB vs the cutover's 121.6 (−119.5); the
+  heavy fwd/bwd templates land byte-equal to the cutover (their kept set =
+  needed ∪ mandatory covers the same results).
+- **View-base conservatism ("b"-source pairs: harvested views whose handle died
+  but whose base survived) is real but secondary, and small-scale-only**: the
+  small backward template keeps +155.2 MB over cutover with 57/218 needed pairs
+  base-only; at 124M the heavy template has b=3. NOT tightened: judging
+  survival by the view handle would rely on the late-consumer guard for any
+  actual reader, and `prunedExecuted` is STEP-SCOPED — a consumer in a LATER
+  step reading a pruned view result would raw-crash ("Input not ready"),
+  unguarded. Recorded as the open design question (a persistent
+  pruned-pair→stamp map, or stage-3 remat, would make it sound).
+- A second structural (unfixable-cheaply) source: consumer plan SHAPES in the
+  build-from-IR arm are collected against a fuller materialization world, so
+  they leaf-read more producer results → larger consumed-sets (c=76 on the
+  small backward). Bounded, and covered by the same near-parity numbers.
+
+**The tightening: IDLE-RETIRE (landed, this increment).** At the
+observed-liveness step boundary, a template that has not executed for
+`K_IDLE=3` consecutive boundaries has its compiled plan retired
+(`destroyCompiledPlanBuffers` → registry entries relisted, buffers fence-gated
+deferredDestroy), GATED on liveness: the plan records the storage ids its last
+replay's harvest exposed (`CompiledPlan._lastHarvestIds`, assigned + skipped
+pre-existing handles), and retire proceeds only when EVERY one is already
+destroyed (`storageTracker.isDestroyed`) — no live reader can dangle. This is
+strictly more conservative than the landed convergence invalidation (which
+destroys with live survivors and leans on fence timing + re-harvest). A retired
+template that re-executes rebuilds from IR (no lowered re-execution). Telemetry:
+`retiredTemplates` on `getPayloadThrashStats()`. Also landed for the analysis:
+needed-source attribution (c/s/b/g per pair), `debugTemplatePlanMemory()`,
+`debugPlannerRegistryStats()`.
+
+**Result: the residual is not just closed — build-from-IR-pruned+retire beats
+the recorded cutover at BOTH scales** (retire also releases what the cutover
+arm leaves as pool residue, and relisted entries serve later plans as temps):
+
+| config | cutover ref | pruned+retire | vs ref |
+|--------|------------:|--------------:|-------:|
+| small  | 1670.1 | **1522.6** | **−8.8%** |
+| 124M-class | 5066.1 | **2914.8** | **−42.5%** |
+
+(retiredTemplates=2 at both scales; converged/prunedPairs unchanged; zero
+guard misses.)
+
+**Gates (this increment, all green):** observed-liveness spec 5/5 (set-parity +
+late-consumer both arms); test:gates 4/4; fullstack parity BUILD_FROM_IR=1 vs
+GENERATED_PLAN=0 maxΔ 6.7e-6 / 30 steps; STRICT_LIFETIME+STRICT_GPU
+build-from-IR fullstack zero throws (losses within fp noise of the non-strict
+arm, 7.6e-6); memory A/B above; full suite + production regression (below).
+
+**FLIP RECOMMENDATION: FLIP.** The gating residual is eliminated with margin at
+both scales; the trajectory is bit-identical; zero guard misses anywhere. The
+known caveat carried into increment 2: the flip's own gate ladder (suite,
+regression baseline-exact, decode, memory A/B at the flipped default) decides.
+
 ### (ORIGINAL DESIGN, retained for the rationale)
 
 ### (a) Why per-plan survivor-pruning breaks — the crash class, characterized

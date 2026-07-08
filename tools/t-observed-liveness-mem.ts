@@ -19,19 +19,26 @@ import { Torchlette } from "../src/frontend/torchlette";
 import type { Tensor } from "../src/frontend/tensor";
 import { Adam } from "../src/optim/index.ts";
 import {
+  debugTemplatePlanMemory,
   getPayloadThrashStats,
 } from "../src/executor/executor";
-import { setObservedLivenessEnabled } from "../src/executor/observed-liveness";
+import { debugPlannerRegistryStats } from "../src/executor/compiled-plan";
+import {
+  debugAllNeededSets,
+  setObservedLivenessEnabled,
+} from "../src/executor/observed-liveness";
 
 const MODE = process.env.MODE ?? "pruned";
 const STEPS = parseInt(process.env.STEPS ?? "20", 10);
 const RESET_AT = parseInt(process.env.RESET_AT ?? "12", 10);
-const VOCAB = 512;
-const SEQ = 256;
-const BATCH = 4;
-const LAYERS = 6;
-const EMBED = 384;
-const HEADS = 6;
+// Scale knobs (defaults = the stage-1 small config). The 124M-class sweep is
+// VOCAB=50257 LAYERS=12 EMBED=768 HEADS=12 BATCH=1 (the 4.4 scaling-table row).
+const VOCAB = parseInt(process.env.VOCAB ?? "512", 10);
+const SEQ = parseInt(process.env.SEQ ?? "256", 10);
+const BATCH = parseInt(process.env.BATCH ?? "4", 10);
+const LAYERS = parseInt(process.env.LAYERS ?? "6", 10);
+const EMBED = parseInt(process.env.EMBED ?? "384", 10);
+const HEADS = parseInt(process.env.HEADS ?? "6", 10);
 
 function fillFor(name: string, n: number): number[] {
   const lower = name.toLowerCase();
@@ -135,10 +142,34 @@ async function main() {
       steadyPeakMB: +(steadyPeak / 1e6).toFixed(1),
       convergedTemplates: stats.convergedTemplates,
       prunedPairsRemoved: stats.prunedPairsRemoved,
+      retiredTemplates: stats.retiredTemplates,
       dirtyMisses: stats.dirtyMisses,
       cleanMisses: stats.cleanMisses,
     }),
   );
+  // Attribution dump (DUMP=1): per-template plan memory + registry totals +
+  // observed needed-set sources — the stage-2 increment-1 residual analysis.
+  if (process.env.DUMP === "1") {
+    console.log("REGISTRY " + JSON.stringify(debugPlannerRegistryStats()));
+    const mem = debugTemplatePlanMemory();
+    const obs = debugAllNeededSets();
+    for (const [fp, m] of Object.entries(mem)) {
+      const o = obs[fp];
+      console.log(
+        `TEMPLATE ${fp} nodes=${m.nodes} valid=${m.valid} results=${m.results} pruned=${m.pruned} resultMB=${m.resultMB} tempMB=${m.tempMB}` +
+          (o
+            ? ` converged=${o.converged} pinned=${o.pinned} needed=${o.needed.length} src=${JSON.stringify(o.srcCounts)}`
+            : ""),
+      );
+    }
+    for (const [fp, o] of Object.entries(obs)) {
+      if (!mem[fp]) {
+        console.log(
+          `OBS-ONLY ${fp} converged=${o.converged} pinned=${o.pinned} needed=${o.needed.length} src=${JSON.stringify(o.srcCounts)}`,
+        );
+      }
+    }
+  }
   try {
     destroyWebGPU();
   } catch {

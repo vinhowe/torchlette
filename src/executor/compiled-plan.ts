@@ -238,6 +238,11 @@ export interface CompiledPlan {
    *  harvest. Registered into the step-scoped prunedExecuted map at replay so a
    *  late consumer's bind-time miss can name the culprit and decide recovery. */
   _prunedPairs?: Array<{ ni: number; oi: number }>;
+  /** [observed-liveness] Storage ids of every result the LAST replay's harvest
+   *  exposed (assigned handles + pre-existing handles it skipped). The
+   *  idle-retire gate releases this plan's registry entries only when ALL of
+   *  them are destroyed — no live reader can dangle. */
+  _lastHarvestIds?: number[];
 }
 
 // ============================================================================
@@ -590,6 +595,61 @@ export function resetPlannerRegistry(): void {
       e.buffer = undefined;
     }
   }
+}
+
+/** Test/debug: snapshot of the shared planner registry — entry count and byte
+ *  totals split result-holder vs shareable temp (the stage-1 residual
+ *  attribution axis: result bytes are the harvest's footprint). */
+export function debugPlannerRegistryStats(): {
+  entries: number;
+  totalMB: number;
+  resultMB: number;
+  tempMB: number;
+  materializedMB: number;
+} {
+  let total = 0;
+  let result = 0;
+  let materialized = 0;
+  for (const e of plannerRegistry.entries) {
+    total += e.bytes;
+    if (e.resultHolder) result += e.bytes;
+    if (e.buffer) materialized += e.bytes;
+  }
+  const mb = (b: number) => +(b / 1e6).toFixed(1);
+  return {
+    entries: plannerRegistry.entries.length,
+    totalMB: mb(total),
+    resultMB: mb(result),
+    tempMB: mb(total - result),
+    materializedMB: mb(materialized),
+  };
+}
+
+/** Test/debug: per-compiled-plan registry footprint (bytes of co-owned entries,
+ *  split result/temp). Temps are shared across plans, so summing tempMB across
+ *  plans overcounts; resultMB is exclusive and additive. */
+export function debugCompiledPlanEntryBytes(cp: CompiledPlan): {
+  resultMB: number;
+  tempMB: number;
+  entries: number;
+} {
+  let result = 0;
+  let temp = 0;
+  let n = 0;
+  if (cp.plannerEntries && cp.plannerGen === plannerRegistry.generation) {
+    for (const idx of cp.plannerEntries) {
+      const e = plannerRegistry.entries[idx];
+      if (!e) continue;
+      n++;
+      if (e.resultHolder) result += e.bytes;
+      else temp += e.bytes;
+    }
+  }
+  return {
+    resultMB: +(result / 1e6).toFixed(1),
+    tempMB: +(temp / 1e6).toFixed(1),
+    entries: n,
+  };
 }
 
 /** Debug: stable small ids for GPUBuffer identity in logs. */
@@ -1627,6 +1687,11 @@ export async function executeCompiledPlan(
       }
     }
     const viewBaseRetains: number[] = [];
+    // [observed-liveness] Storage ids this replay's harvest exposes (assigned
+    // OR pre-existing) — the idle-retire liveness gate. Only tracked when the
+    // plan participates in observation (templateFp stamped).
+    const lastHarvestIds: number[] | undefined =
+      compiled.templateFp !== undefined ? [] : undefined;
     const resolveInputStorage = (
       node: LazyIRNode,
       j: number,
@@ -1667,6 +1732,13 @@ export async function executeCompiledPlan(
         );
       }
       if (!assignsPrimary && !assignsExtra) {
+        // Pre-existing handle the harvest leaves in place: it still reads this
+        // plan's buffers, so it participates in the idle-retire liveness gate.
+        if (lastHarvestIds) {
+          const existing =
+            r.outputIndex === 0 ? node.result : node.results?.[r.outputIndex];
+          if (existing) lastHarvestIds.push(existing.id);
+        }
         if (ENV.TORCHLETTE_DEBUG_HARVEST) {
           dbgHarvestSkipped++;
           if (dbgHarvestSkipped <= 5 && node.result) {
@@ -1730,6 +1802,7 @@ export async function executeCompiledPlan(
       if (compiled.templateFp !== undefined) {
         stampResult(sh, compiled.templateFp, r.nodeIndex, r.outputIndex);
       }
+      if (lastHarvestIds) lastHarvestIds.push(sh.id);
     }
     // [observed-liveness] Register the pairs this pruned plan EXCLUDED from its
     // harvest, keyed by THIS step's node ids, so a late consumer's bind-time
@@ -1745,6 +1818,7 @@ export async function executeCompiledPlan(
     // harvest start. Storage ids are monotonic (never reused), so releasing a
     // since-freed base id next replay is a safe no-op (rcRelease returns -1).
     compiled._viewBaseRetains = viewBaseRetains;
+    if (lastHarvestIds) compiled._lastHarvestIds = lastHarvestIds;
     if (TAPE_PROFILE) tpAdd("replay-harvest", performance.now() - tpH0);
     if (ENV.TORCHLETTE_DEBUG_HARVEST && dbgHarvestSkipped > 0) {
       console.log(
