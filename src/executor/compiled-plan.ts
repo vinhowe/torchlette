@@ -1139,6 +1139,7 @@ import {
 } from "../backend/webgpu/webgpu-state";
 import { createStorageHandle } from "../graph/node-factory";
 import { rcRelease, rcRetain } from "../graph/refcount";
+import { storageTracker } from "../graph/storage-tracker";
 import { executeOpSync } from "./op-dispatch";
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1827,6 +1828,22 @@ export async function executeCompiledPlan(
           base = st;
           break;
         }
+      }
+      // FLATTEN the view chain to its ROOT owner. Under build-from-IR the
+      // planner binds the SAME registry buffer for an in-place state output
+      // on every replay, so the aliased input found above is itself the
+      // PREVIOUS replay's harvest view — chaining to it grows a base chain
+      // one link per step where every link protects its predecessor from
+      // destroyUnreachable (rc 0 but "base of a live view") forever: the
+      // 156-handles/step churn gate. Chain to the root instead: prior views
+      // then die at markStep (nothing names them as base) and the chain
+      // stays depth-1. stampResult's persistence check (checkId =
+      // baseStorageId ?? id) also WANTS the root — "the persistent buffer
+      // owner, not the per-replay view handle".
+      while (base?.baseStorageId !== undefined) {
+        const parent = storageTracker.getStorage(base.baseStorageId);
+        if (!parent) break;
+        base = parent;
       }
       const tensor = createTensor(
         r.shape,
