@@ -636,3 +636,99 @@ is exactly §4's ruling made load-bearing. Proposed re-staging:
 Landed-scope ladder (this commit): build green; capture.spec flag-on 9/9
 (new #81 test); hardened gen-tape-gate PASS (62/64, 0 invalidations, 0 OOM,
 GPU-pinned); differential-without-fix measured and recorded above.
+
+---
+
+## INC-2A DESIGN (approved scope: the capturable-optimizer contract) +
+## the numerical falsification probe RESULT that shapes the kernel
+
+**Probe run 2026-07-08 (falsification duty, before any code):** riskiest
+inc-2a assumption = "in-kernel f32 derivation of the bias correction from an
+on-device `t` matches the JS-double stepSize to gate tolerance." Emulated
+WGSL f32 (Math.fround chains) vs f64 over t=1..200k, β=(0.9, 0.999):
+
+| derivation | worst rel. err of 1−β₂ᵗ | worst rel. err of stepSize |
+|---|---|---|
+| naive `1 − pow(β,t)` | **1.95e-5 @ t=2** (cancellation) | **1.01e-5 @ t=2** |
+| `−expm1(t·ln β)`, 5-term series for \|y\|<0.25 | 1.15e-6 @ t=240 | **6.0e-7 @ t=240** |
+
+RULING FROM MEASUREMENT: the naive form sits AT the 1e-5 trajectory band at
+early steps (would fail the canonical differential); the kernel/graph
+derivation MUST be the expm1 form — `bc = −expm1(t·ln β)` with `ln β`
+precomputed f64→f32 on CPU (static), a 5-term Horner series for |y|<0.25 and
+`exp(y)−1` beyond. `t` is f32-exact to 2^24 steps. This applies identically
+to WGSL (fused) and to graph ops (foreach/elementwise — needs `expm1` as an
+op or the same series in ops; series-in-graph keeps all three paths on ONE
+formula = the (d) no-per-path-special-case requirement).
+
+**Implementation shape (the SGD-alpha retirement template, adam+scaler):**
+- **State:** per-optimizer persistent tensors: `t` (f32 [1], advanced by ONE
+  in-plan `add_(1)` per step — inside the optimizer plan so replays advance
+  it), `lr` (f32 [1] per param-group, written by `opt.lr=`/scheduler setters
+  at DRIVER level — sketch-3), scaler `scale`/`invScale` (f32 [1], updated
+  in-plan via the existing where-select idiom; `invScale = 1/scale` as a
+  graph op). Per-param `steps[i]` collapses to the shared `t` (the packed
+  fused path ALREADY assumes batch-uniform steps; a param whose grad is
+  absent skips its update but t advances — matches PyTorch capturable
+  semantics; document the divergence from today's per-param counters).
+- **Fused kernel:** bindings +1 storage buffer `hyper` = [t, lr, invScale(?)]
+  (or read t/lr as two 1-elem buffers; ONE packed hyper buffer per optimizer
+  keeps binding count at 9 ≤ 10). Kernel derives bc1/bc2 (expm1 form),
+  stepSize, epsAdjusted, lrTimesWd — the uniform fields beta1/beta2/eps/wd/
+  decoupled stay STATIC (no longer per-step-varying!). RETIREMENTS this
+  buys, each named: AdamStepConfig.stepSize/lrTimesWd/invScale payload
+  fields; setAdamConfigUniforms' per-step volatile fields; the TAG_UNIFORM
+  volatile-repack for adam (the config becomes fully static → the whole
+  adam volatileRepack closure + its recording plumbing); inc-1's
+  batch-representative recorder rule for adam (members' payloads no longer
+  vary → dead rule for this op — keep the mechanism only if another batched
+  op needs it, else delete); the scalar-adapt churn for foreach's per-step
+  coefficients.
+- **Foreach/elementwise:** replace JS-computed bc1/bc2/stepSize scalars with
+  graph ops reading `t`/`lr` tensors (same expm1-series formula). The paths
+  converge on ONE derivation source (a shared helper building the bc
+  subgraph).
+- **GradScaler:** `_scale` becomes the persistent tensor (CPU number kept
+  ONLY as a stats mirror updated at resolveDeferred readbacks — never an
+  input to computation); `scale(loss)` = tensor mul; unscale's invScale =
+  graph `reciprocal(scale)` feeding unscaleGrad as a TENSOR input (retires
+  the unscaleGrad invScale config field + ITS volatile uniform).
+- **#70 connection (scope-fenced):** this lands hyperparams-as-data for
+  Adam+scaler only; the generalized registered-persistence contract stays
+  #70's.
+
+**Gates (chartered):** fused==foreach==elementwise trajectory differentials;
+fullstack + LR schedule honored digit-for-digit vs sequential reference
+(schedule VALUES exact; trajectories within the ~1e-5 band — the 6e-7
+derivation noise is measured headroom); GradScaler trajectory parity;
+t-train-tape-probe eligiblePairs>0/refusals=0 on both paths — EXPECT the
+adamStep refusal class to disappear entirely (configs static, hyper flows
+as buffer data), which lets the batch-cover rule retire; full ladder;
+production regression baseline-exact (NOTE: baselines were re-derived once
+before for a stepSize semantic fix (round-0 9.54→9.81); if per-param→shared-t
+changes numerics for grad-gap edge cases, the regression must be re-baselined
+EXPLICITLY, never waived silently).
+
+## INC-2B DESIGN OPENER (chartered: short design + cheapest falsification)
+
+**Surface:** (i) multi-plan skeletons — `stCaptureCompiledStep` keeps ONE
+`candidate` (overwritten per compiled plan; code-confirmed), so a training
+step's 4-6 plans need `candidates: Candidate[]` accumulated per step and
+promotion matching the tape's ORDERED fp sequence; (ii) async captured
+bodies — `CapturedFn.call` invokes `body()` synchronously (code-confirmed);
+training bodies `await loss.backward()` → fn type + runIntercepted grow an
+async variant; (iii) output-node mapping — fn's returned Tensor(s) must map
+to (plan k, node pos) at promotion so a hit can harvest the loss from the
+replayed plans; (iv) hit-path boundary queueing — `opt.step()` never runs on
+a hit, so the hit calls `api.queueStepBoundary()` itself.
+
+**Riskiest assumption:** "a training step's multi-plan sequence is STABLE
+(same ordered fps every step) under the implied-boundary machinery" — if the
+executor re-segments plans nondeterministically (merge decisions varying with
+pool state), multi-plan skeletons can never be warm. **Cheapest probe —
+ALREADY IN HAND (inc-1 gate data):** `t-train-tape-probe` stores tapes keyed
+by `bucketKey = hash(structKey) + ordered plan fps`; 18 steps produced
+`tapeCount=1` with 7 eligible pairs re-storing the SAME bucket (fused AND
+foreach arms) — the ordered fp sequence is byte-stable across steady-state
+steps. Assumption NOT falsified; inc-2b may proceed on it after inc-2a.
+
