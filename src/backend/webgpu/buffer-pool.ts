@@ -32,6 +32,11 @@ import {
 // Buffer Pool for GPU Buffer Reuse (section 14)
 // ============================================================================
 
+/** [stage-3 idle-trim] Steady boundaries a size class may go undemanded
+ *  before its available bucket is destroyed (mirrors observed-liveness
+ *  K_IDLE). */
+const POOL_TRIM_IDLE_TICKS = 3;
+
 /**
  * Buffer pool with fence integration per spec section 14.
  * Buffers are not immediately available for reuse - they go through a pending
@@ -217,6 +222,7 @@ class SimpleBufferPool {
     this.reuseCount++;
     this.acquireFromPool++;
     this.recordWindowDemand(sizeClass, "acquires");
+    this.touchClass(sizeClass);
     this.pooledBufferSet.add(preferred);
     gpuMemoryTracker.trackAllocation(preferred, actualSize);
     return preferred;
@@ -247,6 +253,9 @@ class SimpleBufferPool {
     this.lastAcquireSource = "";
 
     const sizeClass = getSizeClass(sizeBytes);
+    // [stage-3 idle-trim] Any acquire attempt (hit or miss) marks the class
+    // demanded — a demanded class is never idle-trimmed.
+    this.touchClass(sizeClass);
 
     // Check the main pool (buffers from previous executions).
     // writeSet check removed: pool-resident buffers cannot be in the writeSet because
@@ -321,9 +330,113 @@ class SimpleBufferPool {
     const sc = getSizeClass(sizeBytes);
     this.newAllocsByClass.set(sc, (this.newAllocsByClass.get(sc) ?? 0) + 1);
     this.recordWindowDemand(sc, "acquires");
+    this.touchClass(sc);
+    // [stage-3 idle-trim] A fresh allocation for a class the trim destroyed
+    // is a REWARM — count it, and after >2 rewarms of one class pin the class
+    // untrimmable permanently (the stage-2 rebuild-limit lesson: never churn).
+    if (this.trimmedClasses.has(sc)) {
+      this.trimStats.trimRewarms++;
+      const n = (this.classRewarms.get(sc) ?? 0) + 1;
+      this.classRewarms.set(sc, n);
+      if (n > 2) {
+        this.trimmedClasses.delete(sc);
+        this.untrimmableClasses.add(sc);
+        this.trimStats.untrimmablePinned++;
+      }
+    }
     if (this.debugTrace) {
       console.log(`[pool] NEW allocation: ${(sizeBytes / 1e6).toFixed(2)} MB`);
     }
+  }
+
+  // ── [stage-3] Steady-state idle-trim of pool buckets (docs §Stage 3) ───────
+  // The pool-side twin of arena-reclaim (78c6f73) + stage-2 idle-retire: at a
+  // STEADY step boundary (observed-liveness: every executed template converged
+  // or pinned, no new template — the same activation condition as pruning), a
+  // size class not demanded for POOL_TRIM_IDLE_TICKS consecutive steady
+  // boundaries has its available bucket destroyed. Reclaims warmup residue
+  // (lowered warmup + arena spills + one-time recordings — idle by definition
+  // once every recurring plan replays compiled) WITHOUT the reverted
+  // demand-trim's hazard: trims only BETWEEN steps (never under mid-step
+  // pressure), destruction rides the fence-gated pendingDestroy path, and
+  // accounting is exact (bucket residents were trackDeallocation'd at
+  // release-to-pool, so the trim must NOT re-deallocate — it bypasses
+  // deferredDestroy deliberately).
+  private classLastAcquire = new Map<number, number>();
+  private trimTick = 0;
+  private trimmedClasses = new Set<number>();
+  private classRewarms = new Map<number, number>();
+  private untrimmableClasses = new Set<number>();
+  private trimStats = {
+    trimmedBuffers: 0,
+    trimmedMB: 0,
+    trimRewarms: 0,
+    untrimmablePinned: 0,
+  };
+
+  /** Mark a size class as demanded this trim epoch (any acquire attempt —
+   *  hit, pending-hit, or miss-then-new-alloc — a demanded class is never
+   *  idle). */
+  private touchClass(sizeClass: number): void {
+    this.classLastAcquire.set(sizeClass, this.trimTick);
+  }
+
+  /**
+   * Destroy available-bucket buffers of size classes idle for
+   * POOL_TRIM_IDLE_TICKS steady boundaries. Called ONLY from the
+   * observed-liveness steady-boundary seam (never mid-step; the
+   * sharedEncoderActive guard is defense-in-depth). pendingRelease is never
+   * touched (in-flight); canRecycle is consulted per buffer per the ruling
+   * (bucket residents are safe by construction — defense-in-depth).
+   */
+  idleTrim(): { buffers: number; bytes: number } {
+    if (!this.enabled || sharedEncoderActive) return { buffers: 0, bytes: 0 };
+    this.trimTick++;
+    let buffers = 0;
+    let bytes = 0;
+    for (const [sizeClass, bucket] of this.pool) {
+      if (bucket.length === 0) continue;
+      if (this.untrimmableClasses.has(sizeClass)) continue;
+      const last = this.classLastAcquire.get(sizeClass) ?? 0;
+      if (this.trimTick - last < POOL_TRIM_IDLE_TICKS) continue;
+      const size = getSizeForClass(sizeClass);
+      const survivors: GPUBuffer[] = [];
+      for (const buf of bucket) {
+        if (!this.canRecycle(buf)) {
+          survivors.push(buf);
+          continue;
+        }
+        // Already trackDeallocation'd at release-to-pool: adjust pool
+        // accounting only, and destroy after the next fence
+        // (destroyPendingBuffers' scrub also clears every tracking set).
+        this.pooledBytes -= size;
+        this.pendingDestroy.push({ buffer: buf, size });
+        buffers++;
+        bytes += size;
+      }
+      this.pool.set(sizeClass, survivors);
+      if (survivors.length < bucket.length) this.trimmedClasses.add(sizeClass);
+    }
+    this.trimStats.trimmedBuffers += buffers;
+    this.trimStats.trimmedMB = +(this.trimStats.trimmedMB + bytes / 1e6).toFixed(
+      1,
+    );
+    if (epochTraceEnabled() && buffers > 0) {
+      epochTrace(
+        `poolIdleTrim destroyed=${buffers} (${(bytes / 1e6).toFixed(1)}MB)`,
+      );
+    }
+    return { buffers, bytes };
+  }
+
+  getTrimStats(): {
+    trimmedBuffers: number;
+    trimmedMB: number;
+    trimRewarms: number;
+    untrimmablePinned: number;
+    trimTick: number;
+  } {
+    return { ...this.trimStats, trimTick: this.trimTick };
   }
 
   /** Start recording window demand for this step. */

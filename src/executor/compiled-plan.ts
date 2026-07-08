@@ -287,6 +287,7 @@ import {
   guardMiss,
   observeConsumed,
   registerPrunedExecution,
+  setSteadyBoundaryTrimmer,
   stampResult,
 } from "./observed-liveness";
 
@@ -580,6 +581,14 @@ function finalizeCompiledPlan(
  * stale cross-instance entries were the class behind the "reshape issue").
  */
 const plannerRegistry = new PlannerRegistry();
+
+// [stage-3 idle-trim] At a STEADY observed-liveness boundary, destroy pool
+// buckets idle for K boundaries (warmup residue; see buffer-pool.idleTrim —
+// fence-gated, accounting-exact, rewarm-pinned). Registered here because this
+// module already bridges the executor and the webgpu pool.
+setSteadyBoundaryTrimmer(() => {
+  bufferPool.idleTrim();
+});
 
 /** Reset the planner registry, destroying any materialized buffers via the
  *  fence-gated path. Plans built against the old generation fall back to

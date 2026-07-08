@@ -184,6 +184,15 @@ export function setTemplateIdleRetirer(
   retireIdleTemplate = fn;
 }
 
+/** [stage-3 idle-trim] Callback invoked at a STEADY step boundary (every
+ *  executed template converged or pinned, no new template this step — the
+ *  same activation condition as pruning). The backend registers the pool's
+ *  idle-trim here; the module stays backend-agnostic. */
+let steadyBoundaryTrimmer: (() => void) | undefined;
+export function setSteadyBoundaryTrimmer(fn: () => void): void {
+  steadyBoundaryTrimmer = fn;
+}
+
 export function setObservedLivenessEnabled(on: boolean): void {
   enabled = on;
 }
@@ -432,6 +441,18 @@ export function observeStepBoundary(): void {
     }
   }
   const noNew = newTemplateThisStep === 0;
+  // [stage-3 idle-trim] Steady = no new template this step AND every template
+  // that executed is converged or pinned (computed before the loop clears the
+  // executedThisStep flags). Idle warmup residue is only reclaimed once the
+  // plan set has settled — the same activation condition as pruning.
+  let steady = noNew;
+  let anyExecuted = false;
+  for (const t of templates.values()) {
+    if (t.executedThisStep) {
+      anyExecuted = true;
+      if (!t.converged && !t.pinned) steady = false;
+    }
+  }
   for (const [fp, t] of templates) {
     if (!t.executedThisStep) {
       // Idle-retire clock: a template that stops executing (one-shot warmup
@@ -478,6 +499,7 @@ export function observeStepBoundary(): void {
   newTemplateThisStep = 0;
   inPlaceCommits = 0;
   stepLastReader = new Map();
+  if (steady && anyExecuted) steadyBoundaryTrimmer?.();
 }
 
 // ── Pruning application (build-from-IR harvest) ───────────────────────────────

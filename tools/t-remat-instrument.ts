@@ -119,6 +119,7 @@ async function main() {
     `crossPlanPersistentBindings: ${JSON.stringify(debugCrossPlanPersistentBindings())}`,
   );
   log(`stats: ${JSON.stringify(getObservedLivenessStats())}`);
+  log(`poolTrim: ${JSON.stringify(bufferPool.getTrimStats())}`);
   log("=== step-global releasable summary (per producer template) ===");
   const summary = debugReleasableSummary();
   for (const [fp, s] of Object.entries(summary)) {

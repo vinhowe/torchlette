@@ -1990,3 +1990,57 @@ vs the 6.2 GB bar — the pool residue (5.7 GB) and temp materialization
 class (build-without-execution for ALL plans incl. uncovered ones, or a
 pool-budget policy) more than it requires (B). Reported to the coordinator at
 the (A) checkpoint for the (B) ruling.
+
+### Stage-3 idle-trim LANDED (2026-07-08, coordinator-ruled): steady-state
+### pool-bucket trim at step boundaries — −4.1 GB on the compiled arm
+
+**The ruling** (rejecting bar re-scoping as goal-post-moving, pool budgets as
+the reverted demand-trim's hazard class, and coverage extension as the 4.4
+endgame rather than a memory fix): the pool-side twin of arena-reclaim
+(78c6f73) and stage-2 idle-retire. At a STEADY observed-liveness boundary
+(every executed template converged or pinned, no new template — the same
+activation condition as pruning), a pool size class not DEMANDED (any acquire
+attempt: bucket hit, pending hit, or miss-then-new-alloc) for
+POOL_TRIM_IDLE_TICKS=3 consecutive steady boundaries has its available bucket
+destroyed. Why this avoids the reverted demand-trim's churn (§4.3): that trim
+fired mid-step under pressure with a reservation-window demand signal that
+missed out-of-window acquires; this one (i) triggers only BETWEEN steps at a
+convergence-gated boundary, (ii) uses total demand (every acquire path
+touches the class), and (iii) carries the churn guard below.
+
+Mechanics (`buffer-pool.ts idleTrim`, seam `observed-liveness
+setSteadyBoundaryTrimmer` → registered by `compiled-plan.ts`):
+- **Fence-gated, accounting-exact destruction**: trimmed residents ride the
+  existing `pendingDestroy` path (destroyed post-fence; the scrub clears every
+  tracking set). Bucket residents were `trackDeallocation`'d at
+  release-to-pool, so the trim deliberately BYPASSES `deferredDestroy` (which
+  would double-deallocate) and adjusts `pooledBytes` directly. `canRecycle`
+  consulted per buffer (defense-in-depth; residents are safe by construction).
+  `pendingRelease` is never touched (in-flight).
+- **Rewarm churn guard**: a fresh allocation for a trimmed class counts
+  `trimRewarms`; >2 rewarms of one class pins it untrimmable permanently (the
+  stage-2 rebuild-limit lesson). Telemetry: `bufferPool.getTrimStats()`.
+- Zero new env flags; activation is purely observational.
+
+**Measured (124M-class, both arms, both meters, 5 rounds):**
+| arm | peak | cur | phys (pool-held) | ms/step |
+|---|---:|---:|---:|---:|
+| (a′+trim) arena-free lowered — the BAR | 7659 | 2638 | **6209** (3570) | ~655 |
+| (d′+A+trim) compiled | 9358 | 5541 | **7164** (1623) | ~293 |
+
+- Compiled arm: phys **11,289 → 7,164 MB (−4.1 GB)** — 643 buffers / 4,640 MB
+  trimmed; trimRewarms=6 with 2 classes pinned, then FLAT (rounds 1–4
+  byte-identical: the guard converges, no churn). Loss baseline-exact.
+- Lowered arm: −34 MB only (4 buffers) — as predicted, its pool bytes are the
+  LIVE per-step working set (demanded every step, never idle). The bar is
+  honest and stands.
+- **Remaining gap to the physical bar: +955 MB — almost exactly (B)'s
+  1,113 MB boundary-dead-consumed class.** (B) is now load-bearing and
+  sufficient-looking for the phys bar; peak (9358 vs 7659) remains
+  warmup-transient high-water (set in round 0 before convergence+trim).
+
+Ladder (all green): suite default 90+63 (one network-flaky relay run, green
+on rerun); suite `=0` modulo the env-inheriting obs-spec arm; gates 4/4; obs
+spec 5/5; checkpoint oracle 4/4; fullstack default/`=0`/STRICT maxΔ 8.6e-6 /
+30 steps; production regression baseline-exact flat 2087.6 MB; kv-diff PASS;
+gen-tape PASS.
