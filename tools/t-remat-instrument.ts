@@ -18,6 +18,7 @@
 import * as fs from "node:fs";
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
 import { getGPUMemoryStats } from "../src/backend/webgpu/memory-tracker";
+import { bufferPool } from "../src/backend/webgpu/buffer-pool";
 import { Torchlette } from "../src/frontend/torchlette";
 import {
   type TokenSource,
@@ -98,8 +99,14 @@ async function main() {
     const t0 = Date.now();
     const loss = await trainer.innerSteps(r);
     const mem = getGPUMemoryStats();
+    // Unified PHYSICAL meter (coordinator metric ruling): tracker-current +
+    // pool-held (pooled + pendingRelease) — pool-idle bytes are physically
+    // resident but trackDeallocation'd, so `cur` alone under-reports the
+    // lowered arm (which cycles everything through the pool) vs the compiled
+    // arm (whose registry entries stay tracker-counted). Report BOTH.
+    const poolHeld = bufferPool.getTotalHeldBytes();
     log(
-      `round ${r}: loss=${loss.toFixed(4)} peak_mb=${(mem.peakBytes / 1e6).toFixed(1)} cur_mb=${(mem.currentBytes / 1e6).toFixed(1)} dt=${((Date.now() - t0) / 1000).toFixed(2)}s`,
+      `round ${r}: loss=${loss.toFixed(4)} peak_mb=${(mem.peakBytes / 1e6).toFixed(1)} cur_mb=${(mem.currentBytes / 1e6).toFixed(1)} phys_mb=${((mem.currentBytes + poolHeld) / 1e6).toFixed(1)} (pool_held=${(poolHeld / 1e6).toFixed(1)}) dt=${((Date.now() - t0) / 1000).toFixed(2)}s`,
     );
   }
 

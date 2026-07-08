@@ -83,10 +83,12 @@ const K_IDLE = 3;
 /** Why a pair entered the needed-set (attribution telemetry): "c" cross-plan
  *  consumed, "s" survived the step directly, "b" survived only VIA ITS VIEW
  *  BASE (the handle died but baseStorageId is alive — the deliberately-
- *  conservative view class), "g" guard-miss. First observation wins except a
- *  later "c"/"s" upgrades a "b" (a pair both consumed and base-alive is not a
- *  view-conservatism cost). */
-type NeededSource = "c" | "s" | "b" | "g";
+ *  conservative view class), "g" guard-miss, "r" READ BACK (item()/cpu()/
+ *  readTopK/startItemReadback — consumption OUTSIDE plan order, invisible to
+ *  the plan-read seam; the loss tensor is the canonical case). First
+ *  observation wins except a later non-"b" upgrades a "b" (a pair both
+ *  consumed and base-alive is not a view-conservatism cost). */
+type NeededSource = "c" | "s" | "b" | "g" | "r";
 
 interface TemplateObs {
   needed: Set<string>; // union of observed needed "ni:oi"
@@ -119,6 +121,11 @@ interface TemplateObs {
    *  about ANY survival, ever, since a surviving value is user-visible and
    *  must never be overlaid. */
   everSurvived: Set<string>;
+  /** pairs EVER read back (item()/cpu()/readTopK/startItemReadback) — readers
+   *  outside plan order whose timing observation cannot bound. Kept in the
+   *  harvest (via needed) and permanently excluded from step-global release
+   *  (a future readback could land after any within-step release point). */
+  everReadback: Set<string>;
   /** pair → planner registry entry backing the harvested result in the
    *  CURRENT build (bytes for telemetry; mandatory pairs are terminal/declared
    *  outputs — never releasable). `op` is the producing node's op label
@@ -152,6 +159,8 @@ let stepLastReader = new Map<string, number>();
 // ── Telemetry (folded onto getPayloadThrashStats) ────────────────────────────
 let cleanMisses = 0;
 let dirtyMisses = 0;
+let readbackMisses = 0;
+let convergenceInvalidations = 0;
 let pinnedTemplates = 0;
 let prunedPairsRemoved = 0;
 let retiredTemplates = 0;
@@ -191,6 +200,8 @@ export function resetObservedLiveness(): void {
   stepLastReader = new Map();
   cleanMisses = 0;
   dirtyMisses = 0;
+  readbackMisses = 0;
+  convergenceInvalidations = 0;
   pinnedTemplates = 0;
   prunedPairsRemoved = 0;
   retiredTemplates = 0;
@@ -213,6 +224,7 @@ function obs(fp: number): TemplateObs {
       lastReaderStable: new Map(),
       releaseRevoked: new Set(),
       everSurvived: new Set(),
+      everReadback: new Set(),
       resultEntries: new Map(),
       resultEntriesGen: -1,
     };
@@ -292,6 +304,45 @@ export function observeConsumed(
     // plans), so the final write for a pair this step IS its last reader.
     stepLastReader.set(`${stamp.fp}|${key(stamp.ni, stamp.oi)}`, consumerFp);
   }
+}
+
+/**
+ * [stage-3 A] Record a READBACK of a stamped result (RuntimeEngine.cpu /
+ * readTopK / startItemReadback, after force). Pure observation at an
+ * already-resolved storage — it must never perturb forcing or ordering (the
+ * loss-readback semantics are history-sensitive; see CLAUDE.md "Moving
+ * loss.item() after backward"). A read-back pair is needed (kept in the
+ * harvest even when mandatory-pruning is active) and permanently excluded
+ * from any future step-global release (readback timing is unordered).
+ */
+export function observeReadback(storage: StorageHandle): void {
+  if (!enabled) return;
+  const stamp = storage.stamp;
+  if (!stamp) return;
+  addNeeded(stamp.fp, stamp.ni, stamp.oi, "r");
+  obs(stamp.fp).everReadback.add(key(stamp.ni, stamp.oi));
+}
+
+/**
+ * [stage-3 A] A readback found its tensor STILL PENDING after force — the
+ * pair was pruned as observed-dead and this is its first-ever reader (the
+ * epistemic boundary, same as the stage-1 guard). Self-heal: grow the
+ * needed-set, revoke, invalidate the producer's pruned build (next step
+ * harvests the value). Returns the stamp when the miss was a pruned pair
+ * (caller throws a descriptive error naming the recovery); undefined if
+ * unrelated (caller falls through to its normal not-materialized error).
+ */
+export function readbackMiss(nodeId: number, oi: number): ResultStamp | undefined {
+  if (!enabled) return undefined;
+  const hit = prunedExecuted.get(nodeId);
+  if (!hit || hit.stamp.oi !== oi) return undefined;
+  const { stamp } = hit;
+  readbackMisses++;
+  addNeeded(stamp.fp, stamp.ni, stamp.oi, "r");
+  obs(stamp.fp).everReadback.add(key(stamp.ni, stamp.oi));
+  revokeRelease(stamp.fp, stamp.ni, stamp.oi);
+  invalidateTemplateCompiled?.(stamp.fp);
+  return stamp;
 }
 
 /** Register the pairs a pruned plan EXCLUDED from its harvest, so a later
@@ -413,6 +464,7 @@ export function observeStepBoundary(): void {
         // Invalidate the conservative compiled plan so the next execution
         // rebuilds it (build-from-IR) with the pruned needed-set — where the
         // memory win actually lands.
+        convergenceInvalidations++;
         invalidateTemplateCompiled?.(fp);
       }
     } else {
@@ -432,14 +484,17 @@ export function observeStepBoundary(): void {
 
 /**
  * If the template has converged (and is not pinned), return the pruned harvest
- * pairs = actionPairs ∩ (needed ∪ mandatory); the EXCLUDED pairs are returned so
- * the caller can record them for the bind-time guard. Returns undefined to use
- * the full conservative action-output set (not converged / pinned / disabled).
+ * pairs = actionPairs ∩ (needed ∪ keepAlways); the EXCLUDED pairs are returned
+ * so the caller can record them for the bind-time guard. Returns undefined to
+ * use the full conservative action-output set (not converged / pinned /
+ * disabled). [stage-3 A] `keepAlways` is the TERMINAL node only — declared
+ * outputs are pruned when observation (plan reads + survival + readbacks)
+ * proves them dead; see the executor call site for the rationale.
  */
 export function prunedHarvest(
   fp: number,
   actionPairs: Array<{ i: number; oi: number }>,
-  mandatory: Set<string>,
+  keepAlways: Set<string>,
 ): {
   kept: Array<{ i: number; oi: number }>;
   excluded: Array<{ i: number; oi: number }>;
@@ -451,7 +506,7 @@ export function prunedHarvest(
   const excluded: Array<{ i: number; oi: number }> = [];
   for (const p of actionPairs) {
     const k = key(p.i, p.oi);
-    if (t.needed.has(k) || mandatory.has(k)) kept.push(p);
+    if (t.needed.has(k) || keepAlways.has(k)) kept.push(p);
     else excluded.push(p);
   }
   prunedPairsRemoved += excluded.length;
@@ -577,6 +632,7 @@ export function releasableLastReader(
   if (t.releaseRevoked.has(k)) return undefined;
   if (t.neededSrc.get(k) !== "c") return undefined;
   if (t.everSurvived.has(k)) return undefined;
+  if (t.everReadback.has(k)) return undefined;
   const entry = t.resultEntries.get(k);
   if (!entry || entry.mandatory) return undefined;
   if ((t.lastReaderStable.get(k) ?? 0) < K_HYSTERESIS) return undefined;
@@ -743,7 +799,13 @@ export function debugAllNeededSets(): Record<
     }
   > = {};
   for (const [fp, t] of templates) {
-    const srcCounts: Record<NeededSource, number> = { c: 0, s: 0, b: 0, g: 0 };
+    const srcCounts: Record<NeededSource, number> = {
+      c: 0,
+      s: 0,
+      b: 0,
+      g: 0,
+      r: 0,
+    };
     for (const src of t.neededSrc.values()) srcCounts[src]++;
     out[`0x${fp.toString(16)}`] = {
       needed: [...t.needed].sort(),
@@ -766,6 +828,8 @@ export function getObservedLivenessStats(): {
    *  registry bytes (S3.0 instrumentation; S3.1 turns these into overlays). */
   releasablePairs: number;
   releasableMB: number;
+  readbackMisses: number;
+  convergenceInvalidations: number;
 } {
   let converged = 0;
   for (const t of templates.values()) if (t.converged && !t.pinned) converged++;
@@ -795,5 +859,7 @@ export function getObservedLivenessStats(): {
     retiredTemplates,
     releasablePairs,
     releasableMB: +(releasableBytes / 1e6).toFixed(1),
+    readbackMisses,
+    convergenceInvalidations,
   };
 }

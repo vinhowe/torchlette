@@ -1818,9 +1818,23 @@ export async function executeLoweredPlan(
       // [observed-liveness] The conservative full action-output harvest is the
       // safe default (see the proof above); once observation has converged a
       // recurring template, prune it to the observed needed-set (consumed ∪
-      // survived) ∪ mandatory (terminal + declared outputs, which the executor
-      // returns unconditionally). The EXCLUDED pairs are recorded on the plan so
-      // a late consumer's bind-time miss can name the culprit and gate recovery.
+      // survived ∪ read-back ∪ guard-grown) ∪ {terminal}.
+      //
+      // [stage-3 A] DECLARED outputs (plan.outputIndices — the forced roots)
+      // are NO LONGER unconditionally kept: they must earn their harvest slot
+      // through observation like every other pair. The S3.0 decomposition
+      // showed ~700 MB/step of observed-dead mandatory results at 124M-class
+      // (grad-accumulation intermediates rooted at force time, read by
+      // nothing). Every external reader class is now observed: plan reads
+      // (observeConsumed), boundary survival (everSurvived), readbacks
+      // (observeReadback — the seam that makes this pruning sound; the loss
+      // is the canonical readback-only mandatory pair). A first-ever reader
+      // after convergence is the same epistemic boundary as stage-1 pruning:
+      // plan reads hit the bind-time guard (clean recovery), readbacks hit
+      // the readbackMiss heal (loud once, harvested next step). Only the
+      // TERMINAL node stays unconditional (the plan's return value, read by
+      // the forcing caller immediately). The EXCLUDED pairs are recorded on
+      // the plan so a late reader's miss can name the culprit.
       const actionPairs = actionOutputHarvestPairs(loweredPlan, planNodes, gen);
       const fp = options.templateFp;
       let harvestPairs = actionPairs;
@@ -1837,7 +1851,8 @@ export async function executeLoweredPlan(
           if (outIds.has(planNodes[i].id)) mandatory.add(`${i}:0`);
         }
         mandatoryKeys = mandatory;
-        const pr = prunedHarvest(fp, actionPairs, mandatory);
+        const keepAlways = new Set<string>([`${planNodes.length - 1}:0`]);
+        const pr = prunedHarvest(fp, actionPairs, keepAlways);
         if (pr) {
           harvestPairs = pr.kept;
           prunedPairs = pr.excluded.map((p) => ({ ni: p.i, oi: p.oi }));
@@ -1889,7 +1904,7 @@ export async function executeLoweredPlan(
           loweredPlan.compiledPlan = genPlan = built;
           if (ENV.TORCHLETTE_DEBUG_COMPILED) {
             console.log(
-              `[compiled] phase-4.4 BUILD-FROM-IR: ${gen.commands.length} cmds, ${genResults.length} results${prunedPairs ? ` (pruned ${prunedPairs.length})` : ""} — no lowered execution`,
+              `[compiled] phase-4.4 BUILD-FROM-IR fp=0x${fp?.toString(16)}: ${gen.commands.length} cmds, ${genResults.length} results${prunedPairs ? ` (pruned ${prunedPairs.length})` : ""} — no lowered execution`,
             );
           }
         }
@@ -1977,11 +1992,25 @@ export async function executeLoweredPlan(
   let compilationRecording: ReturnType<
     typeof startCompilationRecording
   > | null = null;
+  /** [stage-3 A] Node ids whose results EXISTED before this execution
+   *  (skip-executed shared nodes — e.g. attention nodes shared with a
+   *  sibling template that already ran this step). A recording claims only
+   *  results THIS execution produced: pre-existing ones are excluded from
+   *  the result collection instead of tripping the unrecordedNodes
+   *  invalidation (consumers re-resolve them per replay as externals via
+   *  planNodes[i].inputs, exactly like any prior-plan result). */
+  let preExistingResults: Set<number> | null = null;
   if (shouldCompile) {
     if (ENV.TORCHLETTE_DEBUG_COMPILED) {
       console.log(`[exec] RECORDING nodes=${planNodes.length}`);
     }
     compilationRecording = startCompilationRecording();
+    preExistingResults = new Set();
+    for (const node of planNodes) {
+      if (node.result || (node.results && node.results.some((r) => !!r))) {
+        preExistingResults.add(node.id);
+      }
+    }
     // Pre-assign external input slots for inputs that are already materialized
     // (results from prior plan executions). Inputs produced within this plan
     // are NOT yet materialized and will get slots during recording via arena alloc.
@@ -2726,6 +2755,9 @@ export async function executeLoweredPlan(
       const unrecordedNodes: string[] = [];
       for (let i = 0; i < planNodes.length; i++) {
         const node = planNodes[i];
+        // [stage-3 A] Results that pre-existed this execution are not this
+        // recording's products — skip them (see preExistingResults above).
+        if (preExistingResults?.has(node.id)) continue;
         if (node.results && node.results.length > 0) {
           for (let oi = 0; oi < node.results.length; oi++) {
             const sh = node.results[oi];
@@ -2787,6 +2819,13 @@ export async function executeLoweredPlan(
             unrecordedNodes.map((s) => `  - ${s}`).join("\n"),
         );
         compiled.valid = false;
+        // [stage-3 A leak fix] The build already assigned planner registry
+        // entries (finalizeCompiledPlan → planMemory, owners = this plan).
+        // Dropping the plan without releasing them leaks every result entry
+        // as a dead-owner resultHolder FOREVER (measured ~390 MB/step when a
+        // template re-recorded each step). Route through the one teardown
+        // path — same rule as every other invalidation.
+        destroyCompiledPlanBuffers(compiled);
       }
       // Arena conflicts no longer block compiled plan storage. The arena
       // hands evicted buffers back to the pool's release chain (see

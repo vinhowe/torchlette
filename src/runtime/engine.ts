@@ -35,7 +35,11 @@ import {
   type OptimizedExecutionStats,
 } from "../executor/executor";
 import { isDataSourceOp } from "../executor/lowered-plan";
-import { RecoverableGuardMiss } from "../executor/observed-liveness";
+import {
+  observeReadback as obsReadback,
+  readbackMiss as obsReadbackMiss,
+  RecoverableGuardMiss,
+} from "../executor/observed-liveness";
 import { buildMergedPlan, tagPlanOutputs } from "../executor/plan-builder";
 import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
 import { STEP_TAPE_RECORD, stRecordReadback } from "../core/step-tape";
@@ -1527,8 +1531,34 @@ export class RuntimeEngine {
     return this.trackNode(node, shape, device, dtype);
   }
 
+  /**
+   * [stage-3 A] Readback observation seam: record that a stamped result was
+   * read back (consumption outside plan order — the loss tensor is the
+   * canonical case), and self-heal the pruned-target case (force completed
+   * but the tensor is still pending because its pair was pruned as
+   * observed-dead: grow the needed-set + invalidate so the next step
+   * harvests it, and fail THIS read loudly with the recovery named).
+   * OBSERVE-ONLY on the success path: no forcing, no ordering change.
+   */
+  private _observeReadbackSeam(a: Tensor): void {
+    const ref = a.lazyRef;
+    if (ref.kind === "materialized") {
+      obsReadback(ref.storage);
+      return;
+    }
+    if (ref.kind === "pending") {
+      const stamp = obsReadbackMiss(ref.node.id, ref.outputIndex ?? 0);
+      if (stamp) {
+        throw new Error(
+          `[observed-liveness] readback of a PRUNED result: template=0x${stamp.fp.toString(16)} node=${stamp.ni} oi=${stamp.oi} was pruned as observed-dead and this is its first observed reader. The pair has been added to the producer's needed-set and its plan invalidated — re-read after the next step. (First-reader-after-convergence epistemic boundary; subsequent steps harvest the value.)`,
+        );
+      }
+    }
+  }
+
   async cpu(a: Tensor): Promise<number[]> {
     await this.force(a);
+    this._observeReadbackSeam(a);
     if (STEP_TAPE_RECORD) stRecordReadback("read");
     if (this._readHook) return this._readHook(a.backendTensor);
     const backend = this.getBackend(a.device);
@@ -1556,6 +1586,7 @@ export class RuntimeEngine {
     opts?: { offset?: number; length?: number },
   ): Promise<{ values: Float32Array; indices: Int32Array }> {
     await this.force(a);
+    this._observeReadbackSeam(a);
     // [step-tape 1b] readTopK dispatches backend-direct, OUTSIDE plan replay
     // (§8.4 item 5) — it is its own tape entry, params included (−1 = full).
     if (STEP_TAPE_RECORD) {
@@ -1605,6 +1636,7 @@ export class RuntimeEngine {
    */
   async startItemReadback(a: Tensor): Promise<() => Promise<number>> {
     await this.force(a);
+    this._observeReadbackSeam(a);
     if (STEP_TAPE_RECORD) stRecordReadback("item");
     if (this._readHook) {
       const hook = this._readHook;

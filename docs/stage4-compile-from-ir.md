@@ -1927,3 +1927,66 @@ A+B ≈ 1.8 GB of the 2.9 GB gap; whether that clears the bar depends on (C)'s
 metric ruling. The dirty-miss and view-survival rulings are unaffected. The
 S3.0 mechanism (stamps, last-reader, everSurvived, registration) is exactly
 the substrate A and B need — nothing built is wasted.
+
+### Stage-3 (A) LANDED (2026-07-08): readback seam + mandatory-set pruning;
+### two general recorded-path bugs found and fixed en route
+
+**(A) as approved:** the readback observation seam (`observeReadback` at
+`RuntimeEngine.cpu/readTopK/startItemReadback`, AFTER force — observe-only,
+no forcing/ordering change; "r" source + `everReadback` pins the pair against
+any future step-global release) + mandatory-set pruning (`prunedHarvest`'s
+unconditional set shrinks from terminal+`plan.outputIndices` to the TERMINAL
+only — declared outputs must now earn their harvest slot through observation:
+plan reads, boundary survival, or readbacks). A pruned pair read back
+first-ever-after-convergence self-heals via `readbackMiss` (needed-set grows +
+producer invalidated + THIS read fails loudly naming the recovery) — the same
+epistemic boundary as stage-1 pruning, now covering the readback channel.
+
+**Two general bugs the increment surfaced (both landed, both pre-existing):**
+1. **Recording result-collection claimed results it didn't produce.** A plan
+   sharing nodes with a sibling template (the node-2675 class — here: 12
+   `fusedAttentionForward` nodes shared with the forward template) records
+   their PRE-EXISTING results' buffers as "unrecorded" → the over-conservative
+   `unrecordedNodes` invalidation → the template re-records EVERY execution,
+   forever (~95 ms/step overhead + entry churn). Fix: snapshot result-bearing
+   node ids at recording start (`preExistingResults`); the collection skips
+   them (consumers re-resolve per replay as externals via `planNodes[i].inputs`
+   — the standard prior-plan-result path). Mandatory pruning made this fire
+   every step (a pruned forward pair re-shapes the next step's merged plan into
+   a sibling variant); the bug itself predates stage 3.
+2. **`valid=false` without releasing planner entries.** The recorded build
+   assigns registry entries (`finalizeCompiledPlan` → `planMemory`) BEFORE the
+   `unrecordedNodes` check; invalidating by flag alone leaked every result
+   entry as a dead-owner `resultHolder` forever — measured **~390 MB/step**
+   (15.6 GB by round 2) under the re-record loop. Fix: route through
+   `destroyCompiledPlanBuffers` (the single teardown path). New telemetry:
+   `orphanResultMB`/`deadOwnerResultMB` on `debugPlannerRegistryStats` (now 0),
+   `readbackMisses`/`convergenceInvalidations` on the observed-liveness stats.
+
+**Measured (124M-class checkpointed, V100, unified PHYSICAL meter = tracker
+`cur` + pool-held; both meters reported per the metric ruling):**
+| arm | peak MB | cur MB | phys MB (pool-held) | ms/step |
+|---|---:|---:|---:|---:|
+| (a′) arena-free lowered — the re-derived BAR | 7659 | 2638 | **6242** (3604) | ~660 |
+| (d′) compiled pre-(A) | 9358 | 5587 | — (not measured) | ~275 |
+| (d′+A) compiled with (A) + fixes | 9358 | 5541 | **11289** (5748) | ~293 |
+
+(A)'s pruning works exactly as designed — dead mandatory results eliminated
+(backward 1595.6→1033.5 MB, live result entries 3501→2941 MB incl. a new
++131 MB sibling-variant plan), zero dirty misses, zero readback misses, loss
+baseline-exact, full ladder green — but its NET memory effect is small
+(cur −46 MB): most pruned entries were unmaterialized or already
+temp-shared, and the sibling variant adds back its own plan. **The unified
+meter reframes the problem**: the compiled arm's physical gap to the bar is
+dominated by POOL-HELD warmup residue (5.7 GB idle — lowered warmup + arena
+spills + one-time recordings, never drawn down at steady state; the
+demand-trim was already tried and reverted, §4.3) and registry temps, not by
+harvested results. Post-(A) held classes: survivors 1674 MB (parity),
+**mandatory-consumed boundary-dead 1113 MB ((B)'s target)**, src=b 12 MB.
+
+**Implication for (B):** even a perfect (B) (−1.1 GB) leaves phys ≈ 10.2 GB
+vs the 6.2 GB bar — the pool residue (5.7 GB) and temp materialization
+(≈1.0 GB) dominate. Clearing the physical bar requires the warmup-residue
+class (build-without-execution for ALL plans incl. uncovered ones, or a
+pool-budget policy) more than it requires (B). Reported to the coordinator at
+the (A) checkpoint for the (B) ruling.

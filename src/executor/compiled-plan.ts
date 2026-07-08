@@ -627,13 +627,29 @@ export function debugPlannerRegistryStats(): {
   resultMB: number;
   tempMB: number;
   materializedMB: number;
+  /** result entries with zero owners that were never relisted (leak class),
+   *  and result entries whose owners include an invalid plan. */
+  orphanResultMB: number;
+  deadOwnerResultMB: number;
 } {
   let total = 0;
   let result = 0;
   let materialized = 0;
+  let orphanResult = 0;
+  let deadOwnerResult = 0;
   for (const e of plannerRegistry.entries) {
     total += e.bytes;
-    if (e.resultHolder) result += e.bytes;
+    if (e.resultHolder) {
+      result += e.bytes;
+      if (e.owners.size === 0) orphanResult += e.bytes;
+      else {
+        let anyValid = false;
+        for (const o of e.owners) {
+          if ((o as { valid?: boolean }).valid) anyValid = true;
+        }
+        if (!anyValid) deadOwnerResult += e.bytes;
+      }
+    }
     if (e.buffer) materialized += e.bytes;
   }
   const mb = (b: number) => +(b / 1e6).toFixed(1);
@@ -643,6 +659,8 @@ export function debugPlannerRegistryStats(): {
     resultMB: mb(result),
     tempMB: mb(total - result),
     materializedMB: mb(materialized),
+    orphanResultMB: mb(orphanResult),
+    deadOwnerResultMB: mb(deadOwnerResult),
   };
 }
 
