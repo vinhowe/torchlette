@@ -1024,10 +1024,16 @@ machinery.
 - **`TORCHLETTE_GENERATED_PLAN`** (opt-out, default-on cutover) — dies when B1
   (the recorded-stream replay path) is deleted after stage 1/2: with no recorded
   replay to opt back into, the flag has no meaning.
-- **`TORCHLETTE_BUILD_FROM_IR`** (opt-in, build-without-execution) — dies when
-  build-from-IR becomes the SOLE default build source (stage 2, unblocked by the
-  stage-1 over-harvest fix): the opt-in becomes the only path and the flag goes
-  with the lowered-first-exec build it toggles against.
+- **`TORCHLETTE_BUILD_FROM_IR`** — **stage-2 increment 2 (2026-07-08): FLIPPED
+  to opt-out default-on** (`!== "0"`, house convention). The opt-in form is
+  dead; the surviving `=0` opt-out toggles back to the record-then-cutover
+  build and dies WITH that build source at B1's deletion (increment 3), the
+  same moment as `TORCHLETTE_GENERATED_PLAN`. Recording now engages only for:
+  verify modes (`TORCHLETTE_STREAM_GENERATE=1`; the determinism gate pins
+  `=0`), plans the generator cannot fully cover (per-plan census-driven
+  fallback), and the opt-outs (`BUILD_FROM_IR=0` / `GENERATED_PLAN=0` /
+  `COMPILED_PLAN=0`) — the single predicate is `buildFromIRActive()`
+  (executor.ts).
 - **`TORCHLETTE_ARENA_LIVENESS=0`** (legacy unbudgeted arena opt-out) — sunsets
   at the REMATERIALIZATION UNIFICATION (stage 3): once checkpointed training
   runs on the planner (liveness edges + recompute), the legacy arena's last
@@ -1223,6 +1229,17 @@ silent-wrongness this campaign exists to surface. LESSON (test-shaped): the
 stage-1 ladder never ran the FULL SUITE under `BUILD_FROM_IR=1` — the flip's
 first casualty was discovering that gap; any future opt-in path claiming
 flip-readiness must run the whole suite under the opt-in first.
+
+**RESOLVED (2026-07-08, same day): all three classes fixed** — `fbccedfe`
+(class 1b: the staleness gate was conditioned on a pre-existing compiled plan,
+so under build-from-IR a recurring fused template's stale baked scalar was
+never detected; it now fires unconditionally), `a318c5cc` (class 2: volatile
+re-writes into replay-persistent buffers within one submit window —
+queue.writeBuffer beats the still-encoded prior reader; flush-before-rewrite
+guard), `e884fdeb` (class 3: the replay harvest chained each in-place view to
+the PREVIOUS replay's view — a base chain growing one protected link per step;
+it now flattens to the root owner). Full suite green under `=1` modulo the two
+verify-mode gates the flip itself pins. The flip proceeds below.
 
 ### (ORIGINAL DESIGN, retained for the rationale)
 

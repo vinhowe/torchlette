@@ -5,9 +5,10 @@
  * dumps, per recurring template (fingerprint hex), the SET of harvested result
  * identities ("nodeIndex:outputIndex") its compiled plan actually keeps.
  *
- * Run twice by test/observed-liveness.spec.ts:
- *   - TORCHLETTE_BUILD_FROM_IR=1  → build-from-IR with observed pruning
- *   - (unset)                     → the default recorded cutover
+ * Run twice by test/observed-liveness.spec.ts (stage-2 flip: build-from-IR is
+ * the default):
+ *   - (unset)                     → build-from-IR with observed pruning
+ *   - TORCHLETTE_BUILD_FROM_IR=0  → the recorded-cutover reference
  * The two result maps must agree on every recurring template: the pruned
  * build-from-IR result set == the cutover's live-result survivor set (single
  * source at the seam). Also prints the guard telemetry for diagnostics.
@@ -109,7 +110,7 @@ async function main() {
   const stats = getPayloadThrashStats();
   console.log(
     JSON.stringify({
-      buildFromIR: process.env.TORCHLETTE_BUILD_FROM_IR === "1",
+      buildFromIR: process.env.TORCHLETTE_BUILD_FROM_IR !== "0",
       losses,
       resultSets,
       neededSets,

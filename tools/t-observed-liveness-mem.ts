@@ -56,7 +56,9 @@ function fillFor(name: string, n: number): number[] {
 async function main() {
   process.env.TORCHLETTE_POOL_BUDGET_MB ??= "12000";
   // Mode wiring (no new env flags): "conservative" opts observation OFF while
-  // build-from-IR still builds — the pre-pruning baseline.
+  // build-from-IR still builds — the pre-pruning baseline. Stage-2 flip:
+  // build-from-IR is the default, so "cutover" (the recorded reference) is the
+  // =0 opt-out.
   if (MODE === "conservative") {
     process.env.TORCHLETTE_BUILD_FROM_IR = "1";
     setObservedLivenessEnabled(false);
@@ -64,7 +66,7 @@ async function main() {
     process.env.TORCHLETTE_BUILD_FROM_IR = "1";
     setObservedLivenessEnabled(true);
   } else {
-    delete process.env.TORCHLETTE_BUILD_FROM_IR;
+    process.env.TORCHLETTE_BUILD_FROM_IR = "0";
     setObservedLivenessEnabled(false);
   }
 

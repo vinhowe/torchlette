@@ -462,10 +462,34 @@ export function debugTemplatePlanMemory(): Record<
   return out;
 }
 
+/** Stage-2 FLIP (2026-07-08): build-from-IR is THE default build source —
+ *  plans compile from IR on their FIRST execution, no recording. RECORDING
+ *  survives only for:
+ *   - verify modes: TORCHLETTE_STREAM_GENERATE=1 diffs the generated stream
+ *     against a recording, so it keeps the recorded build (the stream-diff
+ *     gates; the determinism gate pins BUILD_FROM_IR=0 explicitly);
+ *   - uncovered plans (census-driven, per-plan): when generateStream cannot
+ *     fully cover a plan the build-from-IR block falls through with zero
+ *     residue and the plan records on its next execution (recorded cutover);
+ *   - the opt-outs: BUILD_FROM_IR=0 (this flag's sunset form — dies when the
+ *     recorded build source is deleted), GENERATED_PLAN=0 / COMPILED_PLAN=0
+ *     (the legacy recorded-replay / lowered references, which must disable
+ *     build-from-IR too or they'd measure nothing).
+ *  Single predicate so the observation enable below and the build block can
+ *  never disagree. */
+function buildFromIRActive(): boolean {
+  return (
+    ENV.TORCHLETTE_BUILD_FROM_IR !== "0" &&
+    ENV.TORCHLETTE_GENERATED_PLAN !== "0" &&
+    ENV.TORCHLETTE_COMPILED_PLAN !== "0" &&
+    ENV.TORCHLETTE_STREAM_GENERATE !== "1"
+  );
+}
+
 // [observed-liveness] The module observes cross-plan liveness only when
 // build-from-IR is active (the over-harvest it fixes exists only there). Set
 // once at module load; the flag also gates every observation hook to a no-op.
-setObservedLivenessEnabled(ENV.TORCHLETTE_BUILD_FROM_IR === "1");
+setObservedLivenessEnabled(buildFromIRActive());
 // The guard invalidates a producer template's compiled plan when a late
 // consumer misses its pruned output; route it through the cache here (the
 // module can't import this file — circular).
@@ -1733,27 +1757,27 @@ export async function executeLoweredPlan(
   }
 
   // =========================================================================
-  // BUILD-WITHOUT-EXECUTION (stage-4 phase 4.4)
+  // BUILD-WITHOUT-EXECUTION (stage-4 phase 4.4 → stage-2 DEFAULT, 2026-07-08)
   // =========================================================================
   // Build the compiled plan from the lowered IR on the FIRST call — NO lowered
   // execution, NO recording. Populate the layout captures from IR-derived
   // metadata stubs, generate the stream, harvest the result metadata from the
   // IR (the liveness-output set), build the planner-backed plan, and replay it.
-  // Opt-in via TORCHLETTE_BUILD_FROM_IR=1 (default off; A/B'd against the
-  // record-then-cutover path via the parity ladder). Any failure (uncovered
-  // stream, underivable result, invalid plan) resets the captures and falls
-  // through to the lowered path with zero residue — so flag-off behaviour and
-  // the fallback are byte-identical to the unmodified normal path.
+  // THE DEFAULT build source (stage-2 flip; opt-out TORCHLETTE_BUILD_FROM_IR=0
+  // restores the record-then-cutover build everywhere — see buildFromIRActive
+  // for the recording-survivor cases). Any failure (uncovered stream,
+  // underivable result, invalid plan) resets the captures and falls through to
+  // the lowered path with zero residue — so opt-out behaviour and the fallback
+  // are byte-identical to the unmodified normal path, and an uncovered plan
+  // simply records on its next execution (the census-driven fallback).
   if (
     !options.forceLowered &&
     !scalarAdaptPending &&
-    ENV.TORCHLETTE_BUILD_FROM_IR === "1" &&
+    buildFromIRActive() &&
     backend.name === "webgpu" &&
     useTopLevelSharedEncoder &&
     options.bufferArena &&
     !loweredPlan.compiledPlan &&
-    ENV.TORCHLETTE_COMPILED_PLAN !== "0" &&
-    ENV.TORCHLETTE_GENERATED_PLAN !== "0" &&
     (!arenaLivenessEnabled() || compiledPlannedEnabled())
   ) {
     await ensureFusionImports();

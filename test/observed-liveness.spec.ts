@@ -84,8 +84,10 @@ describe("observed cross-plan liveness — set-parity (gate 2)", () => {
     "build-from-IR-pruned agrees with the recorded cutover (trajectory + zero-miss + demonstrable pruning)",
     async () => {
       if (!(await canUseWebGPU())) return;
-      const bfir = await runProbe({ TORCHLETTE_BUILD_FROM_IR: "1" });
-      const cutover = await runProbe({});
+      // Stage-2 flip: build-from-IR is the DEFAULT ({}); the recorded-cutover
+      // reference is the =0 opt-out.
+      const bfir = await runProbe({});
+      const cutover = await runProbe({ TORCHLETTE_BUILD_FROM_IR: "0" });
 
       // (1) Bit-identical trajectory across the pruning-activation threshold —
       //     a dropped-needed result would diverge or crash. This IS the seam
