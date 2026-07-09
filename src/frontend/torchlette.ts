@@ -1913,6 +1913,21 @@ export class Torchlette {
     if (this._pendingStepBoundary === null) return;
     const gen = this._pendingStepBoundary;
     this._pendingStepBoundary = null;
+    await this._commitStepBoundaryGen(gen);
+  }
+
+  /** Commit a GEN-SCOPED step boundary for the closing generation `gen`: force
+   *  its residue, fence, gen-scoped demote (tensors stamped > gen — the next
+   *  iterations' already-built/in-flight work — are UNTOUCHED), snapshot
+   *  persistents. This gen-scoping is the runahead PIN (inc-3 §2b design (b)):
+   *  a boundary committed K steps late sweeps only ITS gen, so steps
+   *  gen+1..gen+K are protected automatically — the sweep-safety the four
+   *  historical loss-overlap failures lacked (they swept by wall-clock step,
+   *  not gen). Shared by the implied-boundary commit and the ring's settle. */
+  private async _commitStepBoundaryGen(
+    gen: number,
+    finalizeRecorderStep = false,
+  ): Promise<void> {
     this.runtime.endStep();
     try {
       await awaitDeferredFence();
@@ -1950,9 +1965,93 @@ export class Torchlette {
     // must NOT be classified persistent or they'd never be cleaned up).
     storageTracker.snapshotForStep(gen);
     await this.runtime.beginStep();
-    // [step-tape 1b] implied boundaries (training loops) are a different
-    // regime than the bare-markStep decode loop — reset the comparator.
-    if (STEP_TAPE_RECORD) stNoteBoundary("implied-boundary");
+    if (STEP_TAPE_RECORD) {
+      if (finalizeRecorderStep) {
+        // [capture inc-3] The ring's settle is the training step DELIMITER
+        // (KEY FINDING: markStep is what finalizes a recorder step). A deferred
+        // gen-scoped commit must therefore finalize + promote exactly as a
+        // per-step markStep would, or the tape never forms under runahead.
+        stEndStep({
+          opSeq: getNextNodeId(),
+          epoch: currentEpoch(),
+          stepScopedCleanup: this._stepScopedCleanup,
+        });
+        if (STEP_TAPE_REPLAY) stPromoteEligibleSkeleton();
+      } else {
+        // [step-tape 1b] implied boundaries (training loops) are a different
+        // regime than the bare-markStep decode loop — reset the comparator.
+        stNoteBoundary("implied-boundary");
+      }
+    }
+  }
+
+  /**
+   * [capture inc-3] Close THIS captured training step and open a deferred fence
+   * for the ring. Two halves (the load-bearing split — ROOT CAUSE of the earlier
+   * hits=0: the recorder finalize CANNOT be deferred, it must run under THIS
+   * step's tape context, which the next call's `_setCaptureTapeContext` has
+   * already overwritten by settle time):
+   *
+   *  - **SYNCHRONOUS now (this step's context):** finalize the recorder step
+   *    (`stEndStep` + promote), gen-scoped demote of THIS step's temporaries,
+   *    snapshot persistents, ISSUE the step fence. Everything the recorder and
+   *    the sweep need to see step i's state is done here, in order, before the
+   *    next call sets a new context.
+   *  - **DEFERRED (the returned settle, run K steps later):** AWAIT this step's
+   *    fence + destroy its swept buffers. This is the only serialization the
+   *    ring hides behind the GPU — the CPU builds+submits the next K steps while
+   *    this fence-await waits.
+   *
+   * Gen-scoping is the runahead PIN: the sync demote uses `releaseStepTemps(gen)`
+   * with `gen` bumped at THIS point, so the next K steps' tensors (stamped > gen)
+   * are untouched; the deferred destroy only reclaims buffers past their fence.
+   */
+  async _deferBoundaryCommit(): Promise<() => Promise<void>> {
+    this._pendingStepBoundary = null;
+    const gen = storageTracker.bumpStepGen();
+    // ── SYNCHRONOUS (this step's context): finalize + snapshot + ISSUE fence.
+    // Two hard constraints force this exact split:
+    //   1. The RECORDER FINALIZE must run under THIS step's tape context (the
+    //      ROOT CAUSE of an earlier hits=0: deferring it ran it under the NEXT
+    //      call's context, desyncing the consecutive-step comparator).
+    //   2. The demotion SWEEP (releaseStepTemps + destroyUnreachable) must run
+    //      AFTER the fence (QUIESCE-BEFORE-DESTROY, CLAUDE.md buffer-pool
+    //      invariant): destroying a buffer while its step's submit is un-fenced
+    //      poisons the pending submit ("used in submit while destroyed"). So the
+    //      sweep must ride the DEFERRED settle (after the fence-await), not here.
+    // The fence is what we defer; gen-scoping makes the deferred sweep pin-safe
+    // (it only reclaims ≤ gen tensors; later steps stamped > gen are untouched).
+    this.runtime.endStep();
+    await this.runtime.forceAllPending();
+    this.runtime.resetCumulativeFusionStats();
+    storageTracker.snapshotForStep(gen);
+    await this.runtime.beginStep();
+    if (STEP_TAPE_RECORD) {
+      stEndStep({
+        opSeq: getNextNodeId(),
+        epoch: currentEpoch(),
+        stepScopedCleanup: this._stepScopedCleanup,
+      });
+      if (STEP_TAPE_REPLAY) stPromoteEligibleSkeleton();
+    }
+    try {
+      issueDeferredFence();
+    } catch {
+      // CPU-only usage.
+    }
+    // ── DEFERRED (settle, run K steps later): await THIS step's fence, THEN the
+    // gen-scoped sweep (quiesce-before-destroy honored). ─────────────────────
+    return async () => {
+      try {
+        await awaitDeferredFence();
+      } catch {
+        // CPU-only usage.
+      }
+      storageTracker.destroyUnreachable();
+      storageTracker.releaseStepTemps(gen);
+      storageTracker.destroyUnreachable();
+      observeStepBoundary();
+    };
   }
 
   async markStep(): Promise<void> {
@@ -2104,6 +2203,11 @@ export class Torchlette {
     (...args: A): Promise<Tensor | Tensor[]>;
     invalidate(): void;
     stats(): ReturnType<CapturedFn["stats_"]>;
+    /** Drain the runahead ring (inc-3): fence every in-flight captured step in
+     *  order and run its deferred boundary sweep. Call at the end of a training
+     *  loop (or on abort) so the last K steps' GPU work + boundaries complete.
+     *  Idempotent; a no-op on the decode (non-training) ring. */
+    drain(): Promise<void>;
   } {
     const cf = new CapturedFn(
       this,
@@ -2114,9 +2218,11 @@ export class Torchlette {
       (...args: A): Promise<Tensor | Tensor[]>;
       invalidate(): void;
       stats(): ReturnType<CapturedFn["stats_"]>;
+      drain(): Promise<void>;
     };
     callable.invalidate = () => cf.invalidate();
     callable.stats = () => cf.stats_();
+    callable.drain = () => cf.drain();
     return callable;
   }
 

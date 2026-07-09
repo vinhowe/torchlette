@@ -63,7 +63,17 @@ export interface CaptureOptions {
    * smuggle closure values (they belong in the args).
    */
   key?: (...args: unknown[]) => string;
-  /** Staging ring depth (output validity window, §4). Default 3. */
+  /**
+   * Staging ring depth K.
+   *  - Decode (default 3): output-validity window — a handle is valid for K
+   *    subsequent captured calls; reading past it is a LOUD error.
+   *  - Training (default 2): the RUNAHEAD depth (inc-3, docs/staged-execution-
+   *    phase2b.md §2). The driver builds+submits up to K steps ahead while the
+   *    ring holds K deferred step-boundary fences; the (K+1)-th call blocks on
+   *    the oldest (backpressure). G0(b): K=2 saturates the GPU-bound floor —
+   *    K>2 buys zero throughput, only K× in-flight memory. No pressure-reactive
+   *    automation; K is this explicit knob.
+   */
   ringDepth?: number;
   /**
    * TRAINING mode (2b): the body is a whole training step (forward + backward +
@@ -77,6 +87,16 @@ export interface CaptureOptions {
    * have. See docs/staged-execution-phase2b.md §1/surface-4.
    */
   training?: boolean;
+  /**
+   * RUNAHEAD (inc-3): the ring OWNS the step boundary. The driver must NOT call
+   * markStep per step and must `await step.drain()` at the end of the loop. The
+   * ring defers each step's boundary fence+sweep K deep (backpressure at the
+   * top of the (K+1)-th call), so CPU builds+submits step N+1 while GPU drains
+   * step N — the G0(b) ~30% training-wall win. Only meaningful with
+   * `training: true`. When OFF (default), the ring is the 2a output-validity
+   * window and the driver owns markStep (the serial 2a/2b path, bit-identical).
+   */
+  runahead?: boolean;
 }
 
 export interface CaptureStats {
@@ -92,10 +112,17 @@ export interface CaptureStats {
 
 let nextCaptureId = 0;
 
-/** A staging-ring slot: the materialized output(s) of one captured call. */
+/** A staging-ring slot: the materialized output(s) of one captured call.
+ *  `settle` (training/runahead only) is the DEFERRED step-boundary fence+sweep
+ *  this step's `markStep` would have run — held in the ring so CPU can build
+ *  step N+1 while GPU drains step N, and awaited on backpressure / drain. Decode
+ *  entries have no settle (2a's pure output-validity window). */
 interface RingEntry {
   step: number;
   outputs: Tensor[];
+  settle?: () => Promise<void>;
+  /** True once `settle` has run (so drain/expiry never double-fence). */
+  settled?: boolean;
 }
 
 export class CapturedFn {
@@ -103,6 +130,7 @@ export class CapturedFn {
   private readonly keyFn?: (...args: unknown[]) => string;
   private readonly ringDepth: number;
   private readonly training: boolean;
+  private readonly runahead: boolean;
 
   /** Per-bucket count of the fn's INTERNAL uploads (tensorFromArray calls made
    *  inside the body), learned on the first trace of each bucket. */
@@ -128,8 +156,13 @@ export class CapturedFn {
     opts?: CaptureOptions,
   ) {
     this.keyFn = opts?.key;
-    this.ringDepth = Math.max(1, opts?.ringDepth ?? 3);
     this.training = opts?.training === true;
+    this.runahead = this.training && opts?.runahead === true;
+    // Ring depth is the RUNAHEAD knob for training (G0b: K=2 saturates the
+    // GPU-bound floor — one step in flight hides all overlappable CPU behind
+    // the GPU fence; K>2 buys zero throughput, only memory). For decode it is
+    // the 2a output-validity window (default 3). `ringDepth` overrides either.
+    this.ringDepth = Math.max(1, opts?.ringDepth ?? (this.training ? 2 : 3));
   }
 
   /** Derived appKey — the arg-boundary contract made concrete: tensor args
@@ -326,6 +359,23 @@ export class CapturedFn {
     args: unknown[],
     ready: boolean,
   ): Promise<Tensor | Tensor[]> {
+    // RUNAHEAD ring (inc-3): engaged only when the driver RELINQUISHES the step
+    // boundary to the ring — i.e. it does NOT call markStep per step and instead
+    // calls `drain()` at the end. `runahead` (opt-in on the callable) turns the
+    // ring's deferred `settle` on. When OFF (the serial 2a/2b driver that owns
+    // markStep itself), the ring is the pure 2a output-validity window — the
+    // ring never runs a settle, so there is no double-boundary. This keeps the
+    // existing serial 2b path bit-identical while the runahead path defers.
+    if (this.runahead) {
+      // BACKPRESSURE AT THE TOP (§2b (b)): before submitting THIS step, if the
+      // ring is full, fence+sweep the OLDEST in-flight step. Mirrors the real
+      // driver's `scaler.resolveDeferred()→markStep()` at the top of a step:
+      // the oldest boundary must complete BEFORE this step's work is submitted,
+      // or the sweep's destroys race this step's in-flight buffers ("used in
+      // submit while destroyed"). Keeps ≤ K steps un-fenced.
+      await this.backpressure();
+    }
+
     // Batch (x, y) are tensor ARGS → warm upload slots. Persistent tensor args
     // (params) ride their stable buffers live. Donated on a hit.
     const { uploads: argUploads, donatable } = this.api._captureArgUploads(args);
@@ -333,13 +383,25 @@ export class CapturedFn {
     if (ready) {
       const out = await this.api._captureReplay(argUploads);
       if (out !== null) {
-        // HIT: the body never ran. Advance the implied step boundary the
-        // un-run opt.step() would have queued (surface 4 — idempotent under a
-        // scaler.markStep, load-bearing without one). Donate the consumed
-        // upload args.
+        // HIT: the body never ran. Advance the implied step boundary the un-run
+        // opt.step() would have queued (surface 4 — superseded by the driver's
+        // markStep in the serial path, or by the ring's settle under runahead).
         this.stats.hits++;
-        this.api.queueStepBoundary();
         for (const t of donatable) t.dispose();
+        if (this.runahead) {
+          // The ring OWNS this step's boundary: a deferred commit the ring runs
+          // K steps later (backpressure/drain) so the driver never awaits a
+          // per-step fence. Commit FIRST (it takes the fresh step snapshot),
+          // THEN PIN the harvested output(s) INTO that new snapshot (§2 "the
+          // ring PINS each in-flight step's output buffers until its fence") —
+          // persisting before the commit would adopt into the snapshot the
+          // commit immediately replaces, so the loss buffer would still be swept
+          // and the driver's K-steps-later readback reads garbage.
+          const settle = await this.api._deferBoundaryCommit();
+          for (const t of out) this.api.persist(t);
+          return this.pushRing(out, settle);
+        }
+        this.api.queueStepBoundary();
         return this.pushRing(out);
       }
       // Guard declined post-readiness (mid-call plan eviction): drop + re-record.
@@ -368,36 +430,107 @@ export class CapturedFn {
     if (result !== null) {
       this.api._declareCaptureOutputs(Array.isArray(result) ? result : [result]);
     }
-    return this.finishTrace(appKey, result, uploads);
+    // Under runahead the body ran for real; open the SAME deferred boundary so a
+    // miss/trace entry pipelines identically to a hit (K is a pure knob). Serial:
+    // no settle — the driver owns markStep (2a/2b baseline, bit-identical).
+    // Commit FIRST (fresh snapshot), THEN pin the output into it (see hit path).
+    const settle = this.runahead
+      ? await this.api._deferBoundaryCommit()
+      : undefined;
+    if (this.runahead && result !== null) {
+      for (const t of Array.isArray(result) ? result : [result]) this.api.persist(t);
+    }
+    return this.finishTrace(appKey, result, uploads, settle);
   }
 
-  /** Record the bucket's upload count and return the real result via the ring. */
+  /** Record the bucket's upload count and return the real result via the ring.
+   *  On the training path a `settle` (the deferred step-boundary markStep) is
+   *  supplied so a miss/trace entry pipelines identically to a hit — the driver
+   *  never awaits a per-step fence. */
   private finishTrace(
     appKey: string,
     result: Tensor | Tensor[] | null,
     uploads: Array<{ shape: number[]; values: Float32Array }>,
+    settle?: () => Promise<void>,
   ): Tensor | Tensor[] {
     this.stats.traces++;
     this.expectedUploads.set(appKey, uploads.length);
     if (result === null) {
       throw new Error("capture: fn produced no result on trace");
     }
-    return this.pushRing(Array.isArray(result) ? result : [result]);
+    return this.pushRing(Array.isArray(result) ? result : [result], settle);
   }
 
-  /** Output staging ring (§4): materialized handles valid for `ringDepth`
-   *  subsequent captured calls; reading past the window is a LOUD error. */
-  private pushRing(outputs: Tensor[]): Tensor | Tensor[] {
-    const step = this.stepCounter++;
-    const cutoff = step - this.ringDepth;
-    while (this.ring.length && this.ring[0].step <= cutoff) {
+  /**
+   * BACKPRESSURE (training/runahead only): before THIS captured call submits,
+   * if the ring already holds ≥ K in-flight steps, fence+sweep the OLDEST
+   * (run its deferred `settle` = gen-scoped boundary commit) and expire+shift
+   * it. Called at the TOP of a captured call (§2b (b)), so the oldest step's
+   * boundary completes BEFORE this step's work is submitted — no sweep-vs-submit
+   * race. Decode entries carry no settle and are never held here (their window
+   * is enforced at push).
+   */
+  private async backpressure(): Promise<void> {
+    while (this.ring.length >= this.ringDepth) {
       const old = this.ring.shift()!;
+      if (old.settle && !old.settled) {
+        old.settled = true;
+        await old.settle();
+      }
       for (const t of old.outputs) {
-        this.api._markCaptureExpired(t, old.step, step, this.ringDepth);
+        this.api._markCaptureExpired(t, old.step, this.stepCounter, this.ringDepth);
       }
     }
-    this.ring.push({ step, outputs });
+  }
+
+  /**
+   * Output staging ring. Two regimes, ONE structure:
+   *
+   * - **Decode (2a):** materialized handles valid for `ringDepth` subsequent
+   *   captured calls; reading past the window is a LOUD error. No `settle` —
+   *   the decode driver owns its markStep; the ring only bounds validity, and
+   *   the expiry is enforced HERE (at push, no backpressure fence).
+   * - **Training runahead (inc-3):** `settle` is the DEFERRED step-boundary
+   *   fence+sweep, held in the entry. The fence gate runs at the TOP of the NEXT
+   *   over-full call (`backpressure()`), not here — so CPU can build+submit up
+   *   to K steps ahead of the GPU (G0b's runahead).
+   */
+  private pushRing(
+    outputs: Tensor[],
+    settle?: () => Promise<void>,
+  ): Tensor | Tensor[] {
+    const step = this.stepCounter++;
+    if (!settle) {
+      // Decode window: expire (no fence) any entry older than the K-window.
+      const cutoff = step - this.ringDepth;
+      while (this.ring.length && this.ring[0].step <= cutoff) {
+        const old = this.ring.shift()!;
+        for (const t of old.outputs) {
+          this.api._markCaptureExpired(t, old.step, step, this.ringDepth);
+        }
+      }
+    }
+    this.ring.push({ step, outputs, settle });
     return outputs.length === 1 ? outputs[0] : outputs;
+  }
+
+  /**
+   * Drain the ring (user stops training / awaits a handle / process teardown,
+   * §2b design (d)): fence every in-flight step IN ORDER (oldest-first), running
+   * each deferred `settle` so its boundary sweep completes past its buffers' last
+   * GPU use, then clear the ring. A captured step is atomic (its whole plan
+   * sequence submitted, or the fallback ran), so no partial-step state exists;
+   * the only in-flight thing is submitted GPU work + unread ring outputs.
+   * Draining = awaiting every un-fenced entry's settle. Idempotent.
+   */
+  async drain(): Promise<void> {
+    while (this.ring.length) {
+      const old = this.ring.shift()!;
+      if (old.settle && !old.settled) {
+        old.settled = true;
+        await old.settle();
+      }
+    }
   }
 }
 
