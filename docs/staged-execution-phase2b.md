@@ -999,9 +999,63 @@ dividend, applied narrowly to the captured path):**
 inc-2b probe PASS (promotions=1, hits=19/24, bodyRuns=5 — body FROZEN on hits =
 run-exactly-once witness; trajectory within noise floor); capture.spec flag-on
 10/10 (+the 2b training test; decode 2a intact); t-train-tape-probe fused 7/0 +
-foreach 4/0; gen-tape 0-diverged/3101 cmds; compiled-vs-lowered 4.77e-6/30;
-test:gates 4/4; STRICT_LIFETIME+STRICT_GPU captured fullstack exit-0 zero throws;
-full suite both flag states.
+foreach 4/0; gen-tape 0-diverged/3101 cmds (+hardened gen-tape-gate gen3 62/64,
+invalidations=0); kv-differential PASS (taped 13/13, all arms identical);
+compiled-vs-lowered 4.77e-6/30; test:gates 4/4; STRICT_LIFETIME+STRICT_GPU
+captured fullstack exit-0 zero throws; full suite BOTH flag states (flag-off:
+cpu 1172/1-relay-flake→4/4 isolated + webgpu 897/0; flag-on STEP_TAPE=1: cpu
+1173/0 + webgpu 906/0); 124M production regression PASS baseline-exact
+(9.8089/5.9224/5.1528/4.6392 vs {9.81,5.92,5.15,4.64}, peak flat 2087.6 MB,
+zero growth).
+
+### INC-2B STOPPED ARM — LR-schedule-through-hits (gate-3's CosineAnnealingLR
+### arm): three root causes found, residual divergence UNRESOLVED; landed
+### SAFE-BY-MISS; WIP preserved on branch `inc2b-schedule-wip`
+
+**Behavior at HEAD (safe):** a training capture under an LR schedule never
+forms a tape — `setLR`'s `full([1], lr)` fillValue hashes into the template
+fingerprint (the deliberate latent-frozen-scalar defense), so every step is a
+structural miss (measured: structureMisses=25/30, hits=0). The capture falls
+back to the correct slow path every call and the PAYLOAD-THRASH warning names
+the fix. CORRECT, UNSERVED — the charter's fallback-citizen class. The charter
+note "inc-1's rules should already handle it" is FALSIFIED: the lr write is
+not covered, it is structurally refused.
+
+**The three causes (each measured, WIP branch has the mechanisms):**
+1. **Template thrash** — `setLR` must deliver lr as `tensorFromArray` values
+   (PAYLOAD_HASH_EXEMPT, re-executed per replay), not `full(fillValue)`. With
+   this alone the tape FORMS and HITS — with a FROZEN lr (0.48 nats
+   divergence over 30 steps, captured descending FASTER = stale-higher lr,
+   the directional-bias signature). DO NOT land this fix alone.
+2. **Recorded lr-write ghost** — the driver-level lr write (forced at the
+   step-opening markStep) is recorded INSIDE the step interval (at its END —
+   it is the PREVIOUS iteration's write). A replay must not re-execute the
+   recorded ghost. WIP: SkeletonPlan.preBody + stMarkBodyBegin (measured: the
+   ghost lands at interval END, post-optimizer-read, so it was NOT the live
+   divergence — mechanism kept for the class).
+3. **Frozen materialized refs to replace-and-hold scalars** — `copy_` =
+   stridedScatterCopy returns a NEW buffer; the lr tensor's storage identity
+   wanders every step while the skeleton's frozen adamStep input ref reads
+   the recording-era buffer forever. ISOLATION: constant-lr (identical writes/
+   structure, value never changes) = 7.9e-4 = the cross-run noise floor;
+   varying lr = 0.48. WIP: owner-backed ref REBIND (storageTracker.ownerOf,
+   owner snapshot at candidate-capture, re-resolve to the owner's current
+   storage per replay). Measured ladder: rebind-nothing 0.48; rebind-all-
+   changed 0.010 (params rebinding perturbs the planner-consistent chain);
+   scalars+destroyed-only 0.010–0.024 with the lr ref no longer re-identified
+   after the first replay (UNRESOLVED — the stop rule). t/m/v/params are NOT
+   affected: they advance via planner-fixed in-plan buffers (proven by the
+   no-scheduler 40-step noise-floor run).
+
+**Next session:** find why the lr ref stops rebinding after the first replay
+(owner lazyRef state on hit iterations), or — likely cleaner — make the
+optimizer-scalar write BUFFER-STABLE by construction (a declared scalar-slot
+write into a fixed buffer, the TAG_WRITE idiom, instead of a replace-and-hold
+copy_ chain): then no rebind machinery is needed at all and the schedule rides
+the same stable-buffer channel as the batch. Charter both against the
+LR-schedule-exactness differentials (the off-by-one submission-order hazard of
+a queue.writeBuffer-based write is real — the write must stay ORDERED after
+the prior step's optimizer reads).
 
 **G0-HONEST PERF (do not oversell — the ring is inc-3):** this increment is the
 ~3-4% build-skip (G0a). The captured hit skips graph build / plan-collect /
