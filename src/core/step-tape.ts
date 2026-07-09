@@ -306,8 +306,15 @@ let structureMisses = 0;
  *  consumed once by the replay layer (1c) to promote a captured skeleton. */
 let lastEligible: {
   bucketKey: string;
+  /** DEDUPED template fps (guard-4 invalidation index). */
   fps: number[];
-  scalarSlots: Array<{ pos: number; inputIndex: number }>;
+  /** ORDERED plan execution fp sequence — the multi-plan skeleton must match
+   *  candidates to this order (2b surface 1). May repeat fps (a template can
+   *  execute more than once per step); NEVER deduped. */
+  orderedFps: number[];
+  /** Scalar slots carry their plan fp (2b surface 1: route each to the right
+   *  plan of a multi-plan step). */
+  scalarSlots: Array<{ fp: number; pos: number; inputIndex: number }>;
 } | null = null;
 let loweredPairs = 0;
 let eligiblePairs = 0;
@@ -740,7 +747,9 @@ export function stEndStep(info: {
   lastEligible = {
     bucketKey,
     fps: [...templateIds],
+    orderedFps: rec.plans.map((pl) => pl.fp),
     scalarSlots: diff.scalarVarying.map((s) => ({
+      fp: s.fp,
       pos: s.pos,
       inputIndex: s.inputIndex,
     })),
@@ -753,7 +762,8 @@ export function stEndStep(info: {
 export function stConsumeLastEligible(): {
   bucketKey: string;
   fps: number[];
-  scalarSlots: Array<{ pos: number; inputIndex: number }>;
+  orderedFps: number[];
+  scalarSlots: Array<{ fp: number; pos: number; inputIndex: number }>;
 } | null {
   const e = lastEligible;
   lastEligible = null;

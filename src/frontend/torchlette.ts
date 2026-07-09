@@ -45,6 +45,8 @@ import {
 } from "../core/step-tape";
 import { observeStepBoundary } from "../executor/observed-liveness";
 import {
+  stDeclareArgNodes,
+  stDeclareOutputNodes,
   stDropSkeleton,
   stPromoteEligibleSkeleton,
   stReplayStats,
@@ -54,6 +56,7 @@ import {
   stTryReplay,
 } from "../executor/step-tape-replay";
 import { getNextNodeId } from "../graph/node-factory";
+import type { LazyIRNode } from "../graph/types";
 import { storageTracker } from "../graph/storage-tracker";
 import {
   type EngineTensor,
@@ -2049,18 +2052,20 @@ export class Torchlette {
    *  payloads keyed by shape (unique per bucket). */
   async tapeReplay(
     uploads: Array<{ shape: number[]; values: Float32Array }>,
-  ): Promise<Tensor | null> {
+  ): Promise<Tensor[] | null> {
     if (!STEP_TAPE_REPLAY) return null;
     const backend = this.runtime.getBackend("webgpu");
     const r = await stTryReplay(uploads, backend);
-    if (!r.hit || !r.resultHandle) return null;
-    const rt = this.runtime.createFromStorageHandle(
-      r.resultHandle,
-      r.shape ?? [],
-      r.device ?? "webgpu",
-      r.dtype ?? "f32",
-    );
-    return this._wrap(rt);
+    if (!r.hit || !r.outputs || r.outputs.length === 0) return null;
+    return r.outputs.map((o) => {
+      const rt = this.runtime.createFromStorageHandle(
+        o.resultHandle,
+        o.shape,
+        o.device,
+        o.dtype,
+      );
+      return this._wrap(rt);
+    });
   }
 
   /** Guard-miss observability (§6): merged recorder + replay counters. */
@@ -2092,7 +2097,7 @@ export class Torchlette {
    * pass-through (just calls fn).
    */
   capture<A extends unknown[]>(
-    fn: (...args: A) => Tensor | Tensor[],
+    fn: (...args: A) => Tensor | Tensor[] | Promise<Tensor | Tensor[]>,
     opts?: CaptureOptions,
   ): {
     (...args: A): Promise<Tensor | Tensor[]>;
@@ -2101,7 +2106,7 @@ export class Torchlette {
   } {
     const cf = new CapturedFn(
       this,
-      fn as (...a: never[]) => Tensor | Tensor[],
+      fn as (...a: never[]) => Tensor | Tensor[] | Promise<Tensor | Tensor[]>,
       opts,
     );
     const callable = ((...args: A) => cf.call(args)) as {
@@ -2144,8 +2149,45 @@ export class Torchlette {
    *  guard miss. */
   async _captureReplay(
     uploads: Array<{ shape: number[]; values: Float32Array }>,
-  ): Promise<Tensor | null> {
+  ): Promise<Tensor[] | null> {
     return this.tapeReplay(uploads);
+  }
+
+  /** [capture 2b surface 3] Declare the lazy NODES the traced body returned, so
+   *  a multi-plan skeleton harvests them on a hit. The producing node is found
+   *  by identity among the captured candidate plans at promotion. A node with
+   *  no pending producer (already materialized / a plain external) is dropped —
+   *  the skeleton then defaults to last-node-of-last-plan harvest. No-op unless
+   *  replay is active. */
+  _declareCaptureOutputs(results: Tensor[]): void {
+    if (!STEP_TAPE_REPLAY) return;
+    const nodes: LazyIRNode[] = [];
+    for (const t of results) {
+      const ref = (t._unwrap() as unknown as { lazyRef?: unknown })
+        .lazyRef as { kind?: string; node?: LazyIRNode } | undefined;
+      if (ref?.kind === "pending" && ref.node) nodes.push(ref.node);
+    }
+    stDeclareOutputNodes(nodes);
+  }
+
+  /** [capture 2b surface 4] Declare the captured-fn tensor ARG nodes (batch
+   *  x/y) so a training skeleton marks only THOSE upload slots warm (re-dressed
+   *  per replay) — internal constant uploads (zeroGrad's `zeros`) keep their
+   *  recorded payload. Args in call order; pending tensorFromArray args only
+   *  (persistent tensor args ride their stable buffers, not upload slots). */
+  _declareCaptureArgNodes(args: unknown[]): void {
+    if (!STEP_TAPE_REPLAY) return;
+    const nodes: LazyIRNode[] = [];
+    for (const a of args) {
+      const t = a as Tensor;
+      if (!t || typeof t !== "object" || !Array.isArray(t.shape)) continue;
+      const ref = (t._unwrap() as unknown as { lazyRef?: unknown }).lazyRef as
+        | { kind?: string; node?: LazyIRNode }
+        | undefined;
+      if (ref?.kind === "pending" && ref.node?.op === "tensorFromArray")
+        nodes.push(ref.node);
+    }
+    stDeclareArgNodes(nodes);
   }
 
   /** Install the capture interceptor for the duration of one captured call.

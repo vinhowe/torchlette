@@ -65,6 +65,18 @@ export interface CaptureOptions {
   key?: (...args: unknown[]) => string;
   /** Staging ring depth (output validity window, §4). Default 3. */
   ringDepth?: number;
+  /**
+   * TRAINING mode (2b): the body is a whole training step (forward + backward +
+   * optimizer) and MAY be async (`await loss.backward()`). Differences from the
+   * decode default: the body is NEVER short-circuited — on a MISS it runs to
+   * completion (advancing optimizer/param state exactly once); on a HIT it is
+   * NOT run at all (the recorded multi-plan sequence replays, advancing state
+   * via its in-place ops). The batch enters as tensor ARGS (warm slots); the
+   * returned loss maps to an output node harvested from the replayed plans.
+   * The hit path queues the implied step boundary the un-run opt.step() would
+   * have. See docs/staged-execution-phase2b.md §1/surface-4.
+   */
+  training?: boolean;
 }
 
 export interface CaptureStats {
@@ -90,6 +102,7 @@ export class CapturedFn {
   private readonly id = nextCaptureId++;
   private readonly keyFn?: (...args: unknown[]) => string;
   private readonly ringDepth: number;
+  private readonly training: boolean;
 
   /** Per-bucket count of the fn's INTERNAL uploads (tensorFromArray calls made
    *  inside the body), learned on the first trace of each bucket. */
@@ -109,11 +122,14 @@ export class CapturedFn {
 
   constructor(
     private readonly api: Torchlette,
-    private readonly fn: (...args: never[]) => Tensor | Tensor[],
+    private readonly fn: (
+      ...args: never[]
+    ) => Tensor | Tensor[] | Promise<Tensor | Tensor[]>,
     opts?: CaptureOptions,
   ) {
     this.keyFn = opts?.key;
     this.ringDepth = Math.max(1, opts?.ringDepth ?? 3);
+    this.training = opts?.training === true;
   }
 
   /** Derived appKey — the arg-boundary contract made concrete: tensor args
@@ -158,15 +174,15 @@ export class CapturedFn {
    *  wrappers. A body that completes anyway (structural drift: fewer internal
    *  uploads than the recorded bucket expects) returns its real result — a
    *  valid re-record. */
-  private runIntercepted(
-    body: () => Tensor | Tensor[],
+  private async runIntercepted(
+    body: () => Tensor | Tensor[] | Promise<Tensor | Tensor[]>,
     expectedUploads: number,
     shortCircuit: boolean,
-  ): {
+  ): Promise<{
     result: Tensor | Tensor[] | null;
     uploads: Array<{ shape: number[]; values: Float32Array }>;
     shortCircuited: boolean;
-  } {
+  }> {
     const uploads: Array<{ shape: number[]; values: Float32Array }> = [];
     // Short-circuit path: track every Tensor the partial body creates so the
     // throw can reclaim exactly them — orphan pending nodes would otherwise be
@@ -188,7 +204,7 @@ export class CapturedFn {
     });
     let result: Tensor | Tensor[] | null = null;
     try {
-      result = body();
+      result = await body();
     } catch (e) {
       if (!(e instanceof CaptureShortCircuit)) throw e;
       restore(); // stop tracking before the disposal churn
@@ -220,11 +236,13 @@ export class CapturedFn {
     const ready =
       !doVerify && known !== undefined && this.api._tapeReadyFor(appKey);
 
+    if (this.training) return this.callTraining(appKey, args, ready);
+
     if (!ready) {
       // Cold-knob accounting: this bucket is cold while the fn has warm ones.
       // (Verify-forced traces are deliberate, not misses.)
       if (this.stats.hits > 0 && !doVerify) this.stats.coldMisses++;
-      const { result, uploads } = this.runIntercepted(
+      const { result, uploads } = await this.runIntercepted(
         () => this.fn(...(args as never[])),
         Number.MAX_SAFE_INTEGER,
         false,
@@ -251,9 +269,9 @@ export class CapturedFn {
       if (out !== null) {
         this.stats.hits++;
         donate();
-        return this.pushRing(Array.isArray(out) ? out : [out]);
+        return this.pushRing(out);
       }
-      const re = this.runIntercepted(
+      const re = await this.runIntercepted(
         () => this.fn(...(args as never[])),
         Number.MAX_SAFE_INTEGER,
         false,
@@ -262,7 +280,7 @@ export class CapturedFn {
     }
 
     // Body runs EXACTLY ONCE: short-circuit at its last internal upload.
-    const { result, uploads, shortCircuited } = this.runIntercepted(
+    const { result, uploads, shortCircuited } = await this.runIntercepted(
       () => this.fn(...(args as never[])),
       known,
       true,
@@ -273,7 +291,7 @@ export class CapturedFn {
       if (out !== null) {
         this.stats.hits++;
         donate();
-        return this.pushRing(Array.isArray(out) ? out : [out]);
+        return this.pushRing(out);
       }
       // Phase-1 guard declined AFTER the short-circuit — only reachable if the
       // compiled plan invalidated between the validity pre-check (_tapeReadyFor
@@ -284,7 +302,7 @@ export class CapturedFn {
       // step re-records — a bounded, plan-invalidation-only transient.
       this.api._invalidateCapture(appKey);
       this.expectedUploads.delete(appKey);
-      const re = this.runIntercepted(
+      const re = await this.runIntercepted(
         () => this.fn(...(args as never[])),
         Number.MAX_SAFE_INTEGER,
         false,
@@ -293,6 +311,59 @@ export class CapturedFn {
     }
 
     // Structural drift (body completed under short-circuit): real re-record.
+    return this.finishTrace(appKey, result, uploads);
+  }
+
+  /**
+   * TRAINING whole-step capture (2b). The body runs a full step (forward +
+   * backward + optimizer) and is either replayed WITHOUT running (hit) or run
+   * to completion (miss/trace) — never short-circuited (surface 4: the body's
+   * optimizer state must advance exactly once, and the replay advances it via
+   * the recorded in-place ops).
+   */
+  private async callTraining(
+    appKey: string,
+    args: unknown[],
+    ready: boolean,
+  ): Promise<Tensor | Tensor[]> {
+    // Batch (x, y) are tensor ARGS → warm upload slots. Persistent tensor args
+    // (params) ride their stable buffers live. Donated on a hit.
+    const { uploads: argUploads, donatable } = this.api._captureArgUploads(args);
+
+    if (ready) {
+      const out = await this.api._captureReplay(argUploads);
+      if (out !== null) {
+        // HIT: the body never ran. Advance the implied step boundary the
+        // un-run opt.step() would have queued (surface 4 — idempotent under a
+        // scaler.markStep, load-bearing without one). Donate the consumed
+        // upload args.
+        this.stats.hits++;
+        this.api.queueStepBoundary();
+        for (const t of donatable) t.dispose();
+        return this.pushRing(out);
+      }
+      // Guard declined post-readiness (mid-call plan eviction): drop + re-record.
+      this.api._invalidateCapture(appKey);
+      this.expectedUploads.delete(appKey);
+    } else if (this.stats.hits > 0) {
+      this.stats.coldMisses++;
+    }
+
+    // Declare the tensor ARG nodes (batch x/y) so the promoted skeleton marks
+    // only those upload slots warm (surface 4). Declared before the body so the
+    // arg nodes are captured; consumed at the promote boundary.
+    this.api._declareCaptureArgNodes(args);
+    // TRACE / MISS: run the whole body for real (state advances exactly once).
+    const { result, uploads } = await this.runIntercepted(
+      () => this.fn(...(args as never[])),
+      Number.MAX_SAFE_INTEGER,
+      false,
+    );
+    // Declare the returned loss node(s) so a promoted skeleton knows which plan
+    // node to harvest on a hit (surface 3).
+    if (result !== null) {
+      this.api._declareCaptureOutputs(Array.isArray(result) ? result : [result]);
+    }
     return this.finishTrace(appKey, result, uploads);
   }
 

@@ -58,6 +58,7 @@ import {
   stMarkReplayStep,
 } from "../core/step-tape";
 import { executeLoweredPlan } from "./executor";
+import { assignNodeResult, executeOpSync } from "./op-dispatch";
 import { noteTemplateReplayed } from "./observed-liveness";
 
 // ---------------------------------------------------------------------------
@@ -69,6 +70,11 @@ interface UploadNode {
   /** Shape signature (e.g. "1,1,1,128") — the driver keys fresh payloads by it. */
   shapeKey: string;
   shape: number[];
+  /** [2b] True iff this upload node is a captured-fn ARG (batch x/y): re-dressed
+   *  per replay from the fresh arg values. False = an internal constant upload
+   *  (e.g. zeroGrad's `zeros`) whose recorded payload is stable — left untouched
+   *  by the replay. Always true on the decode path (no training args). */
+  isArg: boolean;
 }
 
 interface ScalarSlot {
@@ -78,23 +84,33 @@ interface ScalarSlot {
   recorded: number;
 }
 
-interface Skeleton {
-  appKey: string;
+/** One plan of a (possibly multi-plan) skeleton. A decode step has ONE of
+ *  these; a training step has forward/backward/optimizer plans in order. */
+interface SkeletonPlan {
   fp: number;
   planNodes: LazyIRNode[];
   loweredPlan: LoweredPlan;
   bufferArena: BufferArena;
   uploads: UploadNode[];
   scalars: ScalarSlot[];
-  epoch: number;
-  stepScopedCleanup: boolean;
   /** Canonical command stream at capture time (verify determinism/faithfulness). */
   canonical: string[];
-  lastNode: LazyIRNode;
 }
 
-/** Candidate captured on a compiled normal step, keyed by the active appKey;
- *  promoted to a ready skeleton iff the recorder deems that step eligible. */
+interface Skeleton {
+  appKey: string;
+  /** ORDERED plan sequence (2b surface 1). Length 1 for decode. */
+  plans: SkeletonPlan[];
+  epoch: number;
+  stepScopedCleanup: boolean;
+  /** Output-node refs (2b surface 3): (plan index, node pos) of the tensor(s)
+   *  the captured body returned. Decode: [{planIndex:0, pos:last}]. */
+  outputRefs: Array<{ planIndex: number; pos: number }>;
+}
+
+/** One captured compiled plan of the current step, keyed by the active appKey;
+ *  the per-step accumulator promotes the ordered list iff the recorder deems
+ *  the step eligible. */
 interface Candidate {
   appKey: string;
   fp: number;
@@ -107,7 +123,18 @@ interface Candidate {
 }
 
 const readySkeletons = new Map<string, Skeleton>();
-let candidate: Candidate | null = null;
+/** Per-step ORDERED accumulator of compiled plans under the active appKey
+ *  (2b surface 1: a step is N plans, cleared at each promote boundary). */
+let candidates: Candidate[] = [];
+/** Output-node hints for the just-traced step: the body's returned tensor(s)'
+ *  lazy nodes, set by the capture layer before the promote boundary (2b surface
+ *  3). Matched by identity to candidate plans at promotion. */
+let pendingOutputNodes: LazyIRNode[] = [];
+/** [2b surface 4] Arg-node hints: the captured-fn tensor ARGS' lazy nodes (batch
+ *  x/y), in ARG ORDER. Upload slots matching these are re-dressed per replay;
+ *  all other upload slots keep their recorded (constant) payload. Empty on the
+ *  decode path (every upload is then re-dressed, the historical behavior). */
+let pendingArgNodes: LazyIRNode[] = [];
 
 // Active per-step context (set by the driver via the frontend before the step).
 let ctxAppKey: string | null = null;
@@ -167,12 +194,29 @@ export function stTapeReadyFor(appKey: string): boolean {
 export function stTapeReplayValid(appKey: string): boolean {
   const sk = readySkeletons.get(appKey);
   if (!sk) return false;
-  if (!sk.loweredPlan.compiledPlan?.valid) {
-    readySkeletons.delete(appKey);
-    stats.invalidations++;
-    return false;
+  // Multi-plan (2b surface 4 upfront slot-check): EVERY plan's compiled plan
+  // must still be valid before we commit to a hit.
+  for (const pl of sk.plans) {
+    if (!pl.loweredPlan.compiledPlan?.valid) {
+      readySkeletons.delete(appKey);
+      stats.invalidations++;
+      return false;
+    }
   }
   return true;
+}
+
+/** [capture 2b surface 3] The capture layer declares the lazy NODES the traced
+ *  body returned; matched by identity to candidate plans at promotion. Cleared
+ *  each promote boundary with the candidates. */
+export function stDeclareOutputNodes(nodes: LazyIRNode[]): void {
+  pendingOutputNodes = nodes;
+}
+
+/** [2b surface 4] Declare the captured-fn arg nodes (in arg order) so promotion
+ *  can mark which upload slots are per-replay warm (vs constant internal). */
+export function stDeclareArgNodes(nodes: LazyIRNode[]): void {
+  pendingArgNodes = nodes;
 }
 
 /**
@@ -190,24 +234,29 @@ export function stCaptureCompiledStep(
   if (!STEP_TAPE_REPLAY || ctxAppKey === null || !bufferArena) return;
 
   // Verify cross-check (§2.4 guard 6 / G2): compare the ready skeleton's
-  // recorded stream against the freshly built one for the same appKey.
+  // recorded stream against the freshly built one for the SAME plan (matched by
+  // fp among the skeleton's ordered plans — 2b surface 1: a training verify
+  // fires once per plan of the step, each cross-checked against its own
+  // recording). A plan whose fp isn't in the skeleton is a structural drift
+  // (guard would replay the wrong plan set).
   const ready = readySkeletons.get(ctxAppKey);
   if (STEP_TAPE_VERIFY_N > 0 && ready) {
     stats.verifies++;
+    const skPlan = ready.plans[candidates.length];
     let diff: string | null = null;
-    if (ready.fp !== fp) {
-      diff = `appKey=${ctxAppKey}: skeleton fp=0x${(ready.fp >>> 0).toString(16)} but normal build fp=0x${(fp >>> 0).toString(16)} (guard would have replayed the WRONG plan)`;
+    if (!skPlan || skPlan.fp !== fp) {
+      diff = `appKey=${ctxAppKey}: plan[${candidates.length}] skeleton fp=0x${((skPlan?.fp ?? 0) >>> 0).toString(16)} but normal build fp=0x${(fp >>> 0).toString(16)} (guard would have replayed the WRONG plan)`;
     } else {
       const fresh = canonicalizeStream(commands);
-      const n = Math.min(fresh.length, ready.canonical.length);
+      const n = Math.min(fresh.length, skPlan.canonical.length);
       for (let i = 0; i < n; i++) {
-        if (fresh[i] !== ready.canonical[i]) {
-          diff = `appKey=${ctxAppKey} cmd[${i}]: skeleton="${ready.canonical[i]}" vs normal="${fresh[i]}"`;
+        if (fresh[i] !== skPlan.canonical[i]) {
+          diff = `appKey=${ctxAppKey} plan[${candidates.length}] cmd[${i}]: skeleton="${skPlan.canonical[i]}" vs normal="${fresh[i]}"`;
           break;
         }
       }
-      if (!diff && fresh.length !== ready.canonical.length) {
-        diff = `appKey=${ctxAppKey}: stream length skeleton=${ready.canonical.length} vs normal=${fresh.length}`;
+      if (!diff && fresh.length !== skPlan.canonical.length) {
+        diff = `appKey=${ctxAppKey} plan[${candidates.length}]: stream length skeleton=${skPlan.canonical.length} vs normal=${fresh.length}`;
       }
     }
     if (diff) {
@@ -218,7 +267,7 @@ export function stCaptureCompiledStep(
     }
   }
 
-  candidate = {
+  candidates.push({
     appKey: ctxAppKey,
     fp,
     planNodes,
@@ -227,7 +276,7 @@ export function stCaptureCompiledStep(
     commands,
     epoch: ctxEpoch,
     stepScopedCleanup: ctxStepScopedCleanup,
-  };
+  });
   stats.captures++;
 }
 
@@ -250,55 +299,128 @@ export function stPromoteEligibleSkeleton(): void {
   // clearing here does not affect promotion.
   ctxAppKey = null;
   const elig = stConsumeLastEligible();
-  const cand = candidate;
-  candidate = null;
-  if (!elig || !cand) return;
-  if (!elig.fps.includes(cand.fp)) return;
-  if (readySkeletons.has(cand.appKey)) return; // already ready — keep the first
+  const cands = candidates;
+  const outNodes = pendingOutputNodes;
+  const argNodes = pendingArgNodes;
+  candidates = [];
+  pendingOutputNodes = [];
+  pendingArgNodes = [];
+  if (!elig || cands.length === 0) {
+    return;
+  }
+  const appKey = cands[0].appKey;
+  if (readySkeletons.has(appKey)) return; // already ready — keep the first
+
+  // ORDERED plan-sequence match (2b surface 1): the captured candidate fps must
+  // equal the recorder's ORDERED plan fp sequence, in order and length. A
+  // mismatch (executor re-segmented, or a plan ran outside the appKey window)
+  // aborts promotion → the step re-records next pair.
+  if (cands.length !== elig.orderedFps.length) {
+    return;
+  }
+  for (let k = 0; k < cands.length; k++) {
+    if (cands[k].fp !== elig.orderedFps[k]) {
+      return;
+    }
+  }
 
   const tape = stGetTapes().get(elig.bucketKey);
-  if (!tape) return;
-
-  // Upload nodes: the tape's "upload" slots carry ids "w:<fpHex>:<pos>" — pos
-  // indexes the SAME planNodes array the executor captured this step.
-  const uploads: UploadNode[] = [];
-  const fpHex = (cand.fp >>> 0).toString(16);
-  for (const s of tape.slots) {
-    if (s.source !== "upload") continue;
-    const m = /^w:([0-9a-f]+):(\d+)$/.exec(s.id);
-    if (!m || m[1] !== fpHex) continue;
-    const pos = Number(m[2]);
-    const node = cand.planNodes[pos];
-    if (!node || node.op !== "tensorFromArray") return; // shape drift → abort
-    uploads.push({ node, shapeKey: shapeKeyOf(node.shape), shape: node.shape });
-  }
-  // Ambiguous shapes ⇒ the driver can't key payloads unambiguously; refuse.
-  const seenShapes = new Set<string>();
-  for (const u of uploads) {
-    if (seenShapes.has(u.shapeKey)) return;
-    seenShapes.add(u.shapeKey);
+  if (!tape) {
+    return;
   }
 
-  const scalars: ScalarSlot[] = [];
-  for (const s of elig.scalarSlots) {
-    const node = cand.planNodes[s.pos];
-    const ref = node?.inputs[s.inputIndex];
-    if (!node || !ref || ref.kind !== "scalar") return;
-    scalars.push({ node, inputIndex: s.inputIndex, recorded: ref.value });
+  // Build one SkeletonPlan per candidate, routing the tape's upload/scalar
+  // slots to their owning plan by fpHex (the slot id embeds the plan fp).
+  const skPlans: SkeletonPlan[] = [];
+  for (let k = 0; k < cands.length; k++) {
+    const cand = cands[k];
+    const fpHex = (cand.fp >>> 0).toString(16);
+    // Upload nodes for THIS plan (ordered by node position → the driver dresses
+    // them by ARG ORDER, not shape: a training step's batch x/y share a shape,
+    // so shape-keying is ambiguous; ordered re-dressing is unambiguous). Decode
+    // (unique shapes, one plan) is the length-1 special case and still works.
+    const uploads: UploadNode[] = [];
+    const trainingMode = argNodes.length > 0;
+    for (const s of tape.slots) {
+      if (s.source !== "upload") continue;
+      const m = /^w:([0-9a-f]+):(\d+)$/.exec(s.id);
+      if (!m || m[1] !== fpHex) continue;
+      const pos = Number(m[2]);
+      const node = cand.planNodes[pos];
+      if (!node) {
+        return;
+      }
+      // isArg: in decode (no argNodes) every upload is re-dressed. In training
+      // only the declared arg nodes (batch x/y) are warm; ANY other upload
+      // (constant `zeros`/`full`/mask etc.) keeps its recorded payload. An ARG
+      // upload MUST be a tensorFromArray (re-dressed by fresh values).
+      const isArg = trainingMode ? argNodes.includes(node) : true;
+      if (isArg && node.op !== "tensorFromArray") {
+        return;
+      }
+      uploads.push({
+        node,
+        shapeKey: shapeKeyOf(node.shape),
+        shape: node.shape,
+        isArg,
+      });
+    }
+    uploads.sort((a, b) => a.node.id - b.node.id);
+
+    const scalars: ScalarSlot[] = [];
+    for (const s of elig.scalarSlots) {
+      if (s.fp !== cand.fp) continue;
+      const node = cand.planNodes[s.pos];
+      const ref = node?.inputs[s.inputIndex];
+      if (!node || !ref || ref.kind !== "scalar") {
+        return;
+      }
+      scalars.push({ node, inputIndex: s.inputIndex, recorded: ref.value });
+    }
+
+    skPlans.push({
+      fp: cand.fp,
+      planNodes: cand.planNodes,
+      loweredPlan: cand.loweredPlan,
+      bufferArena: cand.bufferArena,
+      uploads,
+      scalars,
+      canonical: canonicalizeStream(cand.commands),
+    });
   }
 
-  readySkeletons.set(cand.appKey, {
-    appKey: cand.appKey,
-    fp: cand.fp,
-    planNodes: cand.planNodes,
-    loweredPlan: cand.loweredPlan,
-    bufferArena: cand.bufferArena,
-    uploads,
-    scalars,
-    epoch: cand.epoch,
-    stepScopedCleanup: cand.stepScopedCleanup,
-    canonical: canonicalizeStream(cand.commands),
-    lastNode: cand.planNodes[cand.planNodes.length - 1],
+  // Output-node refs (2b surface 3): find each declared output node BY IDENTITY
+  // among the candidate plans → (planIndex, pos). Default (decode, no hint):
+  // the LAST node of the LAST plan — the historical lastNode harvest.
+  const outputRefs: Array<{ planIndex: number; pos: number }> = [];
+  if (outNodes.length > 0) {
+    for (const on of outNodes) {
+      let found = false;
+      for (let pi = 0; pi < skPlans.length && !found; pi++) {
+        const pos = skPlans[pi].planNodes.indexOf(on);
+        if (pos >= 0) {
+          outputRefs.push({ planIndex: pi, pos });
+          found = true;
+        }
+      }
+      if (!found) {
+        return; // output node not in any captured plan → abort
+      }
+    }
+  } else {
+    const last = skPlans[skPlans.length - 1];
+    outputRefs.push({
+      planIndex: skPlans.length - 1,
+      pos: last.planNodes.length - 1,
+    });
+  }
+
+  readySkeletons.set(appKey, {
+    appKey,
+    plans: skPlans,
+    epoch: cands[0].epoch,
+    stepScopedCleanup: cands[0].stepScopedCleanup,
+    outputRefs,
   });
   stats.promotions++;
 }
@@ -307,18 +429,26 @@ export function stPromoteEligibleSkeleton(): void {
 // Replay (§2.3)
 // ---------------------------------------------------------------------------
 
+export interface ReplayOutput {
+  resultHandle: StorageHandle;
+  shape: number[];
+  dtype: DType;
+  device: DeviceKind;
+}
+
 export interface ReplayResult {
   hit: boolean;
-  resultHandle?: StorageHandle;
-  shape?: number[];
-  dtype?: DType;
-  device?: DeviceKind;
+  /** Harvested output tensors (2b surface 3), in declared order. Decode: one
+   *  (the logits/last node). */
+  outputs?: ReplayOutput[];
 }
 
 /**
  * Attempt to replay the current step's tape for `ctxAppKey`. `uploads` supplies
- * the fresh per-token payloads keyed by shape (unique per bucket). Returns
- * hit=false on ANY guard miss (the driver then runs the normal path).
+ * the fresh per-step payloads, matched to the skeleton's upload nodes BY ORDER
+ * (decode: unique shapes ⇒ order and shape agree; training: x/y share a shape
+ * ⇒ order disambiguates). Returns hit=false on ANY guard miss (the driver then
+ * runs the normal path). Multi-plan (2b surface 1): all plans replay in order.
  */
 export async function stTryReplay(
   uploads: Array<{ shape: number[]; values: Float32Array }>,
@@ -331,117 +461,146 @@ export async function stTryReplay(
     return { hit: false };
   }
   stats.replays++;
+  const appKey = ctxAppKey;
 
-  // Guard 4: plan validity.
-  if (!sk.loweredPlan.compiledPlan?.valid) {
-    readySkeletons.delete(ctxAppKey);
-    stats.missValidity++;
-    stats.invalidations++;
-    strictThrow(`plan invalidated for appKey=${ctxAppKey}`);
-    return { hit: false };
+  // Guard 4: EVERY plan's compiled plan valid (upfront — 2b surface 4).
+  for (const pl of sk.plans) {
+    if (!pl.loweredPlan.compiledPlan?.valid) {
+      readySkeletons.delete(appKey);
+      stats.missValidity++;
+      stats.invalidations++;
+      strictThrow(`plan invalidated for appKey=${appKey}`);
+      return { hit: false };
+    }
   }
-  // Guard 5: boundary REGIME. The absolute epoch counter advances several
-  // times per step (stepBoundary + pool flush + fence — src/core/epoch.ts), so
-  // it is NOT an equality target; the meaningful invariant is the boundary
-  // regime (stepScopedCleanup). The one discontinuous epoch bump that matters —
-  // a plannerReset / engine-instance boundary — is caught by guard 4 (the
-  // plannerGen check inside executeCompiledPlan invalidates the compiled plan).
+  // Guard 5: boundary REGIME (see decode note — regime not epoch equality).
   if (sk.stepScopedCleanup !== ctxStepScopedCleanup) {
     stats.missEpoch++;
     strictThrow(
-      `regime drift appKey=${ctxAppKey} (stepScopedCleanup ${sk.stepScopedCleanup}->${ctxStepScopedCleanup})`,
+      `regime drift appKey=${appKey} (stepScopedCleanup ${sk.stepScopedCleanup}->${ctxStepScopedCleanup})`,
     );
     return { hit: false };
   }
-  // Guard 3: scalar coverage (value-level, the frozen-α defense).
-  if (ctxScalars.length !== sk.scalars.length) {
+  // Guard 3: scalar coverage (value-level, the frozen-α defense). Flattened
+  // across plans in plan order (matches how the capture layer collects them).
+  const skScalars: ScalarSlot[] = [];
+  for (const pl of sk.plans) for (const s of pl.scalars) skScalars.push(s);
+  if (ctxScalars.length !== skScalars.length) {
     stats.missScalar++;
     return { hit: false };
   }
-  for (let i = 0; i < sk.scalars.length; i++) {
-    if (!Object.is(ctxScalars[i], sk.scalars[i].recorded)) {
+  for (let i = 0; i < skScalars.length; i++) {
+    if (!Object.is(ctxScalars[i], skScalars[i].recorded)) {
       stats.missScalar++;
       strictThrow(
-        `scalar slot ${i} changed ${sk.scalars[i].recorded} -> ${ctxScalars[i]} (frozen-α guard) appKey=${ctxAppKey}`,
+        `scalar slot ${i} changed ${skScalars[i].recorded} -> ${ctxScalars[i]} (frozen-α guard) appKey=${appKey}`,
       );
       return { hit: false };
     }
   }
 
-  // Re-dress: match fresh payloads to skeleton upload nodes by shape.
-  const byShape = new Map<string, Float32Array>();
-  for (const u of uploads) byShape.set(shapeKeyOf(u.shape), u.values);
-  for (const u of sk.uploads) {
-    const values = byShape.get(u.shapeKey);
-    if (!values || values.length !== u.node.shape.reduce((a, b) => a * b, 1)) {
+  // Upfront upload shape check (2b surface 4: no mid-replay throw). Only ARG
+  // uploads are re-dressed (decode: all uploads are args; training: only batch
+  // x/y — `zeros` etc. keep their recorded constant payload). Flatten arg
+  // uploads in a stable global order (plan order, then node id) matching the
+  // caller's arg order.
+  const argUploadNodes: UploadNode[] = [];
+  for (const pl of sk.plans)
+    for (const u of pl.uploads) if (u.isArg) argUploadNodes.push(u);
+  if (uploads.length !== argUploadNodes.length) {
+    stats.missShape++;
+    strictThrow(
+      `upload count ${uploads.length} != skeleton arg uploads ${argUploadNodes.length} appKey=${appKey}`,
+    );
+    return { hit: false };
+  }
+  for (let i = 0; i < argUploadNodes.length; i++) {
+    const need = argUploadNodes[i].node.shape.reduce((a, b) => a * b, 1);
+    if (uploads[i].values.length !== need) {
       stats.missShape++;
-      strictThrow(`upload shape ${u.shapeKey} missing/mismatched appKey=${ctxAppKey}`);
+      strictThrow(
+        `upload ${i} length ${uploads[i].values.length} != ${need} appKey=${appKey}`,
+      );
       return { hit: false };
     }
-    const p = u.node.payload as { values?: Float32Array; dtype?: DType } | undefined;
+  }
+  // Re-dress by ORDER (preserve each node's recorded dtype — token args are int).
+  for (let i = 0; i < argUploadNodes.length; i++) {
+    const node = argUploadNodes[i].node;
+    const p = node.payload as { values?: Float32Array; dtype?: DType } | undefined;
     if (p && "values" in p) {
-      p.values = values;
+      p.values = uploads[i].values;
     } else {
-      u.node.payload = { values, dtype: "f32" };
+      node.payload = { values: uploads[i].values, dtype: "f32" };
     }
   }
 
-  // Reset per-step node state so the replay behaves as a fresh graph: results
-  // (primary + side outputs) and execution flags must be undefined — otherwise
-  // external-slot resolution and the harvest read stale storages from the prior
-  // replay (whose buffers were swept at the last markStep).
-  for (const n of sk.planNodes) {
-    n.results = undefined;
-    n._executed = undefined;
-    n._inputsRetained = undefined;
+  // Reset ALL plans' per-step node state up front (results/exec flags undefined)
+  // so external-slot resolution + harvest read this replay's buffers, not the
+  // prior replay's swept ones.
+  for (const pl of sk.plans) {
+    for (const n of pl.planNodes) {
+      n.results = undefined;
+      n._executed = undefined;
+      n._inputsRetained = undefined;
+    }
   }
 
-  // Pin the template against idle-retire for this step: a replay does not
-  // execute through the normal path, so observed-liveness would see the
-  // actively-replayed template as IDLE and retire it after K_IDLE steady
-  // boundaries — destroying the compiled plan under this skeleton (every warm
-  // capture died at ~3 boundaries once build-from-IR became the default;
-  // found by capture.spec). Deliberately NOT noteTemplateExecuted: replays
-  // stay invisible to the convergence/steady machinery (today's semantics —
-  // marking them executed would let convergence invalidate + rebuild the plan
-  // mid-tape, forcing a spurious re-trace per convergence). Smallest delta
-  // that stops the retire.
-  noteTemplateReplayed(sk.fp);
-
-  await executeLoweredPlan(
-    { nodes: sk.planNodes },
-    sk.planNodes,
-    sk.loweredPlan,
-    backend,
-    { bufferArena: sk.bufferArena },
-  );
-
-  // If executeLoweredPlan fell back to the lowered path (compiled plan dropped
-  // mid-step by a staleness check), the skeleton is stale — drop it so the next
-  // step re-records. The result is still correct (lowered path ran), so this
-  // step is a valid hit.
-  if (!sk.loweredPlan.compiledPlan?.valid) {
-    readySkeletons.delete(ctxAppKey);
-    stats.invalidations++;
+  // Materialize the ARG upload nodes from their fresh payloads BEFORE any plan
+  // runs. They are EXTERNAL plan inputs (leaves the compiled plan reads from
+  // node.result), not TAG_WRITE-covered (decode's f32 uploads ride the stable
+  // buffer; training's i32 token batch does not) — so the replay must produce
+  // their result buffer, exactly as the driver's tensorFromArray would on the
+  // normal path. (isArg=false uploads keep their recorded payload/result — but
+  // those were nulled above; they re-execute inside their plan as internal ops.)
+  for (const u of argUploadNodes) {
+    const node = u.node;
+    const res = executeOpSync(node, [], backend);
+    const bt = res instanceof Promise ? await res : res;
+    assignNodeResult(node, bt, [], []);
   }
 
-  const result = sk.lastNode.result;
-  if (!result) {
-    // Should never happen for a valid decode plan; degrade to normal path.
-    readySkeletons.delete(ctxAppKey);
-    stats.missValidity++;
-    strictThrow(`replay produced no result for appKey=${ctxAppKey}`);
-    return { hit: false };
+  // Replay every plan in order.
+  for (const pl of sk.plans) {
+    // Pin the template against idle-retire (see decode note): a replay bypasses
+    // the normal path, so mark it replayed to reset only the idle clock.
+    noteTemplateReplayed(pl.fp);
+    await executeLoweredPlan(
+      { nodes: pl.planNodes },
+      pl.planNodes,
+      pl.loweredPlan,
+      backend,
+      { bufferArena: pl.bufferArena },
+    );
+    if (!pl.loweredPlan.compiledPlan?.valid) {
+      // A plan fell back to lowered mid-step (staleness). Result is still
+      // correct (lowered ran); drop the skeleton so the next step re-records.
+      readySkeletons.delete(appKey);
+      stats.invalidations++;
+    }
+  }
+
+  // Harvest declared outputs (2b surface 3).
+  const outputs: ReplayOutput[] = [];
+  for (const ref of sk.outputRefs) {
+    const node = sk.plans[ref.planIndex].planNodes[ref.pos];
+    const result = node?.result;
+    if (!result) {
+      readySkeletons.delete(appKey);
+      stats.missValidity++;
+      strictThrow(`replay produced no output for appKey=${appKey}`);
+      return { hit: false };
+    }
+    outputs.push({
+      resultHandle: result,
+      shape: node.shape,
+      dtype: node.dtype,
+      device: node.device,
+    });
   }
   stats.hits++;
   stMarkReplayStep(); // the upcoming readback + markStep are invisible to the recorder
-  return {
-    hit: true,
-    resultHandle: result,
-    shape: sk.lastNode.shape,
-    dtype: sk.lastNode.dtype,
-    device: sk.lastNode.device,
-  };
+  return { hit: true, outputs };
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +627,8 @@ export function stDropSkeleton(appKey: string): void {
 
 export function stReplayReset(): void {
   readySkeletons.clear();
-  candidate = null;
+  candidates = [];
+  pendingOutputNodes = [];
   ctxAppKey = null;
   ctxScalars = [];
   for (const k of Object.keys(stats)) (stats as Record<string, number>)[k] = 0;
