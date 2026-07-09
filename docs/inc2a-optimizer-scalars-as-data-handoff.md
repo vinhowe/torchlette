@@ -13,7 +13,41 @@ spec — read the spec first, then this.
 
 ---
 
-## PROGRESS MAP (updated: mechanism landed on branch, Gates 1–5 GREEN)
+## PROGRESS MAP (updated: mechanism landed, FULL 11-GATE LADDER GREEN)
+
+**FULL LADDER GREEN (device 2, V100, vk-shim). Verbatim results:**
+- Gate 1 build — GREEN (`npm run build` exit 0).
+- Gate 2 formula (`adam-biascorrection-formula.spec.ts`) — 2/2 (cpu).
+- Gate 3 fused==foreach==elementwise (`fused-vs-elementwise.spec.ts`) — 12/12
+  (11 original + the new CosineAnnealingLR gate), re-confirmed post cache-key fix.
+- Gate 4 (NEW test-first) MULTI-GROUP (`adam-multigroup.spec.ts`) — 2/2 (packed
+  ==sequential==2-group ground truth, 24 steps; caught the cache-key bug below).
+- Gate 5 LR-schedule exactness — late-LR (Gate 3) GREEN; CosineAnnealingLR
+  compiled==sequential **0.0 over 32 steps** (anneal verified).
+- Gate 6 GradScaler (`grad-scaler.spec.ts`) — 11/11.
+- Gate 7 t-train-tape-probe — fused eligiblePairs=7/refusals=0, foreach
+  eligiblePairs=4/refusals=0 (the adam batch-cover rule does NOT fire → dead).
+- Gate 8 full suite BOTH flag states — default: webgpu 883/0, cpu 1173/1173
+  (one CPU oracle-autograd TIMEOUT under concurrent load, passes isolated 3.9s —
+  load flake, not a regression); flag-on (STEP_TAPE=record): webgpu 884/0.
+  test:gates 4/4. observed-liveness in-suite GREEN.
+- Gate 9 124M regression — **BASELINE-EXACT**: r0=9.8089(9.81) r3=5.9222(5.92)
+  r6=5.1531(5.15) r9=4.6401(4.64); peak flat 2087.6MB, zero leak. Shared-t
+  semantics did NOT shift the baselines (no re-baseline needed).
+- Gate 10 gen-tape gate (`t-stream-generate.ts`) — FULLY GENERATED, 0 diverged,
+  3101 cmds verified (incl. the 441-action training plan with the optimizer).
+- Gate 11 STRICT_LIFETIME+STRICT_GPU fullstack — 20 steps, exit 0, ZERO throws.
+
+**REMAINING (deferred, NON-blocking — the mechanism + all gates are green):**
+The step-tape batch-cover rule for adam is proven DEAD (Gate 7 refusals=0;
+`stDeclareBatchCover` is adam-only) but the machinery is NOT yet deleted — it is
+a general defensive mechanism and its own gates (flag-on suite) are green with it
+present. GradScaler `_scale`→persistent-tensor RETIREMENT (#5) NOT done: the
+fullstack + grad-scaler gates pass with GradScaler UNCHANGED (its scale/invScale
+are constant within a no-inf window, so no frozen-scalar exposure), so this
+retirement is a separate cleanup, not a correctness requirement for inc-2a.
+
+## (superseded) earlier progress note
 
 **The core capturable-optimizer mechanism for Adam is IMPLEMENTED and committed
 to this branch.** t/lr flow as persistent on-device f32[1] tensor DATA inputs
