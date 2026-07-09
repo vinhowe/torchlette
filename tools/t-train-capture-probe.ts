@@ -22,7 +22,7 @@
 import * as path from "node:path";
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
 import { Torchlette } from "../src/frontend/torchlette";
-import { Adam, GradScaler } from "../src/optim/index.ts";
+import { Adam, CosineAnnealingLR, GradScaler } from "../src/optim/index.ts";
 import { clipGradNorm_ } from "../src/nn/index.ts";
 import { STEP_TAPE_REPLAY } from "../src/core/step-tape";
 import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
@@ -60,6 +60,10 @@ async function run(useCapture: boolean): Promise<RunResult> {
   model.train(true);
   const params = model.parameters();
   const opt = new Adam(params, { lr: 1e-4, weightDecay: 0.01, adamW: true }, api);
+  // The LR schedule runs at DRIVER level (outside the captured body): setLR
+  // writes the per-group persistent lr TENSOR (inc-2a) — per-step-varying DATA
+  // the tape covers. This is the gate that proves the inc-2a+2b stack composes.
+  const sched = new CosineAnnealingLR(opt, STEPS, parseFloat(process.env.ETA_MIN ?? "1e-5"));
   const scaler = new GradScaler(api, { initScale: 1024.0 });
   const V = model.config.vocabSize;
 
@@ -105,7 +109,9 @@ async function run(useCapture: boolean): Promise<RunResult> {
   );
 
   const losses: number[] = [];
+  const stepMs: number[] = [];
   for (let stp = 0; stp < STEPS; stp++) {
+    const t0 = performance.now();
     await scaler.resolveDeferred();
     for (let i = 0; i < BATCH * SEQ; i++) {
       inp[i] = rnd() % V;
@@ -145,7 +151,17 @@ async function run(useCapture: boolean): Promise<RunResult> {
     loss.dispose();
     input.dispose();
     target.dispose();
+    // Scheduler at DRIVER level (never inside the captured body): the lr write
+    // is a persistent-tensor write the tape rides as data.
+    sched.step();
+    stepMs.push(performance.now() - t0);
   }
+  // G0-honest per-step wall: mean of the LATE (steady-state) half.
+  const late = stepMs.slice(Math.floor(stepMs.length / 2));
+  const meanLate = late.reduce((a, b) => a + b, 0) / late.length;
+  log(
+    `${useCapture ? "captured" : "control"} steady wall/step: ${meanLate.toFixed(1)} ms (late ${late.length} steps; all: ${stepMs.map((m) => m.toFixed(0)).join(",")})`,
+  );
 
   const captureStats = stepAsync.stats();
   const replay = api.getStepTapeStats().replay;

@@ -206,9 +206,15 @@ export class Adam {
     const runtime = this.api._runtime();
     for (let gi = 0; gi < this._groups.length; gi++) {
       this._groups[gi].lr = lr;
+      // tensorFromArray, NOT full(): full's fillValue hashes into the template
+      // fingerprint (deliberately — the latent-frozen-scalar defense), so a
+      // per-step scheduler write via full() thrashes the template every step
+      // (structureMiss — no step-tape can ever form under an LR schedule).
+      // tensorFromArray's `values` are PAYLOAD_HASH_EXEMPT and re-executed per
+      // replay: the write is stable STRUCTURE carrying per-step DATA.
       runtime.copy_(
         this._lrTensor(gi),
-        runtime.full([1], lr, this.device, "f32"),
+        runtime.tensorFromArray([lr], [1], this.device, "f32"),
       );
     }
   }
@@ -223,9 +229,10 @@ export class Adam {
   setGroupLR(groupIndex: number, lr: number): void {
     this._groups[groupIndex].lr = lr;
     const runtime = this.api._runtime();
+    // tensorFromArray, not full() — see setLR.
     runtime.copy_(
       this._lrTensor(groupIndex),
-      runtime.full([1], lr, this.device, "f32"),
+      runtime.tensorFromArray([lr], [1], this.device, "f32"),
     );
   }
 

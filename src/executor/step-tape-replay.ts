@@ -57,6 +57,7 @@ import {
   stGetTapes,
   stMarkReplayStep,
 } from "../core/step-tape";
+import { storageTracker } from "../graph/storage-tracker";
 import { executeLoweredPlan } from "./executor";
 import { assignNodeResult, executeOpSync } from "./op-dispatch";
 import {
@@ -98,6 +99,15 @@ interface SkeletonPlan {
   scalars: ScalarSlot[];
   /** Canonical command stream at capture time (verify determinism/faithfulness). */
   canonical: string[];
+  /** [2b] Captured BEFORE the captured call's body began this step — a
+   *  DRIVER-level side write (the scheduler's lr-tensor write, forced at the
+   *  step-opening markStep). The driver re-creates + re-executes these for
+   *  REAL every iteration (fresh pending nodes), so the replay must SKIP the
+   *  recorded ghost — re-executing it would clobber the fresh value with the
+   *  recorded one (the frozen-LR class, caught by the schedule-through-hits
+   *  gate). Structure guard unaffected: the ordered-fp match covers the full
+   *  sequence. */
+  preBody: boolean;
 }
 
 /** [2b] A CROSS-PLAN dataflow link: a later plan's input is a MATERIALIZED ref
@@ -128,6 +138,11 @@ interface Skeleton {
   outputRefs: Array<{ planIndex: number; pos: number }>;
   /** Cross-plan materialized-ref links (2b). Empty for decode (single plan). */
   crossPlanLinks: CrossPlanLink[];
+  /** [2b rebind] Frozen materialized refs whose OWNING persistent tensor is
+   *  known: re-resolved to the owner's CURRENT storage each replay (the
+   *  frozen-LR class — replace-and-hold writes move a persistent tensor to a
+   *  new storage every step, stranding the recording-era ref). */
+  rebinds: Array<{ ref: { kind: string; storage: StorageHandle }; owner: TensorOwner }>;
 }
 
 /** One captured compiled plan of the current step, keyed by the active appKey;
@@ -147,6 +162,19 @@ interface Candidate {
    *  after the recording sweep, so node.result is unreadable there. Used to
    *  resolve later plans' materialized refs to their cross-plan producer. */
   resultIds: Map<number, { node: LazyIRNode; oi: number }>;
+  /** [2b rebind] materialized-ref → owning RuntimeTensor, captured while the
+   *  storage is alive (the owner backref dies with the storage). Replays
+   *  re-resolve each ref to the owner's CURRENT storage — persistent tensors
+   *  updated by replace-and-hold writes (the scheduler's lr copy_ chain) move
+   *  to a NEW storage every step, so the recording-era ref would read the
+   *  stale buffer forever (the frozen-LR class; caught by the
+   *  schedule-through-hits gate). */
+  matOwners: Map<object, TensorOwner>;
+}
+
+/** Minimal owner surface (the runtime Tensor): its live lazyRef. */
+interface TensorOwner {
+  lazyRef: { kind: string; storage?: StorageHandle };
 }
 
 const readySkeletons = new Map<string, Skeleton>();
@@ -162,6 +190,10 @@ let pendingOutputNodes: LazyIRNode[] = [];
  *  all other upload slots keep their recorded (constant) payload. Empty on the
  *  decode path (every upload is then re-dressed, the historical behavior). */
 let pendingArgNodes: LazyIRNode[] = [];
+/** [2b] Candidate count when the captured call's BODY began this step — plans
+ *  captured before it are driver-level pre-body work (see SkeletonPlan.preBody).
+ *  -1 = no body marker this step (decode / raw drivers: nothing is preBody). */
+let bodyBeginIndex = -1;
 
 // Active per-step context (set by the driver via the frontend before the step).
 let ctxAppKey: string | null = null;
@@ -221,9 +253,12 @@ export function stTapeReadyFor(appKey: string): boolean {
 export function stTapeReplayValid(appKey: string): boolean {
   const sk = readySkeletons.get(appKey);
   if (!sk) return false;
-  // Multi-plan (2b surface 4 upfront slot-check): EVERY plan's compiled plan
-  // must still be valid before we commit to a hit.
+  // Multi-plan (2b surface 4 upfront slot-check): EVERY replayed plan's
+  // compiled plan must still be valid before we commit to a hit. preBody plans
+  // are never replayed (driver-level work) — their template validity is the
+  // driver's normal-path concern, not the tape's.
   for (const pl of sk.plans) {
+    if (pl.preBody) continue;
     if (!pl.loweredPlan.compiledPlan?.valid) {
       readySkeletons.delete(appKey);
       stats.invalidations++;
@@ -244,6 +279,12 @@ export function stDeclareOutputNodes(nodes: LazyIRNode[]): void {
  *  can mark which upload slots are per-replay warm (vs constant internal). */
 export function stDeclareArgNodes(nodes: LazyIRNode[]): void {
   pendingArgNodes = nodes;
+}
+
+/** [2b] The captured call's body is about to run (trace path): candidates
+ *  accumulated so far this step are driver-level PRE-BODY plans. */
+export function stMarkBodyBegin(): void {
+  bodyBeginIndex = candidates.length;
 }
 
 /**
@@ -304,6 +345,16 @@ export function stCaptureCompiledStep(
       if (r) resultIds.set(r.id, { node, oi });
     }
   }
+  // Owner snapshot for materialized refs (see Candidate.matOwners): captured
+  // NOW because the storage->tensor backref dies when the storage is swept.
+  const matOwners = new Map<object, TensorOwner>();
+  for (const node of planNodes) {
+    for (const ref of node.inputs) {
+      if (ref.kind !== "materialized" || matOwners.has(ref)) continue;
+      const owner = storageTracker.ownerOf(ref.storage.id);
+      if (owner) matOwners.set(ref, owner as TensorOwner);
+    }
+  }
 
   candidates.push({
     appKey: ctxAppKey,
@@ -315,6 +366,7 @@ export function stCaptureCompiledStep(
     epoch: ctxEpoch,
     stepScopedCleanup: ctxStepScopedCleanup,
     resultIds,
+    matOwners,
   });
   stats.captures++;
 }
@@ -341,9 +393,11 @@ export function stPromoteEligibleSkeleton(): void {
   const cands = candidates;
   const outNodes = pendingOutputNodes;
   const argNodes = pendingArgNodes;
+  const bodyBegin = bodyBeginIndex;
   candidates = [];
   pendingOutputNodes = [];
   pendingArgNodes = [];
+  bodyBeginIndex = -1;
   if (!elig || cands.length === 0) {
     return;
   }
@@ -425,6 +479,7 @@ export function stPromoteEligibleSkeleton(): void {
       uploads,
       scalars,
       canonical: canonicalizeStream(cand.commands),
+      preBody: bodyBegin >= 0 && k < bodyBegin,
     });
   }
 
@@ -487,6 +542,22 @@ export function stPromoteEligibleSkeleton(): void {
     }
   }
 
+  // [2b rebind] Collect owner-backed materialized refs across replayed plans
+  // (dedup by ref object; owners snapshotted at capture while storages lived).
+  const rebinds: Skeleton["rebinds"] = [];
+  const seenRefs = new Set<object>();
+  for (let k = 0; k < cands.length; k++) {
+    if (skPlans[k].preBody) continue;
+    for (const [ref, owner] of cands[k].matOwners) {
+      if (seenRefs.has(ref)) continue;
+      seenRefs.add(ref);
+      rebinds.push({
+        ref: ref as { kind: string; storage: StorageHandle },
+        owner,
+      });
+    }
+  }
+
   readySkeletons.set(appKey, {
     appKey,
     plans: skPlans,
@@ -494,6 +565,7 @@ export function stPromoteEligibleSkeleton(): void {
     stepScopedCleanup: cands[0].stepScopedCleanup,
     outputRefs,
     crossPlanLinks,
+    rebinds,
   });
   stats.promotions++;
 }
@@ -536,8 +608,10 @@ export async function stTryReplay(
   stats.replays++;
   const appKey = ctxAppKey;
 
-  // Guard 4: EVERY plan's compiled plan valid (upfront — 2b surface 4).
+  // Guard 4: EVERY replayed plan's compiled plan valid (upfront — 2b surface
+  // 4). preBody plans are never replayed → not gated.
   for (const pl of sk.plans) {
+    if (pl.preBody) continue;
     if (!pl.loweredPlan.compiledPlan?.valid) {
       readySkeletons.delete(appKey);
       stats.missValidity++;
@@ -557,7 +631,10 @@ export async function stTryReplay(
   // Guard 3: scalar coverage (value-level, the frozen-α defense). Flattened
   // across plans in plan order (matches how the capture layer collects them).
   const skScalars: ScalarSlot[] = [];
-  for (const pl of sk.plans) for (const s of pl.scalars) skScalars.push(s);
+  for (const pl of sk.plans) {
+    if (pl.preBody) continue;
+    for (const s of pl.scalars) skScalars.push(s);
+  }
   if (ctxScalars.length !== skScalars.length) {
     stats.missScalar++;
     return { hit: false };
@@ -578,8 +655,10 @@ export async function stTryReplay(
   // uploads in a stable global order (plan order, then node id) matching the
   // caller's arg order.
   const argUploadNodes: UploadNode[] = [];
-  for (const pl of sk.plans)
+  for (const pl of sk.plans) {
+    if (pl.preBody) continue; // driver work — never replayed, never dressed
     for (const u of pl.uploads) if (u.isArg) argUploadNodes.push(u);
+  }
   if (uploads.length !== argUploadNodes.length) {
     stats.missShape++;
     strictThrow(
@@ -608,10 +687,59 @@ export async function stTryReplay(
     }
   }
 
-  // Reset ALL plans' per-step node state up front (results/exec flags undefined)
-  // so external-slot resolution + harvest read this replay's buffers, not the
-  // prior replay's swept ones.
+  // [2b rebind] Re-resolve owner-backed materialized refs to the owner's
+  // CURRENT storage. A persistent tensor updated by replace-and-hold writes
+  // (the scheduler's lr copy_ chain) moves to a NEW storage every step; the
+  // skeleton's recording-era ref would read the stale buffer forever (the
+  // frozen-LR class — captured trained with the RECORDING's lr, caught by the
+  // schedule-through-hits gate). No-op when the storage is unchanged (params,
+  // m/v: in-place planner-fixed buffers).
+  for (const rb of sk.rebinds) {
+    const cur = rb.owner.lazyRef as {
+      kind: string;
+      storage?: StorageHandle;
+      node?: LazyIRNode;
+      outputIndex?: number;
+    };
+    // The owner's CURRENT storage: a materialized ref carries it directly; a
+    // pending ref that was already FORCED (markStep runs before every replay)
+    // carries it as the node's result. An unforced pending ref has no current
+    // value yet - keep the recorded binding (loud guards catch a stale read).
+    let curStorage: StorageHandle | undefined;
+    if (cur?.kind === "materialized") {
+      curStorage = cur.storage;
+    } else if (cur?.kind === "pending" && cur.node) {
+      const oi = cur.outputIndex ?? 0;
+      curStorage = cur.node.results?.[oi] ?? (oi === 0 ? cur.node.result : undefined);
+    }
+    // Rebind scope (measured, both directions): (a) SCALAR-STATE refs - the
+    // inc-2a optimizer scalars ([1]-shaped f32: lr per group; scale) are
+    // updated by DRIVER-level replace-and-hold copy_ chains, so their current
+    // storage wanders while the frozen ref reads the recording-era buffer
+    // (frozen-LR: 0.48 nats divergence under CosineAnnealingLR); (b) refs
+    // whose recorded storage is DESTROYED (dangling). Larger LIVE refs
+    // (params/m/v) are NOT rebound: they flow through the planner-consistent
+    // binding chain the compiled replays already maintain, and re-pointing
+    // them to wrapper-tracked results measurably perturbs the trajectory
+    // (0.010 vs noise-floor 1e-3 over 16 steps).
+    if (curStorage && curStorage !== rb.ref.storage) {
+      const numel = rb.ref.storage.backendTensor.shape.reduce(
+        (a: number, b: number) => a * b,
+        1,
+      );
+      if (numel <= 1 || storageTracker.isDestroyed(rb.ref.storage.id)) {
+        rb.ref.storage = curStorage;
+      }
+    }
+  }
+
+  // Reset ALL replayed plans' per-step node state up front (results/exec flags
+  // undefined) so external-slot resolution + harvest read this replay's
+  // buffers, not the prior replay's swept ones. preBody plans are NOT replayed
+  // (their driver-level equivalents run for real each iteration) — leave their
+  // recorded nodes untouched.
   for (const pl of sk.plans) {
+    if (pl.preBody) continue;
     for (const n of pl.planNodes) {
       n.results = undefined;
       n._executed = undefined;
@@ -643,6 +771,11 @@ export async function stTryReplay(
   try {
     for (let pi = 0; pi < sk.plans.length; pi++) {
       const pl = sk.plans[pi];
+      // preBody plans (driver-level side writes, e.g. the scheduler's lr
+      // write) are NOT replayed — the driver's fresh pending nodes execute
+      // them for real at each step's markStep; replaying the recorded ghost
+      // would clobber the fresh value with the recorded one (frozen-LR).
+      if (pl.preBody) continue;
       // Pin the template against idle-retire (see decode note): a replay
       // bypasses the normal path, so mark it replayed to reset only the idle
       // clock.
