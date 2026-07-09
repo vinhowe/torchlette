@@ -100,7 +100,7 @@ function buildAttentionSeams(
   const maskMods = mod.maskMods ?? [];
   if (maskMods.length > 0) {
     seams.attn_mask = (
-      _ctx: KernelContext,
+      ctx: KernelContext,
       active: BlockExpr,
       args: Record<string, BlockExpr>,
     ) => {
@@ -108,10 +108,14 @@ function buildAttentionSeams(
       for (const m of maskMods) {
         if (m.kind === "causal") {
           a = a.and(args.kvIdx.le(args.qIdx));
+        } else if (m.kind === "slidingWindow") {
+          // active iff kv > q − window, computed u32-underflow-safe as
+          // kv + window > q. The window value is uniform DATA (mod_window)
+          // — same template serves any window size.
+          a = a.and(args.kvIdx.add(ctx.uniform("mod_window")).gt(args.qIdx));
         } else {
-          // slidingWindow lands in the soft-cap/window increment (#64 iii).
           throw new Error(
-            `attention maskMod '${m.kind}' not implemented in kernel emission`,
+            `attention maskMod '${(m as { kind: string }).kind}' not implemented in kernel emission`,
           );
         }
       }
@@ -119,20 +123,55 @@ function buildAttentionSeams(
     };
   }
   if (mod.scoreMod) {
-    // softcap emission lands in the soft-cap/window increment (#64 iii).
-    throw new Error(
-      `attention scoreMod '${mod.scoreMod.kind}' not implemented in kernel emission`,
-    );
+    if (mod.scoreMod.kind !== "softcap") {
+      throw new Error(
+        `attention scoreMod '${(mod.scoreMod as { kind: string }).kind}' not implemented in kernel emission`,
+      );
+    }
+    // Logit soft-cap: s' = cap · tanh(s / cap) (Gemma-2). Emitted in f32 —
+    // modifier arithmetic stays f32 under f16 QKV (mandatory f16 gate).
+    // Backward's paired "attn_dscore" (1 − (s'/cap)²) is inference-first —
+    // backward entries throw via assertBackwardSupportsModifier.
+    seams.attn_score = (ctx: KernelContext, sVal: BlockExpr) => {
+      const cap = ctx.uniform("mod_softcap").bitcastTo("f32");
+      return sVal.div(cap).tanh().mul(cap);
+    };
   }
   return seams;
 }
 
+const _f32BitsBuf = new Float32Array(1);
+const _f32BitsU32 = new Uint32Array(_f32BitsBuf.buffer);
+function f32Bits(x: number): number {
+  _f32BitsBuf[0] = x;
+  return _f32BitsU32[0];
+}
+
 /** Uniform-content words contributed by modifier params (packed into the
- *  config buffer's pad words 5..7). None yet — softcap.cap / window arrive
- *  with their emission (#64 iii). Kept single-source with the key. */
+ *  config buffer's words 5..7, after B,H,N,D,scale). ORDER IS THE CONTRACT
+ *  with modifierUniformFields: scoreMod param first, then mask-mod params in
+ *  maskMods order — declaration order == pack order. */
 function modifierParamWords(mod?: AttnModifierSpec): number[] {
   if (!mod) return [];
-  return [];
+  const words: number[] = [];
+  if (mod.scoreMod) words.push(f32Bits(mod.scoreMod.cap));
+  for (const m of mod.maskMods ?? []) {
+    if (m.kind === "slidingWindow") words.push(m.window >>> 0);
+  }
+  return words;
+}
+
+/** Uniform struct fields for modifier params — paired with
+ *  modifierParamWords (same order; see its doc). Spread after scale_u32 in
+ *  each seam-site spec's uniforms. */
+function modifierUniformFields(mod?: AttnModifierSpec): Record<string, "u32"> {
+  if (!mod) return {};
+  const fields: Record<string, "u32"> = {};
+  if (mod.scoreMod) fields.mod_softcap = "u32";
+  for (const m of mod.maskMods ?? []) {
+    if (m.kind === "slidingWindow") fields.mod_window = "u32";
+  }
+  return fields;
 }
 
 /** True when the modifier adds nothing — canonicalized to undefined so `{}`
@@ -159,15 +198,22 @@ function normalizeAttnModifier(
     return isCausal ? { mod: { maskMods: [{ kind: "causal" }] } } : {};
   }
   const m = mod as AttnModifierSpec;
-  if (isCausal && !hasCausalMask(m)) {
-    return {
-      mod: {
-        ...m,
-        maskMods: [{ kind: "causal" }, ...(m.maskMods ?? [])],
-      },
-    };
+  const maskMods =
+    isCausal && !hasCausalMask(m)
+      ? [{ kind: "causal" } as const, ...(m.maskMods ?? [])]
+      : (m.maskMods ?? []);
+  // Canonical order (sort by kind): semantically identical compositions
+  // share one template regardless of declaration order. Duplicate kinds
+  // would collide on uniform field names — reject loudly.
+  const sorted = [...maskMods].sort((a, b) => a.kind.localeCompare(b.kind));
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].kind === sorted[i - 1].kind) {
+      throw new Error(
+        `attention modifier has duplicate maskMod kind '${sorted[i].kind}'`,
+      );
+    }
   }
-  return { mod: m };
+  return { mod: { ...m, maskMods: sorted } };
 }
 
 /** Append the modifier fragment to a cache key (WGSL or pipeline). */
@@ -310,6 +356,7 @@ function makeForwardAttentionSpec(
       seq_len: "u32",
       head_dim: "u32",
       scale_u32: "u32",
+      ...modifierUniformFields(mod),
     },
     grid: tiledGrid({
       x: { uniform: "seq_len", tileSize: BR },
@@ -484,6 +531,7 @@ function makeBackwardDQSpec(
       seq_len: "u32",
       head_dim: "u32",
       scale_u32: "u32",
+      ...modifierUniformFields(mod),
     },
     grid: tiledGrid({
       x: { uniform: "seq_len", tileSize: BR },
@@ -623,6 +671,7 @@ function makeBackwardDKVSpec(
       seq_len: "u32",
       head_dim: "u32",
       scale_u32: "u32",
+      ...modifierUniformFields(mod),
     },
     grid: tiledGrid({
       x: { uniform: "seq_len", tileSize: BC_BW },

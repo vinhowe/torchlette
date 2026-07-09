@@ -332,23 +332,26 @@ export function scaledDotProductAttentionImpl(
     ...(modifier ? { modifier } : {}),
   };
 
+  // Inference-first (#64): scoreMod backward is not implemented on EITHER
+  // path — the fused kernels lack the paired "attn_dscore" chain factor and
+  // the CPU decomposed backward assumes plain softmax attention (it would be
+  // SILENTLY wrong, the worst failure mode). Fail BEFORE creating any lazy
+  // node (a post-hoc throw leaves a poisoned node that still executes at the
+  // next force/markStep), and at FORWARD time, when the user can still
+  // restructure, not deep in backward().
+  if (
+    modifier?.scoreMod &&
+    torch.isGradEnabled() &&
+    (q.requiresGrad || k.requiresGrad || v.requiresGrad)
+  ) {
+    throw new Error(
+      `scaledDotProductAttention: backward with scoreMod ` +
+        `'${modifier.scoreMod.kind}' is not implemented (inference-first); ` +
+        `wrap in noGrad() or drop the scoreMod`,
+    );
+  }
+
   if (q.device === "webgpu") {
-    // Inference-first (#64): scoreMod backward (the paired "attn_dscore"
-    // derivative) is designed but not implemented — fail BEFORE creating the
-    // lazy node (a post-hoc throw would leave a poisoned node that still
-    // executes at the next force/markStep), and at FORWARD time, when the
-    // user can still restructure, not deep in backward().
-    if (
-      modifier?.scoreMod &&
-      torch.isGradEnabled() &&
-      (q.requiresGrad || k.requiresGrad || v.requiresGrad)
-    ) {
-      throw new Error(
-        `scaledDotProductAttention: backward with scoreMod ` +
-          `'${modifier.scoreMod.kind}' is not implemented (inference-first); ` +
-          `wrap in noGrad() or drop the scoreMod`,
-      );
-    }
     // Fused FlashAttention path
     const fwdResult = torch.runtime.fusedAttentionForward(
       q._unwrap(),
@@ -422,36 +425,49 @@ export function scaledDotProductAttentionImpl(
   }
 
   // CPU fallback: decomposed matmul + softmax + matmul.
-  // Modifiers are interpreted here as tensor ops (the cross-path reference).
-  // Kinds land in lockstep with their GPU kernel emission: causal now;
-  // softcap / slidingWindow with #64 iii — until then both paths throw.
+  // Modifiers are interpreted here as tensor ops — the cross-path reference
+  // the fused kernels are diffed against. Order matches the kernel seams:
+  // scale → scoreMod → masks (additive −1e9; softcapped scores are bounded
+  // by ±cap, so −1e9 dominates).
   const cpuMaskMods = modifier?.maskMods ?? [];
-  if (modifier?.scoreMod) {
-    throw new Error(
-      `scaledDotProductAttention (cpu): scoreMod '${modifier.scoreMod.kind}' not implemented`,
-    );
-  }
-  for (const m of cpuMaskMods) {
-    if (m.kind !== "causal") {
-      throw new Error(
-        `scaledDotProductAttention (cpu): maskMod '${m.kind}' not implemented`,
-      );
-    }
-  }
   const cpuCausal = isCausal || cpuMaskMods.some((m) => m.kind === "causal");
   const kT = torch.runtime.transpose(k._unwrap(), { dim0: 2, dim1: 3 });
   const scores = torch.runtime.matmul(q._unwrap(), kT);
   const scaleTensor = torch.runtime.full([], actualScale, q.device);
   const scaledScores = torch.runtime.mul(scores, scaleTensor);
 
-  let finalScores: RuntimeTensor;
+  let finalScores: RuntimeTensor = scaledScores;
+  if (modifier?.scoreMod) {
+    if (modifier.scoreMod.kind !== "softcap") {
+      throw new Error(
+        `scaledDotProductAttention (cpu): scoreMod '${(modifier.scoreMod as { kind: string }).kind}' not implemented`,
+      );
+    }
+    // softcap: cap · tanh(s / cap)
+    const capT = torch.runtime.full([], modifier.scoreMod.cap, q.device);
+    finalScores = torch.runtime.mul(
+      torch.runtime.tanh(torch.runtime.div(finalScores, capT)),
+      capT,
+    );
+  }
   if (cpuCausal) {
-    // Create causal mask: -1e9 where j > i, 0 elsewhere
+    // Causal mask: -1e9 where j > i, 0 elsewhere
     const negInf = torch.runtime.full([1, 1, seq, seq], -1e9, q.device);
     const mask = torch.runtime.triu(negInf, 1);
-    finalScores = torch.runtime.add(scaledScores, mask);
-  } else {
-    finalScores = scaledScores;
+    finalScores = torch.runtime.add(finalScores, mask);
+  }
+  for (const m of cpuMaskMods) {
+    if (m.kind === "causal") continue;
+    if (m.kind === "slidingWindow") {
+      // Window recency bound: -1e9 where j <= i - window (tril at -window)
+      const negInf = torch.runtime.full([1, 1, seq, seq], -1e9, q.device);
+      const mask = torch.runtime.tril(negInf, -m.window);
+      finalScores = torch.runtime.add(finalScores, mask);
+    } else {
+      throw new Error(
+        `scaledDotProductAttention (cpu): maskMod '${(m as { kind: string }).kind}' not implemented`,
+      );
+    }
   }
 
   // Softmax along last dim (using the public softmax which handles autograd)
