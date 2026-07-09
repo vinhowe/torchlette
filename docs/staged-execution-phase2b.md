@@ -1008,9 +1008,52 @@ cpu 1172/1-relay-flake→4/4 isolated + webgpu 897/0; flag-on STEP_TAPE=1: cpu
 (9.8089/5.9224/5.1528/4.6392 vs {9.81,5.92,5.15,4.64}, peak flat 2087.6 MB,
 zero growth).
 
-### INC-2B STOPPED ARM — LR-schedule-through-hits (gate-3's CosineAnnealingLR
-### arm): three root causes found, residual divergence UNRESOLVED; landed
-### SAFE-BY-MISS; WIP preserved on branch `inc2b-schedule-wip`
+### INC-2B SCHEDULE ARM — RESOLVED 2026-07-09 (merge 64b84efc). LR schedules
+### flow through replay hits exactly; FIVE root causes found and fixed; one
+### PRE-EXISTING plain-path bug exposed, minimally reproduced, quarantined
+
+**Final state:** CosineAnnealingLR stepped at driver level flows through
+hits. Battery (V100): fused 3× {6.7e-4, 1.3e-3, 1.0e-3}, foreach 3× {7.2e-4,
+5.9e-4, 5.0e-4}, STRICT 6.4e-4/0 throws — all at the cross-run fp noise
+floor. In-suite gate: `test/capture.spec.ts` "[2b-sched]". Suites green both
+flag states (cpu 1173 + webgpu 907/897), gates 4/4, stream-generate
+0-diverged/3101, 124M baseline-exact 4.6403/2087.6MB flat, compiled-vs-
+lowered 6.7e-6/30.
+
+**The five causes (each measured; details in commit 64b84efc):**
+1. setLR `full(lr)` template-thrash (no tape CAN form; plain loops OOM 34GB)
+   → deliver via `tensorFromArray` (payload-exempt).
+2. Frozen materialized refs to replace-and-hold scalars (0.48 nats) →
+   owner-backed SCALAR-ONLY rebind (owners snapshotted at candidate capture;
+   larger refs NEVER rebound — the isDestroyed-shotgun variant sporadically
+   aliased planner temps: 6e-3..1.06 nats, ~1-in-3).
+3. In-plan lr-write ghost chains replay the recorded upload payload →
+   `scalarDresses`: per-replay re-dress of the recorded write node (owner
+   resolved at PROMOTION — at capture the wrapper hasn't materialized into
+   the chain output yet).
+4. Interval-END ghosts are consumed one step stale (~0.03) → pre-replay
+   `queue.writeBuffer` of the current value into the recorded binding.
+   NEVER force the pending chain mid-attempt (12.7-nat corruption).
+5. Mixed markStep regimes staled chain-derived values (sporadic 3e-3..0.07)
+   → `src/core/scalar-slots.ts`: authoritative host-value registry — setLR
+   NOTES the value, the replay dresses from it. Single source at the seam.
+
+**PRE-EXISTING plain-path bug exposed (own follow-on campaign):** a plain
+flag-OFF loop with a per-step scheduler grows GPU memory toward the ceiling;
+a second in-process run sporadically (~1-in-3) lands a BIMODAL wrong
+trajectory (finals 10.581 vs 11.291/10.630 — same wrong values each time = a
+deterministic wrong branch under memory pressure). Repro:
+`tools/t-sched-plain-repro.ts`; reproduces on main + the delivery fix alone
+(masked on unpatched main only because the thrash OOMs first). The capture
+probe now runs its arms in CHILD processes — captured-arm finals were
+identical 16/16 across runs; only the plain arm is fragile.
+
+Known tool rot (pre-existing, unrelated): standalone
+`tools/t-stream-determinism.ts` fails "STREAM COUNT differs: 3 vs 2" on main
+in BOTH flag states; the load-bearing determinism gate is in-suite
+(test:gates) and green.
+
+### (superseded 2026-07-09) original stop-report for this arm
 
 **Behavior at HEAD (safe):** a training capture under an LR schedule never
 forms a tape — `setLR`'s `full([1], lr)` fillValue hashes into the template
