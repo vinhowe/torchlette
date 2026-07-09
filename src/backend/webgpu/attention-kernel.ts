@@ -61,8 +61,13 @@ const BC_BW = 64; // KV rows per workgroup (backward dKV)
 // WGSL/pipeline/config cache key via attnModifierKey(), the single source.
 // Numeric params (cap, window) are uniform DATA, not key material — except
 // in the config-buffer key, which keys uniform CONTENT (like scale already
-// does). Null modifier ⇒ key fragment "" ⇒ byte-identical keys AND WGSL to
-// the pre-seam kernel (applySeam is identity when no seam is injected).
+// does).
+//
+// CAUSALITY IS A MODIFIER (commit B): the legacy is_causal uniform and its
+// triplicated inline predicate were deleted; normalizeAttnModifier folds the
+// public isCausal flag into a causal maskMod at every entry. Bit-parity of
+// the two paths was gated BEFORE the deletion
+// (test/webgpu/attention-modifier-parity.spec.ts, fwd + dQ/dK/dV exact).
 //
 // Backward for scoreMod is INFERENCE-FIRST: paired-derivative design lives
 // in docs/attention-modifier-seams-design.md §2; until implemented,
@@ -85,8 +90,8 @@ function hasCausalMask(mod?: AttnModifierSpec): boolean {
   return (mod?.maskMods ?? []).some((m) => m.kind === "causal");
 }
 
-/** Build the seam functions for a modifier (undefined for null modifier —
- *  keeps the spec object, and thus the emitted WGSL, identical to legacy). */
+/** Build the seam functions for a modifier (undefined for the null modifier
+ *  — applySeam is identity, the kernel is the bare bounds-checked softmax). */
 function buildAttentionSeams(
   mod: AttnModifierSpec | undefined,
 ): Record<string, SeamFn> | undefined {
@@ -123,7 +128,7 @@ function buildAttentionSeams(
 }
 
 /** Uniform-content words contributed by modifier params (packed into the
- *  config buffer's pad words 6..7). None yet — softcap.cap / window arrive
+ *  config buffer's pad words 5..7). None yet — softcap.cap / window arrive
  *  with their emission (#64 iii). Kept single-source with the key. */
 function modifierParamWords(mod?: AttnModifierSpec): number[] {
   if (!mod) return [];
@@ -139,29 +144,30 @@ function isNullModifier(mod?: AttnModifierSpec): boolean {
 
 /**
  * Canonicalize (isCausal, modifier) at every public dispatch/plan entry —
- * the SINGLE place the two composition surfaces meet. Rules:
- *  - null modifier ⇒ legacy path (isCausal stays a uniform, keys unchanged);
- *  - modifier present ⇒ isCausal=true folds INTO the modifier as a causal
- *    maskMod (structural), and the returned isCausal is false — the kernel's
- *    legacy uniform clause is not emitted on the modifier path, so dropping
- *    the fold would silently lose causality.
+ * the SINGLE place the two composition surfaces meet. Since the legacy
+ * is_causal uniform branch was deleted (commit B; exonerated bit-exactly by
+ * test/webgpu/attention-modifier-parity.spec.ts), causality ALWAYS travels
+ * as a causal maskMod: isCausal=true folds INTO the modifier (structural).
+ * Null modifier + isCausal=false canonicalizes to undefined ({} ≡ undefined
+ * — guards the ""-key WGSL collision).
  */
 function normalizeAttnModifier(
   isCausal: boolean,
   mod?: AttnModifierSpec,
-): { isCausal: boolean; mod?: AttnModifierSpec } {
-  if (isNullModifier(mod)) return { isCausal, mod: undefined };
+): { mod?: AttnModifierSpec } {
+  if (isNullModifier(mod)) {
+    return isCausal ? { mod: { maskMods: [{ kind: "causal" }] } } : {};
+  }
   const m = mod as AttnModifierSpec;
   if (isCausal && !hasCausalMask(m)) {
     return {
-      isCausal: false,
       mod: {
         ...m,
         maskMods: [{ kind: "causal" }, ...(m.maskMods ?? [])],
       },
     };
   }
-  return { isCausal: false, mod: m };
+  return { mod: m };
 }
 
 /** Append the modifier fragment to a cache key (WGSL or pipeline). */
@@ -204,19 +210,19 @@ function getTileIRWGSL(key: string, specFactory: () => TileKernelSpec): string {
 
 const configCache = new Map<string, GPUBuffer>();
 
-/** Config-buffer cache key: uniform CONTENT identity (dims + scale + causal
- *  flag + modifier structure + modifier param values). Single source — used
- *  by getOrCreateConfigBuffer and lookupAttentionConfigBuffer. */
+/** Config-buffer cache key: uniform CONTENT identity (dims + scale +
+ *  modifier structure + modifier param values; causality lives in the
+ *  modifier since commit B). Single source — used by
+ *  getOrCreateConfigBuffer and lookupAttentionConfigBuffer. */
 function attentionConfigKey(
   batchSize: number,
   numHeads: number,
   seqLen: number,
   headDim: number,
   scale: number,
-  isCausal: number,
   mod?: AttnModifierSpec,
 ): string {
-  const base = `${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${isCausal}`;
+  const base = `${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}`;
   const modKey = attnModifierKey(mod);
   if (!modKey) return base;
   return `${base}:${modKey}:${modifierParamWords(mod).join(",")}`;
@@ -229,7 +235,6 @@ function getOrCreateConfigBuffer(
   seqLen: number,
   headDim: number,
   scale: number,
-  isCausal: number,
   mod?: AttnModifierSpec,
 ): GPUBuffer {
   const key = attentionConfigKey(
@@ -238,7 +243,6 @@ function getOrCreateConfigBuffer(
     seqLen,
     headDim,
     scale,
-    isCausal,
     mod,
   );
   let buf = configCache.get(key);
@@ -250,6 +254,8 @@ function getOrCreateConfigBuffer(
     mappedAtCreation: false,
   });
 
+  // Layout: [0..4] = B,H,N,D,scale; [5..7] = modifier param words (causality
+  // is template structure since commit B, not uniform content).
   const data = new ArrayBuffer(32);
   const u32View = new Uint32Array(data);
   const f32View = new Float32Array(data);
@@ -258,14 +264,11 @@ function getOrCreateConfigBuffer(
   u32View[2] = seqLen;
   u32View[3] = headDim;
   f32View[4] = scale;
-  u32View[5] = isCausal;
-  u32View[6] = 0; // pad / modifier param 0
-  u32View[7] = 0; // pad / modifier param 1
   const params = modifierParamWords(mod);
   for (let i = 0; i < params.length; i++) {
-    if (6 + i > 7)
+    if (5 + i > 7)
       throw new Error("attention modifier params exceed config pad words");
-    u32View[6 + i] = params[i];
+    u32View[5 + i] = params[i];
   }
   device.queue.writeBuffer(buf, 0, new Uint8Array(data));
   // Cache it (the "getOrCreate" contract — was missing, so every attention
@@ -307,7 +310,6 @@ function makeForwardAttentionSpec(
       seq_len: "u32",
       head_dim: "u32",
       scale_u32: "u32",
-      is_causal: "u32",
     },
     grid: tiledGrid({
       x: { uniform: "seq_len", tileSize: BR },
@@ -324,7 +326,6 @@ function makeForwardAttentionSpec(
       const N = ctx.uniform("seq_len");
       const Dim = ctx.u32(D);
       const numHeads = ctx.uniform("num_heads");
-      const isCausal = ctx.uniform("is_causal");
       const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
       const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
@@ -373,11 +374,13 @@ function makeForwardAttentionSpec(
             head: hIdx,
             batch: bIdx,
           };
-          // Seam "attn_mask": modifier path replaces the legacy uniform-driven
-          // causal clause with structural mask predicates.
-          let base = valid.and(kvPos.lt(N));
-          if (!mod) base = base.and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
-          const isActive = ctx.applySeam("attn_mask", base, seamArgs);
+          // Seam "attn_mask": mask predicates (incl. causal) are structural
+          // modifier emissions AND'ed onto the bounds check.
+          const isActive = ctx.applySeam(
+            "attn_mask",
+            valid.and(kvPos.lt(N)),
+            seamArgs,
+          );
           // Seam "attn_score": wraps the scaled pre-softmax score.
           const s = ctx.applySeam(
             "attn_score",
@@ -435,7 +438,6 @@ function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
       seq_len: "u32",
       head_dim: "u32",
       scale_u32: "u32",
-      is_causal: "u32",
     },
     grid: (u) => [u.batch_size * u.num_heads * u.seq_len],
 
@@ -482,7 +484,6 @@ function makeBackwardDQSpec(
       seq_len: "u32",
       head_dim: "u32",
       scale_u32: "u32",
-      is_causal: "u32",
     },
     grid: tiledGrid({
       x: { uniform: "seq_len", tileSize: BR },
@@ -499,7 +500,6 @@ function makeBackwardDQSpec(
       const N = ctx.uniform("seq_len");
       const Dim = ctx.u32(D);
       const numHeads = ctx.uniform("num_heads");
-      const isCausal = ctx.uniform("is_causal");
       const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
       const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
@@ -563,9 +563,11 @@ function makeBackwardDQSpec(
             head: hIdx,
             batch: bIdx,
           };
-          let base = valid.and(kvPos.lt(N));
-          if (!mod) base = base.and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
-          const isActive = ctx.applySeam("attn_mask", base, seamArgs);
+          const isActive = ctx.applySeam(
+            "attn_mask",
+            valid.and(kvPos.lt(N)),
+            seamArgs,
+          );
           // Flash-style recompute: raw score is rebuilt from Q·K, so the
           // score modifier's forward AND its local derivative (the
           // "attn_dscore" seam, chain factor d(modded)/d(raw)) are available
@@ -621,7 +623,6 @@ function makeBackwardDKVSpec(
       seq_len: "u32",
       head_dim: "u32",
       scale_u32: "u32",
-      is_causal: "u32",
     },
     grid: tiledGrid({
       x: { uniform: "seq_len", tileSize: BC_BW },
@@ -638,7 +639,6 @@ function makeBackwardDKVSpec(
       const N = ctx.uniform("seq_len");
       const Dim = ctx.u32(D);
       const numHeads = ctx.uniform("num_heads");
-      const isCausal = ctx.uniform("is_causal");
       const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
       const kvRow = kvBlock.mul(ctx.u32(BC_BW)).add(tidx);
@@ -680,18 +680,12 @@ function makeBackwardDKVSpec(
         const qStart = qt.mul(ctx.u32(BQ_BW));
 
         // Causal tile-skip: Q-tiles entirely above the diagonal contribute
-        // nothing. Legacy path gates on the is_causal uniform; the modifier
-        // path bakes it structurally when a causal maskMod is present (the
+        // nothing — baked structurally when a causal maskMod is present (the
         // affine-mask → loop-bound rule's precedent; window bounds land with
-        // #64 iii). Workgroup-uniform either way (qStart/kvBlock only).
-        const fullyMasked = qStart
-          .add(ctx.u32(BQ_BW - 1))
-          .lt(kvBlock.mul(ctx.u32(BC_BW)));
-        const skipTile = !mod
-          ? isCausal.ne(ctx.u32(0)).and(fullyMasked)
-          : hasCausalMask(mod)
-            ? fullyMasked
-            : undefined;
+        // #64 iii). Workgroup-uniform (qStart/kvBlock only).
+        const skipTile = hasCausalMask(mod)
+          ? qStart.add(ctx.u32(BQ_BW - 1)).lt(kvBlock.mul(ctx.u32(BC_BW)))
+          : undefined;
 
         const emitTileBody = () => {
           const offsR = ctx.arange(qStart, BQ_BW);
@@ -730,9 +724,11 @@ function makeBackwardDKVSpec(
               head: hIdx,
               batch: bIdx,
             };
-            let base = valid.and(qi.lt(N));
-            if (!mod) base = base.and(isCausal.eq(ctx.u32(0)).or(kvRow.le(qi)));
-            const isActive = ctx.applySeam("attn_mask", base, seamArgs);
+            const isActive = ctx.applySeam(
+              "attn_mask",
+              valid.and(qi.lt(N)),
+              seamArgs,
+            );
             const s = ctx.dotRow(K, QTile, j).mul(scale);
             const sMod = ctx.applySeam("attn_score", s, seamArgs);
             const p = isActive.select(
@@ -786,7 +782,6 @@ function dispatchAttention(
   numHeads: number,
   seqLen: number,
   scale: number,
-  isCausal: boolean,
   // Template identity vs config content: templateMod keys the WGSL/pipeline
   // caches (undefined for D-precompute — no seam sites, one template);
   // configMod keys the SHARED config buffer all four dispatches bind (its
@@ -804,7 +799,6 @@ function dispatchAttention(
     seqLen,
     headDim,
     scale,
-    isCausal ? 1 : 0,
     configMod,
   );
   const wgsl = getTileIRWGSL(withModKey(wgslKey, templateMod), specFactory);
@@ -839,27 +833,18 @@ export interface AttentionStepPlan {
 
 /** Read-only lookup of the cached attention config buffer (persistent slot
  *  in the stream). Null if not yet created (guaranteed hit post-recording).
- *  Expects NORMALIZED (isCausal, mod) — plan* entries normalize. */
+ *  Expects a NORMALIZED modifier — plan* entries normalize. */
 export function lookupAttentionConfigBuffer(
   batchSize: number,
   numHeads: number,
   seqLen: number,
   headDim: number,
   scale: number,
-  isCausal: boolean,
   mod?: AttnModifierSpec,
 ): GPUBuffer | null {
   return (
     configCache.get(
-      attentionConfigKey(
-        batchSize,
-        numHeads,
-        seqLen,
-        headDim,
-        scale,
-        isCausal ? 1 : 0,
-        mod,
-      ),
+      attentionConfigKey(batchSize, numHeads, seqLen, headDim, scale, mod),
     ) ?? null
   );
 }
@@ -899,7 +884,6 @@ export function planFlashAttentionForward(
     seqLen,
     headDim,
     scale,
-    norm.isCausal,
     norm.mod,
   );
   return {
@@ -941,7 +925,6 @@ export function planFlashAttentionBackward(
     seqLen,
     headDim,
     scale,
-    norm.isCausal,
     norm.mod,
   );
   const bhnd = batchSize * numHeads * seqLen * headDim * 4;
@@ -1006,7 +989,6 @@ export function dispatchFlashAttentionForward(
     numHeads,
     seqLen,
     scale,
-    norm.isCausal,
     norm.mod,
     norm.mod,
     [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer],
@@ -1041,7 +1023,6 @@ export function dispatchFlashAttentionBackwardD(
     numHeads,
     seqLen,
     scale,
-    norm.isCausal,
     undefined, // D-precompute: no seam sites — one template for all mods
     norm.mod,
     [dOBuffer, oBuffer, outBuffer],
@@ -1080,7 +1061,6 @@ export function dispatchFlashAttentionBackwardDQ(
     numHeads,
     seqLen,
     scale,
-    norm.isCausal,
     norm.mod,
     norm.mod,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer],
@@ -1124,7 +1104,6 @@ export function dispatchFlashAttentionBackwardDKV(
     numHeads,
     seqLen,
     scale,
-    norm.isCausal,
     norm.mod,
     norm.mod,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer],
