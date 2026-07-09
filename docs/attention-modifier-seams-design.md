@@ -1,6 +1,14 @@
 # Attention scoreMod / maskMod seams (FlexAttention-class) — DESIGN [ACCEPTED]
 
-Task #64. Status: **ACCEPTED (review 2026-07-08) — implementation staged.**
+Task #64. Status: **ACCEPTED (review 2026-07-08) — forward/inference surface
+IMPLEMENTED (commits i–iv, 2026-07-09):** (i) seam plumbing + causal-as-modifier
++ bit-parity gate; (ii) legacy is_causal branch deleted; (iii) softcap +
+slidingWindow emission + parity/f16 gates; (iv) modifier key → pipeline/WGSL
+cache keys asserted under STRICT_GPU + decode bucketKey fragment
+(`Qwen3.attnModKey`). Still design-only: backward paired-derivative (§2,
+inference-first) and the affine → loop-bound window compilation (§3, perf
+follow-on; window ships as select-masking).
+
 Review dispositions binding on the implementation:
 
 1. **Selection = spec-factory keyed by the modifier key, NOT a registry.** The

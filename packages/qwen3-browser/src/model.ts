@@ -448,6 +448,12 @@ export type Qwen3ForwardOptions = {
 
 export class Qwen3 extends Module {
   readonly config: Qwen3Config;
+  /** Attention-modifier key fragment for capture/tape bucket keys (#64 iv).
+   *  "" = null modifier (plain causal) — keeps existing bucketKeys
+   *  byte-stable. A Gemma-2-style port sets this to the attnModifierKey()
+   *  union of its per-layer modifiers, so a different modifier set can
+   *  never replay another's tape. */
+  readonly attnModKey: string = "";
   readonly embedTokens: Embedding;
   readonly layers: ModuleList;
   readonly norm: RMSNorm;

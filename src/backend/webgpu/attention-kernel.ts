@@ -15,6 +15,7 @@
  * memory code. Auto-CSE handles all sub-expression sharing.
  */
 
+import { ENV } from "../../core/env";
 import type { AttnModifierSpec } from "../types";
 import { cachedCreateBindGroup } from "./bind-group-cache";
 import { allocateOutputBuffer } from "./buffer-arena";
@@ -250,6 +251,20 @@ function getTileIRWGSL(key: string, specFactory: () => TileKernelSpec): string {
   if (!wgsl) {
     wgsl = compileTileKernel(specFactory());
     tileIRWGSLCache.set(key, wgsl);
+  } else if (ENV.TORCHLETTE_STRICT_GPU === "1") {
+    // Seam assertion (#64 iv): the key is DERIVED from the modifier spec
+    // (attnModifierKey), so a hit whose fresh emission differs means the key
+    // fn and the emission fn drifted — the cache-collision class that
+    // produces correct-looking-but-wrong kernels. Strict mode pays a
+    // recompile per hit to make that drift LOUD.
+    const fresh = compileTileKernel(specFactory());
+    if (fresh !== wgsl) {
+      throw new Error(
+        `attention WGSL cache collision under key '${key}': the modifier ` +
+          `key fn and the kernel emission drifted (attnModifierKey vs ` +
+          `buildAttentionSeams/modifierUniformFields)`,
+      );
+    }
   }
   return wgsl;
 }

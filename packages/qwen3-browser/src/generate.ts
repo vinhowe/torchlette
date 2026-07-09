@@ -6,7 +6,7 @@
  * transformers (Node and browser) satisfy it.
  */
 
-import type { Torchlette, FrontendTensor as Tensor } from "torchlette";
+import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
 import { stStats } from "torchlette";
 import type { Qwen3, ResidualHook } from "./model";
 import { kvBucketLen } from "./model";
@@ -298,7 +298,15 @@ export async function generateChat(
     const decode = api.capture(
       (idx: Tensor) =>
         api.noGrad(() => model.forward(idx, { staticKV, residualHook }).logits),
-      { key: () => `kv:bkt${kvBucketLen(staticKV.len + 1, maxSeq)}` },
+      // The modifier key is a STRUCTURAL discriminator like the bucket
+      // length: a model whose attention modifiers differ must never replay
+      // this model's tape ("" for the null modifier — key byte-stable).
+      {
+        key: () =>
+          `kv:bkt${kvBucketLen(staticKV.len + 1, maxSeq)}${
+            model.attnModKey ? `:mod${model.attnModKey}` : ""
+          }`,
+      },
     );
     while (count < maxNew && !QWEN3_STOP_TOKENS.has(nextTok) && !isAborted()) {
       emit(nextTok);
@@ -379,7 +387,8 @@ export async function generateChat(
             loweredPairs: r.loweredPairs,
             boundaryResets: r.boundaryResets,
             boundaryReasons: r.boundaryReasons,
-            lastRefusal: r.refusalDiagnostics[r.refusalDiagnostics.length - 1] ?? "",
+            lastRefusal:
+              r.refusalDiagnostics[r.refusalDiagnostics.length - 1] ?? "",
           },
         };
       })(),
