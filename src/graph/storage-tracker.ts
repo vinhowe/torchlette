@@ -276,6 +276,16 @@ class StorageTracker {
     return !this.allStorages.has(storageId);
   }
 
+  /** [step-tape 2b] The RuntimeTensor that owns a storage (if alive). A
+   *  multi-plan tape skeleton uses this to re-resolve a frozen materialized
+   *  ref to the owner's CURRENT storage each replay - persistent tensors
+   *  updated by replace-and-hold writes (the scheduler's lr copy_) move to a
+   *  new storage every step, so the recording-era ref would otherwise read
+   *  the stale buffer (the frozen-LR class). */
+  ownerOf(storageId: number): object | undefined {
+    return this.tensorWeakRefs.get(storageId)?.deref();
+  }
+
   /**
    * Release tensor refs for step-scoped temporaries.
    * For each tracked storage: if its owning tensor is alive but was NOT

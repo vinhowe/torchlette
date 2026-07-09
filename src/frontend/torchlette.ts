@@ -47,6 +47,7 @@ import { observeStepBoundary } from "../executor/observed-liveness";
 import {
   stDeclareArgNodes,
   stDeclareOutputNodes,
+  stMarkBodyBegin,
   stDropSkeleton,
   stPromoteEligibleSkeleton,
   stReplayStats,
@@ -2188,6 +2189,14 @@ export class Torchlette {
         nodes.push(ref.node);
     }
     stDeclareArgNodes(nodes);
+  }
+
+  /** [capture 2b] The captured call's body is about to run (trace path):
+   *  candidates accumulated so far this step are driver-level PRE-BODY plans
+   *  (e.g. the scheduler's lr-tensor write forced at the step-opening
+   *  markStep) — never replayed; the driver re-executes them for real. */
+  _markCaptureBodyBegin(): void {
+    if (STEP_TAPE_REPLAY) stMarkBodyBegin();
   }
 
   /** Install the capture interceptor for the duration of one captured call.

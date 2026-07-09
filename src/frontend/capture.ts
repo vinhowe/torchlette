@@ -353,6 +353,10 @@ export class CapturedFn {
     // only those upload slots warm (surface 4). Declared before the body so the
     // arg nodes are captured; consumed at the promote boundary.
     this.api._declareCaptureArgNodes(args);
+    // Mark the BODY-BEGIN boundary: plans captured before this point this step
+    // are driver-level pre-body work (scheduler lr writes) — recorded for
+    // structure, never replayed (the driver re-executes them for real).
+    this.api._markCaptureBodyBegin();
     // TRACE / MISS: run the whole body for real (state advances exactly once).
     const { result, uploads } = await this.runIntercepted(
       () => this.fn(...(args as never[])),
