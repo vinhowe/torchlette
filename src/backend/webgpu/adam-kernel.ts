@@ -48,6 +48,11 @@ function makeAdamStepSpec(
     param: { storage: "read_write", type: "f32" },
     m: { storage: "read_write", type: "f32" },
     v: { storage: "read_write", type: "f32" },
+    // inc-2a: t (step counter) and lr flow as persistent 1-element f32 tensor
+    // DATA, not per-step-varying uniforms. The recorder sees stable buffers
+    // (TAG_WRITE), which kills the frozen-scalar / volatile-repack class.
+    t: { storage: "read", type: "f32" },
+    lr: { storage: "read", type: "f32" },
   };
   if (emitF16) {
     bindings.param_f16 = { storage: "read_write", type: "f16" };
@@ -56,14 +61,18 @@ function makeAdamStepSpec(
     bindings.inf_flag = { storage: "atomic", type: "u32" };
   }
 
-  // Build uniforms
+  // Build uniforms. inc-2a: the config is now FULLY STATIC — beta1/beta2/
+  // eps(orig)/weight_decay/decoupled_wd never vary per step. ln_beta1/ln_beta2
+  // are precomputed f64->f32 on the CPU and used by the in-kernel expm1-form
+  // bias correction (bc = -expm1(t*lnBeta)); they replace the retired
+  // step_size / lr_times_wd per-step fields.
   const uniforms: Record<string, UniformType> = {
     beta1: "f32",
     beta2: "f32",
-    step_size: "f32",
+    ln_beta1: "f32",
+    ln_beta2: "f32",
     eps: "f32",
     weight_decay: "f32",
-    lr_times_wd: "f32",
     decoupled_wd: "u32",
     num_elements: "u32",
   };
@@ -92,9 +101,10 @@ function makeAdamStepSpec(
       enableF16: emitF16,
       autoVectorize: true,
       kernel(ctx) {
+        const bc = emitBiasCorrection(ctx);
         const idx = ctx.elementIndex(WORKGROUP_SIZE, "num_elements");
         const gVar = ctx.emitVar("g", "f32", ctx.load("grad", idx));
-        emitAdamScalarBody(ctx, idx, gVar, emitF16);
+        emitAdamScalarBody(ctx, idx, gVar, emitF16, bc);
       },
     };
   }
@@ -119,6 +129,7 @@ function makeAdamStepSpec(
       const numElements = ctx.uniform("num_elements");
       const gridStride = ctx.uniform("grid_stride");
       const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
+      const bc = emitBiasCorrection(ctx);
 
       if (useVec4) {
         const flatId = ctx.emitLet(
@@ -149,7 +160,7 @@ function makeAdamStepSpec(
         }
         for (let e = 0; e < 4; e++) {
           const off = e === 0 ? base : base.add(ctx.u32(e));
-          emitAdamScalarBody(ctx, off, gVars[e], emitF16, `${e}`);
+          emitAdamScalarBody(ctx, off, gVars[e], emitF16, bc, `${e}`);
         }
       } else {
         const idx = ctx.emitLet(
@@ -172,7 +183,7 @@ function makeAdamStepSpec(
           gVar.set(ctx.f32(0.0));
         });
 
-        emitAdamScalarBody(ctx, idx, gVar, emitF16);
+        emitAdamScalarBody(ctx, idx, gVar, emitF16, bc);
       }
     },
   };
@@ -186,12 +197,58 @@ function loadAdamUniforms(ctx: KernelContext) {
   return {
     beta1: ctx.uniform("beta1").bitcastTo("f32"),
     beta2: ctx.uniform("beta2").bitcastTo("f32"),
-    stepSize: ctx.uniform("step_size").bitcastTo("f32"),
+    lnBeta1: ctx.uniform("ln_beta1").bitcastTo("f32"),
+    lnBeta2: ctx.uniform("ln_beta2").bitcastTo("f32"),
     eps: ctx.uniform("eps").bitcastTo("f32"),
     weightDecay: ctx.uniform("weight_decay").bitcastTo("f32"),
-    lrTimesWd: ctx.uniform("lr_times_wd").bitcastTo("f32"),
     decoupledWd: ctx.uniform("decoupled_wd"),
   };
+}
+
+/**
+ * LOCKED formula (single source at the seam; mirrored by
+ * `test/optim/adam-biascorrection-formula.spec.ts`'s `expm1F32`):
+ *   expm1(y):  |y| < 0.25 → 5-term Horner series
+ *                y*(1 + y*(1/2 + y*(1/6 + y*(1/24 + y/120))))
+ *              else       → exp(y) - 1
+ * y = t * lnBeta (≤ 0), so the naive `1-pow(beta,t)` cancellation is avoided.
+ * Returns expm1(y) as a BlockExpr. `select` computes both branches — fine for
+ * a scalar derivation evaluated once per thread.
+ */
+function emitExpm1(ctx: KernelContext, y: BlockExpr): BlockExpr {
+  // 5-term Horner series (small-|y| branch).
+  let r: BlockExpr = ctx.f32(1 / 120);
+  r = ctx.f32(1 / 24).add(y.mul(r));
+  r = ctx.f32(1 / 6).add(y.mul(r));
+  r = ctx.f32(1 / 2).add(y.mul(r));
+  r = ctx.f32(1.0).add(y.mul(r));
+  const series = y.mul(r);
+  const large = y.exp().sub(ctx.f32(1.0));
+  return y.abs().lt(ctx.f32(0.25)).select(series, large);
+}
+
+/**
+ * Derive the bias-corrected step size and epsilon from the on-device step
+ * counter `t` and learning rate `lr` (both read from 1-element storage
+ * bindings). Replaces the retired JS-computed `stepSize`/`lrTimesWd` config
+ * fields. bc = -expm1(t*lnBeta); the PyTorch-equivalent update is
+ *   p -= (lr*sqrt(bc2)/bc1) * m / (sqrt(v) + eps*sqrt(bc2))
+ * i.e. p -= lr * (m/bc1) / (sqrt(v/bc2) + eps_orig).
+ */
+function emitBiasCorrection(ctx: KernelContext): {
+  stepSize: BlockExpr;
+  epsAdjusted: BlockExpr;
+  lr: BlockExpr;
+} {
+  const t = ctx.load("t", ctx.u32(0));
+  const lr = ctx.load("lr", ctx.u32(0));
+  const { lnBeta1, lnBeta2, eps } = loadAdamUniforms(ctx);
+  const bc1 = ctx.emitLet("bc1", emitExpm1(ctx, t.mul(lnBeta1)).neg());
+  const bc2 = ctx.emitLet("bc2", emitExpm1(ctx, t.mul(lnBeta2)).neg());
+  const sqrtBc2 = ctx.emitLet("sqrt_bc2", bc2.sqrt());
+  const stepSize = ctx.emitLet("step_size", lr.mul(sqrtBc2).div(bc1));
+  const epsAdjusted = ctx.emitLet("eps_adj", eps.mul(sqrtBc2));
+  return { stepSize, epsAdjusted, lr };
 }
 
 /** Emit the Adam update logic for a single element at `idx`. */
@@ -200,11 +257,11 @@ function emitAdamScalarBody(
   idx: BlockExpr,
   gVar: VarHandle,
   emitF16: boolean,
+  bc: { stepSize: BlockExpr; epsAdjusted: BlockExpr; lr: BlockExpr },
   suffix = "",
 ): void {
   const p = ctx.emitLet(`p${suffix}`, ctx.load("param", idx));
-  const { beta1, beta2, stepSize, eps, weightDecay, lrTimesWd, decoupledWd } =
-    loadAdamUniforms(ctx);
+  const { beta1, beta2, weightDecay, decoupledWd } = loadAdamUniforms(ctx);
 
   // L2 weight decay (Adam): grad += wd * param
   ctx.ifThen(
@@ -227,12 +284,12 @@ function emitAdamScalarBody(
   const pNewVar = ctx.emitVar(
     `p_new${suffix}`,
     "f32",
-    p.sub(stepSize.mul(mNew).div(vNew.sqrt().add(eps))),
+    p.sub(bc.stepSize.mul(mNew).div(vNew.sqrt().add(bc.epsAdjusted))),
   );
 
-  // Decoupled weight decay (AdamW)
+  // Decoupled weight decay (AdamW): p -= lr*wd*p
   ctx.ifThen(decoupledWd.eq(ctx.u32(1)), () => {
-    pNewVar.set(pNewVar.get().sub(lrTimesWd.mul(p)));
+    pNewVar.set(pNewVar.get().sub(bc.lr.mul(weightDecay).mul(p)));
   });
 
   // Write outputs
@@ -279,13 +336,15 @@ interface AdamStepResult {
 }
 
 /**
- * Write the config-derived (per-step-varying) uniform fields. SINGLE SOURCE
- * for the AdamStepConfig → kernel-uniform mapping: used both by the live
- * dispatch and by the compiled plan's volatile repack (which re-derives these
- * from the current step's adamStep node payload at replay time). stepSize
- * carries the bias correction (varies with t), lrTimesWd varies with LR
- * schedules, invScale varies when GradScaler rescales — none of these may be
- * frozen into a replayed config buffer.
+ * Write the STATIC Adam config uniforms. inc-2a: every field here is now
+ * step-invariant — beta1/beta2, eps (ORIGINAL, un-adjusted), weight_decay,
+ * decoupled_wd, and the precomputed ln(beta) constants (f64→f32 on the CPU;
+ * the in-kernel expm1-form bias correction derives bc1/bc2/step_size/
+ * epsAdjusted from the on-device `t` and `lr` tensor inputs). The retired
+ * per-step fields (step_size, lr_times_wd) and their volatile-repack are gone:
+ * the config buffer is bound once and never rewritten across replays.
+ * `invScale` remains a per-step value for the fused-unscale path (GradScaler
+ * uses graph-level unscaleGrad, so nothing engages that path here).
  */
 function setAdamConfigUniforms(
   uniforms: Record<string, number>,
@@ -294,10 +353,12 @@ function setAdamConfigUniforms(
 ): void {
   uniforms.beta1 = config.beta1;
   uniforms.beta2 = config.beta2;
-  uniforms.step_size = config.stepSize;
+  // Precompute ln(beta) in f64 then narrow to f32 (Math.fround) so the static
+  // uniform matches the Gate-2 emulation's `f(Math.log(beta))` exactly.
+  uniforms.ln_beta1 = Math.fround(Math.log(config.beta1));
+  uniforms.ln_beta2 = Math.fround(Math.log(config.beta2));
   uniforms.eps = config.eps;
   uniforms.weight_decay = config.weightDecay;
-  uniforms.lr_times_wd = config.lrTimesWd;
   uniforms.decoupled_wd = config.decoupledWd ? 1 : 0;
   if (doUnscale) {
     uniforms.inv_scale = config.invScale ?? 1.0;
@@ -316,6 +377,8 @@ export function dispatchAdamStep(
   paramBuffer: GPUBuffer,
   mBuffer: GPUBuffer,
   vBuffer: GPUBuffer,
+  tBuffer: GPUBuffer,
+  lrBuffer: GPUBuffer,
   numElements: number,
   config: AdamStepConfig,
   emitF16 = false,
@@ -338,6 +401,10 @@ export function dispatchAdamStep(
   trackSharedEncoderWrite(paramBuffer);
   trackSharedEncoderWrite(mBuffer);
   trackSharedEncoderWrite(vBuffer);
+  // t/lr are read-only 1-element inputs — track so the pool won't hand them
+  // back for output allocation within this shared-encoder scope.
+  trackSharedEncoderWrite(tBuffer);
+  trackSharedEncoderWrite(lrBuffer);
 
   // Allocate f16 output buffer if needed.
   let paramF16Out: GPUBuffer | null = null;
@@ -356,6 +423,8 @@ export function dispatchAdamStep(
     param: paramBuffer,
     m: mBuffer,
     v: vBuffer,
+    t: tBuffer,
+    lr: lrBuffer,
   };
   if (doF16 && paramF16Out) buffers.param_f16 = paramF16Out;
   if (doUnscale && infFlagBuffer) buffers.inf_flag = infFlagBuffer;
@@ -392,26 +461,10 @@ export function dispatchAdamStep(
 
   const dispatcher = getAdamDispatcher(useVec4, doF16, doUnscale);
 
-  // Volatile repack for compiled-plan replays: re-derive the config-driven
-  // uniform values from the CURRENT step's adamStep node payload. Static
-  // fields (num_elements, grid_stride, pads) are captured from this dispatch.
-  // All adamStep nodes in one packed batch share the same hyperparameters
-  // (adamStepBatch builds batches that way), so any node of the batch is a
-  // valid source.
-  const baseUniforms = { ...uniforms };
-  const volatileRepack = (node: {
-    op?: string;
-    payload?: unknown;
-  }): Record<string, number> => {
-    if (node.op !== "adamStep" || !node.payload) {
-      throw new Error(
-        `[adam-kernel] volatile repack expected an adamStep node, got '${node.op}' — compiled plan / node-index mismatch`,
-      );
-    }
-    const u = { ...baseUniforms };
-    setAdamConfigUniforms(u, node.payload as AdamStepConfig, doUnscale);
-    return u;
-  };
+  // inc-2a: the config is fully STATIC now (bias correction is derived
+  // in-kernel from the t/lr tensor DATA inputs), so there is NO volatile
+  // repack — the config buffer is bound once and never rewritten across
+  // compiled-plan replays. The retired volatile-repack closure lived here.
 
   _st = profileSubOpBegin();
   if (needsChunking) {
@@ -421,6 +474,9 @@ export function dispatchAdamStep(
       param: "chunked",
       m: "chunked",
       v: "chunked",
+      // t/lr are 1-element inputs read at index 0 by every chunk — bind whole.
+      t: "scalar",
+      lr: "scalar",
     };
     if (doF16) modes.param_f16 = "chunked";
     if (doUnscale) modes.inf_flag = "scalar";
@@ -429,21 +485,16 @@ export function dispatchAdamStep(
       ? { param_f16: f16BytesPerElement }
       : undefined;
 
-    dispatcher.dispatchChunked(
-      buffers,
-      uniforms,
-      {
-        modes,
-        bytesPerElement: bpe,
-        sizeUniform: "num_elements",
-        totalElements: numElements,
-        maxBytesPerElement: bytesPerElement,
-        elementsPerAlignment: epa,
-      },
-      volatileRepack,
-    );
+    dispatcher.dispatchChunked(buffers, uniforms, {
+      modes,
+      bytesPerElement: bpe,
+      sizeUniform: "num_elements",
+      totalElements: numElements,
+      maxBytesPerElement: bytesPerElement,
+      elementsPerAlignment: epa,
+    });
   } else {
-    dispatcher.dispatch(buffers, uniforms, volatileRepack);
+    dispatcher.dispatch(buffers, uniforms);
   }
   profileSubOpEnd("adam.dispatch", _st);
 
@@ -463,7 +514,11 @@ export function dispatchAdamStep(
  * Stage-4 plan/encode: the adam-step dispatch plan (non-f16 path used by the
  * packed optimizer), derived from the SAME dispatcher instance + uniform
  * mapping dispatchAdamStep uses. Returns null on the f16 / chunked routes.
- * The binding order is [grad, param, m, v, (inf_flag?), config].
+ * The binding order is [grad, param, m, v, t, lr, (inf_flag?), config].
+ *
+ * inc-2a: config is fully STATIC (bias correction derived in-kernel from the
+ * t/lr tensor inputs), so there is NO volatilePack — the generated stream
+ * binds the config buffer once (no TAG_UNIFORM repack).
  */
 export function planAdamStepDispatch(
   numElements: number,
@@ -477,9 +532,6 @@ export function planAdamStepDispatch(
    *  binding the caller must allocate (numElements*2 bytes, allocKind 1). */
   doF16: boolean;
   f16Bytes: number;
-  /** Volatile-uniform packer for the generated TAG_UNIFORM — re-derives the
-   *  per-step Adam config (bias-corrected step_size) from the node payload. */
-  volatilePack: (node: LazyIRNode) => ArrayBufferView;
 } | null {
   if (numElements * 4 > getMaxStorageBufferBindingSize()) return null; // chunked
   const doF16 = emitF16 && isF16Supported();
@@ -503,29 +555,11 @@ export function planAdamStepDispatch(
     uniforms._pad3 = 0;
   }
   const dispatcher = getAdamDispatcher(useVec4, doF16, doUnscale);
-  // Volatile repack for the generated stream's TAG_UNIFORM: re-derive the
-  // config-driven uniform fields (the per-step bias-corrected step_size etc.)
-  // from the CURRENT step's adamStep node payload, keeping the static fields
-  // (num_elements, grid_stride, pads) captured here. Identical to the recorded
-  // path's volatileRepack (dispatchAdamStep) — without it the generated plan
-  // freezes the step_size at recording time (the frozen-step_size class).
-  const baseUniforms = { ...uniforms };
-  const volatileRepack = (node: LazyIRNode): Record<string, number> => {
-    if (node.op !== "adamStep" || !node.payload) {
-      throw new Error(
-        `[adam-kernel] volatile repack expected an adamStep node, got '${node.op}'`,
-      );
-    }
-    const u = { ...baseUniforms };
-    setAdamConfigUniforms(u, node.payload as AdamStepConfig, doUnscale);
-    return u;
-  };
   return {
     plan: dispatcher.plan(uniforms),
     doUnscale,
     doF16,
     f16Bytes: numElements * 2,
-    volatilePack: dispatcher.volatilePack(volatileRepack),
   };
 }
 

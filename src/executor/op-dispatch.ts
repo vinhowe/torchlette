@@ -1,4 +1,3 @@
-import { ENV } from "../core/env";
 import { getBackend } from "../backend/registry";
 import type {
   AdamStepConfig,
@@ -7,6 +6,7 @@ import type {
   DeviceKind,
   DType,
 } from "../backend/types";
+import { ENV } from "../core/env";
 import { sizeOf } from "../core/shape";
 import {
   createStorageHandle,
@@ -59,12 +59,7 @@ export function isMultiOutputResult(
   v: BackendTensor | MultiOutputResult,
 ): v is MultiOutputResult {
   // BackendTensor objects don't have a `primary` field; MultiOutputResult does.
-  return (
-    typeof v === "object" &&
-    v !== null &&
-    "primary" in v &&
-    "extras" in v
-  );
+  return typeof v === "object" && v !== null && "primary" in v && "extras" in v;
 }
 
 /**
@@ -90,9 +85,7 @@ export function assignNodeResult(
     node.result = primary;
     node.results = [
       primary,
-      ...handlerResult.extras.map((bt) =>
-        createStorageHandle(node.device, bt),
-      ),
+      ...handlerResult.extras.map((bt) => createStorageHandle(node.device, bt)),
     ];
     return;
   }
@@ -495,6 +488,8 @@ function executeAdamStep(
       backendInputs[1],
       backendInputs[2],
       backendInputs[3],
+      backendInputs[4], // t
+      backendInputs[5], // lr
       payload,
     );
     // Return all three outputs explicitly. The wrapper at the call site

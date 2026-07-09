@@ -98,19 +98,27 @@ function packUniforms(
 }
 
 /**
- * Build a cache key from uniform values.
- * Only dimension-like uniforms (u32, i32) are included — f32 values like eps
- * change the config buffer data but not the pipeline or struct layout.
+ * Build a cache key from uniform values, keyed on ALL uniform values (u32/i32
+ * AND f32). A cached config buffer is shared by every dispatch with the same
+ * key; a compiled-plan replay binds that buffer by IDENTITY and never rewrites
+ * it (for STATIC configs — no volatile repack). So two configs whose f32 bytes
+ * differ (e.g. inc-2a's now-static Adam `weight_decay`: 0.1 for one param
+ * group, 0.0 for another) MUST get DISTINCT buffers — otherwise the
+ * last-written config silently trains the other group's params under compiled
+ * replay (the frozen-scalar-family failure mode; Gate 4 caught it). f32 fields
+ * were excluded historically because per-step-varying f32s (Adam step_size)
+ * rode a TAG_UNIFORM volatile repack that rewrote the shared buffer every
+ * dispatch — inc-2a retired that (config is static), so the exclusion is no
+ * longer safe. Volatile kernels are unaffected: distinct buffers still get
+ * rewritten per dispatch, just fewer aliasing collisions.
  */
 function uniformCacheKey(
   spec: TileKernelSpec,
   values: Record<string, number>,
 ): string {
   const parts: string[] = [];
-  for (const [name, type] of Object.entries(spec.uniforms)) {
-    if (type !== "f32") {
-      parts.push(`${values[name]}`);
-    }
+  for (const name of Object.keys(spec.uniforms)) {
+    parts.push(`${values[name]}`);
   }
   return parts.join(":");
 }
@@ -187,9 +195,9 @@ export interface TileKernelInstance {
    * corrected step_size) MUST carry this packer, not a no-op — else the config
    * freezes at the recording-time value (the frozen-step_size class).
    */
-  volatilePack(volatileRepack: VolatileUniformRepack): (
-    node: LazyIRNode,
-  ) => ArrayBufferView;
+  volatilePack(
+    volatileRepack: VolatileUniformRepack,
+  ): (node: LazyIRNode) => ArrayBufferView;
 
   /** Reset cached pipelines and config buffers. */
   reset(): void;
@@ -332,14 +340,21 @@ export function createTileKernelDispatcher(
       const uniformIdx = spec.uniformBindingIndex;
       let bindingIndex = 0;
       for (let i = 0; i < bindingNames.length; i++) {
-        if (hasConfig && uniformIdx !== undefined && bindingIndex === uniformIdx) {
+        if (
+          hasConfig &&
+          uniformIdx !== undefined &&
+          bindingIndex === uniformIdx
+        ) {
           bindingOrder.push(null);
           bindingIndex++;
         }
         bindingOrder.push(bindingNames[i]);
         bindingIndex++;
       }
-      if (hasConfig && (uniformIdx === undefined || bindingIndex <= uniformIdx)) {
+      if (
+        hasConfig &&
+        (uniformIdx === undefined || bindingIndex <= uniformIdx)
+      ) {
         bindingOrder.push(null);
       }
       const g = resolveGrid(spec)(uniforms);

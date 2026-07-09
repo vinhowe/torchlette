@@ -44,8 +44,8 @@ import {
   computePlanFingerprint,
   type ExecutionSegment,
   groupToRecipe,
-  isFusibleOp,
   inlinedConstantValue,
+  isFusibleOp,
 } from "../compiler/fusion-detect";
 import { analyzeGraph } from "../compiler/graph-compiler";
 import { runPasses, SIMPLIFICATION_PASSES } from "../compiler/graph-rewrites";
@@ -107,9 +107,9 @@ import {
   buildCompiledPlanFromGenerated,
   type CompiledPlan,
   debugCompiledPlanEntryBytes,
+  debugEntryBufferIndex,
   destroyCompiledPlanBuffers,
   executeCompiledPlan,
-  debugEntryBufferIndex,
   isCompilationRecordingActive,
   type NodeResult,
   plannerEntryBytes,
@@ -127,18 +127,18 @@ import {
   type LoweredPlan,
 } from "./lowered-plan";
 import {
+  clearResultEntries,
   getObservedLivenessStats,
   isObservedLivenessEnabled,
   noteInPlaceCommit,
   noteNewTemplate,
   noteTemplateExecuted,
-  clearResultEntries,
   prunedHarvest,
   registerResultEntries,
   releasableEntryReader,
   releasableLastReader,
-  resultEntryFor,
   resetObservedLiveness,
+  resultEntryFor,
   setObservedLivenessEnabled,
   setTemplateCompiledInvalidator,
   setTemplateIdleRetirer,
@@ -152,14 +152,7 @@ const IN_PLACE_COMMIT_OPS: ReadonlySet<string> = new Set([
   "stridedScatterCopy",
   "stridedScatterAdd",
 ]);
-import {
-  assignNodeResult,
-  executeOpSync,
-  getInputStorage,
-  withProfileContext,
-} from "./op-dispatch";
-import { pretunePlanMatmuls } from "./plan-builder";
-import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
+
 import {
   STEP_TAPE_RECORD,
   STEP_TAPE_REPLAY,
@@ -167,7 +160,14 @@ import {
   stDeclareBatchCover,
   stEndPlan,
 } from "../core/step-tape";
-import { stCaptureCompiledStep } from "./step-tape-replay";
+import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
+import {
+  assignNodeResult,
+  executeOpSync,
+  getInputStorage,
+  withProfileContext,
+} from "./op-dispatch";
+import { pretunePlanMatmuls } from "./plan-builder";
 import {
   clearActiveScalarTable,
   destroyScalarTable,
@@ -179,6 +179,7 @@ import {
   executeRowProgram,
 } from "./segment-executors";
 import { executePlanSequential } from "./sequential";
+import { stCaptureCompiledStep } from "./step-tape-replay";
 
 // ============================================================================
 // Optimized Execution Types
@@ -2556,6 +2557,8 @@ export async function executeLoweredPlan(
                 param: inputs[1].backendTensor,
                 m: inputs[2].backendTensor,
                 v: inputs[3].backendTensor,
+                t: inputs[4].backendTensor, // inc-2a: persistent step counter
+                lr: inputs[5].backendTensor, // inc-2a: persistent learning rate
                 config,
               });
             }
@@ -2570,7 +2573,8 @@ export async function executeLoweredPlan(
             // AGREEMENT per compared step, so a member whose config diverges
             // (per-group hyperparams) refuses loudly instead of replaying the
             // representative's config silently.
-            if (STEP_TAPE_RECORD) stDeclareBatchCover(executedIdx, firstNodeIdx);
+            if (STEP_TAPE_RECORD)
+              stDeclareBatchCover(executedIdx, firstNodeIdx);
             const results = adamStepBatch(items);
             for (let i = 0; i < nodes.length; i++) {
               const r = results[i];

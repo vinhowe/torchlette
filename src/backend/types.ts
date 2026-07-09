@@ -231,10 +231,9 @@ export type FusedRMSNormConfig = {
 export type AdamStepConfig = {
   beta1: number;
   beta2: number;
-  stepSize: number;
+  /** ORIGINAL (un-adjusted) epsilon. The kernel derives eps*sqrt(bc2). */
   eps: number;
   weightDecay: number;
-  lrTimesWd: number;
   decoupledWd: boolean;
   emitF16?: boolean;
   /** Gradient inverse scale factor for fused unscale (default 1.0 = no unscaling). */
@@ -242,6 +241,10 @@ export type AdamStepConfig = {
   /** Shared atomic inf-flag buffer for fused unscale inf detection. */
   infFlagBuffer?: unknown;
 };
+// inc-2a: `stepSize` and `lrTimesWd` were RETIRED from AdamStepConfig. The
+// bias-corrected step size and lr*wd are derived IN-KERNEL from the persistent
+// on-device `t` (step counter) and `lr` tensor inputs — the config is fully
+// static, killing the per-step volatile-uniform repack class.
 
 /** One parameter's inputs for a batched Adam step. */
 export type AdamBatchItem = {
@@ -249,6 +252,10 @@ export type AdamBatchItem = {
   param: BackendTensor;
   m: BackendTensor;
   v: BackendTensor;
+  /** Persistent 1-element f32 step counter (shared across the group's params). */
+  t: BackendTensor;
+  /** Persistent 1-element f32 learning rate (shared across the group's params). */
+  lr: BackendTensor;
   config: AdamStepConfig;
 };
 
@@ -474,6 +481,8 @@ export interface BackendOps {
     param: BackendTensor,
     m: BackendTensor,
     v: BackendTensor,
+    t: BackendTensor,
+    lr: BackendTensor,
     config: AdamStepConfig,
   ):
     | { param: BackendTensor; m: BackendTensor; v: BackendTensor }

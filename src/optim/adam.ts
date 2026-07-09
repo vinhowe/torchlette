@@ -1,5 +1,5 @@
-import { ENV } from "../core/env";
 import type { AdamStepConfig, DeviceKind } from "../backend/types";
+import { ENV } from "../core/env";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
 import { createLazyIRNode } from "../graph/node-factory";
 import { createPendingRef } from "../graph/types";
@@ -43,9 +43,21 @@ export class Adam {
   private _groupIndex: number[];
   private expAvg: RuntimeTensor[];
   private expAvgSq: RuntimeTensor[];
-  /** Intermediate tensors from the last step — disposed after markStep(). */
-  private _intermediates: RuntimeTensor[] = [];
   private steps: number[];
+  /**
+   * inc-2a (capturable-optimizer contract): the step counter `t` and the
+   * per-group learning rate flow as persistent on-device f32 [1] tensors
+   * (DATA), not as per-step-varying node payload scalars. The fused kernel
+   * and the graph paths derive the bias-corrected step size from `t`/`lr`
+   * (expm1-form; see `_biasCorrection`). `t` is advanced IN-PLAN by
+   * copy_(t, add(t,1)) inside the optimizer plan so replays advance it.
+   * Per-param `steps[]` collapses to the shared `t` (PyTorch capturable
+   * semantics: a param whose grad is absent skips its update but `t` still
+   * advances). `_t`/`_lrTensors` are lazily created on first step (device
+   * known once a real param is stepped) — mirrors m/v lazy init.
+   */
+  private _t: RuntimeTensor | null = null;
+  private _lrTensors: (RuntimeTensor | null)[];
   /**
    * Packed foreach state, keyed by group index. While the foreach path is
    * active, m/v live as ONE flat tensor per group (the per-param expAvg
@@ -131,6 +143,32 @@ export class Adam {
     this.expAvg = flatParams.map((p) => runtime.zeros(p.shape, device));
     this.expAvgSq = flatParams.map((p) => runtime.zeros(p.shape, device));
     this.steps = new Array(flatParams.length).fill(0);
+    // inc-2a: persistent step counter (shared) + per-group lr tensors.
+    // Created eagerly (device known); f32 [1]. Materialize on first force.
+    this._t = runtime.full([1], 0, device, "f32");
+    this._lrTensors = this._groups.map((g) =>
+      runtime.full([1], g.lr, device, "f32"),
+    );
+  }
+
+  /** The persistent step-counter tensor (lazily kept non-null after ctor). */
+  private _tTensor(): RuntimeTensor {
+    if (!this._t) {
+      this._t = this.api._runtime().full([1], 0, this.device, "f32");
+    }
+    return this._t;
+  }
+
+  /** The persistent lr tensor for a group (created on demand). */
+  private _lrTensor(gi: number): RuntimeTensor {
+    let t = this._lrTensors[gi];
+    if (!t) {
+      t = this.api
+        ._runtime()
+        .full([1], this._groups[gi].lr, this.device, "f32");
+      this._lrTensors[gi] = t;
+    }
+    return t;
   }
 
   getParams(): Tensor[] {
@@ -148,6 +186,11 @@ export class Adam {
       keep.push(this.api._wrapRuntime(this.expAvg[i], false));
       keep.push(this.api._wrapRuntime(this.expAvgSq[i], false));
     }
+    // inc-2a: persistent t/lr must survive step boundaries too.
+    if (this._t) keep.push(this.api._wrapRuntime(this._t, false));
+    for (const lrT of this._lrTensors) {
+      if (lrT) keep.push(this.api._wrapRuntime(lrT, false));
+    }
     return keep;
   }
 
@@ -156,9 +199,18 @@ export class Adam {
     return this._groups[0].lr;
   }
 
-  /** Set learning rate for all parameter groups. */
+  /** Set learning rate for all parameter groups. Writes the persistent lr
+   *  tensors IN-PLACE (copy_) so a compiled replay sees the new value as DATA
+   *  — the LR-schedule-exactness seam (schedulers funnel through here). */
   setLR(lr: number): void {
-    for (const g of this._groups) g.lr = lr;
+    const runtime = this.api._runtime();
+    for (let gi = 0; gi < this._groups.length; gi++) {
+      this._groups[gi].lr = lr;
+      runtime.copy_(
+        this._lrTensor(gi),
+        runtime.full([1], lr, this.device, "f32"),
+      );
+    }
   }
 
   /** Get per-group learning rates. */
@@ -166,19 +218,20 @@ export class Adam {
     return this._groups.map((g) => g.lr);
   }
 
-  /** Set learning rate for a specific parameter group. */
+  /** Set learning rate for a specific parameter group. Writes the persistent
+   *  lr tensor IN-PLACE (copy_). */
   setGroupLR(groupIndex: number, lr: number): void {
     this._groups[groupIndex].lr = lr;
+    const runtime = this.api._runtime();
+    runtime.copy_(
+      this._lrTensor(groupIndex),
+      runtime.full([1], lr, this.device, "f32"),
+    );
   }
 
   /** Get the number of parameter groups. */
   get numGroups(): number {
     return this._groups.length;
-  }
-
-  /** Get per-param LR for the fused kernel. */
-  private _getParamLR(i: number): number {
-    return this._groups[this._groupIndex[i]].lr;
   }
 
   /** Get per-param weight decay for the fused kernel. */
@@ -218,10 +271,7 @@ export class Adam {
     let updated: Tensor[];
     if (this.hasFusedKernel() && ENV.TORCHLETTE_FUSED_ADAM !== "0") {
       updated = this._stepFused(runtime);
-    } else if (
-      ENV.TORCHLETTE_FOREACH_ADAM !== "0" &&
-      this.params.length > 1
-    ) {
+    } else if (ENV.TORCHLETTE_FOREACH_ADAM !== "0" && this.params.length > 1) {
       updated = this._stepForeach(runtime);
     } else {
       updated = this._stepElementwise(runtime);
@@ -257,9 +307,15 @@ export class Adam {
       if (list) list.push(i);
       else groups.set(gi, [i]);
     }
+    // inc-2a: advance the shared on-device `t` ONCE per step (before any
+    // group's update graph reads it).
+    this._advanceT(runtime);
     for (const [gi, idxs] of groups) {
       this._foreachGroupStep(runtime, gi, idxs);
     }
+    // Persist t/lr (materialize mid-step).
+    runtime.persist(this._tTensor());
+    for (const lrT of this._lrTensors) if (lrT) runtime.persist(lrT);
     return updated;
   }
 
@@ -279,10 +335,11 @@ export class Adam {
     }
     const sig = idxs.map((i, k) => `${i}:${sizes[k]}`).join(",");
 
+    // JS step mirror (diagnostics + intermittent-missing-grad detection).
     for (const i of idxs) this._advanceStep(i);
-    const t = this.steps[idxs[0]];
+    const tScalar = this.steps[idxs[0]];
     for (const i of idxs) {
-      if (this.steps[i] !== t) {
+      if (this.steps[i] !== tScalar) {
         throw new Error(
           "Adam foreach: params in one group have diverging step counts " +
             "(gradients intermittently missing for some params). Set " +
@@ -290,7 +347,8 @@ export class Adam {
         );
       }
     }
-    const lr = this._groups[gi].lr;
+    // inc-2a: lr flows as the persistent per-group tensor; wd stays a JS scalar.
+    const lrTensor = this._lrTensor(gi);
     const wd = this._groups[gi].weightDecay;
 
     // Pack grads and params: [size_i] flats concatenated to one [total].
@@ -359,15 +417,17 @@ export class Adam {
     // Reading mNew/vNew directly leaves the copy_ nodes as dangling roots
     // that defer to a LATER plan — after zeroGrad has zeroed/freed the grad
     // buffer their pending source reads (see _updateParamElementwise).
-    const bc1 = 1 - this.beta1 ** t;
-    const bc2 = 1 - this.beta2 ** t;
+    // inc-2a: bias correction from the shared on-device `t` via the ONE
+    // expm1-form derivation (matches the fused kernel + elementwise path).
+    // bc1/bc2 are [1] tensors; the div broadcasts over the packed [total].
+    const { bc1, bc2 } = this._biasCorrection(runtime, this._tTensor());
     const mHat = runtime.div(st.m, bc1);
     const vHat = runtime.div(st.v, bc2);
     const denom = runtime.add(runtime.sqrt(vHat), this.eps);
-    let scaled = runtime.mul(runtime.div(mHat, denom), lr);
+    let scaled = runtime.mul(runtime.div(mHat, denom), lrTensor);
     if (wd !== 0 && this.adamW) {
-      // Decoupled weight decay: p -= lr*wd*p (PyTorch AdamW).
-      scaled = runtime.add(scaled, runtime.mul(P, lr * wd));
+      // Decoupled weight decay: p -= lr*wd*p (PyTorch AdamW). lr is a tensor.
+      scaled = runtime.add(scaled, runtime.mul(P, runtime.mul(lrTensor, wd)));
     }
     const pNew = runtime.sub(P, scaled);
 
@@ -388,11 +448,21 @@ export class Adam {
     // intermediate (328MB each at 124M) is conservatively protected as
     // "user-held" and the packed chain costs ~2x the fused path's memory.
     // st.m / st.v / params are NOT disposed (persistent state).
-    for (const t of [G, gAdj, mNew, vNew, mHat, vHat, denom, scaled, pNew, P]) {
-      if (
-        t !== (st.m as unknown) &&
-        t !== (st.v as unknown)
-      ) {
+    for (const t of [
+      G,
+      gAdj,
+      mNew,
+      vNew,
+      mHat,
+      vHat,
+      denom,
+      scaled,
+      pNew,
+      P,
+      bc1,
+      bc2,
+    ]) {
+      if (t !== (st.m as unknown) && t !== (st.v as unknown)) {
         (t as { dispose?: () => void }).dispose?.();
       }
     }
@@ -407,6 +477,12 @@ export class Adam {
   private _stepFused(runtime: ReturnType<Torchlette["_runtime"]>): Tensor[] {
     const updated: Tensor[] = [];
 
+    // inc-2a: advance the SHARED on-device step counter ONCE per step, before
+    // the param loop, so every param's adamStep node reads the post-increment
+    // `t` (the kernel derives bias correction from it). t is advanced in-plan.
+    this._advanceT(runtime);
+    const tRt = this._tTensor();
+
     for (let i = 0; i < this.params.length; i++) {
       const param = this.params[i];
       const grad = param.grad?._unwrap() ?? null;
@@ -415,30 +491,26 @@ export class Adam {
         continue;
       }
 
+      // JS mirror advance (diagnostics + foreach divergence assert only).
       this._advanceStep(i);
-      const step = this.steps[i];
-      const bc1 = 1 - this.beta1 ** step;
-      const bc2 = 1 - this.beta2 ** step;
-      const lr = this._getParamLR(i);
-      const stepSize = (lr * Math.sqrt(bc2)) / bc1;
-      // Adjust epsilon so the kernel formula p -= stepSize * m / (sqrt(v) + eps)
-      // becomes equivalent to PyTorch's p -= lr * (m/bc1) / (sqrt(v/bc2) + eps_orig).
-      // The adjustment: eps_adjusted = eps_orig * sqrt(bc2)
-      const epsAdjusted = this.eps * Math.sqrt(bc2);
 
+      const gi = this._groupIndex[i];
       const wd = this._getParamWeightDecay(i);
+      // inc-2a: config is FULLY STATIC — no stepSize/lrTimesWd. eps is the
+      // ORIGINAL value; the kernel derives eps*sqrt(bc2) and lr*wd from the
+      // t/lr tensor inputs.
       const config: AdamStepConfig = {
         beta1: this.beta1,
         beta2: this.beta2,
-        stepSize,
-        eps: epsAdjusted,
+        eps: this.eps,
         weightDecay: wd,
-        lrTimesWd: lr * wd,
         decoupledWd: this.adamW,
         emitF16: true,
       };
 
-      // Create a single adamStep lazy node with 4 inputs: grad, param, m, v
+      // inc-2a: 6-input adamStep node [grad, param, m, v, t, lr]. t/lr flow as
+      // persistent tensor DATA (stable buffers → TAG_WRITE, no volatile repack).
+      const lrRt = this._lrTensor(gi);
       const adamNode = createLazyIRNode(
         "adamStep",
         [
@@ -446,6 +518,8 @@ export class Adam {
           param._unwrap().lazyRef,
           this.expAvg[i].lazyRef,
           this.expAvgSq[i].lazyRef,
+          tRt.lazyRef,
+          lrRt.lazyRef,
         ],
         param.shape,
         "f32",
@@ -485,12 +559,66 @@ export class Adam {
       updated.push(param);
     }
 
+    // Persist t/lr (lazily materialize mid-step; same rationale as m/v).
+    runtime.persist(tRt);
+    for (const lrT of this._lrTensors) if (lrT) runtime.persist(lrT);
+
     return updated;
   }
 
   /** Advance step counter. */
   private _advanceStep(i: number): void {
     this.steps[i] += 1;
+  }
+
+  /**
+   * inc-2a: advance the persistent on-device step counter `t` by 1, IN-PLAN
+   * (copy_(t, add(t,1))) so compiled-plan replays advance it too. Idempotent
+   * per step-boundary: call ONCE per optimizer step (before building the
+   * update graph that reads t). The JS `steps[]` mirror is kept for the
+   * foreach-group divergence assert and diagnostics only.
+   */
+  private _advanceT(runtime: ReturnType<Torchlette["_runtime"]>): void {
+    const t = this._tTensor();
+    runtime.copy_(t, runtime.add(t, 1));
+  }
+
+  /**
+   * Shared expm1-form bias-correction subgraph. ONE derivation source across
+   * foreach and elementwise (the fused kernel emits the identical WGSL in
+   * `emitExpm1`/`emitBiasCorrection`; Gate-2 pins the numerics). Given the
+   * persistent `t` tensor, returns bc1 = -expm1(t*lnB1), bc2 = -expm1(t*lnB2)
+   * as graph tensors.
+   *
+   *   expm1(y):  |y| < 0.25 → 5-term Horner series
+   *                y*(1 + y*(1/2 + y*(1/6 + y*(1/24 + y/120))))
+   *              else       → exp(y) - 1
+   *
+   * lnB* are precomputed f64→f32 (Math.fround) to match the kernel's static
+   * uniforms. `t` (≤ 2^24 steps) is exact.
+   */
+  private _biasCorrection(
+    runtime: ReturnType<Torchlette["_runtime"]>,
+    t: RuntimeTensor,
+  ): { bc1: RuntimeTensor; bc2: RuntimeTensor } {
+    const expm1 = (lnBeta: number): RuntimeTensor => {
+      const y = runtime.mul(t, lnBeta); // t * lnBeta  (≤ 0)
+      // 5-term Horner series (small-|y| branch).
+      let r: RuntimeTensor = runtime.full([1], 1 / 120, this.device, "f32");
+      r = runtime.add(runtime.mul(r, y), 1 / 24);
+      r = runtime.add(runtime.mul(r, y), 1 / 6);
+      r = runtime.add(runtime.mul(r, y), 1 / 2);
+      r = runtime.add(runtime.mul(r, y), 1);
+      const series = runtime.mul(y, r);
+      const large = runtime.sub(runtime.exp(y), 1);
+      const cond = runtime.lt(runtime.abs(y), 0.25);
+      return runtime.where(cond, series, large);
+    };
+    const lnB1 = Math.fround(Math.log(this.beta1));
+    const lnB2 = Math.fround(Math.log(this.beta2));
+    const bc1 = runtime.neg(expm1(lnB1));
+    const bc2 = runtime.neg(expm1(lnB2));
+    return { bc1, bc2 };
   }
 
   /**
@@ -573,16 +701,21 @@ export class Adam {
     // intermediates were reacquired (src==dst in the scatter kernel is a
     // Dawn read-write usage validation error → dropped command buffer).
     // That was the gpt2-memorization stepAsync NaN regression.
-    const bc1 = 1 - this.beta1 ** this.steps[i];
-    const bc2 = 1 - this.beta2 ** this.steps[i];
+    // inc-2a: bias correction from the shared on-device `t` via the ONE
+    // expm1-form derivation; lr from the persistent per-group tensor. bc1/bc2/
+    // lr are [1] tensors that broadcast over the param shape.
+    const { bc1, bc2 } = this._biasCorrection(runtime, this._tTensor());
+    const lrTensor = this._lrTensor(this._groupIndex[i]);
     const mHat = runtime.div(prevAvg, bc1);
     const vHat = runtime.div(prevAvgSq, bc2);
     const denom = runtime.add(runtime.sqrt(vHat), this.eps);
-    const lr = this._getParamLR(i);
-    let scaled = runtime.mul(runtime.div(mHat, denom), lr);
+    let scaled = runtime.mul(runtime.div(mHat, denom), lrTensor);
     if (wd !== 0 && this.adamW) {
-      // Decoupled weight decay: p -= lr*wd*p (PyTorch AdamW).
-      scaled = runtime.add(scaled, runtime.mul(param._unwrap(), lr * wd));
+      // Decoupled weight decay: p -= lr*wd*p (PyTorch AdamW). lr is a tensor.
+      scaled = runtime.add(
+        scaled,
+        runtime.mul(param._unwrap(), runtime.mul(lrTensor, wd)),
+      );
     }
     runtime.copy_(param._unwrap(), runtime.sub(param._unwrap(), scaled));
   }
@@ -594,6 +727,8 @@ export class Adam {
     runtime: ReturnType<Torchlette["_runtime"]>,
   ): Tensor[] {
     const updated: Tensor[] = [];
+    // inc-2a: advance the shared on-device `t` ONCE per step.
+    this._advanceT(runtime);
     for (let i = 0; i < this.params.length; i++) {
       const param = this.params[i];
       const grad = param.grad?._unwrap() ?? null;
@@ -604,6 +739,8 @@ export class Adam {
       this._updateParamElementwise(runtime, i, param, grad);
       updated.push(param);
     }
+    runtime.persist(this._tTensor());
+    for (const lrT of this._lrTensors) if (lrT) runtime.persist(lrT);
     return updated;
   }
 
@@ -615,6 +752,10 @@ export class Adam {
   async stepAsync(): Promise<Tensor[]> {
     const runtime = this.api._runtime();
     const updated: Tensor[] = [];
+    // inc-2a: advance the shared on-device `t` ONCE per step, then force it so
+    // the per-param forces below read the settled post-increment value.
+    this._advanceT(runtime);
+    await runtime.force(this._tTensor());
     for (let i = 0; i < this.params.length; i++) {
       const param = this.params[i];
       const grad = param.grad?._unwrap() ?? null;
@@ -626,6 +767,8 @@ export class Adam {
       await runtime.force(param._unwrap());
       updated.push(param);
     }
+    runtime.persist(this._tTensor());
+    for (const lrT of this._lrTensors) if (lrT) runtime.persist(lrT);
     this.api.queueStepBoundary();
     return updated;
   }
@@ -650,6 +793,10 @@ export class Adam {
       this.expAvgSq[i] = runtime.zeros(this.params[i].shape, this.device);
       this.steps[i] = 0;
     }
+    // inc-2a: reset the on-device step counter IN-PLACE (preserve the
+    // persistent buffer identity; never replace-and-hold).
+    if (this._t)
+      runtime.copy_(this._t, runtime.full([1], 0, this.device, "f32"));
     // Packed foreach state is built FROM the per-param state on the next
     // step — dispose it so the reset takes effect there too.
     for (const st of this._foreachState.values()) {

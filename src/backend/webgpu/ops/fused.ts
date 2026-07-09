@@ -96,6 +96,8 @@ function adamStepInner(
   param: BackendTensor,
   m: BackendTensor,
   v: BackendTensor,
+  t: BackendTensor,
+  lr: BackendTensor,
   config: import("../../types").AdamStepConfig,
 ): { param: BackendTensor; m: BackendTensor; v: BackendTensor } {
   let _st = profileSubOpBegin();
@@ -103,6 +105,9 @@ function adamStepInner(
   const paramT = asContiguous(param);
   const mT = asContiguous(m);
   const vT = asContiguous(v);
+  // t/lr are read-only 1-element inputs — resolve their buffers (contiguous).
+  const tT = asContiguous(t);
+  const lrT = asContiguous(lr);
   profileSubOpEnd("adam.ensureContig", _st);
 
   // Evict stale f16 cache entry for the old param buffer before dispatch.
@@ -164,6 +169,8 @@ function adamStepInner(
     paramBuf,
     mBuf,
     vBuf,
+    tT.buffer,
+    lrT.buffer,
     numElements,
     config,
     emitF16,
@@ -179,6 +186,11 @@ function adamStepInner(
   }
 
   cleanupContiguous([grad, gradT]);
+  // t/lr are persistent optimizer state owned by the caller — only free the
+  // contiguous COPY if asContiguous made one (cleanupContiguous no-ops when
+  // tT===t). The original t/lr buffers are never destroyed here.
+  cleanupContiguous([t, tT]);
+  cleanupContiguous([lr, lrT]);
 
   // Cache the f16 param buffer (keyed by the param buffer, same as before)
   if (result.paramF16Buffer) {
@@ -214,6 +226,8 @@ export async function adamStep(
   param: BackendTensor,
   m: BackendTensor,
   v: BackendTensor,
+  t: BackendTensor,
+  lr: BackendTensor,
   config: import("../../types").AdamStepConfig,
 ): Promise<{ param: BackendTensor; m: BackendTensor; v: BackendTensor }> {
   // Suppress memory limit checks for the entire adam step.
@@ -227,7 +241,7 @@ export async function adamStep(
     // which conflicts within the same command encoder synchronization scope.
     // Flushing ensures prior passes are submitted before the in-place writes.
     flushSharedEncoder();
-    return adamStepInner(grad, param, m, v, config);
+    return adamStepInner(grad, param, m, v, t, lr, config);
   } finally {
     gpuMemoryTracker.unsuppressLimitCheck();
   }
@@ -285,11 +299,17 @@ export function adamStepBatch(items: AdamBatchItem[]): AdamBatchResult[] {
         numElements: c.gradT.size,
       }));
 
-      // Packed kernel uses the FIRST item's config; all items in a batch
-      // share the same Adam hyperparameters by construction (Adam.step()
-      // builds the batch).
+      // Packed kernel uses the FIRST item's config AND the FIRST item's t/lr
+      // tensors. This is SOUND because the executor's adam-batch grouping key
+      // (inc-2a) breaks the batch on lr-tensor identity: every item in one
+      // batch shares the same static config AND the same persistent t/lr
+      // tensors by construction. t/lr are 1-element shared bindings — they are
+      // NOT scatter/gathered (packed-dispatch assumes per-item numElements
+      // sizing); they are bound ONCE via the dispatch closure.
       const config = items[0].config;
       const infFlagBuffer = (config.infFlagBuffer as GPUBuffer | null) ?? null;
+      const tBuf = (asContiguous(items[0].t) as WebGPUTensor).buffer;
+      const lrBuf = (asContiguous(items[0].lr) as WebGPUTensor).buffer;
 
       const handled = dispatchPackedOptimizer({
         items: packedItems,
@@ -300,6 +320,8 @@ export function adamStepBatch(items: AdamBatchItem[]): AdamBatchResult[] {
             packed[1],
             packed[2],
             packed[3],
+            tBuf,
+            lrBuf,
             totalElements,
             config,
             false,
@@ -352,6 +374,8 @@ export function adamStepBatch(items: AdamBatchItem[]): AdamBatchResult[] {
         item.param,
         item.m,
         item.v,
+        item.t,
+        item.lr,
         item.config,
       );
     }

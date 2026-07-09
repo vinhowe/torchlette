@@ -23,10 +23,10 @@
  * existing sequence-hinted pool.
  */
 
-import { ENV } from "../core/env";
 import type { DType } from "../backend/types";
 import type { FusedKernelRecipe } from "../backend/webgpu/fusion-types";
 import type { EpilogueOp } from "../compiler/matmul-epilogue";
+import { ENV } from "../core/env";
 import { collectScalarSlots } from "./scalar-table";
 
 /** A path to resolve a tensor reference: planNodes[planNodeIndex].inputs[inputIndex]. */
@@ -80,7 +80,9 @@ interface LoweredNodeAction {
    *  liveness-released by plan-build). A string is a bail reason
    *  (contiguous-prologue / ksplit) — uncovered, keeps record/replay.
    *  Geometry is shape/dtype-pure → invariant within a template. */
-  cachedMatmulPlan?: import("../backend/webgpu/dispatch").BareMatmulPlan | string;
+  cachedMatmulPlan?:
+    | import("../backend/webgpu/dispatch").BareMatmulPlan
+    | string;
   /** Stage-4 phase-3: input shapes captured at lowering for ops whose
    *  generator can't derive them post-hoc (released multi-output inputs);
    *  e.g. narrowBackward's grad dim size. Template-invariant. */
@@ -484,11 +486,56 @@ import type {
 } from "../compiler/row-program-types";
 import type { LazyIRNode, LazyRef } from "../graph/types";
 
+/**
+ * HORIZONTAL-PACKING GROUP KEY — the single source of truth for "may these
+ * two nodes of the same op be packed into one batched dispatch?".
+ *
+ * GENERIC RULE (op-metadata driven, no per-optimizer semantics): a horizontal
+ * pack binds each op's DISPATCH-SHARED operands ONCE for the whole batch and
+ * reads the static config from a representative; only PER-ITEM operands are
+ * scatter/gathered. Two nodes may share a batch iff they AGREE on (a) every
+ * dispatch-shared operand's storage identity and (b) their static config bytes.
+ * The per-item operands are free to differ. `sharedOperandInputIndices` is the
+ * only op-specific datum — the set of input positions that are shared, not
+ * per-item. Everything else is derived structurally.
+ *
+ * NOTE (wart + exit): this lives behind an op-name switch (`adamStep`) because
+ * the executor's batched-op plumbing is adam-named today. That is a pre-inc-2a
+ * wart; the generic derivation here makes the exit MECHANICAL — replace the
+ * switch with an op-metadata lookup of `sharedOperandInputIndices` once
+ * horizontal packing is generalized to op-metadata-driven packing (home:
+ * #78/#83). inc-2a's static config is exactly what makes the generic predicate
+ * sufficient (no per-step payload variance to reconcile).
+ *
+ * The executor and stream-generate MUST consume this ONE function (via the
+ * `adam-batch` action's nodeIndices it produces) and never recompute a
+ * grouping decision independently — the single-source-at-the-seam rule.
+ */
+export function horizontalPackKey(node: LazyIRNode): string {
+  const refKey = (r: LazyRef | undefined): string => {
+    if (!r) return "none";
+    if (r.kind === "materialized") return `m:${r.storage.id}`;
+    if (r.kind === "pending") return `p:${r.node.id}:${r.outputIndex ?? 0}`;
+    return `s:${r.value}`;
+  };
+  // Op-specific datum: which input positions are dispatch-shared (bound once).
+  // For adamStep [grad, param, m, v, t, lr], t (4) and lr (5) are shared.
+  const sharedOperandInputIndices =
+    node.op === "adamStep" ? [4, 5] : ([] as number[]);
+  const sharedKey = sharedOperandInputIndices
+    .map((i) => refKey(node.inputs[i]))
+    .join("|");
+  // Static config bytes (JSON is a stable serialization for the small,
+  // step-invariant config payloads batched ops carry post-inc-2a).
+  const cfgKey =
+    node.payload !== undefined ? JSON.stringify(node.payload) : "nocfg";
+  return `${node.op}|${sharedKey}|${cfgKey}`;
+}
+
 /** Default reclaim interval, overridable via TORCHLETTE_RECLAIM_INTERVAL env var. */
-export const DEFAULT_RECLAIM_INTERVAL =
-  ENV.TORCHLETTE_RECLAIM_INTERVAL
-    ? parseInt(ENV.TORCHLETTE_RECLAIM_INTERVAL, 10)
-    : 10000;
+export const DEFAULT_RECLAIM_INTERVAL = ENV.TORCHLETTE_RECLAIM_INTERVAL
+  ? parseInt(ENV.TORCHLETTE_RECLAIM_INTERVAL, 10)
+  : 10000;
 
 interface BuildFromAnalysisInput {
   segments: ExecutionSegment[];
@@ -750,11 +797,19 @@ function emitSequentialActions(
     // same-op sequential dispatches adjacently for ANY op — no op-name
     // whitelist in the executor (the old ADAM_HOISTABLE_OPS hoisting).
     if (node.op === "adamStep") {
+      // Horizontal-packing group key (single source: `horizontalPackKey`).
+      // The packed fused path binds the DISPATCH-SHARED operands (t, lr) ONCE
+      // for the whole batch and reads the static config from the first item;
+      // only PER-ITEM operands (grad/param/m/v) are scatter/gathered. So a
+      // batch may contain only nodes that AGREE on their shared operands and
+      // static config. Break the consecutive run on any change.
+      const runKey = horizontalPackKey(node);
       const adamIndices: number[] = [];
       let consumed = 0;
       for (let j = nodeIdx; j < nodes.length; j++) {
         const nj = nodes[j];
         if (nj.op !== "adamStep") break;
+        if (horizontalPackKey(nj) !== runKey) break;
         if (!nj.result) {
           adamIndices.push(posMap.get(nj.id) as number);
         }
