@@ -22,6 +22,7 @@ import {
 import { storageTracker } from "../graph/storage-tracker";
 import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
 import { OP_REGISTRY } from "../ops/registry";
+import { isStepTapeReplayActive } from "./observed-liveness";
 import { lookupScalarStorage } from "./scalar-table";
 
 /** One-shot flag for the reclaimed-storage-read warning. */
@@ -130,7 +131,15 @@ export function getInputStorage(
     // step-scoped demotion reclaiming a mid-step-created tensor that user
     // code still holds; the buffer is back in the pool and may carry another
     // op's data). Warn by default; TORCHLETTE_STRICT_LIFETIME=1 throws.
-    if (ref.storage.releasedOverlay) {
+    // [2b §5] Inside a multi-plan TAPE replay the whole step's dataflow is
+    // DECLARED: cross-plan buffers re-bound by the planner are reachable for
+    // the replay even though their recording-era handle was demoted at the
+    // recording markStep. The per-handle liveness verdicts (releasedOverlay,
+    // isDestroyed) are observation-layer facts that the declaration supersedes
+    // — correctness proven by trajectory parity within the fp-noise floor. Skip
+    // both guards during the replay; outside it they are unchanged.
+    const declaredReplay = isStepTapeReplayActive();
+    if (ref.storage.releasedOverlay && !declaredReplay) {
       const msg =
         `[lifetime] reading step-globally RELEASED storage id=${ref.storage.id} ` +
         `(shape=${JSON.stringify(ref.storage.backendTensor.shape)}). Its registry entry was ` +
@@ -142,7 +151,7 @@ export function getInputStorage(
         console.warn(msg);
       }
     }
-    if (storageTracker.isDestroyed(ref.storage.id)) {
+    if (storageTracker.isDestroyed(ref.storage.id) && !declaredReplay) {
       const msg =
         `[lifetime] reading RECLAIMED storage id=${ref.storage.id} ` +
         `(shape=${JSON.stringify(ref.storage.backendTensor.shape)}). A tensor created ` +

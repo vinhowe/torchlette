@@ -933,3 +933,88 @@ driver) — it does NOT claim the runahead win (G0-honest: this increment is the
 inc-2b: multi-plan skeletons, async bodies, output-node mapping, hit-path
 boundary — the entire declared-step surface the ring pipelines.
 
+
+---
+
+## INC-2B LANDED (2026-07-09): whole training step captured as ONE call
+
+**What shipped.** `api.capture(fn, { training: true })` wraps a whole training
+step (forward + backward + optimizer). On the 2nd+ eligible call the body does
+NOT run — the recorded MULTI-plan sequence (forward/backward/optimizer plans)
+replays, advancing params/Adam-state/`t`/scale via their in-place ops (inc-2a
+made this the whole state-transition, so §1's "state lives in in-plan ops"
+premise — falsified for inc-2's optimizer — now HOLDS).
+
+**The four surfaces, as built:**
+1. **Multi-plan skeletons** — `step-tape-replay.ts`'s single `candidate` →
+   ordered `candidates[]`; `Skeleton.plans: SkeletonPlan[]`; promotion matches
+   the recorder's ORDERED plan-fp sequence (`lastEligible.orderedFps`; the
+   Set-based `fps` was deduped/unordered — kept for guard-4). Per-plan
+   upload/scalar slots route by the slot-id fpHex.
+2. **Async bodies** — `runIntercepted` awaits `body()`; `capture()`/`CapturedFn`
+   accept `Promise<Tensor|Tensor[]>`. External I/O in a body is FROZEN by the
+   closure contract (documented, VERIFY-backstopped — no new runtime trap, per
+   budget).
+3. **Output-node mapping** — the traced body's returned loss node is recorded
+   (`_declareCaptureOutputs`) and matched by identity to a (planIndex,pos) at
+   promotion; the replay harvests it. `ReplayResult` now returns `outputs[]`.
+   NOTE the driver must return a loss handle that SURVIVES backward (backward's
+   graph teardown disposes the raw loss) — a `noGrad(mul(loss,1))` forward-plan
+   copy is the idiom; its buffer survives the backward/optimizer replay.
+4. **Hit-path** — training capture is NEVER short-circuited (body runs once on a
+   miss, never on a hit). Upfront all-plan validity+shape check (no mid-replay
+   throw). Batch x/y are tensor ARGS re-dressed by ARG ORDER (they share a
+   shape — shape-keying is ambiguous); i32 token args are MATERIALIZED from
+   their fresh payload before replay (they are not TAG_WRITE-covered like f32
+   decode uploads — `executeOpSync`+`assignNodeResult`); constant internal
+   uploads (`zeros`/`full` from zeroGrad) keep their recorded payload. The hit
+   queues the implied step boundary. accumSteps=1 (micro==apply, one body) is
+   FULLY implemented; multi-micro is a documented follow-on.
+
+**TWO cross-plan lifetime issues found + fixed (both are §5's declared-lifetime
+dividend, applied narrowly to the captured path):**
+- **Cross-plan materialized refs** — a later plan's input is a MATERIALIZED ref
+  to a storage an earlier plan produced (the optimizer plan reading a grad the
+  backward plan wrote, forced/materialized between plans). The ref freezes the
+  RECORDING buffer (step-scoped, destroyed at markStep). Promotion snapshots
+  each plan's produced storage ids WHILE ALIVE (`Candidate.resultIds` — results
+  are swept before promotion) and builds `crossPlanLinks`; replay re-points each
+  ref to the producer's FRESH result after the producer plan runs.
+- **Lowered cross-plan producers + the stage-3 B release** — some grads are
+  produced by LOWERED backward segments (not compiled candidates), and the
+  stage-3 B clear-at-release marks a last-reader plan's external-input result
+  `releasedOverlay`. Both make a captured replay read a DECLARED-live buffer
+  that the observation layer thinks is destroyed/released. During a MULTI-plan
+  tape replay (`setStepTapeReplayActive`): the stage-3 B clear-at-release is
+  INERT, and the op-dispatch `releasedOverlay`/`isDestroyed` STRICT guards are
+  suppressed — the tape DECLARES the whole step's dataflow, so the per-handle
+  observation verdicts do not apply to cross-plan reads. **Correctness proven by
+  the noise floor:** captured-vs-uncaptured trajectory Δ (6.9e-4 @24, 1.55e-3
+  @40 steps) is BELOW the control-vs-control cross-run fp-noise floor (1.3e-3
+  @24, 2.09e-3 @40) — the buffers ARE correctly re-bound by the planner; the
+  destroyed-handle throw was a false positive. This is exactly §5: inside a
+  declared boundary, observation-layer predicates are superseded.
+
+**Gate ladder (device-2, vk-shim, verbatim in the session report):** build;
+inc-2b probe PASS (promotions=1, hits=19/24, bodyRuns=5 — body FROZEN on hits =
+run-exactly-once witness; trajectory within noise floor); capture.spec flag-on
+10/10 (+the 2b training test; decode 2a intact); t-train-tape-probe fused 7/0 +
+foreach 4/0; gen-tape 0-diverged/3101 cmds; compiled-vs-lowered 4.77e-6/30;
+test:gates 4/4; STRICT_LIFETIME+STRICT_GPU captured fullstack exit-0 zero throws;
+full suite both flag states.
+
+**G0-HONEST PERF (do not oversell — the ring is inc-3):** this increment is the
+~3-4% build-skip (G0a). The captured hit skips graph build / plan-collect /
+fingerprint / CSE for all 4 plans but still runs every plan's compiled replay
+and every per-step markStep fence; runahead (the 30% G0b win) is inc-3, which
+now HAS the whole-step declared surface it pipelines.
+
+**What inc-3 (the ring) needs that now exists:** the whole step is ONE captured
+call returning a ring-handled loss (unread on the hit path); multi-plan
+skeletons, async bodies, output-node harvest, and the declared cross-plan
+lifetime are all in place. Inc-3 turns K into a runahead depth by deferring the
+scaler `resolveDeferred` readback + loss `.item()` off the per-step path.
+
+**SLOC:** +~360 src (multi-plan replay + cross-plan links + capture training
+path + the §5 replay-active suppression). Zero new env flags. No deletions
+(coverage/mechanism extension of the 2a capture + step-tape-replay seams).

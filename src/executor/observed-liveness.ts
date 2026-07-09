@@ -210,6 +210,26 @@ export function isObservedLivenessEnabled(): boolean {
   return enabled;
 }
 
+/** [2b §5 declared-lifetime dividend] True while a MULTI-plan step TAPE replays
+ *  its plan sequence. Inside a captured training step the whole step's dataflow
+ *  is DECLARED, so the observation-layer's per-handle liveness verdicts do not
+ *  apply to cross-plan reads: (a) the stage-3 B clear-at-release must not fire
+ *  (a last-reader plan overlaying a claimed released external mid-replay would
+ *  strand the next replay's read); (b) a cross-plan buffer produced by an
+ *  earlier plan (or a lowered backward segment) and re-bound by the planner is
+ *  reachable for the whole replay even though its RECORDING-era storage handle
+ *  was demoted at the recording markStep — the destroyed-handle lifetime guard
+ *  is a false positive here (correctness proven: captured trajectory tracks the
+ *  uncaptured control WITHIN the cross-run fp-noise floor). Both are suppressed
+ *  only for the duration of the replay; outside it the guards are unchanged. */
+let stTapeReplayActive = false;
+export function setStepTapeReplayActive(on: boolean): void {
+  stTapeReplayActive = on;
+}
+export function isStepTapeReplayActive(): boolean {
+  return stTapeReplayActive;
+}
+
 export function resetObservedLiveness(): void {
   templates.clear();
   stepStamped = [];

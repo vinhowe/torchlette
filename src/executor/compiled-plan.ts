@@ -300,6 +300,7 @@ import { getInputStorage } from "./op-dispatch";
 import { planMemory, PlannerRegistry } from "./memory-planner";
 import {
   guardMiss,
+  isStepTapeReplayActive,
   noteAliasedBase,
   observeConsumed,
   registerPrunedExecution,
@@ -2003,7 +2004,7 @@ export async function executeCompiledPlan(
     // the miss is attributed + revocable). All: mark the storage handle
     // releasedOverlay so materialized-ref reads and readbacks hit the
     // [lifetime] warn / STRICT throw.
-    if (compiled._claimedExternal) {
+    if (compiled._claimedExternal && !isStepTapeReplayActive()) {
       for (const c of compiled._claimedExternal) {
         const src = compiled.slots[c.slot];
         if (src?.kind !== "external") continue;

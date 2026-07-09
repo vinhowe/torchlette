@@ -275,5 +275,82 @@ describe("capture() — flag-independent surface", () => {
       await api.markStep();
       expect(stStats().ceremonyResetsWhileWarm).toBeGreaterThan(before);
     });
+
+    // ---- 2b: whole-step TRAINING capture ------------------------------------
+    it("[2b] whole training step captures; body FROZEN on hits; params advance via replay", async () => {
+      if (!hasGPU) return;
+      const { Adam } = await import("../src/optim/index");
+      type T = import("../src/frontend/tensor").Tensor;
+
+      // Build one runner: a captured whole training step (forward matmul + MSE
+      // + Adam), and an uncaptured control that advances identical state. The
+      // batch x is a tensor ARG (warm slot); w is closure state advanced in
+      // place by the replayed optimizer plan.
+      async function runTrain(useCapture: boolean) {
+        const api = new Torchlette("webgpu", {
+          enableFusion: true,
+          enableMemoryPlanning: true,
+        });
+        const w = api.persist(
+          api.tensorFromArray([0.5, -0.5, 0.25, 0.75], [2, 2], {
+            requiresGrad: true,
+          }),
+        );
+        const target = api.persist(api.tensorFromArray([1, 0], [1, 2]));
+        const opt = new Adam([w], { lr: 1e-2 }, api);
+        let bodyRuns = 0;
+        const losses: number[] = [];
+
+        const stepFn = async (x: T): Promise<T> => {
+          bodyRuns++;
+          const pred = api.matmul(x, w);
+          const diff = api.sub(pred, target);
+          const loss = api.mean(api.mul(diff, diff));
+          const lossOut = api.noGrad(() => api.mul(loss, 1)); // survives backward
+          await loss.backward();
+          opt.step();
+          opt.zeroGrad();
+          return lossOut;
+        };
+        const step = api.capture(stepFn, { training: true });
+
+        const prev = api.setStepScopedCleanup(true);
+        try {
+          for (let i = 0; i < 16; i++) {
+            const x = api.tensorFromArray([1 + i * 0.01, 2 - i * 0.01], [1, 2]);
+            let loss: T;
+            if (useCapture) {
+              loss = (await step(x)) as T;
+            } else {
+              loss = await stepFn(x);
+            }
+            losses.push((await api.cpu(loss))[0]);
+            // markStep is the captured training step delimiter (the recorder
+            // step boundary — see docs/staged-execution-phase2b.md KEY FINDING;
+            // a real loop gets it from GradScaler.resolveDeferred's markStep).
+            await api.markStep();
+          }
+        } finally {
+          api.setStepScopedCleanup(prev);
+        }
+        return { bodyRuns, losses, hits: step.stats().hits, calls: step.stats().calls };
+      }
+
+      const cap = await runTrain(true);
+      const ctl = await runTrain(false);
+
+      // Hits happened and the body was NOT re-run on them (run-exactly-once).
+      expect(cap.hits).toBeGreaterThan(0);
+      expect(cap.bodyRuns).toBeLessThan(cap.calls);
+      // Captured trajectory tracks the uncaptured control (state advances via
+      // the replayed in-place optimizer plan).
+      let maxD = 0;
+      for (let i = 0; i < cap.losses.length; i++) {
+        maxD = Math.max(maxD, Math.abs(cap.losses[i] - ctl.losses[i]));
+      }
+      expect(maxD).toBeLessThan(1e-3);
+      // The loss actually descended (params are moving, not frozen at init).
+      expect(cap.losses[cap.losses.length - 1]).toBeLessThan(cap.losses[0]);
+    });
   },
 );

@@ -59,7 +59,10 @@ import {
 } from "../core/step-tape";
 import { executeLoweredPlan } from "./executor";
 import { assignNodeResult, executeOpSync } from "./op-dispatch";
-import { noteTemplateReplayed } from "./observed-liveness";
+import {
+  noteTemplateReplayed,
+  setStepTapeReplayActive,
+} from "./observed-liveness";
 
 // ---------------------------------------------------------------------------
 // Skeleton store (§8.2 option i)
@@ -97,6 +100,23 @@ interface SkeletonPlan {
   canonical: string[];
 }
 
+/** [2b] A CROSS-PLAN dataflow link: a later plan's input is a MATERIALIZED ref
+ *  to a storage that an EARLIER plan's node produced (e.g. the optimizer plan
+ *  reading a grad the backward plan wrote — forced/materialized between plans at
+ *  recording). The materialized ref freezes the RECORDING buffer, which is
+ *  step-scoped and destroyed at markStep → a dangling read on replay. Re-point
+ *  it to the producer node's FRESH result each replay after the producer plan
+ *  runs. Matched by storage id at promotion. */
+interface CrossPlanLink {
+  /** The consumer plan's node and input index holding the materialized ref. */
+  consumerPlan: number;
+  consumerNode: LazyIRNode;
+  inputIndex: number;
+  /** The producing node (in an earlier plan) whose fresh result to bind. */
+  producerNode: LazyIRNode;
+  producerOutputIndex: number;
+}
+
 interface Skeleton {
   appKey: string;
   /** ORDERED plan sequence (2b surface 1). Length 1 for decode. */
@@ -106,6 +126,8 @@ interface Skeleton {
   /** Output-node refs (2b surface 3): (plan index, node pos) of the tensor(s)
    *  the captured body returned. Decode: [{planIndex:0, pos:last}]. */
   outputRefs: Array<{ planIndex: number; pos: number }>;
+  /** Cross-plan materialized-ref links (2b). Empty for decode (single plan). */
+  crossPlanLinks: CrossPlanLink[];
 }
 
 /** One captured compiled plan of the current step, keyed by the active appKey;
@@ -120,6 +142,11 @@ interface Candidate {
   commands: GpuCommand[];
   epoch: number;
   stepScopedCleanup: boolean;
+  /** [2b cross-plan] storage-id → (node, outputIndex) snapshot of THIS plan's
+   *  produced results, taken while they are alive (at capture) — promotion runs
+   *  after the recording sweep, so node.result is unreadable there. Used to
+   *  resolve later plans' materialized refs to their cross-plan producer. */
+  resultIds: Map<number, { node: LazyIRNode; oi: number }>;
 }
 
 const readySkeletons = new Map<string, Skeleton>();
@@ -267,6 +294,17 @@ export function stCaptureCompiledStep(
     }
   }
 
+  // Snapshot this plan's produced storage ids WHILE ALIVE (results get swept
+  // before promotion) so cross-plan materialized refs resolve to their producer.
+  const resultIds = new Map<number, { node: LazyIRNode; oi: number }>();
+  for (const node of planNodes) {
+    const results = node.results ?? (node.result ? [node.result] : []);
+    for (let oi = 0; oi < results.length; oi++) {
+      const r = results[oi];
+      if (r) resultIds.set(r.id, { node, oi });
+    }
+  }
+
   candidates.push({
     appKey: ctxAppKey,
     fp,
@@ -276,6 +314,7 @@ export function stCaptureCompiledStep(
     commands,
     epoch: ctxEpoch,
     stepScopedCleanup: ctxStepScopedCleanup,
+    resultIds,
   });
   stats.captures++;
 }
@@ -415,12 +454,46 @@ export function stPromoteEligibleSkeleton(): void {
     });
   }
 
+  // Cross-plan links (2b): index every node's produced storage ids across all
+  // plans, then find later-plan MATERIALIZED inputs whose storage a node in an
+  // EARLIER plan produced. Those refs freeze the recording's step-scoped buffer
+  // (destroyed at markStep); re-point them to the fresh producer result per
+  // replay. (Storage ids are monotonic + unique, so an id match is exact.)
+  const producerById = new Map<number, { node: LazyIRNode; oi: number; plan: number }>();
+  for (let pi = 0; pi < cands.length; pi++) {
+    for (const [id, { node, oi }] of cands[pi].resultIds) {
+      producerById.set(id, { node, oi, plan: pi });
+    }
+  }
+  const crossPlanLinks: CrossPlanLink[] = [];
+  for (let pi = 0; pi < skPlans.length; pi++) {
+    for (const node of skPlans[pi].planNodes) {
+      for (let ii = 0; ii < node.inputs.length; ii++) {
+        const ref = node.inputs[ii];
+        if (ref.kind !== "materialized") continue;
+        const prod = producerById.get(ref.storage.id);
+        // Only a link if the producer is in an EARLIER plan (a within-plan
+        // materialized ref is handled by the plan's own execution).
+        if (prod && prod.plan < pi) {
+          crossPlanLinks.push({
+            consumerPlan: pi,
+            consumerNode: node,
+            inputIndex: ii,
+            producerNode: prod.node,
+            producerOutputIndex: prod.oi,
+          });
+        }
+      }
+    }
+  }
+
   readySkeletons.set(appKey, {
     appKey,
     plans: skPlans,
     epoch: cands[0].epoch,
     stepScopedCleanup: cands[0].stepScopedCleanup,
     outputRefs,
+    crossPlanLinks,
   });
   stats.promotions++;
 }
@@ -560,24 +633,50 @@ export async function stTryReplay(
     assignNodeResult(node, bt, [], []);
   }
 
-  // Replay every plan in order.
-  for (const pl of sk.plans) {
-    // Pin the template against idle-retire (see decode note): a replay bypasses
-    // the normal path, so mark it replayed to reset only the idle clock.
-    noteTemplateReplayed(pl.fp);
-    await executeLoweredPlan(
-      { nodes: pl.planNodes },
-      pl.planNodes,
-      pl.loweredPlan,
-      backend,
-      { bufferArena: pl.bufferArena },
-    );
-    if (!pl.loweredPlan.compiledPlan?.valid) {
-      // A plan fell back to lowered mid-step (staleness). Result is still
-      // correct (lowered ran); drop the skeleton so the next step re-records.
-      readySkeletons.delete(appKey);
-      stats.invalidations++;
+  // Replay every plan in order. For a MULTI-plan step (training) suppress the
+  // stage-3 B clear-at-release: a cross-plan intermediate (grad buffer produced
+  // by the backward plan, read by the optimizer plan) must live for the whole
+  // replay, not be released mid-replay by the last-reader plan (§5 declared
+  // lifetime). Single-plan decode has no cross-plan release → flag stays off.
+  const multiPlan = sk.plans.length > 1;
+  if (multiPlan) setStepTapeReplayActive(true);
+  try {
+    for (let pi = 0; pi < sk.plans.length; pi++) {
+      const pl = sk.plans[pi];
+      // Pin the template against idle-retire (see decode note): a replay
+      // bypasses the normal path, so mark it replayed to reset only the idle
+      // clock.
+      noteTemplateReplayed(pl.fp);
+      await executeLoweredPlan(
+        { nodes: pl.planNodes },
+        pl.planNodes,
+        pl.loweredPlan,
+        backend,
+        { bufferArena: pl.bufferArena },
+      );
+      if (!pl.loweredPlan.compiledPlan?.valid) {
+        // A plan fell back to lowered mid-step (staleness). Result is still
+        // correct (lowered ran); drop the skeleton so the next step re-records.
+        readySkeletons.delete(appKey);
+        stats.invalidations++;
+      }
+      // Re-point any cross-plan materialized refs whose producer plan is THIS
+      // one: bind the consumer's frozen ref to the producer's FRESH result (the
+      // recording buffer is step-scoped + destroyed; §5 declared lifetime).
+      for (const link of sk.crossPlanLinks) {
+        if (link.producerNode.result === undefined && !link.producerNode.results)
+          continue;
+        if (!pl.planNodes.includes(link.producerNode)) continue;
+        const fresh =
+          link.producerOutputIndex === 0
+            ? link.producerNode.result
+            : link.producerNode.results?.[link.producerOutputIndex];
+        const ref = link.consumerNode.inputs[link.inputIndex];
+        if (fresh && ref.kind === "materialized") ref.storage = fresh;
+      }
     }
+  } finally {
+    if (multiPlan) setStepTapeReplayActive(false);
   }
 
   // Harvest declared outputs (2b surface 3).
