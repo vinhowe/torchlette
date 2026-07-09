@@ -352,5 +352,75 @@ describe("capture() — flag-independent surface", () => {
       // The loss actually descended (params are moving, not frozen at init).
       expect(cap.losses[cap.losses.length - 1]).toBeLessThan(cap.losses[0]);
     });
+
+    // ---- 2b: LR schedule THROUGH hits (the frozen-LR class) -----------------
+    it("[2b-sched] driver-level LR schedule flows through replay hits", async () => {
+      if (!hasGPU) return;
+      const { Adam, CosineAnnealingLR } = await import("../src/optim/index");
+      type T = import("../src/frontend/tensor").Tensor;
+
+      // Same captured-training shape as [2b], plus a CosineAnnealingLR stepped
+      // at DRIVER level (outside the body) every iteration. The scheduler's
+      // setLR writes the persistent lr tensor via a replace-and-hold copy_
+      // chain that is still LAZY when the next hit begins — the skeleton must
+      // re-resolve it (owner rebind / pending-payload write) or every hit
+      // trains at the RECORDING's lr (measured 0.48-nat divergence at
+      // distilgpt2 scale before the fix).
+      async function runTrain(useCapture: boolean) {
+        const api = new Torchlette("webgpu", {
+          enableFusion: true,
+          enableMemoryPlanning: true,
+        });
+        const w = api.persist(
+          api.tensorFromArray([0.5, -0.5, 0.25, 0.75], [2, 2], {
+            requiresGrad: true,
+          }),
+        );
+        const target = api.persist(api.tensorFromArray([1, 0], [1, 2]));
+        const opt = new Adam([w], { lr: 5e-2 }, api);
+        const sched = new CosineAnnealingLR(opt, 16, 1e-4);
+        const losses: number[] = [];
+
+        const stepFn = async (x: T): Promise<T> => {
+          const pred = api.matmul(x, w);
+          const diff = api.sub(pred, target);
+          const loss = api.mean(api.mul(diff, diff));
+          const lossOut = api.noGrad(() => api.mul(loss, 1));
+          await loss.backward();
+          opt.step();
+          opt.zeroGrad();
+          return lossOut;
+        };
+        const step = api.capture(stepFn, { training: true });
+
+        const prev = api.setStepScopedCleanup(true);
+        try {
+          for (let i = 0; i < 16; i++) {
+            const x = api.tensorFromArray([1 + i * 0.01, 2 - i * 0.01], [1, 2]);
+            const loss = useCapture ? ((await step(x)) as T) : await stepFn(x);
+            losses.push((await api.cpu(loss))[0]);
+            await api.markStep();
+            sched.step(); // driver level — between steps, like a real loop
+          }
+        } finally {
+          api.setStepScopedCleanup(prev);
+        }
+        return { losses, hits: step.stats().hits, lr: opt.getLR() };
+      }
+
+      const cap = await runTrain(true);
+      const ctl = await runTrain(false);
+
+      expect(cap.hits).toBeGreaterThan(0);
+      // The schedule actually ran (lr decayed from 5e-2 toward the floor).
+      expect(cap.lr).toBeLessThan(1e-2);
+      // Captured trajectory tracks control: the DECAYING lr flowed into the
+      // replayed optimizer, not the recording-era value.
+      let maxD = 0;
+      for (let i = 0; i < cap.losses.length; i++) {
+        maxD = Math.max(maxD, Math.abs(cap.losses[i] - ctl.losses[i]));
+      }
+      expect(maxD).toBeLessThan(1e-3);
+    });
   },
 );

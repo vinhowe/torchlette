@@ -184,24 +184,58 @@ async function run(useCapture: boolean): Promise<RunResult> {
   };
 }
 
+/** Run one arm in a CHILD process and parse its result line. The two arms
+ *  must NOT share a process: the plain (control) arm with a per-step LR
+ *  scheduler grows GPU memory toward the 32GB ceiling, and whichever arm
+ *  runs second then trains under memory pressure — the plain arm sporadically
+ *  lands on a distinct WRONG trajectory there (~1-in-3, final 10.67→11.13,
+ *  same-signature wrong finals; PRE-EXISTING plain-path bug, repro:
+ *  tools/t-sched-plain-repro.ts — flag-off, no capture, and reproduces on
+ *  main + the setLR delivery fix alone). Child processes give each arm a
+ *  fresh device budget and make this gate deterministic. */
+async function runArmInChild(arm: "captured" | "control"): Promise<RunResult> {
+  const { execFileSync } = await import("node:child_process");
+  const out = execFileSync(
+    process.execPath,
+    ["--import", "tsx", import.meta.filename],
+    {
+      env: { ...process.env, TRAIN_CAPTURE_ARM: arm },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "inherit"],
+      maxBuffer: 64 * 1024 * 1024,
+    },
+  );
+  const line = out
+    .split("\n")
+    .find((l) => l.startsWith("=== ARM-RESULT === "));
+  if (!line) throw new Error(`arm ${arm}: no result line in child output`);
+  return JSON.parse(line.slice("=== ARM-RESULT === ".length)) as RunResult;
+}
+
 async function main() {
   if (!STEP_TAPE_REPLAY) {
     log("FAIL: set TORCHLETTE_STEP_TAPE=1 (flag read at module load)");
     process.exit(1);
   }
-  if (!(await initWebGPU())) {
-    log("WebGPU init failed");
-    process.exit(1);
+
+  // Child mode: run ONE arm and emit its result as JSON.
+  const armEnv = process.env.TRAIN_CAPTURE_ARM;
+  if (armEnv === "captured" || armEnv === "control") {
+    if (!(await initWebGPU())) {
+      log("WebGPU init failed");
+      process.exit(1);
+    }
+    const r = await run(armEnv === "captured");
+    console.log(`=== ARM-RESULT === ${JSON.stringify(r)}`);
+    destroyWebGPU();
+    process.exit(0);
   }
 
-  log("=== captured run ===");
-  const cap = await run(true);
+  const ctl = await runArmInChild("control");
+  log(`control losses: ${ctl.losses.map((l) => l.toFixed(4)).join(", ")}`);
+  const cap = await runArmInChild("captured");
   log(`captured: bodyRuns=${cap.bodyRuns} calls=${cap.captureStats.calls} hits=${cap.captureStats.hits} replayHits=${cap.replayHits} refusals=${cap.refusals}`);
   log(`captured losses: ${cap.losses.map((l) => l.toFixed(4)).join(", ")}`);
-
-  log("=== uncaptured control run ===");
-  const ctl = await run(false);
-  log(`control losses: ${ctl.losses.map((l) => l.toFixed(4)).join(", ")}`);
 
   // Parity: captured trajectory tracks control to the band.
   let maxDelta = 0;
@@ -235,14 +269,17 @@ async function main() {
     cap.captureStats.hits > 0 &&
     cap.refusals === 0 &&
     bodyFrozen &&
-    maxDelta < 1e-3;
+    // Threshold ABOVE the measured control-vs-control cross-run fp noise
+    // floor (1.3e-3 @ 24 steps, 2.1e-3 @ 40 — separate processes, pool/timing
+    // reorders). The frozen-LR failure mode this gate exists for measures
+    // 0.48 — two orders of magnitude above.
+    maxDelta < 2.5e-3;
   console.log(
     pass
       ? "PASS: whole training step captured; body frozen on hits; trajectory tracks control"
       : `FAIL (hits=${cap.captureStats.hits} refusals=${cap.refusals} bodyFrozen=${bodyFrozen} maxDelta=${maxDelta})`,
   );
-  await destroyWebGPU();
-  process.exit(pass ? 0 : 1);
+  process.exit(pass ? 0 : 1); // parent never inits WebGPU (arms are children)
 }
 
 main().catch((e) => {

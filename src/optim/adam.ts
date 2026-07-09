@@ -1,3 +1,4 @@
+import { noteScalarSlotValue } from "../core/scalar-slots";
 import type { AdamStepConfig, DeviceKind } from "../backend/types";
 import { ENV } from "../core/env";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
@@ -212,10 +213,15 @@ export class Adam {
       // (structureMiss — no step-tape can ever form under an LR schedule).
       // tensorFromArray's `values` are PAYLOAD_HASH_EXEMPT and re-executed per
       // replay: the write is stable STRUCTURE carrying per-step DATA.
+      const lrT = this._lrTensor(gi);
       runtime.copy_(
-        this._lrTensor(gi),
+        lrT,
         runtime.tensorFromArray([lr], [1], this.device, "f32"),
       );
+      // Authoritative host value for replayed step-tapes (see
+      // core/scalar-slots.ts) — the tape re-dresses its recorded lr write
+      // from here each replay.
+      noteScalarSlotValue(lrT, lr);
     }
   }
 
@@ -230,10 +236,12 @@ export class Adam {
     this._groups[groupIndex].lr = lr;
     const runtime = this.api._runtime();
     // tensorFromArray, not full() — see setLR.
+    const lrT = this._lrTensor(groupIndex);
     runtime.copy_(
-      this._lrTensor(groupIndex),
+      lrT,
       runtime.tensorFromArray([lr], [1], this.device, "f32"),
     );
+    noteScalarSlotValue(lrT, lr);
   }
 
   /** Get the number of parameter groups. */

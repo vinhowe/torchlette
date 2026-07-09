@@ -57,6 +57,8 @@ import {
   stGetTapes,
   stMarkReplayStep,
 } from "../core/step-tape";
+import { ENV } from "../core/env";
+import { getScalarSlotValue } from "../core/scalar-slots";
 import { storageTracker } from "../graph/storage-tracker";
 import { executeLoweredPlan } from "./executor";
 import { assignNodeResult, executeOpSync } from "./op-dispatch";
@@ -143,6 +145,9 @@ interface Skeleton {
    *  frozen-LR class — replace-and-hold writes move a persistent tensor to a
    *  new storage every step, stranding the recording-era ref). */
   rebinds: Array<{ ref: { kind: string; storage: StorageHandle }; owner: TensorOwner }>;
+  /** [2b sched] Per-replay payload re-dress of recorded in-plan scalar-write
+   *  chains (see Candidate.scalarDresses). */
+  scalarDresses: Array<{ writeNode: LazyIRNode; resultId: number }>;
 }
 
 /** One captured compiled plan of the current step, keyed by the active appKey;
@@ -170,6 +175,14 @@ interface Candidate {
    *  stale buffer forever (the frozen-LR class; caught by the
    *  schedule-through-hits gate). */
   matOwners: Map<object, TensorOwner>;
+  /** [2b sched] Recorded IN-PLAN driver scalar-write chains (the lr ghost):
+   *  scatter(dst, tensorFromArray([v])) forced INSIDE the step interval when
+   *  the driver's write is still lazy at body force time. The optimizer then
+   *  reads the scalar THROUGH this chain, so on replay the value is the
+   *  recorded upload payload — frozen. Each entry pairs the recorded WRITE
+   *  node (payload re-dressed per replay) with the owning persistent tensor
+   *  (source of the CURRENT value via its pending chain). */
+  scalarDresses: Array<{ writeNode: LazyIRNode; owner: TensorOwner }>;
 }
 
 /** Minimal owner surface (the runtime Tensor): its live lazyRef. */
@@ -345,6 +358,26 @@ export function stCaptureCompiledStep(
       if (r) resultIds.set(r.id, { node, oi });
     }
   }
+  // [2b sched] In-plan scalar-write ghost chains (see Candidate.scalarDresses):
+  // detected NOW (results alive). The chain's own output storage identifies
+  // the owning persistent tensor (the scatter dst's old storage has no owner
+  // backref by now — replace-and-hold already moved past it).
+  const scalarDresses: Candidate["scalarDresses"] = [];
+  for (const node of planNodes) {
+    if (node.op !== "stridedScatterCopy") continue;
+    const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+    if (n > 1) continue;
+    const srcRef = node.inputs[1] as { kind: string; node?: LazyIRNode };
+    if (srcRef?.kind !== "pending" || srcRef.node?.op !== "tensorFromArray")
+      continue;
+    const out = node.results?.[0] ?? node.result;
+    // Owner resolved at PROMOTION: the wrapper only materializes into the
+    // chain's output storage (registering the backref) after this force
+    // completes; the storage survives the recording sweep because the
+    // persistent wrapper holds it.
+    if (out) scalarDresses.push({ writeNode: srcRef.node, resultId: out.id });
+  }
+
   // Owner snapshot for materialized refs (see Candidate.matOwners): captured
   // NOW because the storage->tensor backref dies when the storage is swept.
   const matOwners = new Map<object, TensorOwner>();
@@ -353,6 +386,16 @@ export function stCaptureCompiledStep(
       if (ref.kind !== "materialized" || matOwners.has(ref)) continue;
       const owner = storageTracker.ownerOf(ref.storage.id);
       if (owner) matOwners.set(ref, owner as TensorOwner);
+      if (ENV.TORCHLETTE_DEBUG_REBIND === "1") {
+        const n = ref.storage.backendTensor.shape.reduce(
+          (a: number, b: number) => a * b,
+          1,
+        );
+        if (n <= 4)
+          console.error(
+            `[rebind-dbg] CAPTURE node=${node.op} inputStorage=${ref.storage.id} numel=${n} owner=${owner ? "yes" : "MISSING"}`,
+          );
+      }
     }
   }
 
@@ -367,6 +410,7 @@ export function stCaptureCompiledStep(
     stepScopedCleanup: ctxStepScopedCleanup,
     resultIds,
     matOwners,
+    scalarDresses,
   });
   stats.captures++;
 }
@@ -546,6 +590,8 @@ export function stPromoteEligibleSkeleton(): void {
   // (dedup by ref object; owners snapshotted at capture while storages lived).
   const rebinds: Skeleton["rebinds"] = [];
   const seenRefs = new Set<object>();
+  const scalarDresses: Skeleton["scalarDresses"] = [];
+  const seenWrites = new Set<LazyIRNode>();
   for (let k = 0; k < cands.length; k++) {
     if (skPlans[k].preBody) continue;
     for (const [ref, owner] of cands[k].matOwners) {
@@ -556,8 +602,23 @@ export function stPromoteEligibleSkeleton(): void {
         owner,
       });
     }
+    for (const d of cands[k].scalarDresses) {
+      if (seenWrites.has(d.writeNode)) continue;
+      seenWrites.add(d.writeNode);
+      const owner = storageTracker.ownerOf(d.resultId);
+      if (owner)
+        scalarDresses.push({
+          writeNode: d.writeNode,
+          owner: owner as TensorOwner,
+        });
+    }
   }
 
+  if (ENV.TORCHLETTE_DEBUG_REBIND === "1") {
+    console.error(
+      `[rebind-dbg] PROMOTE appKey=${appKey} rebinds=${rebinds.length} dresses=${scalarDresses.length} plans=${skPlans.length}`,
+    );
+  }
   readySkeletons.set(appKey, {
     appKey,
     plans: skPlans,
@@ -566,6 +627,7 @@ export function stPromoteEligibleSkeleton(): void {
     outputRefs,
     crossPlanLinks,
     rebinds,
+    scalarDresses,
   });
   stats.promotions++;
 }
@@ -573,6 +635,32 @@ export function stPromoteEligibleSkeleton(): void {
 // ---------------------------------------------------------------------------
 // Replay (§2.3)
 // ---------------------------------------------------------------------------
+
+/** [2b rebind] Host payload of an UNFORCED driver-level scalar write chain.
+ *  Shape: copy_(dst, tensorFromArray([v])) lowers to a pending
+ *  stridedScatterCopy whose src input is a pending tensorFromArray carrying
+ *  `v` in its payload. Returns the f32 bytes, or undefined when the chain has
+ *  any other shape (the rebind then leaves the recorded binding; loud guards
+ *  catch a stale read). */
+function extractPendingScalarPayload(
+  node: LazyIRNode,
+): Float32Array | undefined {
+  let src: LazyIRNode | undefined;
+  if (node.op === "tensorFromArray") {
+    src = node;
+  } else if (node.op === "stridedScatterCopy") {
+    const srcRef = node.inputs[1] as
+      | { kind: string; node?: LazyIRNode }
+      | undefined;
+    if (srcRef?.kind === "pending" && srcRef.node?.op === "tensorFromArray") {
+      src = srcRef.node;
+    }
+  }
+  const values = (src?.payload as { values?: ArrayLike<number> } | undefined)
+    ?.values;
+  if (!values || values.length !== 1) return undefined;
+  return Float32Array.from(values as ArrayLike<number>);
+}
 
 export interface ReplayOutput {
   resultHandle: StorageHandle;
@@ -687,6 +775,36 @@ export async function stTryReplay(
     }
   }
 
+  // [2b sched] Re-dress recorded in-plan scalar-write chains from the owning
+  // tensor's CURRENT pending payload (the driver's setLR issued since the
+  // last markStep). TAG_WRITE re-executes the recorded write node from its
+  // payload, so the replayed optimizer reads THIS step's value. Sticky when
+  // no pending write exists this step: the last-dressed value IS the current
+  // value (scalars only change via writes).
+  for (const d of sk.scalarDresses) {
+    // Authoritative host value first (the setter notes it — single source at
+    // the seam; core/scalar-slots.ts). Chain extraction is the fallback for
+    // authors that don't note values; it is only valid while the write is
+    // still pending — a FORCED write leaves no chain, and skipping then
+    // (sticky dress) goes stale by one step whenever markStep regimes mix
+    // (measured: sporadic 3e-3..0.07).
+    const noted = getScalarSlotValue(d.owner);
+    let bytes: Float32Array | undefined =
+      noted !== undefined ? Float32Array.of(noted) : undefined;
+    if (!bytes) {
+      const cur = d.owner.lazyRef as { kind: string; node?: LazyIRNode };
+      if (cur?.kind === "pending" && cur.node)
+        bytes = extractPendingScalarPayload(cur.node);
+    }
+    if (ENV.TORCHLETTE_DEBUG_REBIND === "1")
+      console.error(
+        `[rebind-dbg] DRESS noted=${noted} bytes=${bytes?.[0] ?? "n/a"}`,
+      );
+    if (bytes) {
+      d.writeNode.payload = { values: bytes, dtype: "f32" };
+    }
+  }
+
   // [2b rebind] Re-resolve owner-backed materialized refs to the owner's
   // CURRENT storage. A persistent tensor updated by replace-and-hold writes
   // (the scheduler's lr copy_ chain) moves to a NEW storage every step; the
@@ -711,6 +829,10 @@ export async function stTryReplay(
     } else if (cur?.kind === "pending" && cur.node) {
       const oi = cur.outputIndex ?? 0;
       curStorage = cur.node.results?.[oi] ?? (oi === 0 ? cur.node.result : undefined);
+      // Pending and UNFORCED: no current storage to repoint to. The value
+      // itself flows via the scalar DRESS above (authoritative registry /
+      // chain payload). NEVER force the chain mid-attempt — forcing here
+      // corrupts replay state (measured 12.7-nat divergence).
     }
     // Rebind scope (measured, both directions): (a) SCALAR-STATE refs - the
     // inc-2a optimizer scalars ([1]-shaped f32: lr per group; scale) are
@@ -722,13 +844,57 @@ export async function stTryReplay(
     // binding chain the compiled replays already maintain, and re-pointing
     // them to wrapper-tracked results measurably perturbs the trajectory
     // (0.010 vs noise-floor 1e-3 over 16 steps).
-    if (curStorage && curStorage !== rb.ref.storage) {
-      const numel = rb.ref.storage.backendTensor.shape.reduce(
-        (a: number, b: number) => a * b,
-        1,
+    const numel = rb.ref.storage.backendTensor.shape.reduce(
+      (a: number, b: number) => a * b,
+      1,
+    );
+    if (ENV.TORCHLETTE_DEBUG_REBIND === "1") {
+      console.error(
+        `[rebind-dbg] numel=${numel} cur=${cur?.kind}${curStorage ? "+storage" : ""} refStorage=${rb.ref.storage.id} destroyed=${storageTracker.isDestroyed(rb.ref.storage.id)} same=${curStorage === rb.ref.storage}`,
       );
-      if (numel <= 1 || storageTracker.isDestroyed(rb.ref.storage.id)) {
-        rb.ref.storage = curStorage;
+    }
+    // SCALAR-ONLY ([1]-shaped): the optimizer-scalar channel (lr; scale).
+    // Larger refs (params/m/v) are NEVER rebound — even when the recorded
+    // storage handle is swept, the underlying planner-bound buffers remain
+    // the live value chain across replays (main runs at the noise floor with
+    // no rebinding at all); re-pointing them to wrapper-tracked storages
+    // intermittently aliases planner temps (measured 6e-3..1.06-nat sporadic
+    // divergence in the foreach arm, 1-in-3 runs).
+    if (numel > 1) continue;
+    if (curStorage && curStorage !== rb.ref.storage) {
+      // The owner's forced current storage carries the value — repoint.
+      rb.ref.storage = curStorage;
+    } else if (!curStorage) {
+      // Pending-UNFORCED write (the driver's setLR issued since the last
+      // markStep): there is no storage to repoint to, but the VALUE is host
+      // data — inject it into the recorded binding pre-replay
+      // (queue.writeBuffer executes ahead of the replay's submits; prior
+      // replays' readers are fenced by the intervening markStep). This is
+      // the delivery path for cross-plan consumers of the recorded lr-write
+      // ghost's OUTPUT buffer (deleting it measured a consistent ~0.03
+      // one-step-stale-lr divergence). Registry first, chain fallback —
+      // same sourcing as the dress.
+      const noted = getScalarSlotValue(rb.owner);
+      const bytes =
+        noted !== undefined
+          ? Float32Array.of(noted)
+          : cur?.kind === "pending" && cur.node
+            ? extractPendingScalarPayload(cur.node)
+            : undefined;
+      const bt = rb.ref.storage.backendTensor as unknown as {
+        buffer: GPUBuffer;
+        offset?: number;
+        dtype?: string;
+      };
+      const dev = (backend as unknown as { device?: GPUDevice }).device;
+      if (bytes && dev && bt.buffer && (bt.dtype ?? "f32") === "f32") {
+        dev.queue.writeBuffer(
+          bt.buffer,
+          (bt.offset ?? 0) * 4,
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength,
+        );
       }
     }
   }
