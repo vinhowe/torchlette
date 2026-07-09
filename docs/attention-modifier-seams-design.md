@@ -1,7 +1,37 @@
-# Attention scoreMod / maskMod seams (FlexAttention-class) — DESIGN [PROPOSED]
+# Attention scoreMod / maskMod seams (FlexAttention-class) — DESIGN [ACCEPTED]
 
-Task #64. Status: **PROPOSED — design only.** No implementation lands with this
-doc. Protocol: review → hardening → separate implementation go.
+Task #64. Status: **ACCEPTED (review 2026-07-08) — implementation staged.**
+Review dispositions binding on the implementation:
+
+1. **Selection = spec-factory keyed by the modifier key, NOT a registry.** The
+   matmul variant registry earned its existence from many variants; attention
+   has one kernel family and one new axis. **Registry trigger:** build an
+   attention variant registry only when a SECOND independent variation axis
+   (beyond the modifier) demands it — until then a keyed spec-factory is the
+   smallest sufficient mechanism.
+2. **Decode-path window is staged:** additive-mask term first (correctness),
+   the `narrow` lower-bound as a follow-on (perf). At demo context lengths the
+   4096 window rarely binds.
+3. **f16 is a MANDATORY numbered gate** (§7): modifier arithmetic stays f32
+   under f16 QKV — the browser demo runs f16.
+4. **Causal deletion is differential-first, two commits:** (A) seam infra +
+   causal-as-modifier ALONGSIDE the legacy branch + a bit-parity differential
+   gate; (B) delete the legacy branch (named deletion). The parity gate exists
+   before the thing it exonerates is deleted.
+5. **Forward only now** (inference-first per §5); backward paired-derivative
+   stays design-only until a training demo needs it.
+
+Implementation refinement (commit A, consistent with the review): modifiers
+are **tagged data** (`AttnModifierSpec` in `backend/types.ts` — kinds + numeric
+params), not raw `SeamFn` closures at the API boundary. The SeamFn machinery is
+the internal emission mechanism (`buildAttentionSeams`); data-form keeps
+modifiers serializable (remote wire), hashable (CSE structural keys + plan
+fingerprints hash payload content — verified: fusedAttention is not payload-
+exempt), and interpretable by the CPU decomposed path for cross-path parity.
+The canonical key is `attnModifierKey()` (attention-kernel.ts) — kinds are
+template identity, params are uniform content. Arbitrary-closure modifiers
+(FlexAttention-general) remain a possible later escape hatch; not needed for
+Gemma-2.
 
 Driving requirement: **Gemma-2 in the browser** (→ Gemma-2-2B + Gemma Scope SAEs =
 the SAE-steering-in-a-tab demo). Gemma-2 attention needs three things the current
@@ -382,22 +412,33 @@ injected by hand). Both are gated in §7.
    (soft-cap, sliding-window, causal, and compositions), the fused-kernel output must
    match a naive materialized `matmul→scoreMod→mask→softmax→matmul` reference to ~1e-4
    (f32) — the G0(c) probe, promoted to an in-suite webgpu spec and extended to each
-   modifier. Include an f16-QKV variant with f32 modifier arithmetic.
-2. **Qwen3 unchanged = the null-modifier gate.** Qwen3's attention is the identity
+   modifier.
+2. **f16 gate (MANDATORY — review disposition 3).** The same per-modifier parity with
+   f16 QKV inputs, asserting modifier arithmetic stays f32 (like the existing `scale`
+   uniform's `bitcastTo("f32")`); tolerance at f16 level (~1e-2 absolute on outputs).
+   The browser demo runs f16 — this is the deployment configuration.
+3. **Qwen3 unchanged = the null-modifier gate.** Qwen3's attention is the identity
    scoreMod + causal maskMod. Its trajectories must be **bit-identical** before/after
    the seam lands (the disabled branch reproduces stock attention — probe confirms the
-   principle). Run `examples/qwen3/kv-differential.ts` (cached==uncached token
-   sequence) and the taped-decode gates green.
-3. **Tape/decode gates.** `modifier.key` folded into the capture bucketKey;
-   `taped-decode.ts` + `kv-differential.ts` green with a modifier present (Gemma-2
-   local/global alternation must key distinctly and replay the right mask).
-4. **Fingerprint seam assertion.** WGSL-cache stores emitted source per key; a key
+   principle; the commit-A gate `test/webgpu/attention-modifier-parity.spec.ts`
+   proves causal-modifier ≡ legacy-causal bit-exactly, fwd+bwd). Run
+   `examples/qwen3/kv-differential.ts` (cached==uncached token sequence) and the
+   taped-decode gates green.
+4. **Tape/decode gates.** The modifier key folded into the capture bucketKey;
+   `gen-tape-gate.ts` (3-gen, hits asserted) + `kv-differential.ts` green with a
+   modifier present (Gemma-2 local/global alternation must key distinctly and replay
+   the right mask). Null modifier keys as "" — existing bucketKeys byte-stable.
+5. **Fingerprint seam assertion.** WGSL-cache stores emitted source per key; a key
    collision with differing source throws (mirror `getConfigBuffer`'s byte-compare).
-5. **Backward parity (only if training lands).** Paired `dRaw` checked numerically vs
+   With modifiers-as-data the key is DERIVED from the spec (`attnModifierKey`), so
+   collisions are impossible by construction; the assertion guards drift between the
+   key fn and the emission fn (strict-mode recompile-and-compare).
+6. **Backward parity (only if training lands).** Paired `dRaw` checked numerically vs
    finite-difference and vs an unfused autograd composition, per modifier.
-6. **Full suite** (`npm run test`) + **gates** (`npm run test:gates`) green;
-   weight-norm vector snapshot (the causal-branch deletion should hold SLOC flat or
-   down — the seam replaces ~90 SLOC of triplicated `isCausal` branches).
+7. **Full suite** (`npm run test`) both flag states + **gates** (`npm run test:gates`)
+   green; STRICT modes (`TORCHLETTE_STRICT_GPU=1`, `TORCHLETTE_STRICT_LIFETIME=1`) on
+   the attention specs; weight-norm vector snapshot (the causal-branch deletion should
+   hold SLOC ~flat — the seam replaces the triplicated `isCausal` branches).
 
 ---
 

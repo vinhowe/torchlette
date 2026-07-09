@@ -34,8 +34,8 @@ import {
   type AutocastContext,
   createAutocastContext,
 } from "../compiler/amp";
-import { shapesEqual, sizeOf } from "../core/shape";
 import { currentEpoch } from "../core/epoch";
+import { shapesEqual, sizeOf } from "../core/shape";
 import {
   STEP_TAPE_RECORD,
   STEP_TAPE_REPLAY,
@@ -43,6 +43,7 @@ import {
   stNoteBoundary,
   stStats,
 } from "../core/step-tape";
+import { observeStepBoundary } from "../executor/observed-liveness";
 import {
   stDropSkeleton,
   stPromoteEligibleSkeleton,
@@ -54,7 +55,6 @@ import {
 } from "../executor/step-tape-replay";
 import { getNextNodeId } from "../graph/node-factory";
 import { storageTracker } from "../graph/storage-tracker";
-import { observeStepBoundary } from "../executor/observed-liveness";
 import {
   type EngineTensor,
   RuntimeEngine,
@@ -65,8 +65,8 @@ import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 // Re-export the Tensor class and DisposedTensorError from their new home
 export { DisposedTensorError, Tensor } from "./tensor";
 
-import { Tensor } from "./tensor";
 import { CapturedFn, type CaptureOptions } from "./capture";
+import { Tensor } from "./tensor";
 
 // Re-export types from frontend-types
 export type {
@@ -1102,8 +1102,17 @@ export class Torchlette {
     v: Tensor,
     scale?: number,
     isCausal = false,
+    modifier?: import("../backend/types").AttnModifierSpec,
   ): Tensor {
-    return scaledDotProductAttentionImpl(this, q, k, v, scale, isCausal);
+    return scaledDotProductAttentionImpl(
+      this,
+      q,
+      k,
+      v,
+      scale,
+      isCausal,
+      modifier,
+    );
   }
 
   layernorm(x: Tensor, weight: Tensor, bias: Tensor, eps = 1e-5): Tensor {
@@ -2090,7 +2099,11 @@ export class Torchlette {
     invalidate(): void;
     stats(): ReturnType<CapturedFn["stats_"]>;
   } {
-    const cf = new CapturedFn(this, fn as (...a: never[]) => Tensor | Tensor[], opts);
+    const cf = new CapturedFn(
+      this,
+      fn as (...a: never[]) => Tensor | Tensor[],
+      opts,
+    );
     const callable = ((...args: A) => cf.call(args)) as {
       (...args: A): Promise<Tensor | Tensor[]>;
       invalidate(): void;
@@ -2109,7 +2122,12 @@ export class Torchlette {
 
   _setCaptureTapeContext(appKey: string, scalars: number[]): void {
     if (STEP_TAPE_REPLAY) {
-      stSetTapeContext(appKey, scalars, currentEpoch(), this._stepScopedCleanup);
+      stSetTapeContext(
+        appKey,
+        scalars,
+        currentEpoch(),
+        this._stepScopedCleanup,
+      );
     }
   }
 
@@ -2171,7 +2189,8 @@ export class Torchlette {
         kind: string;
         node?: { op?: string; payload?: unknown };
       };
-      if (ref.kind !== "pending" || ref.node?.op !== "tensorFromArray") continue;
+      if (ref.kind !== "pending" || ref.node?.op !== "tensorFromArray")
+        continue;
       const p = ref.node.payload as { values?: ArrayLike<number> } | undefined;
       if (!p?.values) continue;
       uploads.push({

@@ -640,6 +640,7 @@ export function fusedAttentionForward(
     config.headDim,
     config.scale,
     config.isCausal,
+    config.modifier,
   );
 
   cleanupContiguous([q, qT], [k, kT], [v, vT]);
@@ -682,6 +683,7 @@ export function fusedAttentionBackward(
     config.headDim,
     config.scale,
     config.isCausal,
+    config.modifier,
   );
 
   // Step 2: Compute dQ
@@ -698,6 +700,7 @@ export function fusedAttentionBackward(
     config.headDim,
     config.scale,
     config.isCausal,
+    config.modifier,
   );
 
   // Step 3: Compute dK, dV
@@ -714,6 +717,7 @@ export function fusedAttentionBackward(
     config.headDim,
     config.scale,
     config.isCausal,
+    config.modifier,
   );
 
   // D buffer is an intermediate — release it back to the pool now

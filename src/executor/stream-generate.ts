@@ -1879,6 +1879,7 @@ function generateAttention(
         headDim?: number;
         scale?: number;
         isCausal?: boolean;
+        modifier?: import("../backend/types").AttnModifierSpec;
       }
     | undefined;
   if (
@@ -1940,6 +1941,7 @@ function generateAttention(
       cfg.headDim,
       cfg.scale,
       causal,
+      cfg.modifier,
     );
     if (!p.plan.configBuffer) return "config-missing";
     const cfgSlot = bufferSlot(p.plan.configBuffer as unknown, "persistent");
@@ -1995,6 +1997,7 @@ function generateAttention(
     cfg.headDim,
     cfg.scale,
     causal,
+    cfg.modifier,
   );
   if (!p.dPlan.configBuffer) return "config-missing";
   const cfgSlot = bufferSlot(p.dPlan.configBuffer as unknown, "persistent");

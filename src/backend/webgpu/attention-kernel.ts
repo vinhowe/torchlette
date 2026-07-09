@@ -15,6 +15,7 @@
  * memory code. Auto-CSE handles all sub-expression sharing.
  */
 
+import type { AttnModifierSpec } from "../types";
 import { cachedCreateBindGroup } from "./bind-group-cache";
 import { allocateOutputBuffer } from "./buffer-arena";
 import { dispatchComputePass, getPipeline } from "./dispatch";
@@ -22,7 +23,12 @@ import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { F32_NEG_MAX, WORKGROUP_SIZE } from "./shape-utils";
 import { compileTileKernel } from "./tile-compiler";
-import type { TileKernelSpec } from "./tile-ir";
+import type {
+  BlockExpr,
+  KernelContext,
+  SeamFn,
+  TileKernelSpec,
+} from "./tile-ir";
 import { tiledGrid } from "./tile-ir";
 import {
   onTeardown,
@@ -40,6 +46,149 @@ const BQ_BW = 16; // Q rows per tile (backward dKV)
 const BC_BW = 64; // KV rows per workgroup (backward dKV)
 
 // ============================================================================
+// Attention modifier seams (task #64 — FlexAttention-class score/mask mods)
+//
+// Modifiers arrive as DATA (AttnModifierSpec, backend/types.ts) and are
+// lowered here to tile-IR expressions at the kernels' declared seam points
+// (spec.seams + ctx.applySeam — the #62 machinery):
+//   - "attn_score": wraps the scaled pre-softmax score (fwd + both bwd
+//     recompute sites). Args: qIdx, kvIdx, head, batch (u32 BlockExprs).
+//   - "attn_mask": wraps the active-position predicate (AND'ed onto the
+//     bounds check). Same args. Inactive positions get F32_NEG_MAX (fwd)
+//     / p=0 (bwd), exactly like the legacy causal branch.
+//
+// A modifier's STRUCTURE (which kinds) is template identity → part of every
+// WGSL/pipeline/config cache key via attnModifierKey(), the single source.
+// Numeric params (cap, window) are uniform DATA, not key material — except
+// in the config-buffer key, which keys uniform CONTENT (like scale already
+// does). Null modifier ⇒ key fragment "" ⇒ byte-identical keys AND WGSL to
+// the pre-seam kernel (applySeam is identity when no seam is injected).
+//
+// Backward for scoreMod is INFERENCE-FIRST: paired-derivative design lives
+// in docs/attention-modifier-seams-design.md §2; until implemented,
+// dispatching a backward kernel with a scoreMod throws. Mask mods need no
+// derivative (constant structure) and are wired in backward.
+// ============================================================================
+
+/** Canonical structural key for a modifier — SINGLE SOURCE for every cache
+ *  seam (WGSL cache, pipeline cache, config-buffer cache, and the decode
+ *  bucketKey fragment). "" = null modifier = legacy keys, byte-stable. */
+export function attnModifierKey(mod?: AttnModifierSpec): string {
+  if (!mod) return "";
+  const parts: string[] = [];
+  if (mod.scoreMod) parts.push(`s.${mod.scoreMod.kind}`);
+  for (const m of mod.maskMods ?? []) parts.push(`m.${m.kind}`);
+  return parts.join("+");
+}
+
+function hasCausalMask(mod?: AttnModifierSpec): boolean {
+  return (mod?.maskMods ?? []).some((m) => m.kind === "causal");
+}
+
+/** Build the seam functions for a modifier (undefined for null modifier —
+ *  keeps the spec object, and thus the emitted WGSL, identical to legacy). */
+function buildAttentionSeams(
+  mod: AttnModifierSpec | undefined,
+): Record<string, SeamFn> | undefined {
+  if (!mod) return undefined;
+  const seams: Record<string, SeamFn> = {};
+  const maskMods = mod.maskMods ?? [];
+  if (maskMods.length > 0) {
+    seams.attn_mask = (
+      _ctx: KernelContext,
+      active: BlockExpr,
+      args: Record<string, BlockExpr>,
+    ) => {
+      let a = active;
+      for (const m of maskMods) {
+        if (m.kind === "causal") {
+          a = a.and(args.kvIdx.le(args.qIdx));
+        } else {
+          // slidingWindow lands in the soft-cap/window increment (#64 iii).
+          throw new Error(
+            `attention maskMod '${m.kind}' not implemented in kernel emission`,
+          );
+        }
+      }
+      return a;
+    };
+  }
+  if (mod.scoreMod) {
+    // softcap emission lands in the soft-cap/window increment (#64 iii).
+    throw new Error(
+      `attention scoreMod '${mod.scoreMod.kind}' not implemented in kernel emission`,
+    );
+  }
+  return seams;
+}
+
+/** Uniform-content words contributed by modifier params (packed into the
+ *  config buffer's pad words 6..7). None yet — softcap.cap / window arrive
+ *  with their emission (#64 iii). Kept single-source with the key. */
+function modifierParamWords(mod?: AttnModifierSpec): number[] {
+  if (!mod) return [];
+  return [];
+}
+
+/** True when the modifier adds nothing — canonicalized to undefined so `{}`
+ *  and undefined share the legacy templates (a `{}`-keyed spec would emit
+ *  different WGSL under the SAME "" cache key — the collision this guards). */
+function isNullModifier(mod?: AttnModifierSpec): boolean {
+  return !mod || (!mod.scoreMod && !mod.maskMods?.length);
+}
+
+/**
+ * Canonicalize (isCausal, modifier) at every public dispatch/plan entry —
+ * the SINGLE place the two composition surfaces meet. Rules:
+ *  - null modifier ⇒ legacy path (isCausal stays a uniform, keys unchanged);
+ *  - modifier present ⇒ isCausal=true folds INTO the modifier as a causal
+ *    maskMod (structural), and the returned isCausal is false — the kernel's
+ *    legacy uniform clause is not emitted on the modifier path, so dropping
+ *    the fold would silently lose causality.
+ */
+function normalizeAttnModifier(
+  isCausal: boolean,
+  mod?: AttnModifierSpec,
+): { isCausal: boolean; mod?: AttnModifierSpec } {
+  if (isNullModifier(mod)) return { isCausal, mod: undefined };
+  const m = mod as AttnModifierSpec;
+  if (isCausal && !hasCausalMask(m)) {
+    return {
+      isCausal: false,
+      mod: {
+        ...m,
+        maskMods: [{ kind: "causal" }, ...(m.maskMods ?? [])],
+      },
+    };
+  }
+  return { isCausal: false, mod: m };
+}
+
+/** Append the modifier fragment to a cache key (WGSL or pipeline). */
+function withModKey(base: string, mod?: AttnModifierSpec): string {
+  const k = attnModifierKey(mod);
+  return k ? `${base}:${k}` : base;
+}
+
+/** Backward is inference-first for score modifiers: the paired-derivative
+ *  ("attn_dscore") emission is designed (doc §2) but not implemented. Mask
+ *  mods are constant structure (no derivative) and are supported. */
+function assertBackwardSupportsModifier(mod?: AttnModifierSpec): void {
+  if (mod?.scoreMod) {
+    throw new Error(
+      `attention backward with scoreMod '${mod.scoreMod.kind}' is not ` +
+        `implemented (inference-first; see docs/attention-modifier-seams-design.md §2)`,
+    );
+  }
+}
+
+/** WGSL-identifier-safe name fragment ("" for null modifier). */
+function modNameFragment(mod?: AttnModifierSpec): string {
+  const k = attnModifierKey(mod);
+  return k ? `_${k.replace(/[^A-Za-z0-9]/g, "_")}` : "";
+}
+
+// ============================================================================
 // WGSL Cache & Config Buffer Cache
 // ============================================================================
 
@@ -55,6 +204,24 @@ function getTileIRWGSL(key: string, specFactory: () => TileKernelSpec): string {
 
 const configCache = new Map<string, GPUBuffer>();
 
+/** Config-buffer cache key: uniform CONTENT identity (dims + scale + causal
+ *  flag + modifier structure + modifier param values). Single source — used
+ *  by getOrCreateConfigBuffer and lookupAttentionConfigBuffer. */
+function attentionConfigKey(
+  batchSize: number,
+  numHeads: number,
+  seqLen: number,
+  headDim: number,
+  scale: number,
+  isCausal: number,
+  mod?: AttnModifierSpec,
+): string {
+  const base = `${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${isCausal}`;
+  const modKey = attnModifierKey(mod);
+  if (!modKey) return base;
+  return `${base}:${modKey}:${modifierParamWords(mod).join(",")}`;
+}
+
 function getOrCreateConfigBuffer(
   device: GPUDevice,
   batchSize: number,
@@ -63,8 +230,17 @@ function getOrCreateConfigBuffer(
   headDim: number,
   scale: number,
   isCausal: number,
+  mod?: AttnModifierSpec,
 ): GPUBuffer {
-  const key = `${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${isCausal}`;
+  const key = attentionConfigKey(
+    batchSize,
+    numHeads,
+    seqLen,
+    headDim,
+    scale,
+    isCausal,
+    mod,
+  );
   let buf = configCache.get(key);
   if (buf) return buf;
 
@@ -83,8 +259,14 @@ function getOrCreateConfigBuffer(
   u32View[3] = headDim;
   f32View[4] = scale;
   u32View[5] = isCausal;
-  u32View[6] = 0; // pad
-  u32View[7] = 0; // pad
+  u32View[6] = 0; // pad / modifier param 0
+  u32View[7] = 0; // pad / modifier param 1
+  const params = modifierParamWords(mod);
+  for (let i = 0; i < params.length; i++) {
+    if (6 + i > 7)
+      throw new Error("attention modifier params exceed config pad words");
+    u32View[6 + i] = params[i];
+  }
   device.queue.writeBuffer(buf, 0, new Uint8Array(data));
   // Cache it (the "getOrCreate" contract — was missing, so every attention
   // dispatch re-created + re-uploaded this 32-byte uniform; caching is a
@@ -98,16 +280,20 @@ function getOrCreateConfigBuffer(
 // Kernel Specs (tile-IR)
 // ============================================================================
 
-function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
+function makeForwardAttentionSpec(
+  headDim: number,
+  mod?: AttnModifierSpec,
+): TileKernelSpec {
   if (headDim % 4 !== 0)
     throw new Error(`headDim must be divisible by 4, got ${headDim}`);
   const D = headDim;
   const WG = BR;
 
   return {
-    name: `tileAttnFwd_D${D}`,
+    name: `tileAttnFwd_D${D}${modNameFragment(mod)}`,
     workgroupSize: WG,
     autoBarriers: true,
+    seams: buildAttentionSeams(mod),
     bindings: {
       Q: { storage: "read", type: "f32" },
       K: { storage: "read", type: "f32" },
@@ -181,13 +367,24 @@ function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
 
         ctx.range(0, BC, (j) => {
           const kvPos = kvStart.add(j);
-          const isActive = valid
-            .and(kvPos.lt(N))
-            .and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
-          scores.set(
-            j,
-            isActive.select(scores.get(j).mul(scale), ctx.f32(F32_NEG_MAX)),
+          const seamArgs = {
+            qIdx: qRow,
+            kvIdx: kvPos,
+            head: hIdx,
+            batch: bIdx,
+          };
+          // Seam "attn_mask": modifier path replaces the legacy uniform-driven
+          // causal clause with structural mask predicates.
+          let base = valid.and(kvPos.lt(N));
+          if (!mod) base = base.and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
+          const isActive = ctx.applySeam("attn_mask", base, seamArgs);
+          // Seam "attn_score": wraps the scaled pre-softmax score.
+          const s = ctx.applySeam(
+            "attn_score",
+            scores.get(j).mul(scale),
+            seamArgs,
           );
+          scores.set(j, isActive.select(s, ctx.f32(F32_NEG_MAX)));
         });
 
         const mNew = scores.max(1);
@@ -256,16 +453,20 @@ function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
   };
 }
 
-function makeBackwardDQSpec(headDim: number): TileKernelSpec {
+function makeBackwardDQSpec(
+  headDim: number,
+  mod?: AttnModifierSpec,
+): TileKernelSpec {
   if (headDim % 4 !== 0)
     throw new Error(`headDim must be divisible by 4, got ${headDim}`);
   const D = headDim;
   const WG = BR;
 
   return {
-    name: `tileAttnBwdDQ_D${D}`,
+    name: `tileAttnBwdDQ_D${D}${modNameFragment(mod)}`,
     workgroupSize: WG,
     autoBarriers: true,
+    seams: buildAttentionSeams(mod),
     bindings: {
       Q: { storage: "read", type: "f32" },
       K: { storage: "read", type: "f32" },
@@ -356,13 +557,28 @@ function makeBackwardDQSpec(headDim: number): TileKernelSpec {
         // Fused single-loop: compute score, p, ds per KV-row, accumulate dQ inline
         ctx.range(0, BC, (j) => {
           const kvPos = kvStart.add(j);
-          const isActive = valid
-            .and(kvPos.lt(N))
-            .and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
+          const seamArgs = {
+            qIdx: qRow,
+            kvIdx: kvPos,
+            head: hIdx,
+            batch: bIdx,
+          };
+          let base = valid.and(kvPos.lt(N));
+          if (!mod) base = base.and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
+          const isActive = ctx.applySeam("attn_mask", base, seamArgs);
+          // Flash-style recompute: raw score is rebuilt from Q·K, so the
+          // score modifier's forward AND its local derivative (the
+          // "attn_dscore" seam, chain factor d(modded)/d(raw)) are available
+          // inline — no extra saved tensor.
           const s = ctx.dotRow(Q, K, j).mul(scale);
+          const sMod = ctx.applySeam("attn_score", s, seamArgs);
           const dov = ctx.dotRow(dO, V, j);
-          const p = isActive.select(s.sub(lVar.get()).exp(), ctx.f32(0));
-          const ds = p.mul(dov.sub(dVar.get()));
+          const p = isActive.select(sMod.sub(lVar.get()).exp(), ctx.f32(0));
+          const ds = ctx.applySeam("attn_dscore", p.mul(dov.sub(dVar.get())), {
+            ...seamArgs,
+            raw: s,
+            modded: sMod,
+          });
           ctx.accumRow(dqAcc, ds, K, j);
         });
       });
@@ -375,16 +591,20 @@ function makeBackwardDQSpec(headDim: number): TileKernelSpec {
   };
 }
 
-function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
+function makeBackwardDKVSpec(
+  headDim: number,
+  mod?: AttnModifierSpec,
+): TileKernelSpec {
   if (headDim % 4 !== 0)
     throw new Error(`headDim must be divisible by 4, got ${headDim}`);
   const D = headDim;
   const WG = BC_BW;
 
   return {
-    name: `tileAttnBwdDKV_D${D}`,
+    name: `tileAttnBwdDKV_D${D}${modNameFragment(mod)}`,
     workgroupSize: WG,
     autoBarriers: true,
+    seams: buildAttentionSeams(mod),
     bindings: {
       Q: { storage: "read", type: "f32" },
       K: { storage: "read", type: "f32" },
@@ -459,11 +679,21 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
       ctx.forRange(ctx.u32(0), numQTiles, (qt) => {
         const qStart = qt.mul(ctx.u32(BQ_BW));
 
-        const skipTile = isCausal
-          .ne(ctx.u32(0))
-          .and(qStart.add(ctx.u32(BQ_BW - 1)).lt(kvBlock.mul(ctx.u32(BC_BW))));
+        // Causal tile-skip: Q-tiles entirely above the diagonal contribute
+        // nothing. Legacy path gates on the is_causal uniform; the modifier
+        // path bakes it structurally when a causal maskMod is present (the
+        // affine-mask → loop-bound rule's precedent; window bounds land with
+        // #64 iii). Workgroup-uniform either way (qStart/kvBlock only).
+        const fullyMasked = qStart
+          .add(ctx.u32(BQ_BW - 1))
+          .lt(kvBlock.mul(ctx.u32(BC_BW)));
+        const skipTile = !mod
+          ? isCausal.ne(ctx.u32(0)).and(fullyMasked)
+          : hasCausalMask(mod)
+            ? fullyMasked
+            : undefined;
 
-        ctx.ifThen(skipTile.not(), () => {
+        const emitTileBody = () => {
           const offsR = ctx.arange(qStart, BQ_BW);
           const offsD = ctx.arange(ctx.u32(0), D);
           const tilePtr = ctx.tilePtr(
@@ -494,19 +724,39 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
           // Fused single-loop: compute score, p, ds per Q-row, accumulate dK/dV inline
           ctx.range(0, BQ_BW, (j) => {
             const qi = qStart.add(j);
-            const isActive = valid
-              .and(qi.lt(N))
-              .and(isCausal.eq(ctx.u32(0)).or(kvRow.le(qi)));
+            const seamArgs = {
+              qIdx: qi,
+              kvIdx: kvRow,
+              head: hIdx,
+              batch: bIdx,
+            };
+            let base = valid.and(qi.lt(N));
+            if (!mod) base = base.and(isCausal.eq(ctx.u32(0)).or(kvRow.le(qi)));
+            const isActive = ctx.applySeam("attn_mask", base, seamArgs);
             const s = ctx.dotRow(K, QTile, j).mul(scale);
-            const p = isActive.select(s.sub(lTile.read(j)).exp(), ctx.f32(0));
+            const sMod = ctx.applySeam("attn_score", s, seamArgs);
+            const p = isActive.select(
+              sMod.sub(lTile.read(j)).exp(),
+              ctx.f32(0),
+            );
             const dov = ctx.dotRow(V, dOTile, j);
-            const ds = p.mul(dov.sub(dTile.read(j))).mul(scale);
+            // "attn_dscore" applies BEFORE the trailing d(raw)/d(QK) scale
+            // factor — the chain multiplies d(modded)/d(raw) into dS first.
+            const ds = ctx
+              .applySeam("attn_dscore", p.mul(dov.sub(dTile.read(j))), {
+                ...seamArgs,
+                raw: s,
+                modded: sMod,
+              })
+              .mul(scale);
             ctx.accumRow(dkAcc, ds, QTile, j);
             ctx.accumRow(dvAcc, p, dOTile, j);
           });
 
           ctx.barrier();
-        });
+        };
+        if (skipTile) ctx.ifThen(skipTile.not(), emitTileBody);
+        else emitTileBody();
       });
 
       ctx.ifThen(valid, () => {
@@ -521,7 +771,12 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 // Dispatch Functions
 // ============================================================================
 
-/** Shared attention dispatch: config buffer + WGSL cache + pipeline + bind group + tracking. */
+/** Shared attention dispatch: config buffer + WGSL cache + pipeline + bind
+ *  group + tracking. `isCausal`/`mod` must already be normalized
+ *  (normalizeAttnModifier) by the caller. A modifier is template identity:
+ *  its key fragment goes into BOTH the WGSL cache key and the pipeline key
+ *  (same emitted-source, same key — diverging them is the cache-collision
+ *  class this file's header warns about). */
 function dispatchAttention(
   wgslKey: string,
   pipelinePrefix: string,
@@ -532,6 +787,12 @@ function dispatchAttention(
   seqLen: number,
   scale: number,
   isCausal: boolean,
+  // Template identity vs config content: templateMod keys the WGSL/pipeline
+  // caches (undefined for D-precompute — no seam sites, one template);
+  // configMod keys the SHARED config buffer all four dispatches bind (its
+  // pad words carry the modifier params, so its key always carries the mod).
+  templateMod: AttnModifierSpec | undefined,
+  configMod: AttnModifierSpec | undefined,
   buffers: GPUBuffer[], // all data buffers (config appended automatically)
   ...grid: number[]
 ): void {
@@ -544,9 +805,14 @@ function dispatchAttention(
     headDim,
     scale,
     isCausal ? 1 : 0,
+    configMod,
   );
-  const wgsl = getTileIRWGSL(wgslKey, specFactory);
-  const pipeline = getPipeline(ctx, `${pipelinePrefix}:tile:${headDim}`, wgsl);
+  const wgsl = getTileIRWGSL(withModKey(wgslKey, templateMod), specFactory);
+  const pipeline = getPipeline(
+    ctx,
+    withModKey(`${pipelinePrefix}:tile:${headDim}`, templateMod),
+    wgsl,
+  );
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
     ...buffers,
     configBuf,
@@ -572,7 +838,8 @@ export interface AttentionStepPlan {
 }
 
 /** Read-only lookup of the cached attention config buffer (persistent slot
- *  in the stream). Null if not yet created (guaranteed hit post-recording). */
+ *  in the stream). Null if not yet created (guaranteed hit post-recording).
+ *  Expects NORMALIZED (isCausal, mod) — plan* entries normalize. */
 export function lookupAttentionConfigBuffer(
   batchSize: number,
   numHeads: number,
@@ -580,10 +847,19 @@ export function lookupAttentionConfigBuffer(
   headDim: number,
   scale: number,
   isCausal: boolean,
+  mod?: AttnModifierSpec,
 ): GPUBuffer | null {
   return (
     configCache.get(
-      `${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${isCausal ? 1 : 0}`,
+      attentionConfigKey(
+        batchSize,
+        numHeads,
+        seqLen,
+        headDim,
+        scale,
+        isCausal ? 1 : 0,
+        mod,
+      ),
     ) ?? null
   );
 }
@@ -593,12 +869,17 @@ function planAttentionStep(
   pipelinePrefix: string,
   specFactory: () => TileKernelSpec,
   headDim: number,
+  mod: AttnModifierSpec | undefined,
   configBuffer: GPUBuffer | null,
   grid: [number, number, number],
 ): AttentionStepPlan {
   const ctx = requireContext();
-  const wgsl = getTileIRWGSL(wgslKey, specFactory);
-  const pipeline = getPipeline(ctx, `${pipelinePrefix}:tile:${headDim}`, wgsl);
+  const wgsl = getTileIRWGSL(withModKey(wgslKey, mod), specFactory);
+  const pipeline = getPipeline(
+    ctx,
+    withModKey(`${pipelinePrefix}:tile:${headDim}`, mod),
+    wgsl,
+  );
   return { pipeline, configBuffer, grid };
 }
 
@@ -609,21 +890,25 @@ export function planFlashAttentionForward(
   headDim: number,
   scale: number,
   isCausal: boolean,
+  modifier?: AttnModifierSpec,
 ): { plan: AttentionStepPlan; outBytes: number; lseBytes: number } {
+  const norm = normalizeAttnModifier(isCausal, modifier);
   const cfg = lookupAttentionConfigBuffer(
     batchSize,
     numHeads,
     seqLen,
     headDim,
     scale,
-    isCausal,
+    norm.isCausal,
+    norm.mod,
   );
   return {
     plan: planAttentionStep(
       `fwd:${headDim}`,
       "faFwd",
-      () => makeForwardAttentionSpec(headDim),
+      () => makeForwardAttentionSpec(headDim, norm.mod),
       headDim,
+      norm.mod,
       cfg,
       [Math.ceil(seqLen / BR), numHeads, batchSize],
     ),
@@ -639,6 +924,7 @@ export function planFlashAttentionBackward(
   headDim: number,
   scale: number,
   isCausal: boolean,
+  modifier?: AttnModifierSpec,
 ): {
   dPlan: AttentionStepPlan;
   dqPlan: AttentionStepPlan;
@@ -647,13 +933,16 @@ export function planFlashAttentionBackward(
   dqBytes: number;
   dkvBytes: number;
 } {
+  const norm = normalizeAttnModifier(isCausal, modifier);
+  assertBackwardSupportsModifier(norm.mod);
   const cfg = lookupAttentionConfigBuffer(
     batchSize,
     numHeads,
     seqLen,
     headDim,
     scale,
-    isCausal,
+    norm.isCausal,
+    norm.mod,
   );
   const bhnd = batchSize * numHeads * seqLen * headDim * 4;
   return {
@@ -662,22 +951,25 @@ export function planFlashAttentionBackward(
       "faBwdD",
       () => makeDPrecomputeSpec(headDim),
       headDim,
+      undefined, // D-precompute has no score/mask sites — one template
       cfg,
       [batchSize * numHeads * seqLen, 1, 1],
     ),
     dqPlan: planAttentionStep(
       `bwdDQ:${headDim}`,
       "faBwdDQ",
-      () => makeBackwardDQSpec(headDim),
+      () => makeBackwardDQSpec(headDim, norm.mod),
       headDim,
+      norm.mod,
       cfg,
       [Math.ceil(seqLen / BR), numHeads, batchSize],
     ),
     dkvPlan: planAttentionStep(
       `bwdDKV:${headDim}`,
       "faBwdDKV",
-      () => makeBackwardDKVSpec(headDim),
+      () => makeBackwardDKVSpec(headDim, norm.mod),
       headDim,
+      norm.mod,
       cfg,
       [Math.ceil(seqLen / BC_BW), numHeads, batchSize],
     ),
@@ -698,7 +990,9 @@ export function dispatchFlashAttentionForward(
   headDim: number,
   scale: number,
   isCausal: boolean,
+  modifier?: AttnModifierSpec,
 ): { outputBuffer: GPUBuffer; logsumexpBuffer: GPUBuffer } {
+  const norm = normalizeAttnModifier(isCausal, modifier);
   const outBuffer = allocateOutputBuffer(
     batchSize * numHeads * seqLen * headDim * 4,
   );
@@ -706,13 +1000,15 @@ export function dispatchFlashAttentionForward(
   dispatchAttention(
     `fwd:${headDim}`,
     "faFwd",
-    () => makeForwardAttentionSpec(headDim),
+    () => makeForwardAttentionSpec(headDim, norm.mod),
     headDim,
     batchSize,
     numHeads,
     seqLen,
     scale,
-    isCausal,
+    norm.isCausal,
+    norm.mod,
+    norm.mod,
     [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer],
     Math.ceil(seqLen / BR),
     numHeads,
@@ -731,7 +1027,10 @@ export function dispatchFlashAttentionBackwardD(
   headDim: number,
   scale: number,
   isCausal: boolean,
+  modifier?: AttnModifierSpec,
 ): GPUBuffer {
+  const norm = normalizeAttnModifier(isCausal, modifier);
+  assertBackwardSupportsModifier(norm.mod);
   const outBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * 4);
   dispatchAttention(
     `bwdD:${headDim}`,
@@ -742,7 +1041,9 @@ export function dispatchFlashAttentionBackwardD(
     numHeads,
     seqLen,
     scale,
-    isCausal,
+    norm.isCausal,
+    undefined, // D-precompute: no seam sites — one template for all mods
+    norm.mod,
     [dOBuffer, oBuffer, outBuffer],
     batchSize * numHeads * seqLen,
   );
@@ -763,20 +1064,25 @@ export function dispatchFlashAttentionBackwardDQ(
   headDim: number,
   scale: number,
   isCausal: boolean,
+  modifier?: AttnModifierSpec,
 ): GPUBuffer {
+  const norm = normalizeAttnModifier(isCausal, modifier);
+  assertBackwardSupportsModifier(norm.mod);
   const outBuffer = allocateOutputBuffer(
     batchSize * numHeads * seqLen * headDim * 4,
   );
   dispatchAttention(
     `bwdDQ:${headDim}`,
     "faBwdDQ",
-    () => makeBackwardDQSpec(headDim),
+    () => makeBackwardDQSpec(headDim, norm.mod),
     headDim,
     batchSize,
     numHeads,
     seqLen,
     scale,
-    isCausal,
+    norm.isCausal,
+    norm.mod,
+    norm.mod,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer],
     Math.ceil(seqLen / BR),
     numHeads,
@@ -799,7 +1105,10 @@ export function dispatchFlashAttentionBackwardDKV(
   headDim: number,
   scale: number,
   isCausal: boolean,
+  modifier?: AttnModifierSpec,
 ): { dKBuffer: GPUBuffer; dVBuffer: GPUBuffer } {
+  const norm = normalizeAttnModifier(isCausal, modifier);
+  assertBackwardSupportsModifier(norm.mod);
   const dKBuffer = allocateOutputBuffer(
     batchSize * numHeads * seqLen * headDim * 4,
   );
@@ -809,13 +1118,15 @@ export function dispatchFlashAttentionBackwardDKV(
   dispatchAttention(
     `bwdDKV:${headDim}`,
     "faBwdDKV",
-    () => makeBackwardDKVSpec(headDim),
+    () => makeBackwardDKVSpec(headDim, norm.mod),
     headDim,
     batchSize,
     numHeads,
     seqLen,
     scale,
-    isCausal,
+    norm.isCausal,
+    norm.mod,
+    norm.mod,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer],
     Math.ceil(seqLen / BC_BW),
     numHeads,

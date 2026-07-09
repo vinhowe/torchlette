@@ -1,4 +1,11 @@
 // Tile-IR custom kernel API + WebGPU init
+
+// Attention score/mask modifiers (#64 — declarations, as data)
+export type {
+  AttnMaskModSpec,
+  AttnModifierSpec,
+  AttnScoreModSpec,
+} from "./backend/types";
 export {
   type BindingSpec,
   ceilDivGrid,
@@ -10,17 +17,16 @@ export {
   enableAllAllocDebug,
   enableProfiling,
   getAndResetFlowCounters,
-  getGpuUncapturedErrorCount,
   getGPUMemoryStats,
+  getGpuUncapturedErrorCount,
   getLeakedAllocCount,
   getLeakedAllocCountForStep,
   getProfileJSON,
   getWebGPUDevice,
   getWebGPUInitError,
+  type InitWebGPUOptions,
   initGpuTimestamps,
   initWebGPU,
-  type InitWebGPUOptions,
-  webgpuDeviceRequirements,
   KernelContext,
   readGpuTimestamps,
   resetProfileStats,
@@ -34,7 +40,12 @@ export {
   type TileKernelSpec,
   type UniformType,
   webgpuBackend,
+  webgpuDeviceRequirements,
 } from "./backend/webgpu";
+export { attnModifierKey } from "./backend/webgpu/attention-kernel";
+export { STEP_TAPE_RECORD, STEP_TAPE_REPLAY, stStats } from "./core/step-tape";
+// Step-tape observability (§6): guard-miss/hit counters for apps.
+export { stReplayStats } from "./executor/step-tape-replay";
 export {
   type DeviceKind,
   DisposedTensorError,
@@ -69,8 +80,3 @@ export {
   resetTensorDebugStats,
   setDebugTracking,
 } from "./runtime/tensor";
-
-// Step-tape observability (§6): guard-miss/hit counters for apps.
-export { stReplayStats } from "./executor/step-tape-replay";
-export { stStats } from "./core/step-tape";
-export { STEP_TAPE_RECORD, STEP_TAPE_REPLAY } from "./core/step-tape";

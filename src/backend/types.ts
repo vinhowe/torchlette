@@ -154,6 +154,41 @@ export type GeluOptions = {
   approximate?: GeluApproximate;
 };
 
+/**
+ * Attention score/mask modifiers (task #64 — FlexAttention-class seams).
+ *
+ * Modifiers are DATA (tagged specs), not closures: the kernel builder maps
+ * each kind to a tile-IR expression at the declared seam points
+ * (`attn_score` post-QK-dot pre-softmax; `attn_mask` replacing the active
+ * predicate). Data-form keeps them serializable (remote wire), hashable
+ * (CSE structural keys + plan fingerprints hash payload content), and
+ * interpretable by the CPU decomposed path for cross-path parity.
+ *
+ * Structural identity (which template) comes from the kinds; numeric params
+ * (cap, window) flow as uniforms — see attnModifierKey() in
+ * attention-kernel.ts, the single source for the key.
+ */
+export type AttnScoreModSpec = {
+  /** Logit soft-cap: score' = cap * tanh(score / cap) (Gemma-2). */
+  kind: "softcap";
+  cap: number;
+};
+
+export type AttnMaskModSpec =
+  | { kind: "causal" }
+  | {
+      /** Recency bound: active iff kv > q - window (compose with "causal"
+       *  for Gemma-2's local attention: q - window < kv <= q). */
+      kind: "slidingWindow";
+      window: number;
+    };
+
+export type AttnModifierSpec = {
+  scoreMod?: AttnScoreModSpec;
+  /** Composition = AND of all mask mods (and the bounds check). */
+  maskMods?: AttnMaskModSpec[];
+};
+
 export type FusedAttentionConfig = {
   batchSize: number;
   numHeads: number;
@@ -161,6 +196,9 @@ export type FusedAttentionConfig = {
   headDim: number;
   scale: number;
   isCausal: boolean;
+  /** Optional score/mask modifiers. Omit the field entirely (do not assign
+   *  undefined) when unused so existing payload hashes/keys are byte-stable. */
+  modifier?: AttnModifierSpec;
 };
 
 export type FusedCrossEntropyConfig = {
