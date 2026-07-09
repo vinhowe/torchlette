@@ -732,3 +732,204 @@ by `bucketKey = hash(structKey) + ordered plan fps`; 18 steps produced
 foreach arms) — the ordered fp sequence is byte-stable across steady-state
 steps. Assumption NOT falsified; inc-2b may proceed on it after inc-2a.
 
+---
+
+## INC-2B DESIGN (2026-07-09) — the four surfaces resolved; pre-approved
+## conditions recorded; no new falsified premise, so implement.
+
+**Doc-only first commit (this section).** The four opener surfaces are resolved
+below against the code as it stands post-inc-2a (HEAD c6e59a13). No stop-rule
+fired: the riskiest assumption (multi-plan fp-sequence stability) is evidenced
+by inc-1 (tapeCount=1 / 7 eligible pairs, both arms); the one NEW fact surfaced
+below (the step DELIMITER is GradScaler's internal `markStep`, not a pure
+implied boundary) is a mechanism clarification, not a contract change — it makes
+surface 4 EASIER, not harder. Implementation proceeds directly per charter.
+
+### KEY MECHANISM FINDING (load-bearing for surfaces 1 & 4)
+
+The inc-1 probe's "minimal implied-boundary loop" is delimited by
+`GradScaler.resolveDeferred() → api.markStep()` at the TOP of each step
+(`src/optim/grad-scaler.ts:134`), NOT by the pure implied boundary. Measured:
+the probe runs with `boundaryResets = 0` (no `stNoteBoundary` fires) and
+`stepsObserved = 10` — the 10 delimiters are 10 real frontend `markStep()`
+calls from the scaler. Consequences:
+
+- `stEndStep` + `stPromoteEligibleSkeleton` fire ONLY from the public
+  `markStep()` (`torchlette.ts:2011/2019`). The pure implied-boundary commit
+  (`_commitPendingStepBoundary`, used when NO scaler runs a markStep) calls
+  `runtime.markStep()` + `stNoteBoundary("implied-boundary")` — it does NOT
+  finalize a recorder step. **So the captured training regime IS the
+  markStep-delimited regime** (the scaler provides it; the fullstack + all gates
+  use GradScaler). A whole-step capture therefore inherits the EXACT delimiter
+  the recorder already observes — no new boundary plumbing.
+- **The whole captured step lives BETWEEN two of those `markStep()`s.** The
+  recorded step = {forward plans, backward plans, optimizer plans}; the scaler's
+  next-iteration `resolveDeferred()→markStep()` is the boundary that finalizes
+  it and promotes the skeleton. The capture body owns forward+backward+opt; the
+  driver still calls `scaler.resolveDeferred()` (its readback rides the loss
+  cadence, §3). This is why surface 4's "hit must queueStepBoundary" is
+  satisfied structurally: the scaler's markStep already IS the boundary, and on
+  a hit the replayed optimizer plan's in-plan `queueStepBoundary` equivalent is
+  moot (the markStep supersedes any queued boundary — `torchlette.ts:1958`).
+
+### SURFACE 1 — MULTI-PLAN SKELETONS
+
+Today `step-tape-replay.ts` keeps ONE module-level `candidate`, overwritten by
+each `stCaptureCompiledStep` call (the LAST plan of a step wins). A training
+step is N plans. Generalize:
+
+- **`candidate: Candidate | null` → `candidates: Candidate[]`** accumulated per
+  step (cleared at each `stEndStep`/promote boundary via the existing ctxAppKey
+  reset). Each compiled plan under the active appKey pushes one entry in
+  EXECUTION ORDER — the order `stCaptureCompiledStep` is called, which is the
+  plan execution order.
+- **Promotion matches the tape's ORDERED fp sequence.** `Skeleton` grows
+  `plans: SkeletonPlan[]` (each = {planNodes, loweredPlan, bufferArena,
+  canonical, uploads[], scalars[], lastNode}). `stPromoteEligibleSkeleton`
+  iterates the tape's ORDERED plan fps and matches each to the captured
+  candidate at the same ordinal. INVARIANT: `candidates.map(c=>c.fp)` must equal
+  the tape's ordered plan fps (a strict, ordered, length-checked equality). Any
+  mismatch → abort promotion (miss, re-record). NOTE the fp-source bug to fix:
+  `lastEligible.fps` today is `[...templateIds]` (a Set — DEDUPED + UNORDERED);
+  the ORDERED source is `rec.plans.map(pl=>pl.fp)`. Promotion must use the
+  ordered list. Surface: `lastEligible` gains `orderedFps: number[]` (the
+  bucketKey already derives from ordered fps, so this is a field exposure, not a
+  new derivation). Deduped `fps`/`templateIds` stay for guard-4 invalidation.
+- **Per-plan appKey/slot mapping.** ONE appKey per captured step (the arg
+  boundary); each plan's upload/scalar slots resolve against THAT plan's
+  `planNodes` (the tape slot ids already carry `w:<fpHex>:<pos>` / `sc:<fpHex>:
+  <pos>:<ii>` — the fpHex disambiguates WHICH plan a slot belongs to; today's
+  single-plan promotion filters `m[1] !== fpHex` and drops non-matching, which
+  already IS per-plan routing — generalize the loop over all skeleton plans).
+- **Replay invariants (ORDERING):** `stTryReplay` replays the skeleton plans in
+  captured order (forward → backward → optimizer). Each plan's per-step node
+  state (`results`/`_executed`/`_inputsRetained`) is reset before it runs. The
+  cross-plan dataflow (backward reads forward's activation buffers; optimizer
+  reads backward's grad buffers) is already correct by construction: these are
+  external plan inputs resolved live per replay (the inc-1 dead-payload/external
+  rule proved shared nodes resolve the producer plan's CURRENT result buffer per
+  replay — the exact multi-plan cross-reference case). The batch x/y warm slots
+  are written ONCE (surface 4) and read by whichever plan references them.
+- **buffer/arena:** each plan keeps its own `bufferArena` (already per-template).
+  No cross-plan arena sharing assumption is added.
+
+### SURFACE 2 — ASYNC CAPTURED BODIES
+
+`CapturedFn.call` is already `async` and `await`s `_captureReplay`. The BODY
+(`this.fn(...)`) is invoked SYNCHRONOUSLY inside `runIntercepted`. A training
+body does `await loss.backward()` → the fn is async. Contract:
+
+- **`CapturedFn` gains an async body variant.** `runIntercepted` becomes
+  `async` and `await`s `body()`. The upload interceptor + onWrap tracking are
+  synchronous (fire during graph build); awaiting `backward()` inside is fine —
+  it builds the backward graph lazily (does not fence) and the interceptor stays
+  installed across the await (module-level `_captureInterceptor`, restored in
+  `finally`). No short-circuit throw for training (see surface 4), so the async
+  path is simpler than decode's: run the body to completion on a trace, replay
+  without running it on a hit.
+- **WHAT MAY BE AWAITED inside a captured body: engine ops only** (`backward()`,
+  `loss.item()` if the driver chooses — though §3 says defer it, `scaler`
+  ops that build graph). These are deterministic given the args + closure state.
+- **WHAT MUST NOT: external I/O / non-deterministic awaits** (fs, network, a
+  fresh random draw not seeded from a tensor arg, `Date.now`). These break
+  run-exactly-once determinism: on a HIT the body does not run, so any external
+  effect it would have produced is FROZEN (the jax.jit closure contract, already
+  documented for 2a). **Enforcement (cheap, loud):** the arg-boundary contract
+  already freezes closure values; we ADD no new runtime I/O trap (that would be
+  net mechanism for a contract the closure-freeze already states). Instead the
+  contract is DOCUMENTED on `capture()` (training variant) + BACKSTOPPED by
+  TAPE_VERIFY (a body whose external effect changed the plan bytes diffs loudly).
+  This matches 2a's stance exactly (closure freeze is tested, VERIFY is the
+  paranoia backstop) — no new enforcement mechanism, per the complexity budget.
+
+### SURFACE 3 — OUTPUT-NODE MAPPING
+
+The body returns the loss Tensor (NOT awaited — readback stays outside per the
+found-inf / K-window rulings). A hit must hand back a replay-harvested loss.
+
+- **At promotion, map the returned Tensor → (plan k, node pos).** The trace runs
+  the body for real and gets the real result Tensor(s). Its underlying lazy node
+  is findable: `result._unwrap().lazyRef` → the producing node. Match that node
+  identity against `candidates[k].planNodes` to find (k, pos). Store
+  `outputRefs: Array<{planIndex: number; pos: number}>` on the Skeleton. This
+  EXTENDS 2a's mechanism: decode's single-plan skeleton harvests `lastNode`
+  (`planNodes[planNodes.length-1]`) — training generalizes "the last node" to
+  "the declared output node(s), which may be in a non-final plan" (the loss is
+  produced in the FORWARD plan, but backward+optimizer plans run AFTER it).
+- **Harvest on a hit:** after replaying all plans in order, read
+  `skeleton.plans[k].planNodes[pos].result` for each output ref, wrap via
+  `createFromStorageHandle` (2a's exact path, `torchlette.ts:2057`). The loss
+  buffer must SURVIVE the whole replay (backward/optimizer plans run after the
+  forward plan that produced it) — it does: it's a persistent-ish forward output
+  the backward reads (already alive through backward today; the ring PINS it for
+  the K-window, §2 — that pinning is the same 2a ring-output mechanism).
+- **Loss is NOT read on the hit path** (surface 3 ruling honored): the harvested
+  Tensor is pushed to the ring and returned unread; the driver reads `.item()`
+  on the logging cadence (deferred), exactly as 2a decode returns logits unread.
+
+### SURFACE 4 — HIT-PATH SEMANTICS
+
+- **NO short-circuit — upfront slot-check → full replay** (the doc's §1 ruling).
+  Training has no short-circuit: the body is NOT run on a hit; all N plans are
+  replayed (write warm slots → replay forward → backward → optimizer). Because
+  the body-never-runs, the arg-boundary is ARG-ONLY-shaped for training: the
+  batch (x, y) are the tensor ARGS (warm slots), so `known === 0`-style direct
+  replay applies (no internal-upload short-circuit needed) — with the batch
+  built by the driver as fresh pending `tensorFromArray` args (donated on hit).
+  The tape's OTHER uploads (loss-seed / any internal fresh tensor) are covered
+  by the inc-1 dead-payload/external + batch-representative rules; per-step
+  scalars (t/lr/scale) are inc-2a's on-device DATA — nothing to re-dress.
+- **UPFRONT slot-check (all warm slots verified before ANY replay — no mid-body
+  throw):** `stTryReplay` already checks all guards (validity, regime, scalar
+  coverage, upload shapes) BEFORE executing any plan. Multi-plan generalizes:
+  verify EVERY plan's compiled-plan validity + EVERY plan's upload shapes up
+  front, then replay all. A miss on any plan → whole-step miss → normal path
+  (the whole body re-runs for real; the optimizer steps exactly once).
+- **queueStepBoundary / implied boundary.** The recorded path's `opt.step()`
+  queues an implied boundary that commits at the next `backward()`
+  (`torchlette.ts:1460`). On a HIT `opt.step()` never runs. BUT the captured
+  training regime is markStep-delimited (KEY FINDING): the scaler's NEXT-iter
+  `resolveDeferred()→markStep()` is the boundary, and `markStep()` NULLS any
+  pending queued boundary (`torchlette.ts:1958`) — so an un-queued boundary on a
+  hit is harmless (the markStep is the real boundary either way). For ROBUSTNESS
+  and to honor the doc's explicit ruling, the hit path calls
+  `api.queueStepBoundary()` after a successful replay (idempotent — superseded by
+  the scaler's markStep; matters only if a driver runs WITHOUT a scaler-markStep,
+  where the queued boundary at the next backward is then the real commit). This
+  is the "commit it identically to the recorded path" requirement, one line.
+- **params/optimizer-state advance via the replayed in-place plans.** t.add_,
+  copy_, m/v updates are ALL in-plan since inc-2a — the replay re-executes them,
+  so params + Adam state + t + scale advance exactly as the recorded path. This
+  is the §1 closure-state contract: state lives in in-place tensor ops inside
+  the recorded plans (inc-2a made this TRUE — the premise inc-2 STOPPED on is now
+  satisfied; §1's assertion holds post-inc-2a).
+- **MICRO/APPLY split.** Implement the single-micro (accumSteps=1) path FULLY:
+  ONE `capture()` wraps the whole step `(x,y) => { forward; backward; opt.step;
+  opt.zeroGrad }` — this is the accumSteps=1 case where micro==apply (one body).
+  Multi-micro (N>1: a separate `micro=(x,y)=>loss.backward()` capture reused N×
+  + an `apply=()=>{opt.step;zeroGrad}` capture once) adds real structure (two
+  captures, N replays of one, the `.grad` accumulation contract) and is a
+  DOCUMENTED FOLLOW-ON unless it falls out for free. accumSteps=1 is the gate-3
+  fullstack shape and the headline; ship it fully first.
+
+### RUN-EXACTLY-ONCE WITNESS (the gate-2 requirement)
+
+A body-side counter incremented inside the captured fn: on TRACE it advances
+(body runs); on HIT it does NOT (body never runs). The probe asserts the counter
+stops advancing once hits begin AND the trajectory still advances (params update
+via replay). This is both the "body demonstrably not re-run" evidence and the
+run-exactly-once witness the charter names.
+
+### WHAT INCREMENT 3 (the ring) NEEDS THAT NOW EXISTS
+
+After inc-2b: the whole step is ONE captured call returning a ring-handled loss
+(unread). The 2a ring (`pushRing`, K default 3) already stages the output. Inc-3
+turns K into a RUNAHEAD depth (G0b: K=2 saturates the GPU floor) by DEFERRING
+the scaler's `resolveDeferred` readback + the loss `.item()` off the per-step
+path, letting CPU build step N+1 while GPU drains step N. Inc-2b LEAVES the ring
+at output-validity semantics (K=3, per-step readback still happens via the
+driver) — it does NOT claim the runahead win (G0-honest: this increment is the
+~3-4% build-skip, the ring is where the 30% lives). What inc-3 inherits from
+inc-2b: multi-plan skeletons, async bodies, output-node mapping, hit-path
+boundary — the entire declared-step surface the ring pipelines.
+
