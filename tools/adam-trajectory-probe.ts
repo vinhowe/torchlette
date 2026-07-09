@@ -29,7 +29,7 @@
 
 import { initWebGPU } from "../src/backend/webgpu";
 import { Torchlette } from "../src/frontend/torchlette";
-import { Adam, SGD } from "../src/optim";
+import { Adam, CosineAnnealingLR, SGD } from "../src/optim";
 
 const N = parseInt(process.env.N ?? "64", 10);
 const STEPS = parseInt(process.env.STEPS ?? "6", 10);
@@ -138,6 +138,19 @@ async function main() {
   const lr2 = process.env.LR2 ? parseFloat(process.env.LR2) : null;
   const lr2At = parseInt(process.env.LR2_AT ?? "4", 10);
 
+  // COSINE=1 (inc-2a Gate 5): drive a CosineAnnealingLR schedule. Each step's
+  // lr flows through opt.setLR → the persistent lr tensor; a compiled replay
+  // must read the new value as DATA (not freeze it) — the LR-schedule
+  // exactness seam.
+  const cosine =
+    process.env.COSINE === "1" && !(opt instanceof SGD)
+      ? new CosineAnnealingLR(
+          opt as Adam,
+          parseInt(process.env.COSINE_TMAX ?? String(STEPS), 10),
+          parseFloat(process.env.COSINE_ETAMIN ?? "1e-4"),
+        )
+      : null;
+
   const trajectory: number[][] = [];
   for (let step = 0; step < STEPS; step++) {
     if (lr2 !== null && step === lr2At) opt.setGroupLR(0, lr2);
@@ -151,6 +164,8 @@ async function main() {
     }
     await loss!.backward();
     opt.step();
+    // Cosine schedule: advance the lr for the NEXT step (writes the lr tensor).
+    if (cosine) cosine.step();
     // ZEROGRAD_AFTER=1: defer zeroGrad until after markStep — probes whether
     // disposing grads BEFORE their lazy consumers (the optimizer chain)
     // execute is what corrupts state.

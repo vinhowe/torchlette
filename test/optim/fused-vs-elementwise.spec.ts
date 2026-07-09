@@ -32,7 +32,13 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { canUseWebGPU } from "../helpers/webgpu";
 
 const execFileP = promisify(execFile);
-const PROBE = path.join(__dirname, "..", "..", "tools", "adam-trajectory-probe.ts");
+const PROBE = path.join(
+  __dirname,
+  "..",
+  "..",
+  "tools",
+  "adam-trajectory-probe.ts",
+);
 const STEPS = 6;
 
 async function trajectory(env: Record<string, string>): Promise<number[][]> {
@@ -141,7 +147,13 @@ describe("fused vs elementwise Adam differential", { timeout: 600_000 }, () => {
     // Sequential spawns — concurrent Dawn/WebGPU init in sibling processes
     // is flaky on this driver.
     const fused = await trajectory({ ADAMW: "1", WD: "0.1" });
-    const elementwise = await trajectory({ ADAMW: "1", WD: "0.1", ELEMENTWISE: "1", COMPILED: "0", FUSION: "0" });
+    const elementwise = await trajectory({
+      ADAMW: "1",
+      WD: "0.1",
+      ELEMENTWISE: "1",
+      COMPILED: "0",
+      FUSION: "0",
+    });
     const truth = jsGroundTruth({ adamW: true, wd: 0.1 });
     expect(maxAbsDiff(fused, elementwise)).toBeLessThan(1e-5);
     expect(maxAbsDiff(fused, truth)).toBeLessThan(1e-5);
@@ -150,7 +162,13 @@ describe("fused vs elementwise Adam differential", { timeout: 600_000 }, () => {
   it("classic Adam (L2 through gradient): fused == elementwise == ground truth", async () => {
     if (!webgpu) return;
     const fused = await trajectory({ ADAMW: "0", WD: "0.1" });
-    const elementwise = await trajectory({ ADAMW: "0", WD: "0.1", ELEMENTWISE: "1", COMPILED: "0", FUSION: "0" });
+    const elementwise = await trajectory({
+      ADAMW: "0",
+      WD: "0.1",
+      ELEMENTWISE: "1",
+      COMPILED: "0",
+      FUSION: "0",
+    });
     const truth = jsGroundTruth({ adamW: false, wd: 0.1 });
     expect(maxAbsDiff(fused, elementwise)).toBeLessThan(1e-5);
     expect(maxAbsDiff(fused, truth)).toBeLessThan(1e-5);
@@ -159,7 +177,13 @@ describe("fused vs elementwise Adam differential", { timeout: 600_000 }, () => {
   it("no weight decay: fused == elementwise == ground truth", async () => {
     if (!webgpu) return;
     const fused = await trajectory({ ADAMW: "1", WD: "0" });
-    const elementwise = await trajectory({ ADAMW: "1", WD: "0", ELEMENTWISE: "1", COMPILED: "0", FUSION: "0" });
+    const elementwise = await trajectory({
+      ADAMW: "1",
+      WD: "0",
+      ELEMENTWISE: "1",
+      COMPILED: "0",
+      FUSION: "0",
+    });
     const truth = jsGroundTruth({ adamW: true, wd: 0 });
     expect(maxAbsDiff(fused, elementwise)).toBeLessThan(1e-5);
     expect(maxAbsDiff(fused, truth)).toBeLessThan(1e-5);
@@ -172,15 +196,37 @@ describe("fused vs elementwise Adam differential", { timeout: 600_000 }, () => {
   // scalar-table.ts + the fused-recipe adaptation landed.
   it("pure-graph optimizer is faithful under the compiled plan", async () => {
     if (!webgpu) return;
-    const compiled = await trajectory({ ADAMW: "1", WD: "0", ELEMENTWISE: "1", FUSION: "0" });
-    const lowered = await trajectory({ ADAMW: "1", WD: "0", ELEMENTWISE: "1", COMPILED: "0", FUSION: "0" });
+    const compiled = await trajectory({
+      ADAMW: "1",
+      WD: "0",
+      ELEMENTWISE: "1",
+      FUSION: "0",
+    });
+    const lowered = await trajectory({
+      ADAMW: "1",
+      WD: "0",
+      ELEMENTWISE: "1",
+      COMPILED: "0",
+      FUSION: "0",
+    });
     expect(maxAbsDiff(compiled, lowered)).toBeLessThan(1e-5);
   });
 
   it("pure-graph optimizer is faithful under fusion (cached-recipe adaptation)", async () => {
     if (!webgpu) return;
-    const fusionOn = await trajectory({ ADAMW: "1", WD: "0", ELEMENTWISE: "1", COMPILED: "0" });
-    const fusionOff = await trajectory({ ADAMW: "1", WD: "0", ELEMENTWISE: "1", COMPILED: "0", FUSION: "0" });
+    const fusionOn = await trajectory({
+      ADAMW: "1",
+      WD: "0",
+      ELEMENTWISE: "1",
+      COMPILED: "0",
+    });
+    const fusionOff = await trajectory({
+      ADAMW: "1",
+      WD: "0",
+      ELEMENTWISE: "1",
+      COMPILED: "0",
+      FUSION: "0",
+    });
     expect(maxAbsDiff(fusionOn, fusionOff)).toBeLessThan(1e-5);
   });
 
@@ -328,5 +374,34 @@ describe("fused vs elementwise Adam differential", { timeout: 600_000 }, () => {
     const d3 = Math.abs(sequential[3][0] - sequential[2][0]);
     const d5 = Math.abs(sequential[5][0] - sequential[4][0]);
     expect(d5).toBeLessThan(d3 * 0.5);
+  });
+
+  // inc-2a Gate 5: a CosineAnnealingLR schedule is honored digit-for-digit
+  // under the compiled plan vs the sequential reference over 32 steps. The
+  // scheduler funnels through opt.setLR, which writes the persistent lr tensor
+  // in-place; the compiled replay MUST read the per-step lr as DATA (never
+  // freeze it — the frozen-LR-schedule class). Fused default (compiled+fusion)
+  // vs compiled+fusion off.
+  it("CosineAnnealingLR is honored under compiled plan (32 steps)", async () => {
+    if (!webgpu) return;
+    const compiled = await trajectory({
+      ADAMW: "1",
+      WD: "0",
+      COSINE: "1",
+      STEPS: "32",
+    });
+    const sequential = await trajectory({
+      ADAMW: "1",
+      WD: "0",
+      COSINE: "1",
+      STEPS: "32",
+      COMPILED: "0",
+      FUSION: "0",
+    });
+    expect(maxAbsDiff(compiled, sequential)).toBeLessThan(1e-5);
+    // Sanity: the anneal actually took effect (late per-step motion << early).
+    const dEarly = Math.abs(sequential[1][0] - sequential[0][0]);
+    const dLate = Math.abs(sequential[31][0] - sequential[30][0]);
+    expect(dLate).toBeLessThan(dEarly * 0.5);
   });
 });
