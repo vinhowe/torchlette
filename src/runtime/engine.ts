@@ -1068,6 +1068,48 @@ export class RuntimeEngine {
     return t;
   }
 
+  /**
+   * LIVE SCALAR SLOT delivery (src/core/live-scalar.ts): write `value` into a
+   * PERSISTENT f32[1] tensor `dst` IN PLACE, in graph order.
+   *
+   * A per-step scalar delivered to a compiled replay must live in a buffer
+   * whose IDENTITY IS STABLE across record and replay: the compiled plan binds
+   * each consumer (adamStep etc.) to the buffer's slot at RECORD time, and on
+   * replay the value must arrive in THAT SAME buffer. A fresh-buffer
+   * `tensorFromArray` fails this — its result buffer differs at record vs
+   * replay, and a large plan's consumers then read the record-time buffer
+   * (which the pool has since reused → wrong value; measured: the real 124M
+   * model's lr silently corrupted under the compiled plan). So the write is an
+   * in-place scatter into `dst`'s EXISTING buffer (the true-in-place DMA fast
+   * path — same physical buffer, graph-ordered relative to the plan's reads):
+   * clause 1 (ORDERED — the scatter is a plan node, not a raw queue.writeBuffer)
+   * + clause 2 (FIXED BUFFER — the `dst` buffer is created once and written in
+   * place). The value flows to a compiled replay via the step-tape's
+   * `scalarDresses` re-dress (sourced from `scalar-slots.ts`), which re-executes
+   * the recorded `tensorFromArray` scatter-source from the noted value each
+   * replay (clause 3 — LIVE READS). `dst` MUST be a persistent, materializable
+   * f32[1]; `LiveScalar.set` notes the host value at this same seam. */
+  setScalarInPlace(dst: Tensor, value: number): void {
+    // Deliver `value` into dst's fixed buffer via an in-place, graph-ordered
+    // scatter from a per-step `tensorFromArray` source. The scatter's
+    // TRUE-IN-PLACE DMA keeps dst's buffer identity stable across record/replay
+    // (clause 2 — the compiled plan binds ONE buffer and reads the live value;
+    // a fresh-buffer upload silently corrupts a large plan's high-fan-out
+    // readers, measured on the 124M model). Graph-ordered (clause 1). The
+    // step-tape's `scalarDresses` re-dress re-executes this recorded scatter's
+    // tensorFromArray source from the noted host value each replay (clause 3 —
+    // LIVE READS). `dst` MUST be a persistent, materializable f32[1]. */
+    const srcNode = createLazyIRNode(
+      "tensorFromArray",
+      [],
+      dst.shape,
+      "f32",
+      dst.device,
+      { values: Float32Array.of(value), dtype: "f32" },
+    );
+    this._scatterFromNode(dst, srcNode);
+  }
+
   full(
     shape: number[],
     fillValue: number,

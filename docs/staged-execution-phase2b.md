@@ -1718,3 +1718,82 @@ as a plain-value cold bucket — for a FIXED N, one tape). INC-2B rejected (b) f
 reuse, not correctness; given (a)'s two blockers, (b) is the pragmatic next-
 session landing, with accumSteps=1 byte-identity (micro==apply, one body) as the
 hard invariant either way.
+
+---
+
+## LIVE SCALAR SLOT primitive + Consumer 1 (setLR) — LANDED
+
+The `docs/staged-execution-phase2b.md:1093` next-session note ("make the
+optimizer-scalar write BUFFER-STABLE by construction ... then no rebind
+machinery is needed") is realized as `src/core/live-scalar.ts` — ONE primitive
+that owns a fixed-buffer persistent f32[1] tensor and delivers per-step values
+into it as DATA. It rides the EXISTING scalar-write re-dress seam
+(`scalarDresses` + `scalar-slots.ts`), consolidating the ad-hoc
+`copy_(lrT, tensorFromArray) + noteScalarSlotValue` that was open-coded in each
+optimizer.
+
+**The three clauses (each the negation of a historical bug):**
+1. **GRAPH-ORDERED.** `RuntimeEngine.setScalarInPlace` writes the value via an
+   in-place `stridedScatterCopy(dst, tensorFromArray([v]))` — a PLAN NODE
+   ordered against consumers' reads, NOT a raw out-of-graph `queue.writeBuffer`.
+   The item-1 prototype's raw writeBuffer measured 0.008 UNCAPTURED divergence
+   (racing encoded-unsubmitted reads); this passes the ITEM-1 A/B at 6e-4.
+2. **FIXED BUFFER.** The scatter's TRUE-IN-PLACE DMA (strided-scatter.ts) writes
+   dst's EXISTING buffer, so its identity is stable across record/replay. THE
+   FALSIFICATION that redirected the design: a fresh-buffer `tensorFromArray`
+   upload (the naive "expose the arg channel" reading) SILENTLY CORRUPTS a large
+   plan's high-fan-out readers — the packed adam (`fused.ts:314`) binds
+   `items[0].lr` ONCE at record time to the tfa's arena buffer; on replay the
+   TAG_WRITE writes a SEPARATE pinned stableBuf that never feeds the recorded
+   dispatch's slot, so ~50 adamStep readers read a pool-reused record-time
+   buffer → measured 0.04 loss divergence on the real 124M model, present even
+   with a CONSTANT lr (buffer provenance, not value). Root-caused via
+   `TORCHLETTE_PACKED_ADAM=0`/`COMPILED_PLAN=0` (both make it vanish). The
+   in-place scatter into dst's own buffer records as a PERSISTENT slot the
+   packed dispatch binds correctly.
+3. **LIVE REPLAY READS.** The recorded scatter re-executes its `tensorFromArray`
+   source from the current `scalar-slots.ts` host value each replay.
+
+**Consumer 1 — setLR.** `Adam._lrLive` are `LiveScalar`s; `setLR`/`setGroupLR`
+call `.set(lr)`. `_lrTensor(gi)` returns the LiveScalar's persistent tensor,
+read by adamStep / the elementwise+foreach update as before.
+
+**Gates (device 10/11, sivri):** falsification probe (channel is ordered,
+buffer-stable, live across hits) PASS; ITEM-1 uncaptured A/B (my-build vs clean
+HEAD, WITH CosineAnnealingLR) maxΔ 6e-4 PASS (the gate that killed the
+prototype); t-train-capture-probe (schedule through hits) hits=17 refusals=0
+maxΔ 8e-4 PASS; capture.spec 13/13 incl. [2b-sched]; test:gates 4/4; 124M
+regression baseline-exact 9.81/5.92/5.15/4.64 peak-flat 2087.6 MB; CPU suite
+1163 pass. Schedule-exactness compiled==sequential rides the train-capture
+parity.
+
+**KNOWN OPEN (NOT closed by this primitive):** under RUNAHEAD (ringK2) + a
+per-step LR scheduler, ONE warmup-era transient `[lifetime] reading RECLAIMED
+storage id=… (shape=[1])` warn remains on the setLR scatter (the deferred/
+gen-scoped sweep demoting the scatter's per-step source during the pre-tape
+lowered phase; trajectory correct, ringK2 maxΔ ~1e-3). This is UNCHANGED from
+main's copy_ delivery (the doc's pre-existing KNOWN ISSUE `:1497`) — the
+primitive did not regress it, but did NOT close it either. Attempts that DID NOT
+work: (a) a single in-place `writeScalar` fill op with no scatter source —
+correct serially, but its in-place READ of dst's buffer is reclaimed+reused
+under runahead's deferred timing → 0.035 ringK2 divergence (reverted); (b)
+per-dst persistent scatter-source + snapshot adoption — the gen-scoped sweep
+still demotes across the driver/body gen boundary. The real fix is
+ARCHITECTURAL: route the driver-level scalar through the ring's lifetime
+management the way batch ARGS are (they don't warn) — a ring-integration change,
+not a delivery-op change. STRICT keeps NOSCHED until that lands.
+
+**Consumer 2 (scaler-as-tensor) — NOT LANDED this session.** The forward
+`scale()` can ride a LiveScalar (neutral), but the growth-retirement gate
+(`t-scaler-growth-probe`) additionally requires (i) the CPU scale mirror to
+advance on tape HITS (a persistent found-inf buffer the driver resolves each
+step, not the body-set `_pendingInfBuffer` that never runs on a hit) and (ii)
+`invScale` delivered as a live tensor into the FUSED unscaleGrad kernel (today a
+frozen uniform) — a kernel change. Both are substantial sub-features beyond the
+scalar-delivery primitive; deferred. The gate still FAILs on main as designed.
+
+**SLOC:** +~50 (src/core/live-scalar.ts) + ~30 (RuntimeEngine.setScalarInPlace)
+net; Adam's per-optimizer copy_+note deleted (net-neutral). No new env flags.
+Retirements: the ad-hoc per-optimizer `copy_(lrT, tensorFromArray)+noteScalarSlot`
+delivery (now the ONE primitive). scalar-slots.ts + scalarDresses are KEPT (the
+primitive rides them — the proven INC-2B seam — rather than a parallel one).
