@@ -205,6 +205,9 @@ export async function loadPretrainedGemma2(
   // weight operand whole, so a narrow view of the shared embedding buffer can't
   // be used. Building separate chunk buffers is the sub-2GB path.
   let embedData: Float32Array | null = null;
+  // f16 embedding path (#59): keep the raw f16 bits to build the tied lm_head
+  // chunks as f16 too (no f32 round-trip). Set only when the embed loads f16.
+  let embedF16Bits: Uint16Array | null = null;
   const hiddenSize = config.hiddenSize;
 
   for (const shard of shardFiles) {
@@ -250,6 +253,32 @@ export async function loadPretrainedGemma2(
           continue;
         }
 
+        // f16 embedding path (#59): convert bf16/f16 → f16 raw bits and upload
+        // as f16 directly, skipping the 2.36GB f32 intermediate (which would
+        // defeat the residency win at load time). Keep the bits to build the
+        // tied lm_head chunks as f16. The 1.18GB table can't be written with
+        // copy_ (stridedScatterCopy binds the whole dest > 2GB) — upload via
+        // tensorFromArray (chunked writeBuffer, no binding) + re-register.
+        if (isEmbed && dest.dtype === "f16") {
+          const raw = Buffer.alloc(byteBytes);
+          fs.readSync(fd, raw, 0, byteBytes, dataStart + info.data_offsets[0]);
+          const u16 = new Uint16Array(raw.buffer, raw.byteOffset, byteBytes / 2);
+          embedF16Bits =
+            info.dtype === "F16" ? u16.slice() : bf16BufferToF16Bits(u16);
+          const uploaded = api.tensorFromArray(embedF16Bits, info.shape, {
+            dtype: "f16",
+            device: "webgpu",
+          });
+          model.embedTokens.registerParameter("weight", uploaded);
+          loaded++;
+          pendingBytes += embedF16Bits.byteLength;
+          if (pendingBytes >= FLUSH_THRESHOLD) {
+            await api.markStep();
+            pendingBytes = 0;
+          }
+          continue;
+        }
+
         const data = extractWeight(fd, dataStart, info);
         if (isNorm) {
           // Gemma RMSNorm: x_normed * (1 + weight). Bake +1 into the weight so
@@ -257,10 +286,7 @@ export async function loadPretrainedGemma2(
           for (let i = 0; i < data.length; i++) data[i] += 1.0;
         }
         if (isEmbed) {
-          // The 2.36GB f32 embedding can't be written with copy_
-          // (stridedScatterCopy binds the whole dest buffer > 2GB). Upload it
-          // directly via tensorFromArray (chunked writeBuffer, no binding) and
-          // re-register the parameter — the gather then chunks its own read.
+          // f32 embedding: 2.36GB. Same no-binding upload path as above.
           embedData = data;
           const uploaded = api.tensorFromArray(data, info.shape, {
             dtype: dest.dtype,
@@ -290,11 +316,14 @@ export async function loadPretrainedGemma2(
   }
   await api.markStep();
 
-  // Build the tied lm_head as independent sub-2GB weight chunks when the full
-  // f32 table exceeds the 2GB binding limit. Each chunk is [rows, hidden] and
-  // uploaded from a fresh CPU subarray → its own buffer (no shared base).
+  // Build the tied lm_head as independent sub-2GB weight chunks when the table
+  // exceeds the 2GB binding limit. The f32 table (2.36GB) always needs chunking;
+  // the f16 table (#59) is 1.18GB — under the limit — so the tied lm_head reads
+  // embedTokens.weight directly and no chunks are built (lmHeadChunks stays
+  // null). Each chunk is [rows, hidden] from a fresh CPU subarray → own buffer.
   const vocab = config.vocabSize;
-  if (embedData !== null && vocab * hiddenSize * 4 > (1 << 31) - 4) {
+  const embedElemBytes = (config.weightDtype ?? "f32") === "f16" ? 2 : 4;
+  if (embedData !== null && vocab * hiddenSize * embedElemBytes > (1 << 31) - 4) {
     const rowsPerChunk = model.lmHeadChunkRows();
     const chunks: Tensor[] = [];
     for (let start = 0; start < vocab; start += rowsPerChunk) {
@@ -310,8 +339,13 @@ export async function loadPretrainedGemma2(
     }
     model.lmHeadChunks = chunks;
     console.log(`lm_head split into ${chunks.length} vocab chunks (<2GB each)`);
+  } else if (embedF16Bits !== null) {
+    console.log(
+      "lm_head tied to f16 embedding directly (1.18GB < 2GB binding limit)",
+    );
   }
   embedData = null;
+  embedF16Bits = null;
 
   const { evictAllPoolBuffers } = await import("../../src/backend/webgpu");
   evictAllPoolBuffers();
