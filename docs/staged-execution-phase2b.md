@@ -1592,3 +1592,39 @@ that reuses the destination buffer, gated against the UNCAPTURED-trajectory A/B
 above — that A/B, not just the captured probe, is the load-bearing gate the
 naive attempt failed). Working tree reverted to clean HEAD; the prototype is
 preserved at `scratchpad/stable-scalar-item1.ts` + `scratchpad/item1.diff`.
+
+---
+
+## FAST TRAINING LOOPS — the runahead loop as living documentation
+
+The fastest training loop torchlette offers is a whole step captured with
+runahead: `api.capture(fn, { training: true, runahead: 2 })`, driven so the CPU
+builds+submits step N+1 while the GPU drains step N. The canonical, heavily-
+commented example is **`examples/fast-training/fast-training.ts`** — it runs a
+small GPT-2, prints per-step loss + ms/step, and demonstrates a SERIAL variant
+alongside so the ring engaging (hits > 0) and the wall-clock win are visible.
+
+Run it (pin a FREE device — Dawn ignores CUDA_VISIBLE_DEVICES):
+
+    VULKAN_DEVICE_INDEX=10 LD_LIBRARY_PATH=tools/vk-shim \
+    TORCHLETTE_STEP_TAPE=1 npx tsx examples/fast-training/fast-training.ts
+
+Measured on a V100 (device 10, distilgpt2, seq 256, K=2): **SERIAL 198.3 ms/step
+→ RUNAHEAD 159.4 ms/step (−19.6%), ring hits=9, trajectory maxΔ=0.0** (bit-
+identical — K is a pure knob). The four rules the example is annotated with:
+
+1. **Await the CALL, not the loss.** `const h = await step(x, y)` awaits the
+   submit, not GPU completion; `h` is an UNREAD ring handle.
+2. **Read K-behind** (collect-and-drain). Read the loss from K steps ago (it has
+   fenced). `await-every-N` is the logging cadence — exactly ONE fence per N.
+3. **The ring owns the boundary.** Under `runahead` the driver does NOT call
+   `markStep` per step; it MUST `await step.drain()` at the end.
+4. **GradScaler rides the same cadence.** found-inf is DATA (in-graph where-
+   select), `snapshotDeferred()` + `resolveOldestDeferred()` K-behind — never a
+   per-step readback, so it does not cap K.
+
+**What NOT to do:** `await loss.item()` on the per-step critical path fences
+every step = voluntary K=1 (correct but slow — no runahead overlap). The example
+spells this out. **Honest cost:** runahead trades K× in-flight memory for the
+wall win; on a memory-tight config (a model near the device ceiling) K may be
+forced to 1 = no runahead. The win is real only where headroom for K≥2 exists.
