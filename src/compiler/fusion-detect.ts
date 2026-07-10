@@ -272,55 +272,63 @@ function processCandidate(
 }
 
 /**
- * Detect fusion opportunities in a lazy execution plan.
- *
- * @param nodes - Nodes in the plan (topologically sorted)
- * @returns Detected fusion groups
+ * A draft island the fusion policy grows by merge steps during its scan
+ * (islands I2a) — the policy's working object; phases 2-5 consume it.
  */
+interface DraftIsland {
+  nodes: LazyIRNode[];
+  indices: number[];
+  nodeIds: Set<number>;
+}
+
 /**
- * Phase 1: Scan for consecutive fusible ops, flush at dependency breaks.
- * Non-fusible nodes that don't depend on the current candidate pass through.
+ * Phase 1 — the elementwise fusion POLICY (islands I2a).
+ *
+ * Re-expression of the consecutive scan as merge proposals over draft
+ * islands: every fusible node is an implicit singleton island that gets
+ * MERGED into the open draft when legal; a non-fusible node that depends on
+ * the open island CLOSES it (today's boundary rule — stage I2b replaces this
+ * close with taint tracking + the readiness rule so islands span dependent
+ * gaps). Independent non-fusible nodes are not partition units at this
+ * altitude; the island spans them. Decisions are byte-identical to the
+ * deleted scan (`buildCandidateGroups`), pinned by
+ * test/fusion-decision-corpus.spec.ts.
  */
-function buildCandidateGroups(
+function proposeCandidateIslands(
   nodes: LazyIRNode[],
   excludedIds: Set<number> | undefined,
-): {
-  candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }>;
-  fusibleCount: number;
-} {
-  const candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }> = [];
-  let currentGroup: { nodes: LazyIRNode[]; indices: number[] } | null = null;
-  const candidateNodeIds = new Set<number>();
+): { candidates: DraftIsland[]; fusibleCount: number } {
+  const candidates: DraftIsland[] = [];
+  let open: DraftIsland | null = null;
   let fusibleCount = 0;
 
-  const flushCandidate = () => {
-    if (currentGroup && currentGroup.nodes.length >= 2) {
-      candidateGroups.push(currentGroup);
+  const close = () => {
+    if (open && open.nodes.length >= 2) {
+      candidates.push(open);
     }
-    currentGroup = null;
-    candidateNodeIds.clear();
+    open = null;
   };
 
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
     if (isFusibleOp(node.op) && !excludedIds?.has(node.id)) {
       fusibleCount++;
-      if (!currentGroup) {
-        currentGroup = { nodes: [], indices: [] };
-        candidateNodeIds.clear();
+      if (!open) {
+        open = { nodes: [], indices: [], nodeIds: new Set() };
       }
-      currentGroup.nodes.push(node);
-      currentGroup.indices.push(i);
-      candidateNodeIds.add(node.id);
-    } else if (currentGroup && !hasPendingInputIn(node, candidateNodeIds)) {
-      // Independent non-fusible node — passes through as prereq
+      // merge(open, singleton(node)) — append in plan order.
+      open.nodes.push(node);
+      open.indices.push(i);
+      open.nodeIds.add(node.id);
+    } else if (open && !hasPendingInputIn(node, open.nodeIds)) {
+      // Independent non-fusible node — the island spans the gap.
     } else {
-      flushCandidate();
+      close();
     }
   }
-  flushCandidate();
+  close();
 
-  return { candidateGroups, fusibleCount };
+  return { candidates, fusibleCount };
 }
 
 /**
@@ -695,15 +703,15 @@ export function detectFusionGroups(
   const enableMultiOutput = options?.enableMultiOutput ?? false;
   const excludedIds = options?.excludedIds;
 
-  // Phase 1: Build candidate groups of consecutive fusible ops
-  const { candidateGroups, fusibleCount } = buildCandidateGroups(
+  // Phase 1: the fusion policy proposes candidate islands (islands I2a)
+  const { candidates, fusibleCount } = proposeCandidateIslands(
     nodes,
     excludedIds,
   );
 
   // Phase 2: Split into connected components, process each, batch singletons
   const groups = splitCandidatesByComponent(
-    candidateGroups,
+    candidates,
     nodes,
     externalNodeIds,
     enableMultiOutput,
