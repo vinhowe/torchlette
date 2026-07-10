@@ -254,6 +254,109 @@ async function streamTensor(
 }
 
 /**
+ * Stream the 2.36GB f32 embedding table in bounded ROW-BLOCKS so no single CPU
+ * ArrayBuffer ever exceeds ~1GB — Chrome throws `RangeError: Array buffer
+ * allocation failed` for the whole-table Float32Array (256128×2304×4 = 2.36GB
+ * exceeds V8's per-ArrayBuffer allocation ceiling; verified live). Each block is
+ * a fresh contiguous [rows, hidden] Float32Array handed to `onBlock`, which
+ * uploads it to the GPU embedding buffer (a region DMA — no >2GB binding) and
+ * reuses it as a tied-lm_head vocab chunk. Converts BF16/F16/F32 via the same
+ * fixed 8MB staging buffer as streamTensor, yielding to the UI between slices.
+ */
+async function streamEmbeddingBlocks(
+  cursor: ByteCursor,
+  srcDtype: string,
+  byteLength: number,
+  hidden: number,
+  rowsPerBlock: number,
+  onSlice: (fraction: number) => void,
+  onBlock: (block: Float32Array, startRow: number, rows: number) => Promise<void>,
+): Promise<void> {
+  if (srcDtype !== "BF16" && srcDtype !== "F16" && srcDtype !== "F32") {
+    throw new Error(`Unsupported safetensors dtype ${srcDtype}`);
+  }
+  const srcElemBytes = srcDtype === "F32" ? 4 : 2;
+  const totalElems = byteLength / srcElemBytes;
+  const totalRows = totalElems / hidden;
+  if (!Number.isInteger(totalRows)) {
+    throw new Error(`Embedding element count ${totalElems} not a multiple of hidden ${hidden}`);
+  }
+
+  const staging = new Uint8Array(STAGING_BYTES);
+  let stagingLen = 0;
+  let consumed = 0;
+
+  // Current block being filled.
+  let startRow = 0;
+  let block = new Float32Array(Math.min(rowsPerBlock, totalRows) * hidden);
+  let blockElemOffset = 0; // elements written into `block`
+
+  const emitFullBlocks = async () => {
+    // Flush whole staging elements into the current block, rolling over to a
+    // new block whenever the current one fills.
+    let elems = Math.floor(stagingLen / srcElemBytes);
+    if (elems === 0) return;
+    let stagingElemOffset = 0;
+    while (elems > 0) {
+      const room = block.length - blockElemOffset;
+      const take = Math.min(room, elems);
+      const src16Start = stagingElemOffset;
+      if (srcDtype === "F32") {
+        const srcF32 = new Float32Array(
+          staging.buffer,
+          src16Start * 4,
+          take,
+        );
+        block.set(srcF32, blockElemOffset);
+      } else {
+        const src16 = new Uint16Array(staging.buffer, src16Start * 2, take);
+        const out = block.subarray(blockElemOffset, blockElemOffset + take);
+        (srcDtype === "BF16" ? bf16SliceToF32 : f16SliceToF32)(src16, out, 0, take);
+      }
+      blockElemOffset += take;
+      stagingElemOffset += take;
+      elems -= take;
+      if (blockElemOffset === block.length) {
+        const rows = block.length / hidden;
+        await onBlock(block, startRow, rows);
+        startRow += rows;
+        const remainingRows = totalRows - startRow;
+        blockElemOffset = 0;
+        block =
+          remainingRows > 0
+            ? new Float32Array(Math.min(rowsPerBlock, remainingRows) * hidden)
+            : block;
+      }
+    }
+    // Retain any partial-element tail (bytes that don't complete an element).
+    const consumedElemBytes =
+      Math.floor(stagingLen / srcElemBytes) * srcElemBytes;
+    const tail = stagingLen - consumedElemBytes;
+    if (tail > 0) staging.copyWithin(0, consumedElemBytes, stagingLen);
+    stagingLen = tail;
+    onSlice(consumed / byteLength);
+    await yieldToUI();
+  };
+
+  while (consumed < byteLength) {
+    const p = await cursor.piece(
+      Math.min(byteLength - consumed, STAGING_BYTES - stagingLen),
+    );
+    if (!p) throw new Error(`Stream ended mid-embedding (${byteLength - consumed} bytes left)`);
+    staging.set(p, stagingLen);
+    stagingLen += p.length;
+    consumed += p.length;
+    if (stagingLen === STAGING_BYTES || consumed === byteLength) {
+      await emitFullBlocks();
+    }
+  }
+  if (stagingLen !== 0) throw new Error("Embedding byte length not a multiple of element size");
+  if (startRow !== totalRows) {
+    throw new Error(`Embedding stream incomplete: ${startRow}/${totalRows} rows`);
+  }
+}
+
+/**
  * Fetch config.json, instantiate the Gemma2 model, then stream all shards'
  * weights into it. Returns the ready model.
  */
@@ -299,8 +402,6 @@ export async function loadGemma2FromUrl(
   let loadedTensors = 0;
   let pendingBytes = 0;
   let currentTensor = "";
-  // Retained CPU f32 embedding data (built once, released after lm_head chunks).
-  let embedData: Float32Array | null = null;
   const FLUSH_THRESHOLD = 256 * 1024 * 1024;
   let fromCache = 0;
   const emitProgress = () =>
@@ -381,6 +482,61 @@ export async function loadGemma2FromUrl(
       const isEmbed = name === "model.embed_tokens.weight";
       currentTensor = name;
       tensorEvent({ type: "start", name });
+
+      if (isEmbed) {
+        // 2.36GB f32 embedding: streaming the whole table into ONE Float32Array
+        // throws `RangeError: Array buffer allocation failed` in Chrome (exceeds
+        // V8's per-ArrayBuffer ceiling). Stream it in <2GB row-BLOCKS instead:
+        //  - each block is a fresh [rows, hidden] GPU tensor uploaded via
+        //    tensorFromArray (chunked writeBuffer, no binding);
+        //  - copyInto_ DMAs it into the pre-zeroed embedding buffer at its row
+        //    offset — a contiguous buffer-to-buffer region write, which never
+        //    binds the >2GB dest (unlike the strided-scatter kernel path);
+        //  - the same block tensor is retained as a tied-lm_head vocab chunk
+        //    (matmul binds a weight operand whole, so lm_head must be sub-2GB
+        //    INDEPENDENT buffers — these blocks already are).
+        // No CPU or GPU allocation ever exceeds one block (~1GB).
+        const rowsPerBlock = model.lmHeadChunkRows(); // <2GB per block
+        const embedWeight = model.embedTokens.weight;
+        const needLmHeadChunks = vocab * hiddenSize * 4 > (1 << 31) - 4;
+        const lmHeadChunks: Tensor[] = [];
+        await streamEmbeddingBlocks(
+          cursor,
+          info.dtype,
+          end - start,
+          hiddenSize,
+          rowsPerBlock,
+          (fraction) => {
+            emitProgress();
+            tensorEvent({ type: "progress", name, fraction });
+          },
+          async (blockArr, startRow, rows) => {
+            currentTensor = `${name} (rows ${startRow}..${startRow + rows})`;
+            emitProgress();
+            const blockTensor = api.tensorFromArray(blockArr, [rows, hiddenSize], {
+              dtype: dest.dtype,
+              device: "webgpu",
+            });
+            // Region DMA into the single embedding buffer (used by the gather,
+            // which auto-chunks reads of the >2GB table).
+            api.runtime.copyInto_(
+              embedWeight._unwrap(),
+              startRow * hiddenSize,
+              blockTensor._unwrap(),
+            );
+            // Reuse the same independent buffer as a tied-lm_head chunk.
+            if (needLmHeadChunks) lmHeadChunks.push(blockTensor);
+            await api.markStep();
+          },
+        );
+        if (needLmHeadChunks) model.lmHeadChunks = lmHeadChunks;
+        tensorEvent({ type: "done", name });
+        loadedTensors++;
+        currentTensor = name;
+        emitProgress();
+        continue;
+      }
+
       const data = await streamTensor(cursor, info.dtype, end - start, dest.dtype, (fraction) => {
         emitProgress();
         tensorEvent({ type: "progress", name, fraction });
@@ -396,16 +552,6 @@ export async function loadGemma2FromUrl(
         for (let i = 0; i < arr.length; i++) arr[i] += 1.0;
         const src = api.tensorFromArray(arr, info.shape, { dtype: dest.dtype });
         dest.copy_(src);
-      } else if (isEmbed) {
-        // 2.36GB f32 embedding: upload via tensorFromArray (chunked writeBuffer,
-        // no binding) + re-register the parameter; keep the CPU data to build
-        // the tied lm_head vocab chunks after the stream.
-        embedData = data as Float32Array;
-        const uploaded = api.tensorFromArray(embedData, info.shape, {
-          dtype: dest.dtype,
-          device: "webgpu",
-        });
-        model.embedTokens.registerParameter("weight", uploaded);
       } else {
         const src = api.tensorFromArray(data, info.shape, { dtype: dest.dtype });
         dest.copy_(src);
@@ -428,27 +574,6 @@ export async function loadGemma2FromUrl(
   currentTensor = "final GPU flush";
   emitProgress();
   await api.markStep();
-
-  // Build the tied lm_head as independent sub-2GB weight chunks when the full
-  // f32 table exceeds the 2GB binding limit. Each chunk is a fresh CPU subarray
-  // → its own [rows, hidden] buffer (no shared 2.36GB base).
-  if (embedData !== null && vocab * hiddenSize * 4 > (1 << 31) - 4) {
-    currentTensor = "building lm_head chunks";
-    emitProgress();
-    const rowsPerChunk = model.lmHeadChunkRows();
-    const chunks: Tensor[] = [];
-    for (let startRow = 0; startRow < vocab; startRow += rowsPerChunk) {
-      const len = Math.min(rowsPerChunk, vocab - startRow);
-      const slice = embedData.slice(
-        startRow * hiddenSize,
-        (startRow + len) * hiddenSize,
-      );
-      chunks.push(api.tensorFromArray(slice, [len, hiddenSize], { device: "webgpu" }));
-      await api.markStep();
-    }
-    model.lmHeadChunks = chunks;
-  }
-  embedData = null;
 
   progress(totalBytes, totalBytes, `Loaded ${loadedTensors} tensors`);
   return model;
