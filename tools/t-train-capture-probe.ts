@@ -27,6 +27,7 @@ import { clipGradNorm_ } from "../src/nn/index.ts";
 import { STEP_TAPE_REPLAY } from "../src/core/step-tape";
 import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
 import type { Tensor } from "../src/frontend/tensor";
+import { assertInitialLossSane } from "./parity-sanity";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const MODEL = process.env.MODEL ?? "distilgpt2";
@@ -43,6 +44,7 @@ interface RunResult {
   >;
   replayHits: number;
   refusals: number;
+  vocab: number;
 }
 
 async function run(useCapture: boolean): Promise<RunResult> {
@@ -181,6 +183,7 @@ async function run(useCapture: boolean): Promise<RunResult> {
       replay.missShape +
       replay.missValidity +
       replay.missEpoch,
+    vocab: V,
   };
 }
 
@@ -233,6 +236,10 @@ async function main() {
 
   const ctl = await runArmInChild("control");
   log(`control losses: ${ctl.losses.map((l) => l.toFixed(4)).join(", ")}`);
+  // ABSOLUTE sanity (device-2 lesson): the parity delta below is BLIND to
+  // mutual corruption — a silent submit-drop makes both arms read ~0 and the
+  // delta a false 0.0. Assert the REFERENCE arm's initial loss is near ln(V).
+  assertInitialLossSane(ctl.losses[0], ctl.vocab, "t-train-capture-probe/control");
   const cap = await runArmInChild("captured");
   log(`captured: bodyRuns=${cap.bodyRuns} calls=${cap.captureStats.calls} hits=${cap.captureStats.hits} replayHits=${cap.replayHits} refusals=${cap.refusals}`);
   log(`captured losses: ${cap.losses.map((l) => l.toFixed(4)).join(", ")}`);

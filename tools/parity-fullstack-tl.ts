@@ -23,6 +23,7 @@ import { Torchlette } from "../src/frontend/torchlette";
 import type { Tensor } from "../src/frontend/tensor";
 import { Adam, GradScaler } from "../src/optim/index.ts";
 import { clipGradNorm_ } from "../src/nn/index.ts";
+import { assertInitialLossSane } from "./parity-sanity";
 
 const PARITY =
   process.env.PARITY_DIR ?? "/mnt/pccfs2/backed_up/vin/dev/torchlette/ckpts/parity";
@@ -169,6 +170,11 @@ async function main() {
     });
     const lossVal = await loss.item();
     losses.push(lossVal);
+    // ABSOLUTE sanity (device-2 lesson): a silent submit-drop produces a
+    // zero/NaN loss that a downstream tl-vs-PyTorch diff can't distinguish from
+    // a real value if the PyTorch arm is also broken. Assert step-0 loss is near
+    // ln(VOCAB) (band tolerates the checkpoint-loaded start), fail loud on taint.
+    if (step === 0) assertInitialLossSane(lossVal, VOCAB, "parity-fullstack-tl");
 
     const backwardTarget = scaler ? scaler.scale(loss) : loss;
     await backwardTarget.backward();
