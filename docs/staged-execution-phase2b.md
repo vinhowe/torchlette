@@ -1628,3 +1628,67 @@ every step = voluntary K=1 (correct but slow — no runahead overlap). The examp
 spells this out. **Honest cost:** runahead trades K× in-flight memory for the
 wall win; on a memory-tight config (a model near the device ceiling) K may be
 forced to 1 = no runahead. The win is real only where headroom for K≥2 exists.
+
+---
+
+## INC-3 CLEANUP TAIL — ITEM 2 (scaler-as-tensor): BLOCKED on the same
+## compiled-replay scalar-delivery prerequisite as item 1. The bug it retires
+## is PROVEN and now has a permanent retirement gate.
+
+**The bug is REAL and correctness-affecting** (`tools/t-scaler-growth-probe.ts`,
+serial capture, GradScaler growthInterval=4, no inf → scale doubles every 4
+steps): once the tape starts hitting (bodyRuns=6/24), the captured scale FREEZES
+while the control keeps growing:
+
+    control  scales: 4,4,4,4,8,8,8,8,16,16,16,16,32,...,128
+    captured scales: 4,4,4,4,8,8,8,8, 8, 8, 8, 8, 8,..., 8   ← FROZEN at record-time
+    captured trajectory diverges: maxLossΔ = 1.41e-2 (hits=18, refusals=0)
+
+**Two coupled causes, both requiring the item-1 prerequisite:**
+1. **The scale UPDATE doesn't run on hits.** `_scale` is a JS number updated by
+   `_applyScaleAdjustment` (JS if/else), reached via `scaler.update()` /
+   `resolveDeferred()`. In the serial captured path `update()` is INSIDE the
+   body (never runs on a hit) and `resolveDeferred()` is a no-op on a hit
+   (`_pendingInfBuffer` is set by the JS `unscale_`, which also never runs) — so
+   the CPU scale mirror freezes. The inc-3 `snapshotDeferred`/`resolveOldest`
+   found-inf channel was built for the RUNAHEAD path; the serial capture path
+   has no per-hit found-inf report.
+2. **`scale(loss) = mul(loss, jsNumber)` bakes the scale as a graph SCALAR**,
+   frozen at record time. Even if cause 1 were fixed (CPU mirror advancing), the
+   REPLAYED graph would still multiply by the RECORDED scale. Fixing this needs
+   scale/invScale as PERSISTENT TENSORS read live by the replay — which is the
+   **exact compiled-replay scalar-delivery problem that STOPPED item 1**: a
+   persistent f32[1] buffer read by a compiled replay classifies as a static
+   `persistent` slot and does not pick up per-step writes correctly, AND a raw
+   `queue.writeBuffer` scale update loses the graph-ordering (item-1's measured
+   uncaptured-trajectory regression). The scale tensor is the same shape and the
+   same delivery channel as the lr tensor item 1 failed to make buffer-stable.
+
+**Ruling:** item 2 is BLOCKED on item 1's prerequisite (a graph-ordered in-place
+scalar write into a fixed buffer whose compiled-replay reads are live, not a
+frozen `persistent` slot). Implementing scale-as-tensor before that lands would
+reproduce item 1's uncaptured-trajectory regression on the scale path. **NOT
+LANDED.** What DID land: `tools/t-scaler-growth-probe.ts` — the retirement GATE
+(FAILs on main documenting the frozen-scale bug with a pointed message; goes
+green when item-2 lands). Sequencing for the next session: solve the item-1
+graph-ordered buffer-stable scalar write ONCE (a shared primitive), then BOTH lr
+(item 1) and scale/invScale (item 2) ride it; the growth probe + the item-1
+uncaptured A/B are the two load-bearing gates.
+
+---
+
+## INC-3 CLEANUP TAIL — ITEM 3 (N>1 grad accumulation, micro/apply split):
+## NOT ATTEMPTED — scoped out after the item-1/item-2 prerequisite surfaced.
+
+The micro/apply split (micro `(x,y)=>loss.backward()` reused N times, apply
+`()=>{opt.step();opt.zeroGrad()}` once) is well-specified in the INC-2B/§2b
+design, and the substrate exists (autograd already accumulates into `.grad`,
+e9f7943; the distributed trainer's manual `accumSteps` loop is the reference
+shape). The capture-layer work is real but bounded: a micro training capture
+must NOT commit a step boundary (only the apply capture does), which intersects
+the recorder-step-boundary machinery (the micro tape forms by comparing the same
+appKey across CYCLES, all N micros living within one boundary). This is
+independent of items 1/2 and is the cleanest remaining item — but it was
+deprioritized behind the item-1/2 prerequisite discovery and the two landed
+items (4, 5). Left as the next-session pickup with accumSteps=1 byte-identity as
+the hard invariant.
