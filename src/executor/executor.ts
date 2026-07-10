@@ -1049,7 +1049,12 @@ function captureActionLayouts(
     action.kind === "view" &&
     node.op === "reshape" &&
     action.cachedViewInput === undefined &&
-    backendInputs.length >= 1
+    backendInputs.length >= 1 &&
+    // A reshape of a SCALAR ref has no backend tensor to derive a layout from
+    // (backendInputs[0] is null — e.g. a 0-d graph scalar reshaped to [1,1] in
+    // a small-model GradScaler backward). Leave cachedViewInput unset — the
+    // non-cached view path handles it; deriving here crashed on `.shape`.
+    backendInputs[0] != null
   ) {
     const w = backendInputs[0] as {
       shape: number[];

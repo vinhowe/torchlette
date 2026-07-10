@@ -76,8 +76,10 @@ import {
 import { dispatchRoPE as dispatchRoPEKernel } from "../rope-kernel";
 import {
   allocateInfFlagBuffer,
+  readAndDestroyInfSnapshot,
   dispatchUnscaleGrad as dispatchUnscaleGradKernel,
   readInfFlag,
+  snapshotAndResetInfFlag,
 } from "../unscale-kernel";
 
 // ============================================================================
@@ -413,6 +415,15 @@ export function createInfCountBuffer(): unknown {
 
 export async function readAndDestroyInfCount(buffer: unknown): Promise<number> {
   return readInfFlag(buffer as GPUBuffer);
+}
+
+/** [inc-3 ring] Per-step found-inf report isolation — see unscale-kernel.ts. */
+export function snapshotInfFlag(): unknown | null {
+  return snapshotAndResetInfFlag();
+}
+
+export async function readInfSnapshot(snapshot: unknown): Promise<number> {
+  return readAndDestroyInfSnapshot(snapshot as GPUBuffer);
 }
 
 // ============================================================================

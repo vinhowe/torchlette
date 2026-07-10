@@ -424,15 +424,17 @@ describe("capture() — flag-independent surface", () => {
     });
 
     // ---- inc-3: the RUNAHEAD RING -------------------------------------------
-    it("[inc-3] runahead ring (K=1) is bit-identical to the serial 2b path; body frozen; drain clean", async () => {
+    it("[inc-3] runahead ring (K=1 AND K=2) is bit-identical to the serial 2b path; body frozen; drain clean", async () => {
       if (!hasGPU) return;
       const { Adam } = await import("../src/optim/index");
       type T = import("../src/frontend/tensor").Tensor;
 
-      // Same tiny training step as [2b]. Two arms advance IDENTICAL state:
+      // Same tiny training step as [2b]. Three arms advance IDENTICAL state:
       //  - serial: driver owns markStep, reads loss each step (the 2b baseline).
-      //  - runahead K=1: the ring OWNS the boundary (deferred gen-scoped commit,
-      //    recorder-finalize synchronous + sweep-after-fence); driver drains.
+      //  - runahead K=1 and K=2: the ring OWNS the boundary (deferred gen-scoped
+      //    commit, recorder-finalize synchronous + sweep-after-fence, per-settle
+      //    ISOLATED fences, POOL-EXCLUDED staged scalar readbacks); driver reads
+      //    K-behind via the staged copies and drains at the end.
       // K is a PURE knob — the ring only reorders WHEN the fence is awaited, so
       // the trajectory must be BIT-IDENTICAL (not merely within a noise band).
       async function build() {
@@ -478,35 +480,48 @@ describe("capture() — flag-independent surface", () => {
         s.api.setStepScopedCleanup(prev);
       }
 
-      // Runahead K=1 arm: ring owns the boundary; read 1-behind; drain at end.
-      const r = await build();
-      const rLoss = new Array<number>(N);
-      let hits = 0;
-      {
-        const prev = r.api.setStepScopedCleanup(true);
-        const step = r.api.capture(r.stepFn, {
-          training: true,
-          runahead: true,
-          ringDepth: 1,
-        });
-        const handles: T[] = [];
-        for (let i = 0; i < N; i++) {
-          const x = r.api.tensorFromArray([1 + i * 0.01, 2 - i * 0.01], [1, 2]);
-          handles.push((await step(x)) as T);
-          rLoss[i] = (await r.api.cpu(handles[i]))[0];
+      // Runahead arms: ring owns the boundary; read K-behind; drain at end.
+      for (const K of [1, 2]) {
+        const r = await build();
+        const rLoss = new Array<number>(N);
+        let hits = 0;
+        {
+          const prev = r.api.setStepScopedCleanup(true);
+          const step = r.api.capture(r.stepFn, {
+            training: true,
+            runahead: true,
+            ringDepth: K,
+          });
+          const handles: T[] = [];
+          for (let i = 0; i < N; i++) {
+            const x = r.api.tensorFromArray(
+              [1 + i * 0.01, 2 - i * 0.01],
+              [1, 2],
+            );
+            handles.push((await step(x)) as T);
+            // Oldest still-in-window handle (K-behind logging cadence): the
+            // staged pool-excluded copy makes this wait only for ITS step.
+            const oldest = i - K + 1;
+            if (oldest >= 0) rLoss[oldest] = (await r.api.cpu(handles[oldest]))[0];
+          }
+          await step.drain(); // §2b (d) — fence the tail in order, no hang
+          // Tail handles survive drain; read the last K-1 now.
+          for (let i = Math.max(0, N - K + 1); i < N; i++) {
+            if (rLoss[i] === undefined) rLoss[i] = (await r.api.cpu(handles[i]))[0];
+          }
+          hits = step.stats().hits;
+          r.api.setStepScopedCleanup(prev);
         }
-        await step.drain(); // §2b (d) — fence the tail in order, no hang
-        hits = step.stats().hits;
-        r.api.setStepScopedCleanup(prev);
-      }
 
-      // Body frozen on hits (run-exactly-once) and hits actually happened.
-      expect(hits).toBeGreaterThan(0);
-      expect(r.runs()).toBeLessThan(N);
-      // BIT-IDENTICAL to serial (K is a pure knob).
-      let maxD = 0;
-      for (let i = 0; i < N; i++) maxD = Math.max(maxD, Math.abs(sLoss[i] - rLoss[i]));
-      expect(maxD).toBe(0);
+        // Body frozen on hits (run-exactly-once) and hits actually happened.
+        expect(hits).toBeGreaterThan(0);
+        expect(r.runs()).toBeLessThan(N);
+        // BIT-IDENTICAL to serial (K is a pure knob).
+        let maxD = 0;
+        for (let i = 0; i < N; i++)
+          maxD = Math.max(maxD, Math.abs(sLoss[i] - rLoss[i]));
+        expect(maxD, `K=${K}`).toBe(0);
+      }
     });
 
     it("[inc-3] drain mid-ring: interrupt after a few steps resolves cleanly, no hang", async () => {

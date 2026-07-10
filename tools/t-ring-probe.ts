@@ -135,11 +135,11 @@ async function main() {
   }
   log(`maxΔ serial-vs-K1=${dK1.toExponential(2)} serial-vs-K2=${dK2.toExponential(2)} K1-vs-K2=${dK1K2.toExponential(2)}`);
 
-  // VALIDATED (inc-3): the ring mechanism — deferred gen-scoped boundary with
-  // recorder-finalize-synchronous + sweep-after-fence — is BIT-IDENTICAL to the
-  // serial 2b path at K=1 (both the immediate-read `ringNow` and the 1-behind
-  // `ringK1`), with the body frozen on hits (run-exactly-once) and ZERO GPU
-  // "used in submit while destroyed". This proves the boundary split is correct.
+  // VALIDATED (inc-3): the ring — deferred gen-scoped boundary (recorder-
+  // finalize synchronous + sweep-after-fence), per-settle ISOLATED fences, and
+  // POOL-EXCLUDED staged scalar readbacks — is BIT-IDENTICAL to the serial 2b
+  // path at K=1 AND K=2 (K is a pure knob), with the body frozen on hits
+  // (run-exactly-once) and ZERO GPU "used in submit while destroyed".
   const k1Pass =
     now.hits > 0 &&
     now.bodyRuns < now.calls &&
@@ -147,18 +147,10 @@ async function main() {
     dK1 < 1e-9 && // ringK1 bit-identical to serial
     k1.hits > 0 &&
     k1.bodyRuns < k1.calls;
-  // K≥2 (true runahead: ≥1 step in flight) has a RESIDUAL deferred-readback
-  // buffer-lifetime issue at the promotion boundary — the harvested loss buffer
-  // is a planner-assigned slot the next step's replay rebinds, so a 1-behind
-  // read at K=2 can read a rebound buffer (0.00000 / shifted). Fixing it needs a
-  // POOL/PLANNER-EXCLUDED readback staging buffer for ring outputs (CLAUDE.md's
-  // "dedicated readback staging" — the exact requirement the four failed
-  // loss-overlap attempts lacked; buffer-pool surface, outside capture.ts). See
-  // the inc-3 staged handoff in docs/staged-execution-phase2b.md.
-  const k2Runahead = dK2 < 1e-9;
+  const k2Runahead = dK2 < 1e-9 && dK1K2 < 1e-9 && k2.hits > 0;
   log(`K1 mechanism ${k1Pass ? "PASS (bit-identical to serial, body frozen)" : "FAIL"}`);
-  log(`K2 runahead ${k2Runahead ? "PASS" : "WIP (deferred-readback staging needed — see handoff)"}`);
-  const pass = k1Pass;
+  log(`K2 runahead ${k2Runahead ? "PASS (bit-identical: K is a pure knob)" : "FAIL"}`);
+  const pass = k1Pass && k2Runahead;
   log(pass ? "PASS" : "FAIL");
   destroyWebGPU();
   process.exit(pass ? 0 : 1);

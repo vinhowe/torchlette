@@ -1376,3 +1376,141 @@ surface).
 new env flags (`runahead` + `ringDepth` are capture OPTIONS). No deletions (the
 ring EXTENDS 2a's `pushRing`; the boundary split EXTENDS the implied-boundary
 commit).
+
+---
+
+## INC-3 COMPLETE (2026-07-10): both blockers landed post-fix-84-merge —
+## K≥2 runahead SHIPS. Distil@512: uncaptured 223 → ringK2 186.5 ms/step
+## (−16.4%), at the GPU floor, trajectories in the noise band, ring peak
+## BELOW uncaptured.
+
+**The two blockers, as landed (pool/tracker surface in scope after fix-84):**
+
+1. **POOL/PLANNER-EXCLUDED READBACK STAGING (layer #4).** At ring push, each
+   scalar output is copied NOW — in queue order, right after the step's plans,
+   before any newer step can rebind the live planner slot — into a dedicated
+   MAP_READ staging buffer that never enters the pool and is invisible to the
+   planner (extends the `startScalarReadback`/`startItemReadback` primitive per
+   CLAUDE.md's "dedicated readback staging" note — the exact requirement the
+   four historical loss-overlap attempts lacked). `Tensor._stagedScalarRead`:
+   `cpu()`/`item()` prefer the staged copy over the live buffer AND skip the
+   exec-lock entry point entirely (historical failure #3 structurally dead).
+   Cached finish (first read maps + `deferredDestroy`s the buffer); never-read
+   buffers are reclaimed at ring expiry (idempotent fire-and-forget). This is
+   also what makes the deferred readback FAST: the staged copy's mapAsync
+   resolves after only ITS step's GPU work, not the newer in-flight steps'.
+
+2. **PER-SETTLE FENCE ISOLATION.** `captureIsolatedFence()` (buffer-pool.ts):
+   each settle awaits its OWN `onSubmittedWorkDone` promise captured at
+   commit-issue time — the shared single-slot fence is still issued (non-ring
+   paths byte-identical) but is overwritten by the next step before a K≥2
+   settle runs; awaiting it would over-cover (serialize). CRITICALLY the
+   isolated awaiter does NO pool bookkeeping: `flushPendingToPool` at a
+   settle would promote buffers released during the still-in-flight next
+   step's build — the exact #84 run-boundary aliasing class. Pool promotion
+   happens only at true quiescent points: a full markStep, or the ring's
+   `drain()` (`_ringQuiesce` — fence everything, then promote).
+
+**GradScaler made ring-compatible (the found-inf reporting channel):** the
+shared persistent inf flag is (a) OVERWRITE-ZEROED by the next `unscale_`
+before a deferred readback could see it, and (b) never zeroed at all on tape
+HITS (the body never runs — it would latch 1 forever after the first inf).
+`snapshotAndResetInfFlag` (unscale-kernel.ts) snapshots the flag into a
+pool-excluded 4-byte staging buffer AND re-zeroes it, both in queue order;
+`GradScaler.snapshotDeferred()` (driver, once per step, after the captured
+call) queues per-step reports; `resolveOldestDeferred()` resolves them at the
+K-behind cadence (mapAsync self-sync — no markStep, no shared fence, legal
+mid-ring). The per-element zero-MASK in the unscale kernel is unchanged and is
+the trajectory-exactness carrier (in-graph, replay-faithful). `resolveDeferred`
+(serial) is byte-identical.
+
+**Gate ladder (final code; model-scale gates on DEVICE 10/11 — device 2 was
+squatted by a foreign 25.6GB idle allocation that made model-scale runs
+silently OOM-drop submits, discovered when all arms of the first measurement
+read loss=0 from step 1; tiny-model gates were unaffected):**
+1. build: PASS.
+2. K-parity (t-ring-probe): serial == ringNow == ringK1 == ringK2, ALL
+   maxΔ=0.00e+0 (bit-identical), body frozen on hits, zero GPU errors — K is a
+   pure knob. PASS.
+3. INJECTED-INF (t-ring-inf-probe): inf grads at step 12 (a HIT-era step — the
+   mask ran inside a REPLAYED plan): K=1 == K=2 bit-identical incl. the Inf
+   loss; CPU scale mirror backed off 1024→512 at EXACTLY call INF_STEP+K per
+   arm (lag bound ≤K asserted precisely, not absence); recovery clean. PASS.
+4. Drain-on-abort (capture.spec "[inc-3] drain mid-ring"): PASS.
+5. THE MEASUREMENT (t-ring-measure, distil@512, 30 steps, device 10, V100,
+   near-solo; trajectories all ≤6.4e-4 of uncaptured):
+   | arm | wall/step (late half) | peak MB |
+   |---|---:|---:|
+   | uncaptured (plain fullstack) | 223.2 | 8784 |
+   | serial captured (inc-2b) | 215.8 | 10268 |
+   | ringK1 (no overlap, by design) | 222.4 | 8251 |
+   | **ringK2 (runahead)** | **186.5** | **8251** |
+   **−16.4% wall vs uncaptured (−13.6% vs serial), AT the GPU floor** (steady
+   ~186ms ≈ GPU/step; occasional ~30ms steps show the pipeline's headroom).
+   vs G0(b)'s ~30% (236→165) prediction: the MECHANISM saturates exactly as
+   predicted (wall collapses to the GPU floor); the pie is smaller than G0
+   measured because G0 decomposed the LOWERED path — inc-2b's build-skip
+   already banked part of the CPU-overlappable slice. Above the ~15% G-perf
+   pause bar.
+   **gpt2-medium@512 on the 32GB V100 is OUT OF THE RING'S MEMORY ENVELOPE —
+   the §2 honest-cost boundary, measured:** uncaptured peaks 29.5 GB (<2.5 GB
+   headroom — less than one step's transient), so ANY runahead depth (even
+   K=1's one-step-deferred sweep) hits `VK_ERROR_OUT_OF_DEVICE_MEMORY` →
+   dropped submits → the ring arms' trajectories collapse while the serial
+   arms train (uncaptured 1078 ms/step, serial 1009). Exactly the chartered
+   claim: "the win is real only where memory headroom for K≥2 exists." No
+   pressure-reactive automation (per ruling) — the driver chooses K knowing
+   the envelope.
+   **Second in-envelope config — distil@1024 (heavier GPU/step):**
+   | arm | wall/step | peak MB |
+   |---|---:|---:|
+   | uncaptured | 300.7 | 11667 |
+   | serial captured | 279.4 | 12535 |
+   | ringK1 | 284.1 | 10874 |
+   | **ringK2** | **234.0** | **10874** |
+   **−22.2% vs uncaptured (−16.3% vs serial)**, trajectories ≤7.2e-4, ring
+   peak again BELOW uncaptured.
+6. MEMORY: ringK2 peak == ringK1 peak == 8251 MB — BELOW uncaptured (8784) and
+   serial-captured (10268). The K× worst-case did NOT materialize for this
+   config: the gen-scoped per-step sweeps + planner-fixed replay buffers bound
+   the in-flight set; the +K cost is the batch uploads + staged scalars (KB).
+7. capture.spec: 13/13 both flag states ("[inc-3]" now gates K=1 AND K=2
+   bit-parity in-suite).
+8. t-train-tape-probe (device 11): eligiblePairs=7, refusals=0, tapeCount=1
+   PASS. t-train-capture-probe (device 11): hits=14, refusals=0, bodyFrozen,
+   maxLossDelta=5.97e-4, REAL losses (12.72→10.8) PASS.
+9. Full suite BOTH flag states (device 11): flag-ON exit 0 (webgpu 910
+   passed/2 skipped + cpu green); flag-OFF exit 0 (cpu 1173/1 + webgpu 898/14
+   — incl. fix-84's in-suite second-run-determinism gate). test:gates 4/4.
+10. 124M regression (diloco-regression-check, device 10): PASS baseline-exact
+    (9.8089/5.9223/5.1527/4.6396 vs {9.81,5.92,5.15,4.64}), peak FLAT
+    2087.6 MB, zero growth.
+11. Decode stack: kv-differential PASS (cat + static + taped identical, taped
+    13/13 hits, 0 invalidations; needed a node_modules/torchlette self-link in
+    the worktree; exit-139 = benign Dawn teardown after complete output).
+    gen-tape-gate DEFERRED-TO-MERGE (@huggingface/transformers not installed
+    in any local node_modules — coordinator-anticipated worktree/deps issue).
+12. STRICT_LIFETIME+STRICT_GPU on captured ringK2 fullstack (autocast +
+    checkpoint + scaler + clip + AdamW, distil@512, NOSCHED): exit 0, ZERO
+    warns/throws, hits=19, wall 176.4ms. PASS.
+
+**KNOWN ISSUE (scoped, documented in t-ring-measure):** a PER-STEP DRIVER-LEVEL
+LR scheduler under RUNAHEAD produces ONE warmup-era (trace-phase) transient
+`[lifetime] reading RECLAIMED storage` warn on the setLR chain (id stable
+across runs; trajectory impact below the cross-process noise floor — measured
+maxΔ 3.9e-4 WITH the warn). It is the [2b-sched]/dangling-copy_ family (the
+plain-path per-step-scheduler fragility already quarantined with
+t-sched-plain-repro). Two structured fix attempts (pre-body forceAllPending,
+both orderings) each traded it for a worse failure (promotion mismatch → hits=0
+/ missShape=20: the pre-body plan changes the recorded step structure) and were
+reverted — the fix belongs in the setLR delivery (a declared scalar-slot write
+into a FIXED buffer, the TAG_WRITE idiom, as the [2b-sched] stop-report already
+recommended), not in the ring. STRICT gate runs NOSCHED until that lands.
+
+**SLOC (both blockers + scaler ring-compat):** +~130 src on top of the partial
+(staging: tensor field + cpu/item override + `_startRingScalarReadback` +
+`_ringQuiesce`; fence: `captureIsolatedFence`; scaler: snapshot queue + 2
+methods + kernel snapshot fns + 2 backend ops). Zero new env flags. One
+pre-existing main bug fixed en route (executor.ts `captureActionLayouts`
+crashed on reshape-of-SCALAR-ref — null backendInputs[0] — under the
+build-from-IR default; tiny-model+GradScaler repro, flag-independent).

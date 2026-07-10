@@ -398,7 +398,14 @@ export class CapturedFn {
           // commit immediately replaces, so the loss buffer would still be swept
           // and the driver's K-steps-later readback reads garbage.
           const settle = await this.api._deferBoundaryCommit();
-          for (const t of out) this.api.persist(t);
+          for (const t of out) {
+            this.api.persist(t);
+            // Blocker #1: stage each scalar output into a POOL-EXCLUDED
+            // readback buffer NOW (queue order — before any newer step can
+            // rebind the live planner slot). The K-behind read then returns
+            // this step's value and waits only for this step's GPU.
+            t._stagedScalarRead = await this.api._startRingScalarReadback(t);
+          }
           return this.pushRing(out, settle);
         }
         this.api.queueStepBoundary();
@@ -438,7 +445,11 @@ export class CapturedFn {
       ? await this.api._deferBoundaryCommit()
       : undefined;
     if (this.runahead && result !== null) {
-      for (const t of Array.isArray(result) ? result : [result]) this.api.persist(t);
+      for (const t of Array.isArray(result) ? result : [result]) {
+        this.api.persist(t);
+        // Blocker #1 (see hit path): stage the scalar output pool-excluded.
+        t._stagedScalarRead = await this.api._startRingScalarReadback(t);
+      }
     }
     return this.finishTrace(appKey, result, uploads, settle);
   }
@@ -478,6 +489,11 @@ export class CapturedFn {
         await old.settle();
       }
       for (const t of old.outputs) {
+        // Reclaim a never-read staging buffer (cached finish is idempotent —
+        // a no-op if the driver already read it; the map resolves promptly
+        // because the settle above fenced this step). Fire-and-forget: the
+        // buffer's destroy rides deferredDestroy either way.
+        if (t._stagedScalarRead) void t._stagedScalarRead().catch(() => {});
         this.api._markCaptureExpired(t, old.step, this.stepCounter, this.ringDepth);
       }
     }
@@ -524,13 +540,20 @@ export class CapturedFn {
    * Draining = awaiting every un-fenced entry's settle. Idempotent.
    */
   async drain(): Promise<void> {
+    let settled = false;
     while (this.ring.length) {
       const old = this.ring.shift()!;
       if (old.settle && !old.settled) {
         old.settled = true;
         await old.settle();
+        settled = true;
       }
     }
+    // Full quiescent point (runahead only): nothing is in flight after the
+    // settles, so the pool bookkeeping the per-settle isolated fences skip
+    // (#84-safety) is legal here — fence everything, promote pendingRelease,
+    // fire pending destroys. Idempotent (a second drain settles nothing).
+    if (settled && this.runahead) await this.api._ringQuiesce();
   }
 }
 

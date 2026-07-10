@@ -33,6 +33,15 @@ export class Tensor {
    *  ring's K-step validity window (§4). Any read/use after that is a LOUD,
    *  step-naming error rather than silent stale/garbage bytes. */
   _captureExpired: { step: number; now: number; k: number } | null = null;
+  /** [capture inc-3] POOL-EXCLUDED staged readback for a runahead-ring scalar
+   *  output. Set at ring push: the value was copied to a dedicated MAP_READ
+   *  staging buffer (never pooled, never planner-visible) in queue order right
+   *  after this step's plans — so a K-steps-later read returns THIS step's
+   *  value even after the planner rebinds the live output buffer, and resolves
+   *  after only this step's GPU work (not the newer in-flight steps'). cpu()/
+   *  item() prefer this over the live buffer. Cached: first call maps + frees
+   *  the staging buffer; later calls return the same value. */
+  _stagedScalarRead: (() => Promise<number>) | null = null;
 
   constructor(
     engine: Torchlette,
