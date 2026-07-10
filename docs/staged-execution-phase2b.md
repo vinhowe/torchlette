@@ -1678,17 +1678,43 @@ uncaptured A/B are the two load-bearing gates.
 ---
 
 ## INC-3 CLEANUP TAIL — ITEM 3 (N>1 grad accumulation, micro/apply split):
-## NOT ATTEMPTED — scoped out after the item-1/item-2 prerequisite surfaced.
+## ATTEMPTED, STOPPED — TWO real blockers surfaced (recorder-step model +
+## shared-encoder cross-capture hazard). The boundary-suppression piece is
+## trivial; the recorder/encoder work behind it is not.
 
-The micro/apply split (micro `(x,y)=>loss.backward()` reused N times, apply
-`()=>{opt.step();opt.zeroGrad()}` once) is well-specified in the INC-2B/§2b
-design, and the substrate exists (autograd already accumulates into `.grad`,
-e9f7943; the distributed trainer's manual `accumSteps` loop is the reference
-shape). The capture-layer work is real but bounded: a micro training capture
-must NOT commit a step boundary (only the apply capture does), which intersects
-the recorder-step-boundary machinery (the micro tape forms by comparing the same
-appKey across CYCLES, all N micros living within one boundary). This is
-independent of items 1/2 and is the cleanest remaining item — but it was
-deprioritized behind the item-1/2 prerequisite discovery and the two landed
-items (4, 5). Left as the next-session pickup with accumSteps=1 byte-identity as
-the hard invariant.
+The substrate exists (autograd accumulates into `.grad`, e9f7943; the
+distributed trainer's manual `accumSteps` loop is the reference: N micro
+forward+backward each scaled 1/N — MEAN convention — then ONE step+zeroGrad in
+one beginStep so `.grad` never crosses a markStep). A `CaptureOptions.microStep`
+flag suppressing the micro's boundary queue (only the once-per-cycle `apply`
+capture commits) was prototyped and IS trivial (one guarded
+`queueStepBoundary`). But a probe of two captures per cycle (`micro` reused N×
++ `apply` once) surfaced TWO real blockers, BOTH stopping the tape from forming
+(`microHits=0, applyHits=0`):
+
+1. **The recorder-step model is ONE-capture-per-boundary.** The recorder tracks
+   a single step's ordered plan-fp sequence and promotes at the boundary
+   (markStep). With `micro` and `apply` BOTH contributing plans to ONE step
+   (there is no markStep between the N micros and the apply — that IS
+   accumulation), the recorder cannot segment which plans belong to which
+   capture, so neither forms its own tape. The micro tape must form by comparing
+   micro-of-cycle-C vs cycle-C+1, but the boundary is per-CYCLE — a per-capture
+   plan segmentation the recorder does not have.
+2. **Shared-encoder cross-capture read-write hazard.** With two captures per
+   boundary the `.grad` accumulation (micro writes `.grad`) and the optimizer
+   read of `.grad` (apply) land in the SAME shared-encoder synchronization scope
+   with no intervening flush — Dawn rejects it: `usage (Storage(read-write)|
+   Storage(read-only)) includes writable usage and another usage in the same
+   synchronization scope` → invalid command buffer. The single-capture
+   whole-step path never hits this (one body, one encoder lifecycle).
+
+**Ruling:** option (a) micro/apply needs (i) per-capture plan segmentation in
+the recorder within a shared boundary and (ii) an inter-capture shared-encoder
+flush — real mechanism, not one-liners. NOT LANDED (prototype + `microStep` flag
+reverted). **A tractable alternative exists** — design option (b): a SINGLE
+whole-step training capture whose body runs the N micro-backwards + the step
+(one capture per boundary, no recorder/encoder change; re-records per distinct N
+as a plain-value cold bucket — for a FIXED N, one tape). INC-2B rejected (b) for
+reuse, not correctness; given (a)'s two blockers, (b) is the pragmatic next-
+session landing, with accumSteps=1 byte-identity (micro==apply, one body) as the
+hard invariant either way.
