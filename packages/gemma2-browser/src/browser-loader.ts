@@ -259,9 +259,13 @@ async function streamTensor(
  * allocation failed` for the whole-table Float32Array (256128×2304×4 = 2.36GB
  * exceeds V8's per-ArrayBuffer allocation ceiling; verified live). Each block is
  * a fresh contiguous [rows, hidden] Float32Array handed to `onBlock`, which
- * uploads it to the GPU embedding buffer (a region DMA — no >2GB binding) and
- * reuses it as a tied-lm_head vocab chunk. Converts BF16/F16/F32 via the same
- * fixed 8MB staging buffer as streamTensor, yielding to the UI between slices.
+ * uploads it to the GPU embedding buffer (a region DMA — no >2GB binding).
+ * For BF16/F16 sources each block ALSO comes as raw f16 bits (converted
+ * directly from the source — bf16→f16 is exact in the f16 normal range), so
+ * the tied-lm_head vocab chunks can be uploaded at HALF the f32 footprint:
+ * the lm_head matmul sweeps every chunk on every decoded token, so chunk
+ * bytes are both resident memory AND per-token GPU bandwidth. Converts via
+ * the same fixed 8MB staging buffer as streamTensor, yielding between slices.
  */
 async function streamEmbeddingBlocks(
   cursor: ByteCursor,
@@ -270,12 +274,18 @@ async function streamEmbeddingBlocks(
   hidden: number,
   rowsPerBlock: number,
   onSlice: (fraction: number) => void,
-  onBlock: (block: Float32Array, startRow: number, rows: number) => Promise<void>,
+  onBlock: (
+    block: Float32Array,
+    blockF16: Uint16Array | null,
+    startRow: number,
+    rows: number,
+  ) => Promise<void>,
 ): Promise<void> {
   if (srcDtype !== "BF16" && srcDtype !== "F16" && srcDtype !== "F32") {
     throw new Error(`Unsupported safetensors dtype ${srcDtype}`);
   }
   const srcElemBytes = srcDtype === "F32" ? 4 : 2;
+  const wantF16 = srcDtype !== "F32"; // f32 checkpoints keep f32 chunks
   const totalElems = byteLength / srcElemBytes;
   const totalRows = totalElems / hidden;
   if (!Number.isInteger(totalRows)) {
@@ -288,7 +298,10 @@ async function streamEmbeddingBlocks(
 
   // Current block being filled.
   let startRow = 0;
-  let block = new Float32Array(Math.min(rowsPerBlock, totalRows) * hidden);
+  const blockElems = () =>
+    Math.min(rowsPerBlock, totalRows - startRow) * hidden;
+  let block = new Float32Array(blockElems());
+  let blockF16 = wantF16 ? new Uint16Array(blockElems()) : null;
   let blockElemOffset = 0; // elements written into `block`
 
   const emitFullBlocks = async () => {
@@ -312,20 +325,31 @@ async function streamEmbeddingBlocks(
         const src16 = new Uint16Array(staging.buffer, src16Start * 2, take);
         const out = block.subarray(blockElemOffset, blockElemOffset + take);
         (srcDtype === "BF16" ? bf16SliceToF32 : f16SliceToF32)(src16, out, 0, take);
+        if (blockF16) {
+          if (srcDtype === "F16") {
+            blockF16.set(src16, blockElemOffset);
+          } else {
+            bf16SliceToF16Bits(
+              src16,
+              blockF16.subarray(blockElemOffset, blockElemOffset + take),
+              0,
+              take,
+            );
+          }
+        }
       }
       blockElemOffset += take;
       stagingElemOffset += take;
       elems -= take;
       if (blockElemOffset === block.length) {
         const rows = block.length / hidden;
-        await onBlock(block, startRow, rows);
+        await onBlock(block, blockF16, startRow, rows);
         startRow += rows;
-        const remainingRows = totalRows - startRow;
         blockElemOffset = 0;
-        block =
-          remainingRows > 0
-            ? new Float32Array(Math.min(rowsPerBlock, remainingRows) * hidden)
-            : block;
+        if (totalRows - startRow > 0) {
+          block = new Float32Array(blockElems());
+          blockF16 = wantF16 ? new Uint16Array(blockElems()) : null;
+        }
       }
     }
     // Retain any partial-element tail (bytes that don't complete an element).
@@ -492,9 +516,14 @@ export async function loadGemma2FromUrl(
         //  - copyInto_ DMAs it into the pre-zeroed embedding buffer at its row
         //    offset — a contiguous buffer-to-buffer region write, which never
         //    binds the >2GB dest (unlike the strided-scatter kernel path);
-        //  - the same block tensor is retained as a tied-lm_head vocab chunk
-        //    (matmul binds a weight operand whole, so lm_head must be sub-2GB
-        //    INDEPENDENT buffers — these blocks already are).
+        //  - each block is ALSO retained as a tied-lm_head vocab chunk (matmul
+        //    binds a weight operand whole, so lm_head must be sub-2GB
+        //    INDEPENDENT buffers) — as f16 when the checkpoint is BF16/F16:
+        //    bf16→f16 is exact in range, the f32-activation × f16-weight
+        //    matmul is the same mixed-dtype class as every projection linear,
+        //    and the lm_head sweeps ALL chunk bytes on EVERY decoded token, so
+        //    f16 halves both resident memory and per-token bandwidth (2.36GB →
+        //    1.18GB — the single biggest lever on a 16GB Mac).
         // No CPU or GPU allocation ever exceeds one block (~1GB).
         const rowsPerBlock = model.lmHeadChunkRows(); // <2GB per block
         const embedWeight = model.embedTokens.weight;
@@ -510,7 +539,7 @@ export async function loadGemma2FromUrl(
             emitProgress();
             tensorEvent({ type: "progress", name, fraction });
           },
-          async (blockArr, startRow, rows) => {
+          async (blockArr, blockF16, startRow, rows) => {
             currentTensor = `${name} (rows ${startRow}..${startRow + rows})`;
             emitProgress();
             const blockTensor = api.tensorFromArray(blockArr, [rows, hiddenSize], {
@@ -524,8 +553,16 @@ export async function loadGemma2FromUrl(
               startRow * hiddenSize,
               blockTensor._unwrap(),
             );
-            // Reuse the same independent buffer as a tied-lm_head chunk.
-            if (needLmHeadChunks) lmHeadChunks.push(blockTensor);
+            if (needLmHeadChunks) {
+              lmHeadChunks.push(
+                blockF16
+                  ? api.tensorFromArray(blockF16, [rows, hiddenSize], {
+                      dtype: "f16",
+                      device: "webgpu",
+                    })
+                  : blockTensor, // f32 checkpoint: reuse the f32 block
+              );
+            }
             await api.markStep();
           },
         );
