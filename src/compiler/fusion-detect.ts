@@ -1052,6 +1052,88 @@ export type ExecutionSegment =
   | { kind: "fused"; group: FusionGroup; recipe: FusedKernelRecipe }
   | { kind: "sequential"; nodes: LazyIRNode[] };
 
+// ============================================================================
+// Islands IR (stage I0): the plan's dispatch-partition as first-class data.
+//
+// An island is one dispatch group; the partition is the full assignment of a
+// plan's nodes to islands, in emission order. Today the partition is DERIVED
+// from the fusion/claiming decisions (one partition per graph); reifying it
+// as data is the substrate for (a) keying the template cache by partition
+// identity (stage I1) and (b) expressing the fusion detector, editor
+// gestures, and the autotuner as three writers of one object (stage I2).
+// See docs/islands-design.md.
+// ============================================================================
+
+export type IslandKind = "sequential" | "fused" | "reduction";
+
+export interface Island {
+  kind: IslandKind;
+  /**
+   * Member positions in the FINAL plan order (plan-relative — stable across
+   * steps for a static graph; never raw node ids, which are allocation-
+   * ordered and change every step).
+   */
+  members: number[];
+}
+
+export interface PlanPartition {
+  /** Islands in emission order. */
+  islands: Island[];
+  /**
+   * Canonical partition-identity token: FNV-1a over island kinds + member
+   * positions in emission order. Null-stable (a static graph's derived
+   * partition hashes identically every step) and discriminating (any
+   * boundary change changes it). This is the value stage I1 mixes into the
+   * template fingerprint when a non-default partition is requested.
+   */
+  boundaryHash: number;
+}
+
+const ISLAND_KIND_CODE: Record<IslandKind, number> = {
+  sequential: 0,
+  fused: 1,
+  reduction: 2,
+};
+
+/** FNV-1a over the partition's boundary structure. Pure; order-sensitive. */
+export function partitionBoundaryHash(islands: readonly Island[]): number {
+  let h = 0x811c9dc5;
+  const prime = 0x01000193;
+  const mix = (v: number) => {
+    h ^= v & 0xff;
+    h = Math.imul(h, prime);
+    h ^= (v >>> 8) & 0xff;
+    h = Math.imul(h, prime);
+    h ^= (v >>> 16) & 0xff;
+    h = Math.imul(h, prime);
+    h ^= (v >>> 24) & 0xff;
+    h = Math.imul(h, prime);
+  };
+  mix(islands.length);
+  for (const island of islands) {
+    mix(ISLAND_KIND_CODE[island.kind]);
+    mix(island.members.length);
+    for (const m of island.members) mix(m);
+  }
+  return h >>> 0;
+}
+
+/**
+ * Reify the partition from positional segment descriptors (the executor's
+ * CachedSegmentDesc shape: every kind carries its members as final-plan
+ * positions). Pure derivation — stage I0 changes no decision, it makes the
+ * decision an object.
+ */
+export function reifyPartition(
+  segments: ReadonlyArray<{ kind: IslandKind; finalPoss: number[] }>,
+): PlanPartition {
+  const islands: Island[] = segments.map((s) => ({
+    kind: s.kind,
+    members: [...s.finalPoss],
+  }));
+  return { islands, boundaryHash: partitionBoundaryHash(islands) };
+}
+
 /**
  * Segment a lazy plan into fusible and sequential parts.
  *
