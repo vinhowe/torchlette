@@ -22,7 +22,7 @@
  * available for the encode matmul but the parity gate runs f32.
  */
 
-import type { Tensor, Torchlette } from "torchlette";
+import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
 
 export type SAEConfig = {
   /** Residual-stream width of the base model (Gemma-2-2B: 2304). */
@@ -140,16 +140,21 @@ export class GemmaScopeSAE {
     return api.reshape(xHat, [...shape.slice(0, -1), dModel]);
   }
 
-  /** Feature f's residual-stream direction W_dec[f] as a fresh [dModel] tensor
-   *  on GPU. Used by steering to add α·dir into the residual. The rows of W_dec
-   *  are already unit-norm in Gemma Scope (decoder columns are normalized during
-   *  training), so no renormalization is applied by default. */
-  featureDirection(api: Torchlette, feature: number): Tensor {
+  /** Feature f's residual-stream direction W_dec[f] as a CPU Float32Array
+   *  [dModel]. The rows of W_dec are unit-norm in Gemma Scope (verified 1.0000),
+   *  so this is a unit steering direction — α is directly in residual-norm units. */
+  featureDirectionCpu(feature: number): Float32Array {
     const { dModel, numFeatures } = this.config;
     if (feature < 0 || feature >= numFeatures)
       throw new Error(`feature ${feature} out of range [0,${numFeatures})`);
-    const row = this.wDecCpu.slice(feature * dModel, (feature + 1) * dModel);
-    return api.tensorFromArray(row, [dModel]);
+    return this.wDecCpu.slice(feature * dModel, (feature + 1) * dModel);
+  }
+
+  /** Feature f's decoder direction W_dec[f] as a fresh [dModel] GPU tensor. */
+  featureDirection(api: Torchlette, feature: number): Tensor {
+    return api.tensorFromArray(this.featureDirectionCpu(feature), [
+      this.config.dModel,
+    ]);
   }
 
   /** L2 norm of feature f's decoder direction (diagnostic; ~1.0 in Gemma Scope). */
