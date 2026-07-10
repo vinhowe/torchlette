@@ -593,6 +593,16 @@ setTemplateIdleRetirer((fp: number) => {
  * steps/sessions is unaffected.
  */
 export function clearTemplateCacheForNewEngine(): void {
+  // [#84] The storage tracker + refcount registry are module-global singletons
+  // too. A previous engine's residual storages (its params / optimizer m/v / lr
+  // tensors) linger until GC collects the owning tensors — at an unpredictable
+  // time DURING the next engine's run — and their buffers are then released to
+  // the SHARED pool MID-STEP of that run (the "released-to-pool mid-step"
+  // corruption class), so the second-in-process run sporadically diverges. Orphan
+  // them HERE, at construction, before the new engine allocates: dropping them
+  // from the tracker makes the eventual GC-time destroy() a no-op, so no buffer
+  // is re-pooled mid-step of the next run. See disposeAllForNewEngine.
+  storageTracker.disposeAllForNewEngine();
   evictAllArenas(false);
   fusionAnalysisCache.clear();
   // Step-scoped shared planner registry is module-global like the template

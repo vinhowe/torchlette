@@ -48,7 +48,11 @@ import { doubleTransposeRule } from "../compiler/rewriter/rules/double-transpose
 import { fuseMatmulSumRule } from "../compiler/rewriter/rules/fuse-matmul-sum";
 import { transitiveReshapeRule } from "../compiler/rewriter/rules/transitive-reshape";
 import { auditPlan } from "../compiler/scheduler/audit";
-import { getLivePendingNodeIds, getPendingNodeIds } from "./tensor";
+import {
+  clearPendingTensorsForNewEngine,
+  getLivePendingNodeIds,
+  getPendingNodeIds,
+} from "./tensor";
 
 const DSL_RULES = [
   fuseMatmulSumRule,
@@ -438,6 +442,11 @@ export class RuntimeEngine {
     // recorded state belonging to the previous engine). See
     // clearTemplateCacheForNewEngine.
     clearTemplateCacheForNewEngine();
+    // [#84] Drop the module-global pending-tensor registry too: a prior engine's
+    // strongly-held leftover pending Tensors would otherwise be pulled into this
+    // engine's forceAllPending() and executed against the prior engine's (now
+    // instance-boundary-forgotten) storages. See clearPendingTensorsForNewEngine.
+    clearPendingTensorsForNewEngine();
     if (backendName) {
       this.defaultDevice = backendName;
     }

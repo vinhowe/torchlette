@@ -390,6 +390,80 @@ class StorageTracker {
     this.tensorWeakRefs.clear();
   }
 
+  /**
+   * Instance-boundary teardown (a NEW engine is being constructed). The
+   * storage tracker + refcount registry are MODULE-GLOBAL singletons shared
+   * across every RuntimeEngine in the process; a previous engine's residual
+   * storages linger in `allStorages` with their owning tensors still alive
+   * (model params, optimizer m/v, lr tensors) until JavaScript GC collects
+   * them — at an UNPREDICTABLE time DURING the next engine's training run. On
+   * collection, the WeakRef scan in destroyUnreachable() releases the claim,
+   * the storage's `bt.destroy()` runs, and its buffer is `bufferPool.release()`d
+   * back into the SHARED pool MID-STEP of the live run — the exact
+   * "released-to-pool mid-step" corruption class (CLAUDE.md WebGPU Buffer Pool
+   * Invariants). The live run then acquires that buffer for a fresh tensor and
+   * either reads stale data or has its data destroyed under it. Symptom: the
+   * second-and-later training run in one process sporadically (GC-timing
+   * dependent) diverges from step ~0 (task #84; the executor template cache got
+   * the analogous instance-boundary reset — clearTemplateCacheForNewEngine —
+   * for the SAME cross-instance-interference reason, but the storage tracker
+   * was missed).
+   *
+   * The fix: at construction, quiescently tear down every residual storage NOW
+   * (before the new engine does any work), so their buffers are released to the
+   * pool at a safe boundary, never mid-step of the live run. Must be called
+   * only when the backend is live (a buffer pool exists to release into) and
+   * before the new engine allocates anything. Idempotent; safe with an empty
+   * tracker (no residue). Asserts the tracker is empty afterward — a nonzero
+   * residual would mean a storage escaped teardown and could still leak into
+   * the next run (the guard that catches future regressions of this class).
+   */
+  disposeAllForNewEngine(): void {
+    // ORPHAN the previous engine's residual storages — do NOT destroy them, and
+    // do NOT touch the refcount registry. Mechanism, precisely:
+    //
+    // A previous engine's tensor WRAPPERS are still live JS objects (its
+    // model/opt went out of scope but GC has not run) with live rc. The
+    // corruption (#84) was: when GC finally collected one of those wrappers
+    // DURING the next engine's step, the tracker's WeakRef scan in
+    // destroyUnreachable() (or the wrapper's FinalizationRegistry) released the
+    // claim, the storage's `bt.destroy()` ran, and its buffer was
+    // `bufferPool.release()`d back into the SHARED pool MID-STEP of the live run
+    // — the "released-to-pool mid-step" class — where the live run had already
+    // acquired it. Second-and-later runs diverged, GC-timing-sporadically.
+    //
+    // Forgetting the storages HERE (dropping their ids from allStorages +
+    // tensorWeakRefs) breaks that path at its root: destroyUnreachable() no
+    // longer iterates them, so their `bt.destroy()` is never called and their
+    // buffers are never returned to the pool — they are orphaned (leaked for the
+    // process lifetime, but a NEW engine means the OLD one is finished; this is
+    // a bounded one-time-per-construction leak, the same one-live-engine-at-a-
+    // time contract clearTemplateCacheForNewEngine already assumes).
+    //
+    // Deliberately NOT done here: (a) destroying the buffers (they'd be re-pooled
+    // now AND destroyed again by the still-live wrapper's later GC — a
+    // double-release; measured to make the next run diverge deterministically);
+    // (b) rcReset() (the rc registry is keyed by storage id and the previous
+    // engine's ids never collide with the next engine's monotonic ids, so its
+    // entries are inert; wiping it wholesale instead nulls the CURRENT engine's
+    // live scalars' refcounts on later constructions — the shape-[1] `_t`/`lr`
+    // reclaimed-read STRICT_LIFETIME throw). The orphaned ids' lingering rc
+    // entries are harmless: the wrapper's FR does `rcRelease` on an id whose
+    // storage we already forgot, which never reaches destroyStorageIds.
+    //
+    // Root cause of #84: this instance-boundary teardown was simply ABSENT — the
+    // executor template cache got clearTemplateCacheForNewEngine for the
+    // identical cross-instance-interference reason, but the storage tracker was
+    // never given the analogous reset.
+    this.allStorages.clear();
+    this.tensorWeakRefs.clear();
+    if (this.allStorages.size !== 0) {
+      throw new Error(
+        `[storage-tracker] disposeAllForNewEngine left ${this.allStorages.size} residual storages — a storage escaped instance-boundary teardown and would leak into the next engine run (the second-in-process bimodality class, task #84).`,
+      );
+    }
+  }
+
   getStorage(storageId: number): StorageHandle | undefined {
     return this.allStorages.get(storageId);
   }

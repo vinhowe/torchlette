@@ -166,6 +166,30 @@ export function clearDisposedPendingNodeIds(): void {
   disposedPendingNodeIds.clear();
 }
 
+/**
+ * [#84] Instance-boundary reset of the MODULE-GLOBAL pending-tensor registry.
+ *
+ * `pendingTensorsByNodeId` holds STRONG references to un-materialized Tensors,
+ * keyed by their lazy node id (a monotonic global). A previous engine can leave
+ * pending Tensors here (e.g. an optimizer's lazily-built `_t`/`lr` scalar whose
+ * result was never independently forced, or any tail node whose owning wrapper
+ * outlived its consumer). Because the refs are STRONG they never GC, so the NEXT
+ * engine's `forceAllPending()` — which iterates this global — pulls the previous
+ * engine's leftover nodes into ITS plan and tries to execute them against the
+ * previous engine's storages. Combined with the storage-tracker instance-boundary
+ * reset (disposeAllForNewEngine, which forgets those storages), executing a
+ * carried-over node reads a now-orphaned storage — surfaced as a
+ * STRICT_LIFETIME "reading RECLAIMED storage" throw (task #84), and, without the
+ * reset, a SILENT stale-buffer read of the previous run's scalar. Drop the
+ * registry at construction so a new engine starts with no carried-over pending
+ * work. The previous engine is finished (one-live-engine-at-a-time), so its
+ * un-consumed pending tensors are genuinely orphaned.
+ */
+export function clearPendingTensorsForNewEngine(): void {
+  pendingTensorsByNodeId.clear();
+  disposedPendingNodeIds.clear();
+}
+
 /** Debug: track live tensors to find leaks. Enable via Tensor._debugTracking = true. */
 // biome-ignore lint/style/useLet: toggled at runtime
 let _debugTracking = false;
