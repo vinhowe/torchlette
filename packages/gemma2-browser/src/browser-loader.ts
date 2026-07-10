@@ -7,13 +7,14 @@
  * Mirrors packages/qwen3-browser/src/browser-loader.ts's stream/cache/resume
  * machinery. Gemma-2 deltas (all in the per-tensor handler):
  *  - RMSNorm weights (zero-centered) are baked to (1 + weight) before upload.
- *  - The 2.36GB f32 embedding table exceeds the 2GB storage-buffer BINDING
- *    limit, so it is uploaded via api.tensorFromArray + registerParameter (NOT
- *    copy_, whose stridedScatterCopy would bind the whole >2GB dest), and its
- *    CPU f32 data is retained to build the tied lm_head as independent sub-2GB
- *    vocab chunks (model.lmHeadChunks) after the stream completes.
- *  - Projection linears honor weightDtype (f16 fast path); norms + embedding
- *    stay f32.
+ *  - The embedding table is uploaded in row-blocks via api.tensorFromArray +
+ *    copyInto_ region-DMA (NOT copy_, whose stridedScatterCopy would bind the
+ *    whole dest). When the model is f16 the RESIDENT table is f16 (#59: the
+ *    gather is dtype-parametrized) — 2.36GB f32 → 1.18GB f16, which fits the 2GB
+ *    binding limit so the tied lm_head reads it directly (no chunks). The f32
+ *    table (2.36GB > 2GB) still needs sub-2GB f16 lm_head vocab chunks.
+ *  - Projection linears honor weightDtype (f16 fast path); norms stay f32; the
+ *    embedding follows weightDtype (f16 in the shipping config).
  *
  * Works against huggingface.co resolve URLs directly (HF serves CORS) or any
  * static host with the same layout.
@@ -508,26 +509,31 @@ export async function loadGemma2FromUrl(
       tensorEvent({ type: "start", name });
 
       if (isEmbed) {
-        // 2.36GB f32 embedding: streaming the whole table into ONE Float32Array
-        // throws `RangeError: Array buffer allocation failed` in Chrome (exceeds
-        // V8's per-ArrayBuffer ceiling). Stream it in <2GB row-BLOCKS instead:
+        // 2.36GB f32 (1.18GB f16) embedding: streaming the whole table into ONE
+        // Float32Array throws `RangeError: Array buffer allocation failed` in
+        // Chrome (exceeds V8's per-ArrayBuffer ceiling). Stream it in <2GB
+        // row-BLOCKS instead:
         //  - each block is a fresh [rows, hidden] GPU tensor uploaded via
         //    tensorFromArray (chunked writeBuffer, no binding);
         //  - copyInto_ DMAs it into the pre-zeroed embedding buffer at its row
-        //    offset — a contiguous buffer-to-buffer region write, which never
-        //    binds the >2GB dest (unlike the strided-scatter kernel path);
-        //  - each block is ALSO retained as a tied-lm_head vocab chunk (matmul
-        //    binds a weight operand whole, so lm_head must be sub-2GB
-        //    INDEPENDENT buffers) — as f16 when the checkpoint is BF16/F16:
-        //    bf16→f16 is exact in range, the f32-activation × f16-weight
-        //    matmul is the same mixed-dtype class as every projection linear,
-        //    and the lm_head sweeps ALL chunk bytes on EVERY decoded token, so
-        //    f16 halves both resident memory and per-token bandwidth (2.36GB →
-        //    1.18GB — the single biggest lever on a 16GB Mac).
+        //    offset — a contiguous buffer-to-buffer region write (dtype-agnostic
+        //    bytes), which never binds the dest (unlike the strided-scatter
+        //    kernel path).
+        // The RESIDENT embedding dtype follows the model (#59): when the model
+        // is f16 the resident table is f16 (bf16→f16 exact in range) — 2.36GB →
+        // 1.18GB, the single biggest lever on a 16GB Mac. The gather is now
+        // dtype-parametrized so an f16 table lookup is correct; the model then
+        // upcasts the small lookup to keep the residual stream f32.
+        // The 1.18GB f16 table is UNDER the 2GB binding limit, so the tied
+        // lm_head reads embedTokens.weight directly (no chunks). Only the f32
+        // table (2.36GB > 2GB) needs sub-2GB lm_head chunks; each block is then
+        // retained as an f16 chunk (matmul binds a weight operand whole).
         // No CPU or GPU allocation ever exceeds one block (~1GB).
         const rowsPerBlock = model.lmHeadChunkRows(); // <2GB per block
         const embedWeight = model.embedTokens.weight;
-        const needLmHeadChunks = vocab * hiddenSize * 4 > (1 << 31) - 4;
+        const embedIsF16 = embedWeight.dtype === "f16";
+        // f16 resident table (1.18GB) fits the 2GB binding limit → tie directly.
+        const needLmHeadChunks = !embedIsF16 && vocab * hiddenSize * 4 > (1 << 31) - 4;
         const lmHeadChunks: Tensor[] = [];
         await streamEmbeddingBlocks(
           cursor,
@@ -542,12 +548,22 @@ export async function loadGemma2FromUrl(
           async (blockArr, blockF16, startRow, rows) => {
             currentTensor = `${name} (rows ${startRow}..${startRow + rows})`;
             emitProgress();
-            const blockTensor = api.tensorFromArray(blockArr, [rows, hiddenSize], {
-              dtype: dest.dtype,
-              device: "webgpu",
-            });
+            // Upload the block in the RESIDENT dtype: f16 bits when the table is
+            // f16 (halves the resident bytes + the per-token gather bandwidth),
+            // else f32. blockF16 is present exactly when the checkpoint is f16/
+            // bf16, which is also when embedWeight is f16.
+            const blockTensor =
+              embedIsF16 && blockF16
+                ? api.tensorFromArray(blockF16, [rows, hiddenSize], {
+                    dtype: "f16",
+                    device: "webgpu",
+                  })
+                : api.tensorFromArray(blockArr, [rows, hiddenSize], {
+                    dtype: dest.dtype,
+                    device: "webgpu",
+                  });
             // Region DMA into the single embedding buffer (used by the gather,
-            // which auto-chunks reads of the >2GB table).
+            // which auto-chunks reads of a >2GB table).
             api.runtime.copyInto_(
               embedWeight._unwrap(),
               startRow * hiddenSize,
