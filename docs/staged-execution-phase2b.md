@@ -1514,3 +1514,81 @@ methods + kernel snapshot fns + 2 backend ops). Zero new env flags. One
 pre-existing main bug fixed en route (executor.ts `captureActionLayouts`
 crashed on reshape-of-SCALAR-ref — null backendInputs[0] — under the
 build-from-IR default; tiny-model+GradScaler repro, flag-independent).
+
+---
+
+## INC-3 CLEANUP TAIL — ITEM 1 (setLR TAG_WRITE fixed-buffer delivery):
+## ATTEMPTED, STOPPED. The buffer-stable delivery is NOT free-standing —
+## a raw `queue.writeBuffer` lr write is an OUT-OF-GRAPH op that loses the
+## submit-ordering the `copy_` scatter provides, and it perturbs even the
+## UNCAPTURED trajectory. The doc's own "off-by-one submission-order hazard"
+## warning (the [2b-sched] stop-report, `:1099-1101`) is the whole story.
+
+**Mechanism attempted (the doc's prescription, built in full):** a pinned,
+non-owning f32 [1] materialized buffer per lr group (`createStableScalarStorage`
+in a new `src/backend/webgpu/stable-scalar.ts`, surfaced as optional
+`Backend.createStableScalarStorage`/`writeStableScalarStorage` methods +
+`RuntimeEngine.createStableScalar`/`writeScalarInPlace`). `Adam` created its lr
+tensors via `createStableScalar` and `setLR`/`setGroupLR` delivered via
+`writeScalarInPlace` (a pure `device.queue.writeBuffer` into the fixed buffer,
+same materialized ref every step → NO graph node, NO wandering buffer, NO
+`stridedScatterCopy` per step). The recorder saw an unchanged ordered plan-fp
+sequence (setLR contributes zero plans — structure-preserving as required).
+
+**GATE 1 — the warn — PASSED.** Under `STEP_TAPE=1 STRICT_LIFETIME=1`, ringK2 +
+CosineAnnealingLR (`t-ring-measure RING_MEASURE_ARM=ringK2`, un-NOSCHED'd): the
+`[lifetime] reading RECLAIMED storage id=… (shape=[1])` warn went from 1 → **0**,
+exit 0, zero throws. Tape still formed and hit (`tapeCount=1, eligiblePairs=3,
+refusals=0, hits=3`). K-parity 0.0 preserved (t-ring-probe unchanged, no lr in
+that toy). So the warn's proximate cause (the copy_'s replace-and-hold minting a
+new lr buffer that the deferred sweep reclaims) IS what the stable buffer
+removes.
+
+**GATE — schedule-exactness — FAILED, and this is the STOP.** With a VARYING lr
+the trajectory diverged ~0.024 vs the control in `t-train-capture-probe` (clean
+HEAD: 1.2e-3, noise floor). Root-caused by ELIMINATION, in order:
+1. **Constant lr (`ETA_MIN=1e-4`) → 6.6e-4 PASS.** The stable-buffer STRUCTURE
+   is correct; the divergence is specific to per-step-VARYING lr.
+2. **`COMPILED_PLAN=0` (lowered replay) → 5e-4** (hits=0, but trajectory
+   correct). So it is NOT a lowered-delivery bug.
+3. **The DECISIVE test — an UNCAPTURED fullstack A/B, my-build vs clean HEAD,
+   WITH the schedule** (`t-ring-measure RING_MEASURE_ARM=uncaptured`): step-13
+   loss **11.0504 (mine) vs 11.0424 (clean HEAD) — Δ≈0.008, growing across
+   steps.** The divergence exists with **NO capture, NO tape, NO replay** —
+   pure lowered training. It is a **DELIVERY-ORDERING bug**, not a replay bug.
+
+**Why:** `copy_(lrT, tensorFromArray([lr]))` is a GRAPH op — a `stridedScatterCopy`
+node the plan orders relative to the optimizer's read of lr (and forces in the
+per-step chain). A raw `queue.writeBuffer` has NO graph edge: it lands in queue
+order, which is NOT guaranteed to sit after the prior step's optimizer read of
+the lr buffer nor before this step's — the exact "off-by-one submission-order
+hazard" the [2b-sched] stop-report named (`:1099-1101`). An unconditional
+`flushSharedEncoder` before each write did not fix it (Δ unchanged 0.0236): the
+hazard is at the driver↔plan submit boundary, not the shared-encoder window.
+
+**Why lr also lands as a `persistent` (static-singleton) compiled slot** (a
+second, orthogonal wrongness surfaced): the pinned buffer is unmapped in the
+arena at record time, so `buildCompiledPlan`'s `persistentSlot` classifies it as
+a static cache (like the expm1 constants) rather than an `external` re-resolved
+input (which is how `_t` and clean-HEAD's copy_-delivered lr flow). Making it
+truly free-standing would require the compiled recorder to classify a pinned
+driver-scalar buffer as EXTERNAL — a compiled-plan-classification change, not a
+delivery-only change.
+
+**Ruling (STOP-rule honored):** the fix as prescribed ("declared scalar-slot
+write into a FIXED buffer, the TAG_WRITE idiom") is NOT delivery-local — a
+buffer-stable lr that keeps `copy_`'s submit-ordering needs an IN-PLACE ORDERED
+scatter (write into the destination's own buffer as a graph op, so the plan
+still orders it) OR the lr must ride the true TAG_WRITE stable-buffer channel
+the batch args use (which IS graph-ordered — but that channel is for
+tensorFromArray upload NODES, and lr today is a persistent-tensor read, not an
+upload slot). Both are structure-touching changes with a measured
+uncaptured-trajectory regression on the naive attempt — precisely the
+"structure-changing fix for item 1 → STOP" and "unexplained divergence → STOP"
+conditions. **NOT LANDED.** The `[lifetime]` warn remains the documented benign
+warmup-era transient; the STRICT gate keeps NOSCHED until a graph-ordered
+buffer-stable lr write lands (next session: an in-place ordered scatter primitive
+that reuses the destination buffer, gated against the UNCAPTURED-trajectory A/B
+above — that A/B, not just the captured probe, is the load-bearing gate the
+naive attempt failed). Working tree reverted to clean HEAD; the prototype is
+preserved at `scratchpad/stable-scalar-item1.ts` + `scratchpad/item1.diff`.
