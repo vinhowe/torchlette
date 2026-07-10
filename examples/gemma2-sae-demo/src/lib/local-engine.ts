@@ -166,11 +166,14 @@ export async function createSAEEngine(
             resolve();
           }
         });
+        // Svelte 5 $state arrays are Proxies, which structured clone rejects
+        // ("DataCloneError: [object Array] could not be cloned") — copy to
+        // plain objects before crossing the worker boundary.
         worker.postMessage({
           type: "generate",
           id,
           prompt,
-          steer,
+          steer: steer.map((s) => ({ feature: s.feature, alpha: s.alpha })),
           maxNewTokens,
           temperature,
         });
