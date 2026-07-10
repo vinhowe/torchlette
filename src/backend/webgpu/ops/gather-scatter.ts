@@ -60,6 +60,7 @@ export function planGatherDirect(
   indexShape: number[],
   dim: number,
   indexDtype: DType,
+  dataDtype: DType = "f32",
 ): {
   key: string;
   shader: string;
@@ -70,7 +71,11 @@ export function planGatherDirect(
   outputBytes: number;
 } | null {
   const ctx = requireContext();
-  const inputSizeBytes = sizeOf(inputShape) * F32_BYTES;
+  // gather is dtype-preserving: out dtype == source (a) dtype. Buffer sizing
+  // and the maxBinding check must use the SOURCE element size, not a hardcoded
+  // F32 (an f16 table is half the bytes — the #59 fix).
+  const elemBytes = dtypeBytes(dataDtype);
+  const inputSizeBytes = sizeOf(inputShape) * elemBytes;
   const maxBindingSize =
     ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   if (inputSizeBytes > maxBindingSize) return null; // chunked
@@ -81,8 +86,8 @@ export function planGatherDirect(
   const outSize = sizeOf(outShape);
   const dispatch = compute2DDispatch(Math.ceil(outSize / WORKGROUP_SIZE));
   const use2D = dispatch.y > 1;
-  const shader = gatherTileIR(inputShape, indexShape, dim, indexDtype);
-  const key = `gather:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
+  const shader = gatherTileIR(inputShape, indexShape, dim, indexDtype, dataDtype);
+  const key = `gather:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${indexDtype}:${dataDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   return {
     key,
     shader,
@@ -90,7 +95,7 @@ export function planGatherDirect(
     dispatchX: dispatch.x,
     dispatchY: dispatch.y,
     outShape,
-    outputBytes: outSize * F32_BYTES,
+    outputBytes: outSize * elemBytes,
   };
 }
 
@@ -116,8 +121,15 @@ export function gather(
     throw new Error("gather: dimension out of range");
   }
 
+  // gather is dtype-preserving (out dtype == source dtype). All buffer sizing,
+  // the maxBinding check, and the chunk layout below must use the SOURCE
+  // element size — an f16 table is half the bytes (the #59 fix; a f16 gemma
+  // embedding table both halves residency AND stops chunking sooner).
+  const dataDtype = tensorA.dtype;
+  const elemBytes = dtypeBytes(dataDtype);
+
   // Determine chunking
-  const inputSizeBytes = tensorA.size * F32_BYTES;
+  const inputSizeBytes = tensorA.size * elemBytes;
   const deviceLimits = ctx.device.limits;
   const maxBindingSize =
     deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
@@ -141,7 +153,13 @@ export function gather(
 
   // --- Direct path — single-sourced with the stream generator. ---
   if (!chunked) {
-    const plan = planGatherDirect(inputShape, indexShape, dim, indexDtype);
+    const plan = planGatherDirect(
+      inputShape,
+      indexShape,
+      dim,
+      indexDtype,
+      dataDtype,
+    );
     if (!plan) throw new Error("gather: direct path but planGatherDirect null");
     const pipeline = getPipeline(ctx, plan.key, plan.shader);
     const outBuffer = resolveOutputBuffer(ctx.device, plan.outputBytes, [
@@ -158,12 +176,18 @@ export function gather(
     dispatchComputePass(pipeline, bindGroup, plan.dispatchX, plan.dispatchY);
     releaseParamsBuffer(uniformBuf);
     if (tensorA !== tensorAOrig) destroyCopy(tensorA);
-    return createTensor(plan.outShape, outBuffer);
+    return createTensor(plan.outShape, outBuffer, undefined, 0, dataDtype);
   }
 
   // Generate shader for the chunked path.
-  const code = chunkedGatherTileIR(inputShape, indexShape, dim, indexDtype);
-  const pipelineKey = `gatherChunked:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
+  const code = chunkedGatherTileIR(
+    inputShape,
+    indexShape,
+    dim,
+    indexDtype,
+    dataDtype,
+  );
+  const pipelineKey = `gatherChunked:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${indexDtype}:${dataDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   const pipeline = getPipeline(ctx, pipelineKey, code);
 
   // --- Chunked path ---
@@ -175,6 +199,7 @@ export function gather(
     elementsPerSlice,
     maxBindingSize,
     minAlignment,
+    elemBytes,
   );
 
   // Route through resolveOutputBuffer (like the direct path above) so the
@@ -182,7 +207,7 @@ export function gather(
   // (raw device.createBuffer) is invisible to the recorder, which throws under
   // any compiled-plan/capture recording (e.g. a >2GB embedding gather inside a
   // repeated decode template — Gemma-2's 256k-vocab table forces this path).
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * F32_BYTES, [
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * elemBytes, [
     tensorA.buffer,
     tensorIndex.buffer,
   ]);
@@ -218,7 +243,7 @@ export function gather(
   }
 
   if (tensorA !== tensorAOrig) destroyCopy(tensorA);
-  return createTensor(outShape, outBuffer);
+  return createTensor(outShape, outBuffer, undefined, 0, dataDtype);
 }
 
 // ============================================================================
@@ -294,6 +319,19 @@ export function scatterAdd(
 
   if (dim < 0 || dim >= rank) {
     throw new Error("scatterAdd: dimension out of range");
+  }
+
+  // scatterAdd accumulates via an f32 atomic CAS loop (atomicAddF32 over
+  // atomic<u32>). WebGPU has NO f16/bf16 atomic, so the kernel is inherently
+  // f32-only; the accumulator and src bytes are sized as f32. Embedding
+  // BACKWARD (this op's only caller) runs its grads in f32 under autocast, so
+  // f32 is the contract. Guard LOUDLY rather than silently mis-size an f16
+  // input (the #59 seam — extending to f16 here would need f16 atomics we
+  // don't have; out of scope, not silently wrong).
+  if (tensorA.dtype !== "f32" || tensorSrc.dtype !== "f32") {
+    throw new Error(
+      `scatterAdd: f32-only (atomic CAS has no f16 equivalent); got a=${tensorA.dtype} src=${tensorSrc.dtype}`,
+    );
   }
 
   // Determine chunking

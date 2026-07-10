@@ -405,13 +405,19 @@ export function unaryStridedSpec(
   strides: number[],
   offset: number,
   dtype: DataType,
+  // Output dtype may differ from input (e.g. isfinite is always_f32: an f16
+  // input still produces an f32 mask). Binding `out` as the INPUT dtype would
+  // store an f32 result into an f16 slot ("cannot assign f32 to f16") → the
+  // shader fails to compile → dropped submit (the #59 seam). Defaults to
+  // `dtype` for the dtype-preserving majority.
+  outDtype: DataType = dtype,
 ): TileKernelSpec {
   return elementwiseKernel({
     name: `unary_${opKey}`,
-    enableF16: dtype === "f16",
+    enableF16: dtype === "f16" || outDtype === "f16",
     bindings: {
       a: { storage: "read", type: dtype },
-      out: { storage: "read_write", type: dtype },
+      out: { storage: "read_write", type: outDtype },
     },
     kernel(ctx, idx) {
       ctx.emitStore(
@@ -437,9 +443,10 @@ export function unaryStridedTileIR(
   strides: number[],
   offset: number,
   dtype: DataType,
+  outDtype: DataType = dtype,
 ): string {
   return compileTileKernel(
-    unaryStridedSpec(opKey, shape, strides, offset, dtype),
+    unaryStridedSpec(opKey, shape, strides, offset, dtype, outDtype),
   );
 }
 
@@ -722,6 +729,10 @@ function gatherTileIRImpl(
       name: chunked
         ? `gather_chunked_d${dim}_${indexDtype}_${dataDtype}`
         : `gather_d${dim}_${indexDtype}_${dataDtype}`,
+      // f16 data storage needs the shader-f16 extension enabled (typed bindings
+      // otherwise emit `array<f16>` against a shader that never declared it →
+      // compile failure → DROPPED submit → stale readback, the #59 class).
+      enableF16: dataDtype === "f16",
       bindings: {
         input: { storage: "read", type: dataDtype },
         indices: { storage: "read", type: indexDtype },

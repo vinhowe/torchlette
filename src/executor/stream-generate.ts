@@ -1536,7 +1536,7 @@ function generateGather(
   const a = refShapeDtype(aRef);
   const idx = refShapeDtype(idxRef);
   if (!a || !idx) return "no-shape";
-  const plan = planGatherDirect(a.shape, idx.shape, cfg.dim, idx.dtype);
+  const plan = planGatherDirect(a.shape, idx.shape, cfg.dim, idx.dtype, a.dtype);
   if (!plan) return "chunked";
   const pipeline = getPipeline(requireContext(), plan.key, plan.shader);
   const outSlot = slots.length;
