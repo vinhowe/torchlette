@@ -177,13 +177,15 @@ export function gather(
     minAlignment,
   );
 
-  const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * F32_BYTES,
-    usage:
-      GPUBufferUsage.STORAGE |
-      GPUBufferUsage.COPY_SRC |
-      GPUBufferUsage.COPY_DST,
-  });
+  // Route through resolveOutputBuffer (like the direct path above) so the
+  // output is registered with the compiled-plan recorder. createTrackedBuffer
+  // (raw device.createBuffer) is invisible to the recorder, which throws under
+  // any compiled-plan/capture recording (e.g. a >2GB embedding gather inside a
+  // repeated decode template — Gemma-2's 256k-vocab table forces this path).
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * F32_BYTES, [
+    tensorA.buffer,
+    tensorIndex.buffer,
+  ]);
 
   for (let chunk = 0; chunk < layout.numChunks; chunk++) {
     const chunkStart = chunk * layout.maxSlicesPerChunk;
