@@ -100,9 +100,13 @@ export async function inspectFeatures(
     const acts = sae.encode(api, resid2); // [seq, F]
     const flat = new Float32Array(await acts.cpu());
 
-    // Aggregate max over sequence; also the last-token row.
+    // Aggregate max over CONTENT positions (skip position 0 = <bos>: its
+    // attention-sink features fire identically on every prompt and would swamp
+    // the content-specific ones, making the inspector show the same features for
+    // every input). Also read the last-token row.
     const aggArr = new Float32Array(F);
-    for (let s = 0; s < seq; s++) {
+    const start = seq > 1 ? 1 : 0;
+    for (let s = start; s < seq; s++) {
       const off = s * F;
       for (let f = 0; f < F; f++) if (flat[off + f] > aggArr[f]) aggArr[f] = flat[off + f];
     }
