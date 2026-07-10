@@ -459,6 +459,9 @@ export function planUnaryDirectCore(
   bytesPerElement: number,
 ): ElementwiseDirectPlan {
   const dtype = a.dtype;
+  const outDtype = unaryOutputDtype(opKey, dtype);
+  const outBytesPerElement =
+    outDtype === dtype ? bytesPerElement : dtypeBytes(outDtype);
   const totalWorkgroups = Math.ceil(a.size / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
@@ -468,16 +471,26 @@ export function planUnaryDirectCore(
     a.strides,
     a.offset,
     dtype as "f32" | "f16" | "u32" | "i32",
+    outDtype as "f32" | "f16" | "u32" | "i32",
   );
-  const key = `unary:${opKey}:${a.shape.join("x")}:${a.strides.join(",")}:${a.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
+  const key = `unary:${opKey}:${a.shape.join("x")}:${a.strides.join(",")}:${a.offset}:${dtype}:${outDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   return {
     key,
     shader,
-    outputSizeBytes: a.size * bytesPerElement,
+    outputSizeBytes: a.size * outBytesPerElement,
     paramsData: params(a.size),
     dispatchX: dispatch.x,
     dispatchY: dispatch.y,
   };
+}
+
+/** Output dtype for a unary op. isfinite is the only always_f32 unary (it
+ *  returns a 0/1 mask regardless of input dtype); everything else preserves
+ *  the input dtype. Kept local (the backend does not import the op registry);
+ *  the runtime's always_f32 rule is the single source of truth for the tensor
+ *  dtype — this must agree with it. */
+function unaryOutputDtype(opKey: string, inDtype: DType): DType {
+  return opKey === "isfinite" ? "f32" : inDtype;
 }
 
 export function dispatchUnary(
@@ -488,12 +501,18 @@ export function dispatchUnary(
   const ctx = requireContext();
   const dtype = a.dtype;
   const bytesPerElement = dtypeBytes(dtype);
+  // Output dtype may differ from input (isfinite is always_f32). Size the
+  // output buffer and stamp the returned tensor from it, not the input dtype.
+  const outDtype = unaryOutputDtype(opKey, dtype);
+  const outBytesPerElement =
+    outDtype === dtype ? bytesPerElement : dtypeBytes(outDtype);
   const maxBindingSize =
     ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
 
   // Chunked dispatch for large contiguous tensors (offset 0 required: the
   // chunked binding slices the buffer from element 0 — offset-view class,
-  // task #58).
+  // task #58). The chunk element stride uses the LARGER of in/out bytes so a
+  // dtype-widening op (f16→f32 isfinite) never over-runs a binding.
   if (
     a.size * bytesPerElement > maxBindingSize &&
     a.isContiguous &&
@@ -502,7 +521,7 @@ export function dispatchUnary(
     const outSize = a.size;
     const outBuffer = resolveOutputBuffer(
       ctx.device,
-      outSize * bytesPerElement,
+      outSize * outBytesPerElement,
       [a.buffer],
       options?.outBuffer,
     );
@@ -512,6 +531,7 @@ export function dispatchUnary(
       [1],
       0,
       dtype as "f32" | "f16" | "u32" | "i32",
+      outDtype as "f32" | "f16" | "u32" | "i32",
     );
     const dispatcher = createTileKernelDispatcher(spec);
     dispatcher.dispatchChunked(
@@ -521,11 +541,11 @@ export function dispatchUnary(
         modes: { a: "chunked", out: "chunked" },
         sizeUniform: "size",
         totalElements: outSize,
-        maxBytesPerElement: bytesPerElement,
+        maxBytesPerElement: Math.max(bytesPerElement, outBytesPerElement),
       },
     );
     const ownsBuffer = options?.outBuffer === undefined;
-    return createTensor(a.shape, outBuffer, undefined, 0, dtype, ownsBuffer);
+    return createTensor(a.shape, outBuffer, undefined, 0, outDtype, ownsBuffer);
   }
 
   // Direct dispatch — single-sourced with the stream generator.
@@ -543,7 +563,7 @@ export function dispatchUnary(
   });
 
   const ownsBuffer = options?.outBuffer === undefined;
-  return createTensor(a.shape, outBuffer, undefined, 0, dtype, ownsBuffer);
+  return createTensor(a.shape, outBuffer, undefined, 0, outDtype, ownsBuffer);
 }
 
 /**
