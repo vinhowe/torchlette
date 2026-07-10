@@ -13,6 +13,7 @@ import { Torchlette } from "../src/frontend/torchlette";
 import { Adam } from "../src/optim/index.ts";
 import { STEP_TAPE_REPLAY } from "../src/core/step-tape";
 import type { Tensor } from "../src/frontend/tensor";
+import { assertReferenceLossNonzero } from "./parity-sanity";
 
 const STEPS = 20;
 const log = (m: string) => console.error(`[t-ring] ${m}`);
@@ -110,6 +111,10 @@ async function main() {
   const serial = await run("serial");
   log(`serial   losses: ${serial.losses.map((l) => l.toFixed(5)).join(", ")}`);
   log(`serial   hits=${serial.hits} calls=${serial.calls} bodyRuns=${serial.bodyRuns}`);
+  // ABSOLUTE sanity (device-2 lesson): the K-parity deltas below are 0.0 even
+  // when BOTH arms read ~0 from a silent submit-drop. The reference toy MSE
+  // starts at O(1) — assert it, or a tainted device passes a false gate.
+  assertReferenceLossNonzero(serial.losses[0], "t-ring-probe/serial");
   const now = await run("ringNow");
   log(`ringNow  losses: ${now.losses.map((l) => l.toFixed(5)).join(", ")}`);
   log(`ringNow  hits=${now.hits} calls=${now.calls} bodyRuns=${now.bodyRuns}`);

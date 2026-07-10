@@ -1514,3 +1514,207 @@ methods + kernel snapshot fns + 2 backend ops). Zero new env flags. One
 pre-existing main bug fixed en route (executor.ts `captureActionLayouts`
 crashed on reshape-of-SCALAR-ref — null backendInputs[0] — under the
 build-from-IR default; tiny-model+GradScaler repro, flag-independent).
+
+---
+
+## INC-3 CLEANUP TAIL — ITEM 1 (setLR TAG_WRITE fixed-buffer delivery):
+## ATTEMPTED, STOPPED. The buffer-stable delivery is NOT free-standing —
+## a raw `queue.writeBuffer` lr write is an OUT-OF-GRAPH op that loses the
+## submit-ordering the `copy_` scatter provides, and it perturbs even the
+## UNCAPTURED trajectory. The doc's own "off-by-one submission-order hazard"
+## warning (the [2b-sched] stop-report, `:1099-1101`) is the whole story.
+
+**Mechanism attempted (the doc's prescription, built in full):** a pinned,
+non-owning f32 [1] materialized buffer per lr group (`createStableScalarStorage`
+in a new `src/backend/webgpu/stable-scalar.ts`, surfaced as optional
+`Backend.createStableScalarStorage`/`writeStableScalarStorage` methods +
+`RuntimeEngine.createStableScalar`/`writeScalarInPlace`). `Adam` created its lr
+tensors via `createStableScalar` and `setLR`/`setGroupLR` delivered via
+`writeScalarInPlace` (a pure `device.queue.writeBuffer` into the fixed buffer,
+same materialized ref every step → NO graph node, NO wandering buffer, NO
+`stridedScatterCopy` per step). The recorder saw an unchanged ordered plan-fp
+sequence (setLR contributes zero plans — structure-preserving as required).
+
+**GATE 1 — the warn — PASSED.** Under `STEP_TAPE=1 STRICT_LIFETIME=1`, ringK2 +
+CosineAnnealingLR (`t-ring-measure RING_MEASURE_ARM=ringK2`, un-NOSCHED'd): the
+`[lifetime] reading RECLAIMED storage id=… (shape=[1])` warn went from 1 → **0**,
+exit 0, zero throws. Tape still formed and hit (`tapeCount=1, eligiblePairs=3,
+refusals=0, hits=3`). K-parity 0.0 preserved (t-ring-probe unchanged, no lr in
+that toy). So the warn's proximate cause (the copy_'s replace-and-hold minting a
+new lr buffer that the deferred sweep reclaims) IS what the stable buffer
+removes.
+
+**GATE — schedule-exactness — FAILED, and this is the STOP.** With a VARYING lr
+the trajectory diverged ~0.024 vs the control in `t-train-capture-probe` (clean
+HEAD: 1.2e-3, noise floor). Root-caused by ELIMINATION, in order:
+1. **Constant lr (`ETA_MIN=1e-4`) → 6.6e-4 PASS.** The stable-buffer STRUCTURE
+   is correct; the divergence is specific to per-step-VARYING lr.
+2. **`COMPILED_PLAN=0` (lowered replay) → 5e-4** (hits=0, but trajectory
+   correct). So it is NOT a lowered-delivery bug.
+3. **The DECISIVE test — an UNCAPTURED fullstack A/B, my-build vs clean HEAD,
+   WITH the schedule** (`t-ring-measure RING_MEASURE_ARM=uncaptured`): step-13
+   loss **11.0504 (mine) vs 11.0424 (clean HEAD) — Δ≈0.008, growing across
+   steps.** The divergence exists with **NO capture, NO tape, NO replay** —
+   pure lowered training. It is a **DELIVERY-ORDERING bug**, not a replay bug.
+
+**Why:** `copy_(lrT, tensorFromArray([lr]))` is a GRAPH op — a `stridedScatterCopy`
+node the plan orders relative to the optimizer's read of lr (and forces in the
+per-step chain). A raw `queue.writeBuffer` has NO graph edge: it lands in queue
+order, which is NOT guaranteed to sit after the prior step's optimizer read of
+the lr buffer nor before this step's — the exact "off-by-one submission-order
+hazard" the [2b-sched] stop-report named (`:1099-1101`). An unconditional
+`flushSharedEncoder` before each write did not fix it (Δ unchanged 0.0236): the
+hazard is at the driver↔plan submit boundary, not the shared-encoder window.
+
+**Why lr also lands as a `persistent` (static-singleton) compiled slot** (a
+second, orthogonal wrongness surfaced): the pinned buffer is unmapped in the
+arena at record time, so `buildCompiledPlan`'s `persistentSlot` classifies it as
+a static cache (like the expm1 constants) rather than an `external` re-resolved
+input (which is how `_t` and clean-HEAD's copy_-delivered lr flow). Making it
+truly free-standing would require the compiled recorder to classify a pinned
+driver-scalar buffer as EXTERNAL — a compiled-plan-classification change, not a
+delivery-only change.
+
+**Ruling (STOP-rule honored):** the fix as prescribed ("declared scalar-slot
+write into a FIXED buffer, the TAG_WRITE idiom") is NOT delivery-local — a
+buffer-stable lr that keeps `copy_`'s submit-ordering needs an IN-PLACE ORDERED
+scatter (write into the destination's own buffer as a graph op, so the plan
+still orders it) OR the lr must ride the true TAG_WRITE stable-buffer channel
+the batch args use (which IS graph-ordered — but that channel is for
+tensorFromArray upload NODES, and lr today is a persistent-tensor read, not an
+upload slot). Both are structure-touching changes with a measured
+uncaptured-trajectory regression on the naive attempt — precisely the
+"structure-changing fix for item 1 → STOP" and "unexplained divergence → STOP"
+conditions. **NOT LANDED.** The `[lifetime]` warn remains the documented benign
+warmup-era transient; the STRICT gate keeps NOSCHED until a graph-ordered
+buffer-stable lr write lands (next session: an in-place ordered scatter primitive
+that reuses the destination buffer, gated against the UNCAPTURED-trajectory A/B
+above — that A/B, not just the captured probe, is the load-bearing gate the
+naive attempt failed). Working tree reverted to clean HEAD; the prototype is
+preserved at `scratchpad/stable-scalar-item1.ts` + `scratchpad/item1.diff`.
+
+---
+
+## FAST TRAINING LOOPS — the runahead loop as living documentation
+
+The fastest training loop torchlette offers is a whole step captured with
+runahead: `api.capture(fn, { training: true, runahead: 2 })`, driven so the CPU
+builds+submits step N+1 while the GPU drains step N. The canonical, heavily-
+commented example is **`examples/fast-training/fast-training.ts`** — it runs a
+small GPT-2, prints per-step loss + ms/step, and demonstrates a SERIAL variant
+alongside so the ring engaging (hits > 0) and the wall-clock win are visible.
+
+Run it (pin a FREE device — Dawn ignores CUDA_VISIBLE_DEVICES):
+
+    VULKAN_DEVICE_INDEX=10 LD_LIBRARY_PATH=tools/vk-shim \
+    TORCHLETTE_STEP_TAPE=1 npx tsx examples/fast-training/fast-training.ts
+
+Measured on a V100 (device 10, distilgpt2, seq 256, K=2): **SERIAL 198.3 ms/step
+→ RUNAHEAD 159.4 ms/step (−19.6%), ring hits=9, trajectory maxΔ=0.0** (bit-
+identical — K is a pure knob). The four rules the example is annotated with:
+
+1. **Await the CALL, not the loss.** `const h = await step(x, y)` awaits the
+   submit, not GPU completion; `h` is an UNREAD ring handle.
+2. **Read K-behind** (collect-and-drain). Read the loss from K steps ago (it has
+   fenced). `await-every-N` is the logging cadence — exactly ONE fence per N.
+3. **The ring owns the boundary.** Under `runahead` the driver does NOT call
+   `markStep` per step; it MUST `await step.drain()` at the end.
+4. **GradScaler rides the same cadence.** found-inf is DATA (in-graph where-
+   select), `snapshotDeferred()` + `resolveOldestDeferred()` K-behind — never a
+   per-step readback, so it does not cap K.
+
+**What NOT to do:** `await loss.item()` on the per-step critical path fences
+every step = voluntary K=1 (correct but slow — no runahead overlap). The example
+spells this out. **Honest cost:** runahead trades K× in-flight memory for the
+wall win; on a memory-tight config (a model near the device ceiling) K may be
+forced to 1 = no runahead. The win is real only where headroom for K≥2 exists.
+
+---
+
+## INC-3 CLEANUP TAIL — ITEM 2 (scaler-as-tensor): BLOCKED on the same
+## compiled-replay scalar-delivery prerequisite as item 1. The bug it retires
+## is PROVEN and now has a permanent retirement gate.
+
+**The bug is REAL and correctness-affecting** (`tools/t-scaler-growth-probe.ts`,
+serial capture, GradScaler growthInterval=4, no inf → scale doubles every 4
+steps): once the tape starts hitting (bodyRuns=6/24), the captured scale FREEZES
+while the control keeps growing:
+
+    control  scales: 4,4,4,4,8,8,8,8,16,16,16,16,32,...,128
+    captured scales: 4,4,4,4,8,8,8,8, 8, 8, 8, 8, 8,..., 8   ← FROZEN at record-time
+    captured trajectory diverges: maxLossΔ = 1.41e-2 (hits=18, refusals=0)
+
+**Two coupled causes, both requiring the item-1 prerequisite:**
+1. **The scale UPDATE doesn't run on hits.** `_scale` is a JS number updated by
+   `_applyScaleAdjustment` (JS if/else), reached via `scaler.update()` /
+   `resolveDeferred()`. In the serial captured path `update()` is INSIDE the
+   body (never runs on a hit) and `resolveDeferred()` is a no-op on a hit
+   (`_pendingInfBuffer` is set by the JS `unscale_`, which also never runs) — so
+   the CPU scale mirror freezes. The inc-3 `snapshotDeferred`/`resolveOldest`
+   found-inf channel was built for the RUNAHEAD path; the serial capture path
+   has no per-hit found-inf report.
+2. **`scale(loss) = mul(loss, jsNumber)` bakes the scale as a graph SCALAR**,
+   frozen at record time. Even if cause 1 were fixed (CPU mirror advancing), the
+   REPLAYED graph would still multiply by the RECORDED scale. Fixing this needs
+   scale/invScale as PERSISTENT TENSORS read live by the replay — which is the
+   **exact compiled-replay scalar-delivery problem that STOPPED item 1**: a
+   persistent f32[1] buffer read by a compiled replay classifies as a static
+   `persistent` slot and does not pick up per-step writes correctly, AND a raw
+   `queue.writeBuffer` scale update loses the graph-ordering (item-1's measured
+   uncaptured-trajectory regression). The scale tensor is the same shape and the
+   same delivery channel as the lr tensor item 1 failed to make buffer-stable.
+
+**Ruling:** item 2 is BLOCKED on item 1's prerequisite (a graph-ordered in-place
+scalar write into a fixed buffer whose compiled-replay reads are live, not a
+frozen `persistent` slot). Implementing scale-as-tensor before that lands would
+reproduce item 1's uncaptured-trajectory regression on the scale path. **NOT
+LANDED.** What DID land: `tools/t-scaler-growth-probe.ts` — the retirement GATE
+(FAILs on main documenting the frozen-scale bug with a pointed message; goes
+green when item-2 lands). Sequencing for the next session: solve the item-1
+graph-ordered buffer-stable scalar write ONCE (a shared primitive), then BOTH lr
+(item 1) and scale/invScale (item 2) ride it; the growth probe + the item-1
+uncaptured A/B are the two load-bearing gates.
+
+---
+
+## INC-3 CLEANUP TAIL — ITEM 3 (N>1 grad accumulation, micro/apply split):
+## ATTEMPTED, STOPPED — TWO real blockers surfaced (recorder-step model +
+## shared-encoder cross-capture hazard). The boundary-suppression piece is
+## trivial; the recorder/encoder work behind it is not.
+
+The substrate exists (autograd accumulates into `.grad`, e9f7943; the
+distributed trainer's manual `accumSteps` loop is the reference: N micro
+forward+backward each scaled 1/N — MEAN convention — then ONE step+zeroGrad in
+one beginStep so `.grad` never crosses a markStep). A `CaptureOptions.microStep`
+flag suppressing the micro's boundary queue (only the once-per-cycle `apply`
+capture commits) was prototyped and IS trivial (one guarded
+`queueStepBoundary`). But a probe of two captures per cycle (`micro` reused N×
++ `apply` once) surfaced TWO real blockers, BOTH stopping the tape from forming
+(`microHits=0, applyHits=0`):
+
+1. **The recorder-step model is ONE-capture-per-boundary.** The recorder tracks
+   a single step's ordered plan-fp sequence and promotes at the boundary
+   (markStep). With `micro` and `apply` BOTH contributing plans to ONE step
+   (there is no markStep between the N micros and the apply — that IS
+   accumulation), the recorder cannot segment which plans belong to which
+   capture, so neither forms its own tape. The micro tape must form by comparing
+   micro-of-cycle-C vs cycle-C+1, but the boundary is per-CYCLE — a per-capture
+   plan segmentation the recorder does not have.
+2. **Shared-encoder cross-capture read-write hazard.** With two captures per
+   boundary the `.grad` accumulation (micro writes `.grad`) and the optimizer
+   read of `.grad` (apply) land in the SAME shared-encoder synchronization scope
+   with no intervening flush — Dawn rejects it: `usage (Storage(read-write)|
+   Storage(read-only)) includes writable usage and another usage in the same
+   synchronization scope` → invalid command buffer. The single-capture
+   whole-step path never hits this (one body, one encoder lifecycle).
+
+**Ruling:** option (a) micro/apply needs (i) per-capture plan segmentation in
+the recorder within a shared boundary and (ii) an inter-capture shared-encoder
+flush — real mechanism, not one-liners. NOT LANDED (prototype + `microStep` flag
+reverted). **A tractable alternative exists** — design option (b): a SINGLE
+whole-step training capture whose body runs the N micro-backwards + the step
+(one capture per boundary, no recorder/encoder change; re-records per distinct N
+as a plain-value cold bucket — for a FIXED N, one tape). INC-2B rejected (b) for
+reuse, not correctness; given (a)'s two blockers, (b) is the pragmatic next-
+session landing, with accumSteps=1 byte-identity (micro==apply, one body) as the
+hard invariant either way.

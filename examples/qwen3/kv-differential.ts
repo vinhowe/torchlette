@@ -14,6 +14,7 @@ import { Torchlette, type Tensor } from "../../src/frontend/torchlette";
 import type { KVCache } from "./model";
 import { kvBucketLen } from "./model";
 import { loadPretrainedQwen3 } from "./loader";
+import { assertLogitsSane } from "../../tools/parity-sanity";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MODEL_DIR = path.join(__dirname, "../../ckpts/qwen3-1.7b");
@@ -31,9 +32,16 @@ async function main() {
   const argmaxLast = async (
     logits: import("../../src/frontend/torchlette").Tensor,
     pos: number,
+    sanity = false,
   ) => {
     const flat = new Float32Array(await logits.cpu());
     const off = pos * vocab;
+    // ABSOLUTE sanity (device-2 lesson): the cached-vs-uncached token diff below
+    // is BLIND to mutual corruption — a silent submit-drop makes BOTH arms read
+    // all-zero logits, the argmax token sequences match, and the gate passes on
+    // nothing. Assert the REFERENCE (no-cache) logits row has real spread.
+    if (sanity)
+      assertLogitsSane(flat.subarray(off, off + vocab), "kv-differential/no-cache");
     let best = 0;
     for (let v = 1; v < vocab; v++)
       if (flat[off + v] > flat[off + best]) best = v;
@@ -46,7 +54,8 @@ async function main() {
   for (let i = 0; i < NUM_NEW; i++) {
     const idx = api.tensorFromArray(noCache, [1, noCache.length]);
     const { logits } = api.noGrad(() => model.forward(idx));
-    noCache.push(await argmaxLast(logits, noCache.length - 1));
+    // Sanity-check the reference logits on the first decode step.
+    noCache.push(await argmaxLast(logits, noCache.length - 1, i === 0));
     if (!SKIP_MARKSTEP) await api.markStep();
   }
 
