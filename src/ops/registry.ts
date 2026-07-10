@@ -591,6 +591,12 @@ export const OP_DTYPE_RULES: Record<string, { category: OpDtypeCategory }> = {
   matmul: { category: "f16_eligible" },
   sum: { category: "f32_required" },
   mean: { category: "f32_required" },
+  // max/min reductions upcast f16→f32 before reducing, exactly like sum/mean.
+  // The reduction kernel binds its input as f32; without this an f16 tensor
+  // reaches the kernel and its bytes are read as f32 → garbage (the #59
+  // FINDING #B seam). This is the "dtype-aware like sum/mean" contract.
+  max: { category: "f32_required" },
+  min: { category: "f32_required" },
   reshape: { category: "preserve" },
   expand: { category: "preserve" },
   transpose: { category: "preserve" },
