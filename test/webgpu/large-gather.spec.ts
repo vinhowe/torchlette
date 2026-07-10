@@ -3,6 +3,7 @@ import {
   getMaxStorageBufferBindingSize,
   getWebGPUInitError,
   initWebGPU,
+  tensorFromArrayWithDtype,
   webgpuBackend,
 } from "../../src/backend/webgpu";
 import { cpuOnly } from "../helpers/webgpu";
@@ -67,6 +68,37 @@ describe.skipIf(cpuOnly)("Chunked gather for large tensors", () => {
       const values = await webgpuBackend.ops.read(result);
       // Row 0: [0, 1, 2, 3], Row 5: [20, 21, 22, 23], Row 9: [36, 37, 38, 39]
       expect(values).toEqual([0, 1, 2, 3, 20, 21, 22, 23, 36, 37, 38, 39]);
+    });
+  });
+
+  // #59: gather is dtype-parametrized — an f16 source yields an f16 output with
+  // the right lanes (the kernel binds f16 storage + enables the extension). The
+  // >128MB chunked-f16 path is covered end-to-end by the gemma2 port's f16
+  // embedding gather; here we lock the direct-path f16 correctness at the
+  // backend seam so a dtype regression is caught in-suite.
+  describe("f16 gather (dtype-parametrized, #59)", () => {
+    it("gathers f16 rows with correct values + dtype", async () => {
+      const embedding = tensorFromArrayWithDtype(
+        [1, 2, 3, 4, 5, 6],
+        [3, 2],
+        "f16",
+      );
+      const indices = webgpuBackend.ops.tensorFromArray([0, 2, 1, 0], [2, 2]);
+      const result = webgpuBackend.ops.gather(embedding, indices, { dim: 0 });
+      expect(result.shape).toEqual([2, 2]);
+      expect(result.dtype).toBe("f16");
+      const values = await webgpuBackend.ops.read(result);
+      // Same layout as the f32 case: [1, 6, 3, 2] (exact in f16).
+      expect(Array.from(values)).toEqual([1, 6, 3, 2]);
+    });
+
+    it("gathers f16 along dim 1", async () => {
+      const src = tensorFromArrayWithDtype([1, 2, 3, 4, 5, 6], [2, 3], "f16");
+      const idx = webgpuBackend.ops.tensorFromArray([0, 2], [2, 1]);
+      const result = webgpuBackend.ops.gather(src, idx, { dim: 1 });
+      expect(result.dtype).toBe("f16");
+      const values = await webgpuBackend.ops.read(result);
+      expect(Array.from(values)).toEqual([1, 6]);
     });
   });
 
