@@ -287,12 +287,22 @@ interface DraftIsland {
  * Re-expression of the consecutive scan as merge proposals over draft
  * islands: every fusible node is an implicit singleton island that gets
  * MERGED into the open draft when legal; a non-fusible node that depends on
- * the open island CLOSES it (today's boundary rule — stage I2b replaces this
- * close with taint tracking + the readiness rule so islands span dependent
- * gaps). Independent non-fusible nodes are not partition units at this
- * altitude; the island spans them. Decisions are byte-identical to the
- * deleted scan (`buildCandidateGroups`), pinned by
+ * the open island CLOSES it. Independent non-fusible nodes are not partition
+ * units at this altitude; the island spans them. Decisions are byte-identical
+ * to the deleted scan (`buildCandidateGroups`), pinned by
  * test/fusion-decision-corpus.spec.ts.
+ *
+ * I2b MEASURED NULL (2026-07-10, do not re-attempt without a new workload):
+ * gap-spanning with taint tracking + a readiness rule (merge across
+ * chain-dependent gaps when every joiner input precedes the island's
+ * earliest forced emission) was built, proven sound and byte-safe on the
+ * corpus, and measured on real A100 plans — fused-node count moved ZERO on
+ * distilgpt2@512 AND gpt2-medium@512. Root cause: reorderPlanForFusion +
+ * epilogue/prologue/row-program claiming already harvest every spannable
+ * run; the residual unfused fusibles are length-1/2 runs whose consumers
+ * (matmuls) immediately follow them — nothing to span at this altitude.
+ * The mechanism didn't earn its SLOC; reverted. See docs/islands-design.md
+ * §I2b findings for the full analysis and the corrected roadmap target.
  */
 function proposeCandidateIslands(
   nodes: LazyIRNode[],

@@ -494,6 +494,70 @@ a single existing key.
 
 ---
 
+## I2 IMPLEMENTATION FINDINGS (2026-07-10) — the extension measured NULL; the roadmap target is corrected
+
+Stages I0 (reify), I1 (partition token in the fingerprint), and I2a (detector
+re-expressed as a merge-proposing policy; `buildCandidateGroups` deleted)
+landed null-clean: 13-case decision corpus byte-identical, gates 4/4, suites
+green both flag states (one pre-existing artifact: `observed-liveness` gate 2
+asserts "pruning demonstrably activated", which is impossible by design under
+a global `TORCHLETTE_BUILD_FROM_IR=0` — its trajectory-agreement and zero-miss
+assertions pass), fusion stats and losses byte-stable on distil@512.
+
+**I2b — gap-spanning — was built, proven, measured, and REVERTED.** The
+mechanism: a chain-dependent non-fusible gap node no longer closes the open
+island; it is TAINTED and its position becomes the island's earliest forced
+emission (`emitPos` — sound because taint is a superset of the segment walk's
+transitive dependency, so actual emission is never earlier); later fusible
+nodes merge under a READINESS rule (every non-member pending input produced
+before `emitPos` — the guard the failed bypassed-node-transparency attempt
+lacked). Downstream machinery needed zero changes: promotion/re-execution
+covers gap consumers, and buffer liveness/donation/release already operate in
+ACTION-INDEX (execution-order) space, not plan-position space. On the
+synthetic corpus it captured exactly the designed class (stranded chains →
+one island with promoted intermediates; the readiness no-case correctly
+refused; a previously un-batchable singleton pair became batchable).
+
+**Measured on real plans: ZERO movement.** distilgpt2@512 AND gpt2-medium@512
+(A100, `TORCHLETTE_DEBUG_FUSION=1` per-template dumps): identical fused-node
+counts, identical fusion groups, identical losses with and without the
+extension. Root cause, established from the break dumps:
+
+1. **The stranded-run class is already harvested.** `reorderPlanForFusion`
+   (Kahn) plus the epilogue/prologue/row-program claims leave the big
+   backward plan at ~90% of unclaimed fusibles fused (distil: 144/160;
+   medium: 576/628 + a 384/384 plan). The consecutive scan's dependent-gap
+   close almost never fires on a spannable run in these plans.
+2. **The residual is singletons, not runs.** The unfused fusibles (distil
+   ~68/step, medium ~250/step) are length-1/2 runs — mostly weight-grad and
+   activation `cast`s — each immediately consumed by the following matmul
+   (`gelu→cast | transpose(weight)→matmul` is the canonical break). Every
+   downstream fusible flows THROUGH the matmul, so no elementwise-island
+   merge is legal at this altitude, with or without gap-spanning.
+3. **The G0(b) metric is corrected.** The cumulative "3.0% fused" statistic
+   undercounts structurally: compiled replays skip the lowered path's stat
+   increment, so steady-state steps contribute nothing. The honest per-plan
+   template numbers are the ones above. And CLAUDE.md target #5's bwd
+   offender list (reshape/transpose/permute/sum/narrowBackward) is
+   views + matmuls + reductions — not elementwise-fusible ops; only `add:19`
+   was ever in the detector's scope.
+
+**Corrected roadmap target (what the residual actually needs):** the
+matmul-adjacent singleton casts are CLAIM-altitude work — prologue-claiming
+them into the adjacent matmul dispatch (I3's epilogue/prologue-as-atom-merge
+territory), not detector generality. The other real fusion win remains
+reduction batching (bias-grad sums, perf target #3). CLAUDE.md target #5
+("the limiter is the consecutive-only detector") is falsified for current
+default-config plans and should be rewritten to point at the claim altitude.
+
+Per the complexity budget (express-to-measure; mechanisms earn admission),
+the extension was reverted after measurement; its design, soundness argument,
+and this analysis are the retained artifacts, plus the corpus cases that pin
+the readiness no-case and the stranded class for any future re-attempt on a
+workload that actually exhibits it.
+
+---
+
 ## 7. COST / RISK
 
 **SLOC.** Add ~150-250 (the `Partition`/`Island` object, `merge`/`split`,
