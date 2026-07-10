@@ -46,6 +46,8 @@ import {
   groupToRecipe,
   inlinedConstantValue,
   isFusibleOp,
+  type PlanPartition,
+  reifyPartition,
 } from "../compiler/fusion-detect";
 import { analyzeGraph } from "../compiler/graph-compiler";
 import { runPasses, SIMPLIFICATION_PASSES } from "../compiler/graph-rewrites";
@@ -244,6 +246,15 @@ export interface FusionAnalysisTemplate {
 
   /** Segment pattern using positions in the final plan. */
   segments: CachedSegmentDesc[];
+
+  /**
+   * [islands I0] The plan's dispatch-partition as first-class data, reified
+   * from `segments` (same positions, same emission order). Derived today —
+   * one partition per graph; the partition-identity token
+   * (`partition.boundaryHash`) is what stage I1 keys the template cache by
+   * when a non-default partition is requested. See docs/islands-design.md.
+   */
+  partition: PlanPartition;
 
   /** Original plan positions that are epilogue-claimed. */
   epilogueClaimedOrigPoss: number[];
@@ -3314,6 +3325,10 @@ export async function executePlanOptimized(
     const template: FusionAnalysisTemplate = {
       finalPerm,
       segments: cachedSegments,
+      // [islands I0] Reify the partition from the positional segment
+      // descriptors — pure derivation, no decision change. All three
+      // CachedSegmentDesc kinds carry members as finalPoss.
+      partition: reifyPartition(cachedSegments),
       fingerprintSecondary: fingerprint.secondary,
       epilogueClaimedOrigPoss: [...analysis.epilogueClaimedIds].map(
         (id) => origIdToPos.get(id) as number,

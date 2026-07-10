@@ -272,55 +272,73 @@ function processCandidate(
 }
 
 /**
- * Detect fusion opportunities in a lazy execution plan.
- *
- * @param nodes - Nodes in the plan (topologically sorted)
- * @returns Detected fusion groups
+ * A draft island the fusion policy grows by merge steps during its scan
+ * (islands I2a) — the policy's working object; phases 2-5 consume it.
  */
+interface DraftIsland {
+  nodes: LazyIRNode[];
+  indices: number[];
+  nodeIds: Set<number>;
+}
+
 /**
- * Phase 1: Scan for consecutive fusible ops, flush at dependency breaks.
- * Non-fusible nodes that don't depend on the current candidate pass through.
+ * Phase 1 — the elementwise fusion POLICY (islands I2a).
+ *
+ * Re-expression of the consecutive scan as merge proposals over draft
+ * islands: every fusible node is an implicit singleton island that gets
+ * MERGED into the open draft when legal; a non-fusible node that depends on
+ * the open island CLOSES it. Independent non-fusible nodes are not partition
+ * units at this altitude; the island spans them. Decisions are byte-identical
+ * to the deleted scan (`buildCandidateGroups`), pinned by
+ * test/fusion-decision-corpus.spec.ts.
+ *
+ * I2b MEASURED NULL (2026-07-10, do not re-attempt without a new workload):
+ * gap-spanning with taint tracking + a readiness rule (merge across
+ * chain-dependent gaps when every joiner input precedes the island's
+ * earliest forced emission) was built, proven sound and byte-safe on the
+ * corpus, and measured on real A100 plans — fused-node count moved ZERO on
+ * distilgpt2@512 AND gpt2-medium@512. Root cause: reorderPlanForFusion +
+ * epilogue/prologue/row-program claiming already harvest every spannable
+ * run; the residual unfused fusibles are length-1/2 runs whose consumers
+ * (matmuls) immediately follow them — nothing to span at this altitude.
+ * The mechanism didn't earn its SLOC; reverted. See docs/islands-design.md
+ * §I2b findings for the full analysis and the corrected roadmap target.
  */
-function buildCandidateGroups(
+function proposeCandidateIslands(
   nodes: LazyIRNode[],
   excludedIds: Set<number> | undefined,
-): {
-  candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }>;
-  fusibleCount: number;
-} {
-  const candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }> = [];
-  let currentGroup: { nodes: LazyIRNode[]; indices: number[] } | null = null;
-  const candidateNodeIds = new Set<number>();
+): { candidates: DraftIsland[]; fusibleCount: number } {
+  const candidates: DraftIsland[] = [];
+  let open: DraftIsland | null = null;
   let fusibleCount = 0;
 
-  const flushCandidate = () => {
-    if (currentGroup && currentGroup.nodes.length >= 2) {
-      candidateGroups.push(currentGroup);
+  const close = () => {
+    if (open && open.nodes.length >= 2) {
+      candidates.push(open);
     }
-    currentGroup = null;
-    candidateNodeIds.clear();
+    open = null;
   };
 
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
     if (isFusibleOp(node.op) && !excludedIds?.has(node.id)) {
       fusibleCount++;
-      if (!currentGroup) {
-        currentGroup = { nodes: [], indices: [] };
-        candidateNodeIds.clear();
+      if (!open) {
+        open = { nodes: [], indices: [], nodeIds: new Set() };
       }
-      currentGroup.nodes.push(node);
-      currentGroup.indices.push(i);
-      candidateNodeIds.add(node.id);
-    } else if (currentGroup && !hasPendingInputIn(node, candidateNodeIds)) {
-      // Independent non-fusible node — passes through as prereq
+      // merge(open, singleton(node)) — append in plan order.
+      open.nodes.push(node);
+      open.indices.push(i);
+      open.nodeIds.add(node.id);
+    } else if (open && !hasPendingInputIn(node, open.nodeIds)) {
+      // Independent non-fusible node — the island spans the gap.
     } else {
-      flushCandidate();
+      close();
     }
   }
-  flushCandidate();
+  close();
 
-  return { candidateGroups, fusibleCount };
+  return { candidates, fusibleCount };
 }
 
 /**
@@ -695,15 +713,15 @@ export function detectFusionGroups(
   const enableMultiOutput = options?.enableMultiOutput ?? false;
   const excludedIds = options?.excludedIds;
 
-  // Phase 1: Build candidate groups of consecutive fusible ops
-  const { candidateGroups, fusibleCount } = buildCandidateGroups(
+  // Phase 1: the fusion policy proposes candidate islands (islands I2a)
+  const { candidates, fusibleCount } = proposeCandidateIslands(
     nodes,
     excludedIds,
   );
 
   // Phase 2: Split into connected components, process each, batch singletons
   const groups = splitCandidatesByComponent(
-    candidateGroups,
+    candidates,
     nodes,
     externalNodeIds,
     enableMultiOutput,
@@ -1051,6 +1069,88 @@ export function groupToRecipe(
 export type ExecutionSegment =
   | { kind: "fused"; group: FusionGroup; recipe: FusedKernelRecipe }
   | { kind: "sequential"; nodes: LazyIRNode[] };
+
+// ============================================================================
+// Islands IR (stage I0): the plan's dispatch-partition as first-class data.
+//
+// An island is one dispatch group; the partition is the full assignment of a
+// plan's nodes to islands, in emission order. Today the partition is DERIVED
+// from the fusion/claiming decisions (one partition per graph); reifying it
+// as data is the substrate for (a) keying the template cache by partition
+// identity (stage I1) and (b) expressing the fusion detector, editor
+// gestures, and the autotuner as three writers of one object (stage I2).
+// See docs/islands-design.md.
+// ============================================================================
+
+export type IslandKind = "sequential" | "fused" | "reduction";
+
+export interface Island {
+  kind: IslandKind;
+  /**
+   * Member positions in the FINAL plan order (plan-relative — stable across
+   * steps for a static graph; never raw node ids, which are allocation-
+   * ordered and change every step).
+   */
+  members: number[];
+}
+
+export interface PlanPartition {
+  /** Islands in emission order. */
+  islands: Island[];
+  /**
+   * Canonical partition-identity token: FNV-1a over island kinds + member
+   * positions in emission order. Null-stable (a static graph's derived
+   * partition hashes identically every step) and discriminating (any
+   * boundary change changes it). This is the value stage I1 mixes into the
+   * template fingerprint when a non-default partition is requested.
+   */
+  boundaryHash: number;
+}
+
+const ISLAND_KIND_CODE: Record<IslandKind, number> = {
+  sequential: 0,
+  fused: 1,
+  reduction: 2,
+};
+
+/** FNV-1a over the partition's boundary structure. Pure; order-sensitive. */
+export function partitionBoundaryHash(islands: readonly Island[]): number {
+  let h = 0x811c9dc5;
+  const prime = 0x01000193;
+  const mix = (v: number) => {
+    h ^= v & 0xff;
+    h = Math.imul(h, prime);
+    h ^= (v >>> 8) & 0xff;
+    h = Math.imul(h, prime);
+    h ^= (v >>> 16) & 0xff;
+    h = Math.imul(h, prime);
+    h ^= (v >>> 24) & 0xff;
+    h = Math.imul(h, prime);
+  };
+  mix(islands.length);
+  for (const island of islands) {
+    mix(ISLAND_KIND_CODE[island.kind]);
+    mix(island.members.length);
+    for (const m of island.members) mix(m);
+  }
+  return h >>> 0;
+}
+
+/**
+ * Reify the partition from positional segment descriptors (the executor's
+ * CachedSegmentDesc shape: every kind carries its members as final-plan
+ * positions). Pure derivation — stage I0 changes no decision, it makes the
+ * decision an object.
+ */
+export function reifyPartition(
+  segments: ReadonlyArray<{ kind: IslandKind; finalPoss: number[] }>,
+): PlanPartition {
+  const islands: Island[] = segments.map((s) => ({
+    kind: s.kind,
+    members: [...s.finalPoss],
+  }));
+  return { islands, boundaryHash: partitionBoundaryHash(islands) };
+}
 
 /**
  * Segment a lazy plan into fusible and sequential parts.
@@ -1451,6 +1551,16 @@ export interface PlanFingerprint {
 export function computePlanFingerprint(
   nodes: LazyIRNode[],
   externalNodeIds?: Set<number>,
+  /**
+   * [islands I1] Partition-identity token (a `PlanPartition.boundaryHash`).
+   * OMITTED for the default derived partition — today's one-partition-per-
+   * graph world passes nothing and every existing key is byte-identical
+   * (zero template-hit regression by construction). An explicit partition
+   * request (editor gesture, autotuner candidate — stage I3+) passes its
+   * token so two partitions of ONE graph key two templates instead of
+   * colliding (docs/islands-design.md §G0(c) seam 1, §6 probe).
+   */
+  partitionToken?: number,
 ): PlanFingerprint {
   // Map node IDs to plan positions for relative input encoding
   const idToPos = new Map<number, number>();
@@ -1552,6 +1662,16 @@ export function computePlanFingerprint(
         inPayload = false;
       }
     }
+  }
+
+  // [islands I1] Mix the partition-identity token — GUARDED so the default
+  // derived-partition path (no token) emits byte-identical keys to the
+  // pre-islands fingerprint. Mixed into the structural hash too: two
+  // partitions of one graph are different STRUCTURES (different lowered
+  // plans), not payload thrash.
+  if (partitionToken !== undefined) {
+    hashByte(0x1a); // partition marker (distinct from input markers 1-3)
+    hashInt(partitionToken);
   }
 
   return { primary: h1 >>> 0, secondary: h2 >>> 0, structural: h3 >>> 0 };

@@ -1,0 +1,628 @@
+[
+  {
+    "name": "consecutive-chain",
+    "stats": {
+      "totalNodes": 4,
+      "fusibleNodes": 3,
+      "groupCount": 1,
+      "nodesInGroups": 3
+    },
+    "groups": [
+      {
+        "planIndices": [
+          1,
+          2,
+          3
+        ],
+        "output": 3,
+        "additional": [
+          1,
+          2
+        ],
+        "needed": [],
+        "externalInputCount": 1
+      }
+    ],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          1,
+          2,
+          3
+        ]
+      }
+    ]
+  },
+  {
+    "name": "stranded-dependent-gap",
+    "stats": {
+      "totalNodes": 6,
+      "fusibleNodes": 3,
+      "groupCount": 1,
+      "nodesInGroups": 2
+    },
+    "groups": [
+      {
+        "planIndices": [
+          3,
+          4
+        ],
+        "output": 4,
+        "additional": [
+          3
+        ],
+        "needed": [],
+        "externalInputCount": 1
+      }
+    ],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0,
+          1,
+          2
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          3,
+          4
+        ]
+      },
+      {
+        "kind": "sequential",
+        "positions": [
+          5
+        ]
+      }
+    ]
+  },
+  {
+    "name": "independent-gap",
+    "stats": {
+      "totalNodes": 6,
+      "fusibleNodes": 3,
+      "groupCount": 1,
+      "nodesInGroups": 3
+    },
+    "groups": [
+      {
+        "planIndices": [
+          2,
+          4,
+          5
+        ],
+        "output": 5,
+        "additional": [
+          2,
+          4
+        ],
+        "needed": [],
+        "externalInputCount": 1
+      }
+    ],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0,
+          1
+        ]
+      },
+      {
+        "kind": "sequential",
+        "positions": [
+          3
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          2,
+          4,
+          5
+        ]
+      }
+    ]
+  },
+  {
+    "name": "two-components",
+    "stats": {
+      "totalNodes": 7,
+      "fusibleNodes": 5,
+      "groupCount": 2,
+      "nodesInGroups": 5
+    },
+    "groups": [
+      {
+        "planIndices": [
+          2,
+          4,
+          6
+        ],
+        "output": 6,
+        "additional": [
+          2,
+          4
+        ],
+        "needed": [],
+        "externalInputCount": 1
+      },
+      {
+        "planIndices": [
+          3,
+          5
+        ],
+        "output": 5,
+        "additional": [
+          3
+        ],
+        "needed": [],
+        "externalInputCount": 1
+      }
+    ],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0,
+          1
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          3,
+          5
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          2,
+          4,
+          6
+        ]
+      }
+    ]
+  },
+  {
+    "name": "promoted-intermediate",
+    "stats": {
+      "totalNodes": 5,
+      "fusibleNodes": 3,
+      "groupCount": 1,
+      "nodesInGroups": 3
+    },
+    "groups": [
+      {
+        "planIndices": [
+          1,
+          2,
+          3
+        ],
+        "output": 3,
+        "additional": [
+          1,
+          2
+        ],
+        "needed": [],
+        "externalInputCount": 1
+      }
+    ],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          1,
+          2,
+          3
+        ]
+      },
+      {
+        "kind": "sequential",
+        "positions": [
+          4
+        ]
+      }
+    ]
+  },
+  {
+    "name": "split-mixed-shape",
+    "stats": {
+      "totalNodes": 8,
+      "fusibleNodes": 5,
+      "groupCount": 1,
+      "nodesInGroups": 4
+    },
+    "groups": [
+      {
+        "planIndices": [
+          2,
+          3,
+          4,
+          6
+        ],
+        "output": 6,
+        "additional": [
+          2,
+          3,
+          4
+        ],
+        "needed": [],
+        "externalInputCount": 2
+      }
+    ],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0,
+          1
+        ]
+      },
+      {
+        "kind": "sequential",
+        "positions": [
+          5
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          2,
+          3,
+          4,
+          6
+        ]
+      },
+      {
+        "kind": "sequential",
+        "positions": [
+          7
+        ]
+      }
+    ]
+  },
+  {
+    "name": "buffer-limit-split",
+    "stats": {
+      "totalNodes": 12,
+      "fusibleNodes": 6,
+      "groupCount": 3,
+      "nodesInGroups": 6
+    },
+    "groups": [
+      {
+        "planIndices": [
+          6,
+          7
+        ],
+        "output": 7,
+        "additional": [],
+        "needed": [
+          6
+        ],
+        "externalInputCount": 3
+      },
+      {
+        "planIndices": [
+          8,
+          9
+        ],
+        "output": 9,
+        "additional": [],
+        "needed": [
+          8
+        ],
+        "externalInputCount": 3
+      },
+      {
+        "planIndices": [
+          10,
+          11
+        ],
+        "output": 11,
+        "additional": [
+          10
+        ],
+        "needed": [],
+        "externalInputCount": 2
+      }
+    ],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          6,
+          7
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          8,
+          9
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          10,
+          11
+        ]
+      }
+    ]
+  },
+  {
+    "name": "singleton-batching",
+    "stats": {
+      "totalNodes": 6,
+      "fusibleNodes": 2,
+      "groupCount": 0,
+      "nodesInGroups": 0
+    },
+    "groups": [],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      }
+    ]
+  },
+  {
+    "name": "excluded-claimed",
+    "stats": {
+      "totalNodes": 5,
+      "fusibleNodes": 3,
+      "groupCount": 1,
+      "nodesInGroups": 2
+    },
+    "groups": [
+      {
+        "planIndices": [
+          3,
+          4
+        ],
+        "output": 4,
+        "additional": [
+          3
+        ],
+        "needed": [],
+        "externalInputCount": 1
+      }
+    ],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0,
+          1,
+          2
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          3,
+          4
+        ]
+      }
+    ]
+  },
+  {
+    "name": "scalar-refs",
+    "stats": {
+      "totalNodes": 6,
+      "fusibleNodes": 4,
+      "groupCount": 2,
+      "nodesInGroups": 4
+    },
+    "groups": [
+      {
+        "planIndices": [
+          2,
+          4
+        ],
+        "output": 4,
+        "additional": [
+          2
+        ],
+        "needed": [],
+        "externalInputCount": 2
+      },
+      {
+        "planIndices": [
+          3,
+          5
+        ],
+        "output": 5,
+        "additional": [
+          3
+        ],
+        "needed": [],
+        "externalInputCount": 2
+      }
+    ],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0,
+          1
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          2,
+          4
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          3,
+          5
+        ]
+      }
+    ]
+  },
+  {
+    "name": "readiness-no-case",
+    "stats": {
+      "totalNodes": 6,
+      "fusibleNodes": 3,
+      "groupCount": 1,
+      "nodesInGroups": 2
+    },
+    "groups": [
+      {
+        "planIndices": [
+          4,
+          5
+        ],
+        "output": 5,
+        "additional": [
+          4
+        ],
+        "needed": [],
+        "externalInputCount": 2
+      }
+    ],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          4,
+          5
+        ]
+      }
+    ]
+  },
+  {
+    "name": "external-saved",
+    "stats": {
+      "totalNodes": 4,
+      "fusibleNodes": 3,
+      "groupCount": 1,
+      "nodesInGroups": 3
+    },
+    "groups": [
+      {
+        "planIndices": [
+          1,
+          2,
+          3
+        ],
+        "output": 3,
+        "additional": [
+          1,
+          2
+        ],
+        "needed": [],
+        "externalInputCount": 1
+      }
+    ],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          1,
+          2,
+          3
+        ]
+      }
+    ]
+  },
+  {
+    "name": "multi-dependent-gap",
+    "stats": {
+      "totalNodes": 7,
+      "fusibleNodes": 4,
+      "groupCount": 1,
+      "nodesInGroups": 2
+    },
+    "groups": [
+      {
+        "planIndices": [
+          5,
+          6
+        ],
+        "output": 6,
+        "additional": [
+          5
+        ],
+        "needed": [],
+        "externalInputCount": 1
+      }
+    ],
+    "segments": [
+      {
+        "kind": "sequential",
+        "positions": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ]
+      },
+      {
+        "kind": "fused",
+        "positions": [
+          5,
+          6
+        ]
+      }
+    ]
+  }
+]
