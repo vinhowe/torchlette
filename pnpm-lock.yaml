@@ -79,6 +79,64 @@ importers:
         specifier: ^3.2.4
         version: 3.2.4(@types/node@22.18.1)(@vitest/browser@3.2.4)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4)
 
+  examples/gemma2-sae-demo:
+    dependencies:
+      '@huggingface/transformers':
+        specifier: ^3.0.0
+        version: 3.8.1
+      '@lucide/svelte':
+        specifier: ^1.23.0
+        version: 1.23.0(svelte@5.46.1)
+      gemma-scope-sae:
+        specifier: workspace:*
+        version: link:../../packages/gemma-scope-sae
+      gemma2-browser:
+        specifier: workspace:*
+        version: link:../../packages/gemma2-browser
+      katex:
+        specifier: ^0.16.11
+        version: 0.16.45
+      tailwind-merge:
+        specifier: ^3.0.0
+        version: 3.6.0
+      torchlette:
+        specifier: workspace:*
+        version: link:../..
+    devDependencies:
+      '@sveltejs/adapter-static':
+        specifier: ^3.0.8
+        version: 3.0.10(@sveltejs/kit@2.49.4(@sveltejs/vite-plugin-svelte@5.1.1(svelte@5.46.1)(vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4)))(svelte@5.46.1)(typescript@5.9.2)(vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4)))
+      '@sveltejs/kit':
+        specifier: ^2.16.0
+        version: 2.49.4(@sveltejs/vite-plugin-svelte@5.1.1(svelte@5.46.1)(vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4)))(svelte@5.46.1)(typescript@5.9.2)(vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4))
+      '@sveltejs/vite-plugin-svelte':
+        specifier: ^5.0.3
+        version: 5.1.1(svelte@5.46.1)(vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4))
+      '@tailwindcss/vite':
+        specifier: ^4.2.2
+        version: 4.2.2(vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4))
+      '@webgpu/types':
+        specifier: ^0.1.70
+        version: 0.1.70
+      svelte:
+        specifier: ^5.17.3
+        version: 5.46.1
+      svelte-check:
+        specifier: ^4.1.0
+        version: 4.6.0(picomatch@4.0.4)(svelte@5.46.1)(typescript@5.9.2)
+      tailwindcss:
+        specifier: ^4.0.0
+        version: 4.2.2
+      tsx:
+        specifier: ^4.19.0
+        version: 4.22.4
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.2
+      vite:
+        specifier: ^6.0.0
+        version: 6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4)
+
   examples/gpt2-lora-trainer:
     dependencies:
       gpt2-browser:
@@ -151,7 +209,7 @@ importers:
         version: 5.46.1
       svelte-check:
         specifier: ^4.1.0
-        version: 4.6.0(picomatch@4.0.3)(svelte@5.46.1)(typescript@5.9.2)
+        version: 4.6.0(picomatch@4.0.4)(svelte@5.46.1)(typescript@5.9.2)
       tailwindcss:
         specifier: '4'
         version: 4.2.2
@@ -302,6 +360,32 @@ importers:
       vite:
         specifier: ^6.0.7
         version: 6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4)
+
+  packages/gemma-scope-sae:
+    dependencies:
+      torchlette:
+        specifier: workspace:*
+        version: link:../..
+    devDependencies:
+      '@webgpu/types':
+        specifier: ^0.1.70
+        version: 0.1.70
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.2
+
+  packages/gemma2-browser:
+    dependencies:
+      torchlette:
+        specifier: workspace:*
+        version: link:../..
+    devDependencies:
+      '@webgpu/types':
+        specifier: ^0.1.70
+        version: 0.1.70
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.2
 
   packages/gpt2-browser:
     dependencies:
@@ -4384,7 +4468,7 @@ snapshots:
   '@vitest/snapshot@3.2.4':
     dependencies:
       '@vitest/pretty-format': 3.2.4
-      magic-string: 0.30.19
+      magic-string: 0.30.21
       pathe: 2.0.3
 
   '@vitest/spy@3.2.4':
@@ -5750,19 +5834,6 @@ snapshots:
     dependencies:
       has-flag: 4.0.0
 
-  svelte-check@4.6.0(picomatch@4.0.3)(svelte@5.46.1)(typescript@5.9.2):
-    dependencies:
-      '@jridgewell/trace-mapping': 0.3.30
-      '@sveltejs/load-config': 0.1.1
-      chokidar: 4.0.3
-      fdir: 6.5.0(picomatch@4.0.3)
-      picocolors: 1.1.1
-      sade: 1.8.1
-      svelte: 5.46.1
-      typescript: 5.9.2
-    transitivePeerDependencies:
-      - picomatch
-
   svelte-check@4.6.0(picomatch@4.0.4)(svelte@5.46.1)(typescript@5.9.2):
     dependencies:
       '@jridgewell/trace-mapping': 0.3.30
@@ -5971,11 +6042,11 @@ snapshots:
   vite@6.4.1(@types/node@22.18.1)(jiti@2.6.1)(lightningcss@1.32.0)(terser@5.44.0)(tsx@4.22.4):
     dependencies:
       esbuild: 0.25.9
-      fdir: 6.5.0(picomatch@4.0.3)
-      picomatch: 4.0.3
+      fdir: 6.5.0(picomatch@4.0.4)
+      picomatch: 4.0.4
       postcss: 8.5.6
       rollup: 4.50.1
-      tinyglobby: 0.2.15
+      tinyglobby: 0.2.17
     optionalDependencies:
       '@types/node': 22.18.1
       fsevents: 2.3.3

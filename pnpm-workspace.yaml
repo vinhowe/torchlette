@@ -4,6 +4,7 @@ packages:
   - examples/gpt2-lora-trainer
   - examples/menagerie
   - examples/qwen3-chat
+  - examples/gemma2-sae-demo
   - examples/qwen3-steering
   - examples/toy-compartmentalization
 
