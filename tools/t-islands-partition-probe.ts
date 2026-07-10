@@ -27,11 +27,11 @@
  */
 import {
   computePlanFingerprint,
-  segmentPlanForExecution,
-  isFusibleOp,
   type ExecutionSegment,
+  isFusibleOp,
+  segmentPlanForExecution,
 } from "../src/compiler/fusion-detect";
-import { LazyIRNode, createPendingRef } from "../src/graph/types";
+import { createPendingRef, LazyIRNode } from "../src/graph/types";
 
 let NEXT_ID = 1;
 function node(
@@ -41,7 +41,14 @@ function node(
   dtype = "f32",
 ): LazyIRNode {
   const refs = inputs.map((n) => createPendingRef(n));
-  return new LazyIRNode(NEXT_ID++, op as never, refs, shape, dtype as never, "webgpu");
+  return new LazyIRNode(
+    NEXT_ID++,
+    op as never,
+    refs,
+    shape,
+    dtype as never,
+    "webgpu",
+  );
 }
 
 /**
@@ -122,7 +129,9 @@ function main(): void {
   // only DESCRIBE it; the current substrate cannot represent it as a state.
   const alternativePartition =
     "[FUSE relu+exp+neg] (seq reshape,reshape)  <- legal, UNREACHABLE today";
-  console.log("  the legal alternative partition (islands would make first-class):");
+  console.log(
+    "  the legal alternative partition (islands would make first-class):",
+  );
   console.log("   ", alternativePartition, "\n");
 
   // ---- CLAIM B: the master key is partition-blind -------------------------
@@ -152,7 +161,8 @@ function main(): void {
   console.log(
     `  key(graph, partition=merged)  = 0x${keyB.primary.toString(16)}`,
   );
-  const collide = keyA.primary === keyB.primary && keyA.secondary === keyB.secondary;
+  const collide =
+    keyA.primary === keyB.primary && keyA.secondary === keyB.secondary;
   console.log(
     `  COLLIDE (two partitions, one key)? ${collide}  <- ${
       collide ? "confirmed partition-blind" : "unexpected"
@@ -178,25 +188,21 @@ function main(): void {
   const tokMerged = partitionToken(partitionMerged);
 
   const mix = (fp: number, tok: number): number =>
-    (Math.imul(fp ^ tok, 0x01000193) >>> 0);
+    Math.imul(fp ^ tok, 0x01000193) >>> 0;
 
   const extKeyDefaultA = mix(fpDefault.primary, tokDefault1);
   const extKeyDefaultB = mix(fpDefault.primary, tokDefault2);
   const extKeyMerged = mix(fpDefault.primary, tokMerged);
 
   console.log("PROPOSED FIX — mix a partition token into the key:");
-  console.log(
-    `  ext-key(default) #1 = 0x${extKeyDefaultA.toString(16)}`,
-  );
+  console.log(`  ext-key(default) #1 = 0x${extKeyDefaultA.toString(16)}`);
   console.log(
     `  ext-key(default) #2 = 0x${extKeyDefaultB.toString(16)}  (null test)`,
   );
   console.log(`  ext-key(merged)     = 0x${extKeyMerged.toString(16)}`);
   const nullStable = extKeyDefaultA === extKeyDefaultB;
   const partitionsDistinct = extKeyDefaultA !== extKeyMerged;
-  console.log(
-    `  null-stable (same partition => same key)? ${nullStable}`,
-  );
+  console.log(`  null-stable (same partition => same key)? ${nullStable}`);
   console.log(
     `  partitions distinct (different partition => different key)? ${partitionsDistinct}\n`,
   );
@@ -219,8 +225,7 @@ function main(): void {
       nullStable && partitionsDistinct ? "YES" : "NO"
     }`,
   );
-  const overall =
-    claimA && collide && nullStable && partitionsDistinct;
+  const overall = claimA && collide && nullStable && partitionsDistinct;
   console.log(
     `\nRISK ASSESSMENT: ${
       overall

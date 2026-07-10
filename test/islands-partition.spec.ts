@@ -52,7 +52,9 @@ describe("islands partition reification (I0)", () => {
 
   it("boundaryHash is null-stable: same partition → same token", () => {
     const a = reifyPartition(SEGS);
-    const b = reifyPartition(SEGS.map((s) => ({ ...s, finalPoss: [...s.finalPoss] })));
+    const b = reifyPartition(
+      SEGS.map((s) => ({ ...s, finalPoss: [...s.finalPoss] })),
+    );
     expect(a.boundaryHash).toBe(b.boundaryHash);
     // And the standalone hash agrees with the reified one (single source).
     expect(partitionBoundaryHash(a.islands)).toBe(a.boundaryHash);
@@ -64,7 +66,9 @@ describe("islands partition reification (I0)", () => {
       { kind: "fused", members: [1, 2] },
     ];
     const merged: Island[] = [{ kind: "fused", members: [0, 1, 2] }];
-    expect(partitionBoundaryHash(split)).not.toBe(partitionBoundaryHash(merged));
+    expect(partitionBoundaryHash(split)).not.toBe(
+      partitionBoundaryHash(merged),
+    );
   });
 
   it("boundaryHash discriminates: island kind changes the token", () => {
@@ -82,7 +86,9 @@ describe("islands partition reification (I0)", () => {
       { kind: "fused", members: [0, 1] },
       { kind: "fused", members: [2, 3] },
     ];
-    expect(partitionBoundaryHash(cutAt1)).not.toBe(partitionBoundaryHash(cutAt2));
+    expect(partitionBoundaryHash(cutAt1)).not.toBe(
+      partitionBoundaryHash(cutAt2),
+    );
   });
 });
 
@@ -91,7 +97,14 @@ describe("islands partition reification (I0)", () => {
 // ---------------------------------------------------------------------------
 
 function buildChain(): LazyIRNode[] {
-  const x = new LazyIRNode(1, "leafInput" as never, [], [8, 4], "f32", "webgpu");
+  const x = new LazyIRNode(
+    1,
+    "leafInput" as never,
+    [],
+    [8, 4],
+    "f32",
+    "webgpu",
+  );
   const a = new LazyIRNode(
     2,
     "relu" as never,

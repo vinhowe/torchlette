@@ -81,7 +81,11 @@ export function buildCorpus(): CorpusCase[] {
     const c = p.n("exp", [a], [8, 4]); // continues from the CHAIN, not the view
     p.n("neg", [c], [8, 4]);
     p.n("sum", [v], [], "f32"); // keeps the reshape externally consumed
-    cases.push({ name: "stranded-dependent-gap", nodes: p.nodes, options: OPTS });
+    cases.push({
+      name: "stranded-dependent-gap",
+      nodes: p.nodes,
+      options: OPTS,
+    });
   }
 
   // 3. Independent non-fusible gap — passes through, chain unbroken.
@@ -117,7 +121,11 @@ export function buildCorpus(): CorpusCase[] {
     const b = p.n("exp", [a], [8, 4]);
     p.n("neg", [b], [8, 4]);
     p.n("sum", [a], [], "f32"); // external consumer of intermediate `a`
-    cases.push({ name: "promoted-intermediate", nodes: p.nodes, options: OPTS });
+    cases.push({
+      name: "promoted-intermediate",
+      nodes: p.nodes,
+      options: OPTS,
+    });
   }
 
   // 6. Externally-referenced intermediate, DIFFERENT shape from primary —
@@ -238,7 +246,9 @@ export function buildCorpus(): CorpusCase[] {
 /** Serialize the decisions for one corpus case (positions, not ids). */
 export function decisionsFor(c: CorpusCase): unknown {
   const idToPos = new Map<number, number>();
-  c.nodes.forEach((n, i) => idToPos.set(n.id, i));
+  for (let i = 0; i < c.nodes.length; i++) {
+    idToPos.set(c.nodes[i].id, i);
+  }
   const pos = (n: LazyIRNode) => idToPos.get(n.id) as number;
 
   const det = detectFusionGroups(c.nodes, c.externalNodeIds, c.options);
