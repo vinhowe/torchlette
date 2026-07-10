@@ -28,5 +28,16 @@ export default defineConfig({
     // 5173/5174/5175 are taken by the other torchlette demos.
     port: 5176,
     strictPort: true,
+    watch: {
+      // The workspace packages are resolved through node_modules symlinks,
+      // which Vite ignores for HMR by default — so edits to gemma2-browser /
+      // torchlette source were never re-served (the dev server pinned the
+      // first transform of each @fs module). Un-ignore them so source edits
+      // to the linked packages hot-reload instead of requiring a restart.
+      ignored: [
+        "!**/packages/gemma2-browser/**",
+        "!**/packages/gemma-scope-sae/**",
+      ],
+    },
   },
 });

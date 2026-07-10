@@ -274,9 +274,12 @@ async function streamEmbeddingBlocks(
   byteLength: number,
   hidden: number,
   rowsPerBlock: number,
+  /** True when the resident embedding table is f16 — the caller then uploads
+   *  only `blockF16` and never touches the f32 `block`, so it is not built. */
+  residentF16: boolean,
   onSlice: (fraction: number) => void,
   onBlock: (
-    block: Float32Array,
+    block: Float32Array | null,
     blockF16: Uint16Array | null,
     startRow: number,
     rows: number,
@@ -286,7 +289,19 @@ async function streamEmbeddingBlocks(
     throw new Error(`Unsupported safetensors dtype ${srcDtype}`);
   }
   const srcElemBytes = srcDtype === "F32" ? 4 : 2;
-  const wantF16 = srcDtype !== "F32"; // f32 checkpoints keep f32 chunks
+  const wantF16 = srcDtype !== "F32"; // f16 bits available for f16/bf16 sources
+  // The f32 `block` is only uploaded when the resident table is f32. When the
+  // resident table is f16 the caller uses only `blockF16`, so skip the f32
+  // block entirely: it would be a per-block rows×hidden×4 Float32Array, and
+  // `rowsPerBlock` is sized so the f16 chunk is ~1GB — which doubles to ~2GB in
+  // f32 and blows V8's per-ArrayBuffer ceiling (RangeError: Array buffer
+  // allocation failed, the #59 f16-embedding regression).
+  const wantF32Block = !residentF16;
+  if (residentF16 && !wantF16) {
+    // f32 checkpoint into an f16 resident table would need a bf16-quality
+    // downconvert we don't do here; streamTensor rejects F32→f16 too.
+    throw new Error("f16 resident embedding requires an f16/bf16 checkpoint");
+  }
   const totalElems = byteLength / srcElemBytes;
   const totalRows = totalElems / hidden;
   if (!Number.isInteger(totalRows)) {
@@ -297,13 +312,16 @@ async function streamEmbeddingBlocks(
   let stagingLen = 0;
   let consumed = 0;
 
-  // Current block being filled.
+  // Current block being filled. In the f16 path `block` stays null (never
+  // uploaded) so no rows×hidden×4 Float32Array is allocated — `blockLen`
+  // tracks the element capacity independently.
   let startRow = 0;
   const blockElems = () =>
     Math.min(rowsPerBlock, totalRows - startRow) * hidden;
-  let block = new Float32Array(blockElems());
-  let blockF16 = wantF16 ? new Uint16Array(blockElems()) : null;
-  let blockElemOffset = 0; // elements written into `block`
+  let blockLen = blockElems();
+  let block = wantF32Block ? new Float32Array(blockLen) : null;
+  let blockF16 = wantF16 ? new Uint16Array(blockLen) : null;
+  let blockElemOffset = 0; // elements written into the current block
 
   const emitFullBlocks = async () => {
     // Flush whole staging elements into the current block, rolling over to a
@@ -312,7 +330,7 @@ async function streamEmbeddingBlocks(
     if (elems === 0) return;
     let stagingElemOffset = 0;
     while (elems > 0) {
-      const room = block.length - blockElemOffset;
+      const room = blockLen - blockElemOffset;
       const take = Math.min(room, elems);
       const src16Start = stagingElemOffset;
       if (srcDtype === "F32") {
@@ -321,11 +339,13 @@ async function streamEmbeddingBlocks(
           src16Start * 4,
           take,
         );
-        block.set(srcF32, blockElemOffset);
+        block!.set(srcF32, blockElemOffset);
       } else {
         const src16 = new Uint16Array(staging.buffer, src16Start * 2, take);
-        const out = block.subarray(blockElemOffset, blockElemOffset + take);
-        (srcDtype === "BF16" ? bf16SliceToF32 : f16SliceToF32)(src16, out, 0, take);
+        if (block) {
+          const out = block.subarray(blockElemOffset, blockElemOffset + take);
+          (srcDtype === "BF16" ? bf16SliceToF32 : f16SliceToF32)(src16, out, 0, take);
+        }
         if (blockF16) {
           if (srcDtype === "F16") {
             blockF16.set(src16, blockElemOffset);
@@ -342,14 +362,15 @@ async function streamEmbeddingBlocks(
       blockElemOffset += take;
       stagingElemOffset += take;
       elems -= take;
-      if (blockElemOffset === block.length) {
-        const rows = block.length / hidden;
+      if (blockElemOffset === blockLen) {
+        const rows = blockLen / hidden;
         await onBlock(block, blockF16, startRow, rows);
         startRow += rows;
         blockElemOffset = 0;
         if (totalRows - startRow > 0) {
-          block = new Float32Array(blockElems());
-          blockF16 = wantF16 ? new Uint16Array(blockElems()) : null;
+          blockLen = blockElems();
+          block = wantF32Block ? new Float32Array(blockLen) : null;
+          blockF16 = wantF16 ? new Uint16Array(blockLen) : null;
         }
       }
     }
@@ -541,6 +562,7 @@ export async function loadGemma2FromUrl(
           end - start,
           hiddenSize,
           rowsPerBlock,
+          embedIsF16,
           (fraction) => {
             emitProgress();
             tensorEvent({ type: "progress", name, fraction });
@@ -558,7 +580,7 @@ export async function loadGemma2FromUrl(
                     dtype: "f16",
                     device: "webgpu",
                   })
-                : api.tensorFromArray(blockArr, [rows, hiddenSize], {
+                : api.tensorFromArray(blockArr!, [rows, hiddenSize], {
                     dtype: dest.dtype,
                     device: "webgpu",
                   });
