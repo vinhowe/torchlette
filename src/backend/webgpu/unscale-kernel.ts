@@ -236,6 +236,53 @@ export async function readInfFlag(infFlagBuffer: GPUBuffer): Promise<number> {
 }
 
 /**
+ * [inc-3 runahead ring] Snapshot the shared inf flag into a fresh 4-byte
+ * MAP_READ staging buffer (pool-excluded) and RE-ZERO the flag, both in queue
+ * order. Called once per training step by `GradScaler.snapshotDeferred()` right
+ * after the captured call, i.e. after this step's unscale kernels are submitted
+ * and before the next step's writes. This isolates each step's found-inf report
+ * under runahead, where:
+ *  - the serial single-slot readback would be CLOBBERED by the next step's
+ *    `allocateInfFlagBuffer` zero-write before it is read, and
+ *  - a replayed (tape-HIT) step re-executes the unscale kernels but never runs
+ *    `unscale_`, so nothing else would ever re-zero the flag (it would latch 1
+ *    forever after the first inf).
+ * Returns null when the fused path never initialized (no flag buffer yet).
+ */
+export function snapshotAndResetInfFlag(): GPUBuffer | null {
+  if (!persistentInfFlagBuffer) return null;
+  const ctx = requireContext();
+  const staging = ctx.device.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  }) as GPUBuffer;
+  // Copy (submitted now — queue-ordered after this step's kernels), then zero
+  // (writeBuffer executes in queue order after the submitted copy, before any
+  // later step's kernels).
+  const encoder = ctx.device.createCommandEncoder();
+  encoder.copyBufferToBuffer(persistentInfFlagBuffer, 0, staging, 0, 4);
+  ctx.queue.submit([encoder.finish()]);
+  ctx.queue.writeBuffer(persistentInfFlagBuffer, 0, infFlagZeroData);
+  return staging;
+}
+
+/**
+ * Read a snapshot taken by `snapshotAndResetInfFlag` and destroy it. Pure
+ * mapAsync self-synchronization — no shared-fence await (a ring settle has
+ * already fenced the producing step by the time a K-behind resolve reads it,
+ * and the shared-fence path's pool bookkeeping is NOT safe mid-ring).
+ */
+export async function readAndDestroyInfSnapshot(
+  staging: GPUBuffer,
+): Promise<number> {
+  await staging.mapAsync(GPUMapMode.READ);
+  const value = new Float32Array(staging.getMappedRange())[0];
+  staging.unmap();
+  staging.destroy();
+  return value;
+}
+
+/**
  * Destroy the persistent inf flag buffer (cleanup on WebGPU teardown).
  */
 function destroyPersistentInfFlagBuffer(): void {

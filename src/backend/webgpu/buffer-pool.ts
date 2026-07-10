@@ -1223,6 +1223,35 @@ export async function awaitDeferredFence(): Promise<void> {
   }
 }
 
+/**
+ * [inc-3 runahead ring] Capture an ISOLATED fence promise covering exactly the
+ * work submitted so far, WITHOUT touching the shared single-slot fence state
+ * (`fenceState` is untouched — non-ring paths stay byte-identical) and WITHOUT
+ * the quiescent-point pool bookkeeping.
+ *
+ * Why both restrictions matter (the #84-class invariant): a ring settle for
+ * step N runs while step N+1's submits are still in flight. Awaiting the SHARED
+ * slot would await the newest fence (over-covering — serializes, killing the
+ * runahead overlap); running `flushPendingToPool` at that point would promote
+ * buffers released during step N+1's build to the shared pool while N+1's
+ * queued readers haven't executed — the exact run-boundary aliasing class
+ * fix-84 root-caused. So the settle awaits ONLY its own captured promise, and
+ * pool promotion stays where it is safe: the shared quiescent points
+ * (markStep / drain's final full fence).
+ *
+ * Returns null when no GPU context / no onSubmittedWorkDone (CPU-only, remote
+ * stubs) — the caller falls back to the shared fence.
+ */
+export function captureIsolatedFence(): (() => Promise<void>) | null {
+  const ctx = gpuContext;
+  if (!ctx || typeof ctx.queue.onSubmittedWorkDone !== "function") return null;
+  // Profiling mode: onSubmittedWorkDone deadlocks on V100/Dawn with
+  // timestamp-query (see issueDeferredFence) — fall back to the shared fence.
+  if (isProfilingEnabled()) return null;
+  const p = ctx.queue.onSubmittedWorkDone();
+  return () => p;
+}
+
 // ============================================================================
 // Detailed stats, debug trace, and buffer lifecycle helpers
 // ============================================================================

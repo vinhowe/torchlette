@@ -72,6 +72,17 @@ export class GradScaler {
   private _pendingInfBuffer: unknown = null;
   private _pendingInfBackend: Backend | null = null;
 
+  // [inc-3 runahead ring] Per-step found-inf snapshots (fused path), oldest
+  // first. Each entry isolates ONE step's report: the shared flag buffer is
+  // snapshotted + re-zeroed in queue order by `snapshotDeferred()`, so a later
+  // step's zero-write (or a replayed step's kernels, which never re-zero)
+  // cannot clobber an unread report. `handle: null` = the fused path hadn't
+  // initialized that step (reads as "no inf").
+  private _pendingInfSnapshots: Array<{
+    handle: unknown;
+    backend: Backend | null;
+  }> = [];
+
   constructor(api: Torchlette, options: GradScalerOptions = {}) {
     this.api = api;
     this._scale = options.initScale ?? 65536.0;
@@ -148,6 +159,52 @@ export class GradScaler {
       this._pendingInfAccum = null;
       this._applyScaleAdjustment();
     }
+  }
+
+  /**
+   * [inc-3 runahead ring] Snapshot THIS step's found-inf report. Called by a
+   * RUNAHEAD driver once per step, right after the captured call returns (the
+   * step's unscale kernels are submitted; the next step hasn't). Snapshots the
+   * shared inf flag into a pool-excluded staging buffer and re-zeroes it, both
+   * in queue order — isolating the report per step where the serial single-slot
+   * path would lose it (a later `unscale_` zero-write clobbers an unread flag,
+   * and a tape-HIT step replays the kernels without ever re-zeroing).
+   * Subsumes `_pendingInfBuffer` for that step (cleared here) — a runahead
+   * driver resolves via `resolveOldestDeferred()` at its K-behind cadence (or
+   * drains after the ring's `drain()`), NEVER via per-step `resolveDeferred()`
+   * (its `markStep` is a full non-gen boundary — illegal mid-ring).
+   */
+  snapshotDeferred(): void {
+    if (!this.enabled) return;
+    const backend =
+      this._pendingInfBackend ??
+      this._pendingInfSnapshots.find((e) => e.backend)?.backend ??
+      null;
+    const handle = backend?.ops.snapshotInfFlag?.() ?? null;
+    this._pendingInfSnapshots.push({ handle, backend });
+    // The single-slot pending readback is subsumed by the snapshot (reading
+    // the shared flag later would see the re-zeroed value anyway).
+    this._pendingInfBuffer = null;
+  }
+
+  /**
+   * [inc-3 runahead ring] Resolve the OLDEST deferred found-inf snapshot and
+   * apply its scale adjustment (in step order). Self-synchronizing mapAsync —
+   * no step boundary, no shared fence, no pool bookkeeping — so it is legal
+   * mid-ring. A K-behind cadence gives the charter's bookkeeping-lag bound: the
+   * CPU scale mirror lags the GPU trajectory by exactly ≤K steps. Returns false
+   * when no snapshot is pending.
+   */
+  async resolveOldestDeferred(): Promise<boolean> {
+    const entry = this._pendingInfSnapshots.shift();
+    if (!entry) return false;
+    let val = 0;
+    if (entry.handle !== null && entry.backend?.ops.readInfSnapshot) {
+      val = await entry.backend.ops.readInfSnapshot(entry.handle);
+    }
+    this._foundInfThisStep = val > 0.5;
+    this._applyScaleAdjustment();
+    return true;
   }
 
   /** Adjust scale based on whether inf was found this step. */

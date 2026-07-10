@@ -422,5 +422,148 @@ describe("capture() — flag-independent surface", () => {
       }
       expect(maxD).toBeLessThan(1e-3);
     });
+
+    // ---- inc-3: the RUNAHEAD RING -------------------------------------------
+    it("[inc-3] runahead ring (K=1 AND K=2) is bit-identical to the serial 2b path; body frozen; drain clean", async () => {
+      if (!hasGPU) return;
+      const { Adam } = await import("../src/optim/index");
+      type T = import("../src/frontend/tensor").Tensor;
+
+      // Same tiny training step as [2b]. Three arms advance IDENTICAL state:
+      //  - serial: driver owns markStep, reads loss each step (the 2b baseline).
+      //  - runahead K=1 and K=2: the ring OWNS the boundary (deferred gen-scoped
+      //    commit, recorder-finalize synchronous + sweep-after-fence, per-settle
+      //    ISOLATED fences, POOL-EXCLUDED staged scalar readbacks); driver reads
+      //    K-behind via the staged copies and drains at the end.
+      // K is a PURE knob — the ring only reorders WHEN the fence is awaited, so
+      // the trajectory must be BIT-IDENTICAL (not merely within a noise band).
+      async function build() {
+        const api = new Torchlette("webgpu", {
+          enableFusion: true,
+          enableMemoryPlanning: true,
+        });
+        const w = api.persist(
+          api.tensorFromArray([0.5, -0.5, 0.25, 0.75], [2, 2], {
+            requiresGrad: true,
+          }),
+        );
+        const target = api.persist(api.tensorFromArray([1, 0], [1, 2]));
+        const opt = new Adam([w], { lr: 1e-2 }, api);
+        let bodyRuns = 0;
+        const stepFn = async (x: T): Promise<T> => {
+          bodyRuns++;
+          const pred = api.matmul(x, w);
+          const diff = api.sub(pred, target);
+          const loss = api.mean(api.mul(diff, diff));
+          const lossOut = api.noGrad(() => api.mul(loss, 1));
+          await loss.backward();
+          opt.step();
+          opt.zeroGrad();
+          return lossOut;
+        };
+        return { api, stepFn, runs: () => bodyRuns };
+      }
+
+      const N = 16;
+      // Serial arm.
+      const s = await build();
+      const sLoss: number[] = [];
+      {
+        const prev = s.api.setStepScopedCleanup(true);
+        const step = s.api.capture(s.stepFn, { training: true });
+        for (let i = 0; i < N; i++) {
+          const x = s.api.tensorFromArray([1 + i * 0.01, 2 - i * 0.01], [1, 2]);
+          const loss = (await step(x)) as T;
+          sLoss.push((await s.api.cpu(loss))[0]);
+          await s.api.markStep();
+        }
+        s.api.setStepScopedCleanup(prev);
+      }
+
+      // Runahead arms: ring owns the boundary; read K-behind; drain at end.
+      for (const K of [1, 2]) {
+        const r = await build();
+        const rLoss = new Array<number>(N);
+        let hits = 0;
+        {
+          const prev = r.api.setStepScopedCleanup(true);
+          const step = r.api.capture(r.stepFn, {
+            training: true,
+            runahead: true,
+            ringDepth: K,
+          });
+          const handles: T[] = [];
+          for (let i = 0; i < N; i++) {
+            const x = r.api.tensorFromArray(
+              [1 + i * 0.01, 2 - i * 0.01],
+              [1, 2],
+            );
+            handles.push((await step(x)) as T);
+            // Oldest still-in-window handle (K-behind logging cadence): the
+            // staged pool-excluded copy makes this wait only for ITS step.
+            const oldest = i - K + 1;
+            if (oldest >= 0) rLoss[oldest] = (await r.api.cpu(handles[oldest]))[0];
+          }
+          await step.drain(); // §2b (d) — fence the tail in order, no hang
+          // Tail handles survive drain; read the last K-1 now.
+          for (let i = Math.max(0, N - K + 1); i < N; i++) {
+            if (rLoss[i] === undefined) rLoss[i] = (await r.api.cpu(handles[i]))[0];
+          }
+          hits = step.stats().hits;
+          r.api.setStepScopedCleanup(prev);
+        }
+
+        // Body frozen on hits (run-exactly-once) and hits actually happened.
+        expect(hits).toBeGreaterThan(0);
+        expect(r.runs()).toBeLessThan(N);
+        // BIT-IDENTICAL to serial (K is a pure knob).
+        let maxD = 0;
+        for (let i = 0; i < N; i++)
+          maxD = Math.max(maxD, Math.abs(sLoss[i] - rLoss[i]));
+        expect(maxD, `K=${K}`).toBe(0);
+      }
+    });
+
+    it("[inc-3] drain mid-ring: interrupt after a few steps resolves cleanly, no hang", async () => {
+      if (!hasGPU) return;
+      const { Adam } = await import("../src/optim/index");
+      type T = import("../src/frontend/tensor").Tensor;
+      const api = new Torchlette("webgpu", {
+        enableFusion: true,
+        enableMemoryPlanning: true,
+      });
+      const w = api.persist(
+        api.tensorFromArray([0.5, -0.5, 0.25, 0.75], [2, 2], { requiresGrad: true }),
+      );
+      const target = api.persist(api.tensorFromArray([1, 0], [1, 2]));
+      const opt = new Adam([w], { lr: 1e-2 }, api);
+      const stepFn = async (x: T): Promise<T> => {
+        const pred = api.matmul(x, w);
+        const diff = api.sub(pred, target);
+        const loss = api.mean(api.mul(diff, diff));
+        const lossOut = api.noGrad(() => api.mul(loss, 1));
+        await loss.backward();
+        opt.step();
+        opt.zeroGrad();
+        return lossOut;
+      };
+      const prev = api.setStepScopedCleanup(true);
+      const step = api.capture(stepFn, { training: true, runahead: true, ringDepth: 1 });
+      // Build a few steps WITHOUT reading their loss (in-flight ring entries).
+      const held: T[] = [];
+      for (let i = 0; i < 5; i++) {
+        const x = api.tensorFromArray([1 + i * 0.01, 2 - i * 0.01], [1, 2]);
+        held.push((await step(x)) as T);
+      }
+      // Abort mid-training: drain fences all in-flight boundaries in order.
+      await step.drain();
+      // Drain is idempotent (no double-fence, no hang).
+      await step.drain();
+      // The last (un-expired) handle is still readable after drain.
+      const last = held[held.length - 1];
+      const v = await api.cpu(last);
+      expect(Number.isFinite(v[0])).toBe(true);
+      api.setStepScopedCleanup(prev);
+    });
   },
 );

@@ -580,6 +580,13 @@ export interface BackendOps {
   createInfCountBuffer?(): unknown;
   /** Read inf flag (0.0 or 1.0) and destroy buffer. */
   readAndDestroyInfCount?(buffer: unknown): Promise<number>;
+  /** [inc-3 ring] Snapshot the shared inf flag into a pool-excluded staging
+   *  buffer and re-zero it, in queue order (per-step report isolation under
+   *  runahead). Null when the fused unscale path never initialized. */
+  snapshotInfFlag?(): unknown | null;
+  /** [inc-3 ring] Read (mapAsync self-sync — no shared fence) + destroy a
+   *  snapshot from snapshotInfFlag. */
+  readInfSnapshot?(snapshot: unknown): Promise<number>;
   read(a: BackendTensor): Promise<number[]>;
   /** Start async scalar readback: copy to staging buffer, return finish function. */
   startScalarReadback?(a: BackendTensor): () => Promise<number>;
