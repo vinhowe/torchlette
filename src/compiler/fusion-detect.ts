@@ -1533,6 +1533,16 @@ export interface PlanFingerprint {
 export function computePlanFingerprint(
   nodes: LazyIRNode[],
   externalNodeIds?: Set<number>,
+  /**
+   * [islands I1] Partition-identity token (a `PlanPartition.boundaryHash`).
+   * OMITTED for the default derived partition — today's one-partition-per-
+   * graph world passes nothing and every existing key is byte-identical
+   * (zero template-hit regression by construction). An explicit partition
+   * request (editor gesture, autotuner candidate — stage I3+) passes its
+   * token so two partitions of ONE graph key two templates instead of
+   * colliding (docs/islands-design.md §G0(c) seam 1, §6 probe).
+   */
+  partitionToken?: number,
 ): PlanFingerprint {
   // Map node IDs to plan positions for relative input encoding
   const idToPos = new Map<number, number>();
@@ -1634,6 +1644,16 @@ export function computePlanFingerprint(
         inPayload = false;
       }
     }
+  }
+
+  // [islands I1] Mix the partition-identity token — GUARDED so the default
+  // derived-partition path (no token) emits byte-identical keys to the
+  // pre-islands fingerprint. Mixed into the structural hash too: two
+  // partitions of one graph are different STRUCTURES (different lowered
+  // plans), not payload thrash.
+  if (partitionToken !== undefined) {
+    hashByte(0x1a); // partition marker (distinct from input markers 1-3)
+    hashInt(partitionToken);
   }
 
   return { primary: h1 >>> 0, secondary: h2 >>> 0, structural: h3 >>> 0 };
