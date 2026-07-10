@@ -27,6 +27,7 @@ const GPU_TEST_FILES = [
   "test/optim/grad-scaler.spec.ts",
   "test/scope-surface.spec.ts",
   "test/scope-training.spec.ts",
+  "test/second-run-determinism.spec.ts",
   "test/optim/fused-vs-elementwise.spec.ts",
   "test/optim/adam-multigroup.spec.ts",
   "test/oracle/gpt2-checkpoint-parity.spec.ts",
