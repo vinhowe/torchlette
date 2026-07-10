@@ -299,10 +299,18 @@ async function requestDeviceWithFallback(
   const adapterMaxBuffer = adapter.limits?.maxBufferSize ?? 256 * 1024 * 1024;
   const adapterMaxStorageBuffers =
     adapter.limits?.maxStorageBuffersPerShaderStage ?? 8;
+  // The default maxComputeWorkgroupStorageSize is 16KB. The flash-attention
+  // kernel's shared-memory tiles scale with headDim; head_dim=256 (Gemma-2)
+  // needs 32KB and OVERFLOWS the 16KB default → the pipeline is invalid and
+  // every attention submit is DROPPED (silently zeroed downstream). Request the
+  // adapter's supported max (A100/V100 report 48KB). Harmless where headDim is
+  // small (headDim=128 fits 16KB); required for Gemma-2's 256-dim heads.
+  const adapterMaxWgStorage =
+    adapter.limits?.maxComputeWorkgroupStorageSize ?? 16384;
 
   if (isProfilingEnabled()) {
     console.log(
-      `[WebGPU] Adapter limits: maxStorageBufferBindingSize=${adapterMaxStorage}, maxBufferSize=${adapterMaxBuffer}, maxStorageBuffersPerShaderStage=${adapterMaxStorageBuffers}`,
+      `[WebGPU] Adapter limits: maxStorageBufferBindingSize=${adapterMaxStorage}, maxBufferSize=${adapterMaxBuffer}, maxStorageBuffersPerShaderStage=${adapterMaxStorageBuffers}, maxComputeWorkgroupStorageSize=${adapterMaxWgStorage}`,
     );
   }
 
@@ -310,6 +318,7 @@ async function requestDeviceWithFallback(
     maxStorageBufferBindingSize: adapterMaxStorage,
     maxBufferSize: adapterMaxBuffer,
     maxStorageBuffersPerShaderStage: adapterMaxStorageBuffers,
+    maxComputeWorkgroupStorageSize: adapterMaxWgStorage,
   };
 
   // Attempt 1: all features
@@ -406,6 +415,9 @@ export function webgpuDeviceRequirements(adapter: GPUAdapter): {
       maxBufferSize: adapter.limits?.maxBufferSize ?? 256 * 1024 * 1024,
       maxStorageBuffersPerShaderStage:
         adapter.limits?.maxStorageBuffersPerShaderStage ?? 8,
+      // head_dim=256 attention needs 32KB shared memory (> the 16KB default).
+      maxComputeWorkgroupStorageSize:
+        adapter.limits?.maxComputeWorkgroupStorageSize ?? 16384,
     },
   };
 }
