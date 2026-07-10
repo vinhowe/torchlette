@@ -1,4 +1,4 @@
-import { noteScalarSlotValue } from "../core/scalar-slots";
+import { LiveScalar } from "../core/live-scalar";
 import type { AdamStepConfig, DeviceKind } from "../backend/types";
 import { ENV } from "../core/env";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
@@ -54,11 +54,17 @@ export class Adam {
    * copy_(t, add(t,1)) inside the optimizer plan so replays advance it.
    * Per-param `steps[]` collapses to the shared `t` (PyTorch capturable
    * semantics: a param whose grad is absent skips its update but `t` still
-   * advances). `_t`/`_lrTensors` are lazily created on first step (device
-   * known once a real param is stepped) — mirrors m/v lazy init.
+   * advances). `_t`/`_lrLive` are lazily created on first step (device
+   * known once a real param is stepped) — mirrors m/v lazy init. lr rides the
+   * LIVE SCALAR SLOT primitive (see `_lrLive`).
    */
   private _t: RuntimeTensor | null = null;
-  private _lrTensors: (RuntimeTensor | null)[];
+  /** inc-2a lr now rides the LIVE SCALAR SLOT primitive (core/live-scalar.ts):
+   *  a persistent f32[1] whose per-step value the scheduler delivers via an
+   *  in-place, graph-ordered write into its fixed buffer (buffer-stable, live
+   *  across replays). The primitive owns what setLR used to open-code (the
+   *  copy_ scatter + scalar-slots note). Lazily created (device known). */
+  private _lrLive: (LiveScalar | null)[];
   /**
    * Packed foreach state, keyed by group index. While the foreach path is
    * active, m/v live as ONE flat tensor per group (the per-param expAvg
@@ -147,8 +153,8 @@ export class Adam {
     // inc-2a: persistent step counter (shared) + per-group lr tensors.
     // Created eagerly (device known); f32 [1]. Materialize on first force.
     this._t = runtime.full([1], 0, device, "f32");
-    this._lrTensors = this._groups.map((g) =>
-      runtime.full([1], g.lr, device, "f32"),
+    this._lrLive = this._groups.map(
+      (g) => new LiveScalar(engine, g.lr, device as "cpu" | "webgpu"),
     );
   }
 
@@ -160,16 +166,24 @@ export class Adam {
     return this._t;
   }
 
-  /** The persistent lr tensor for a group (created on demand). */
-  private _lrTensor(gi: number): RuntimeTensor {
-    let t = this._lrTensors[gi];
-    if (!t) {
-      t = this.api
-        ._runtime()
-        .full([1], this._groups[gi].lr, this.device, "f32");
-      this._lrTensors[gi] = t;
+  /** The live lr scalar for a group (created on demand). */
+  private _lrScalar(gi: number): LiveScalar {
+    let s = this._lrLive[gi];
+    if (!s) {
+      s = new LiveScalar(
+        this.api,
+        this._groups[gi].lr,
+        this.device as "cpu" | "webgpu",
+      );
+      this._lrLive[gi] = s;
     }
-    return t;
+    return s;
+  }
+
+  /** The persistent lr tensor (runtime) for a group — read by adamStep / the
+   *  elementwise update as an ordinary graph input. */
+  private _lrTensor(gi: number): RuntimeTensor {
+    return this._lrScalar(gi).tensor._unwrap();
   }
 
   getParams(): Tensor[] {
@@ -189,8 +203,8 @@ export class Adam {
     }
     // inc-2a: persistent t/lr must survive step boundaries too.
     if (this._t) keep.push(this.api._wrapRuntime(this._t, false));
-    for (const lrT of this._lrTensors) {
-      if (lrT) keep.push(this.api._wrapRuntime(lrT, false));
+    for (const s of this._lrLive) {
+      if (s) keep.push(s.tensor);
     }
     return keep;
   }
@@ -204,24 +218,13 @@ export class Adam {
    *  tensors IN-PLACE (copy_) so a compiled replay sees the new value as DATA
    *  — the LR-schedule-exactness seam (schedulers funnel through here). */
   setLR(lr: number): void {
-    const runtime = this.api._runtime();
     for (let gi = 0; gi < this._groups.length; gi++) {
       this._groups[gi].lr = lr;
-      // tensorFromArray, NOT full(): full's fillValue hashes into the template
-      // fingerprint (deliberately — the latent-frozen-scalar defense), so a
-      // per-step scheduler write via full() thrashes the template every step
-      // (structureMiss — no step-tape can ever form under an LR schedule).
-      // tensorFromArray's `values` are PAYLOAD_HASH_EXEMPT and re-executed per
-      // replay: the write is stable STRUCTURE carrying per-step DATA.
-      const lrT = this._lrTensor(gi);
-      runtime.copy_(
-        lrT,
-        runtime.tensorFromArray([lr], [1], this.device, "f32"),
-      );
-      // Authoritative host value for replayed step-tapes (see
-      // core/scalar-slots.ts) — the tape re-dresses its recorded lr write
-      // from here each replay.
-      noteScalarSlotValue(lrT, lr);
+      // LIVE SCALAR SLOT delivery (core/live-scalar.ts): an in-place,
+      // graph-ordered write into the lr tensor's FIXED buffer, re-dressed per
+      // replay from the registry — the single primitive that carries the
+      // per-step lr through compiled replays as DATA.
+      this._lrScalar(gi).set(lr);
     }
   }
 
@@ -234,14 +237,8 @@ export class Adam {
    *  lr tensor IN-PLACE (copy_). */
   setGroupLR(groupIndex: number, lr: number): void {
     this._groups[groupIndex].lr = lr;
-    const runtime = this.api._runtime();
-    // tensorFromArray, not full() — see setLR.
-    const lrT = this._lrTensor(groupIndex);
-    runtime.copy_(
-      lrT,
-      runtime.tensorFromArray([lr], [1], this.device, "f32"),
-    );
-    noteScalarSlotValue(lrT, lr);
+    // LIVE SCALAR SLOT delivery — see setLR.
+    this._lrScalar(groupIndex).set(lr);
   }
 
   /** Get the number of parameter groups. */
@@ -330,7 +327,7 @@ export class Adam {
     }
     // Persist t/lr (materialize mid-step).
     runtime.persist(this._tTensor());
-    for (const lrT of this._lrTensors) if (lrT) runtime.persist(lrT);
+    for (const s of this._lrLive) if (s) runtime.persist(s.tensor._unwrap());
     return updated;
   }
 
@@ -576,7 +573,7 @@ export class Adam {
 
     // Persist t/lr (lazily materialize mid-step; same rationale as m/v).
     runtime.persist(tRt);
-    for (const lrT of this._lrTensors) if (lrT) runtime.persist(lrT);
+    for (const s of this._lrLive) if (s) runtime.persist(s.tensor._unwrap());
 
     return updated;
   }
@@ -755,7 +752,7 @@ export class Adam {
       updated.push(param);
     }
     runtime.persist(this._tTensor());
-    for (const lrT of this._lrTensors) if (lrT) runtime.persist(lrT);
+    for (const s of this._lrLive) if (s) runtime.persist(s.tensor._unwrap());
     return updated;
   }
 
@@ -783,7 +780,7 @@ export class Adam {
       updated.push(param);
     }
     runtime.persist(this._tTensor());
-    for (const lrT of this._lrTensors) if (lrT) runtime.persist(lrT);
+    for (const s of this._lrLive) if (s) runtime.persist(s.tensor._unwrap());
     this.api.queueStepBoundary();
     return updated;
   }

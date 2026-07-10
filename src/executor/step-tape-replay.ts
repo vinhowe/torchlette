@@ -146,7 +146,10 @@ interface Skeleton {
    *  new storage every step, stranding the recording-era ref). */
   rebinds: Array<{ ref: { kind: string; storage: StorageHandle }; owner: TensorOwner }>;
   /** [2b sched] Per-replay payload re-dress of recorded in-plan scalar-write
-   *  chains (see Candidate.scalarDresses). */
+   *  chains (see Candidate.scalarDresses). This is the delivery seam the LIVE
+   *  SCALAR SLOT primitive (core/live-scalar.ts) rides — its in-place scatter
+   *  IS the `stridedScatterCopy(dst, tensorFromArray([v]))` chain, re-dressed
+   *  here from the scalar-slots host value the setter noted. */
   scalarDresses: Array<{ writeNode: LazyIRNode; resultId: number }>;
 }
 
