@@ -913,6 +913,7 @@ export async function stTryReplay(
       n.results = undefined;
       n._executed = undefined;
       n._inputsRetained = undefined;
+      n._retainedInputIds = undefined;
     }
   }
 

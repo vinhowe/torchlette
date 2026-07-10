@@ -394,15 +394,19 @@ export function adamStepBatch(items: AdamBatchItem[]): AdamBatchResult[] {
 
 export function unscaleGrad(
   grad: BackendTensor,
-  invScale: number,
+  scale: BackendTensor,
   infFlagBuffer: unknown,
 ): BackendTensor {
   const gradT = asContiguous(grad);
   const numElements = gradT.size;
+  // scaler-as-tensor: scale is a persistent 1-element f32 tensor (the
+  // GradScaler's `_scaleLive` LiveScalar buffer) read LIVE from a storage
+  // binding, not a frozen uniform number (invScale reciprocated in-kernel).
+  const scaleT = scale as WebGPUTensor;
   const result = dispatchUnscaleGradKernel(
     gradT.buffer,
     numElements,
-    invScale,
+    scaleT.buffer,
     infFlagBuffer as GPUBuffer,
   );
   cleanupContiguous([grad, gradT]);

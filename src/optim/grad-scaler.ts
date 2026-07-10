@@ -29,6 +29,7 @@
  */
 
 import type { Backend, DeviceKind } from "../backend/types";
+import { LiveScalar } from "../core/live-scalar";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
 import { createLazyIRNode } from "../graph/node-factory";
 import { createPendingRef } from "../graph/types";
@@ -72,6 +73,27 @@ export class GradScaler {
   private _pendingInfBuffer: unknown = null;
   private _pendingInfBackend: Backend | null = null;
 
+  // [scaler-as-tensor] scale as a LIVE persistent tensor. The forward
+  // `scale(loss)` reads `_scaleLive.tensor` in-graph; the fused `unscale_`
+  // feeds the SAME tensor to unscaleGrad as node.inputs[1] (invScale = 1/scale
+  // reciprocated IN-KERNEL) — so a growth/backoff rescale flows through a
+  // step-tape HIT as DATA via the SINGLE scale write. A second live invScale
+  // tensor would need its own driver scatter, and the per-step re-dress only
+  // cleanly covers one such write per body (the second's recorded
+  // scatter-source is left stale); an in-graph `div(1, scale)` node instead
+  // added compiled-plan fp drift over a trajectory (~5x on the train-capture
+  // gate). ONE tensor, reciprocal in-shader. The CPU `_scale` number is
+  // DEMOTED to a stats-only mirror (getScale / stateDict / bookkeeping).
+  private _scaleLive: LiveScalar | null = null;
+  private _liveDevice: "cpu" | "webgpu" | null = null;
+
+  // [scaler-as-tensor] DRIVER-RESOLVED persistent found-inf. Once the fused
+  // path initializes, the replayed plan writes the persistent inf flag every
+  // step (hit or miss). The DRIVER (`resolveDeferred`) snapshots + reads that
+  // flag at settle time so the CPU scale mirror advances on HITS too (where the
+  // body — hence the old `_pendingInfBuffer` set in `unscale_` — never runs).
+  private _fusedInfBackend: Backend | null = null;
+
   // [inc-3 runahead ring] Per-step found-inf snapshots (fused path), oldest
   // first. Each entry isolates ONE step's report: the shared flag buffer is
   // snapshotted + re-zeroed in queue order by `snapshotDeferred()`, so a later
@@ -93,6 +115,13 @@ export class GradScaler {
     this._growthTracker = 0;
     this._foundInfThisStep = false;
     this._unscaleCalled = false;
+    // [scaler-as-tensor] Create the LIVE scale/invScale tensors EAGERLY on the
+    // api's default device (like Adam's `_lrLive` in its ctor). Mid-step lazy
+    // creation demotes them as step temporaries (they're born inside the first
+    // captured body, after that step's snapshot) → reclaimed-storage corruption.
+    // Constructing here (outside any step) lets the next beginStep snapshot
+    // capture them as persistent model-level state.
+    if (this.enabled) this._ensureLive(api.getDefaultDevice());
   }
 
   /**
@@ -100,6 +129,18 @@ export class GradScaler {
    */
   getScale(): number {
     return this._scale;
+  }
+
+  /** [scaler-as-tensor] Ensure the scale/invScale LiveScalars exist on `device`.
+   *  Idempotent; created once the first consumer (scale/unscale) knows the
+   *  device. The tensors carry the CURRENT scale/invScale as DATA. */
+  private _ensureLive(device: DeviceKind): void {
+    if (this._scaleLive && this._liveDevice === device) return;
+    // Device is fixed for the scaler's life on first materialization; a mid-run
+    // device flip is not a real training pattern.
+    const dev = device as "cpu" | "webgpu";
+    this._liveDevice = dev;
+    this._scaleLive = new LiveScalar(this.api, this._scale, dev);
   }
 
   /**
@@ -140,8 +181,11 @@ export class GradScaler {
    */
   async resolveDeferred(): Promise<void> {
     if (this._pendingInfBuffer) {
-      // Fused path: force all pending GPU work so the unscaleGrad kernels
-      // have written to the infFlagBuffer before we read it back.
+      // MISS path (body ran `unscale_` last step): read the flag it set. A
+      // markStep here commits the prior (possibly implied) boundary + submits
+      // the unscale writes, forming the tape during warmup — the same behavior
+      // as before scaler-as-tensor. Hits take the branch below (NO markStep, so
+      // the implied-boundary regime and its fp are undisturbed).
       await this.api.markStep();
       const val = await this._pendingInfBackend?.ops.readAndDestroyInfCount?.(
         this._pendingInfBuffer,
@@ -150,6 +194,23 @@ export class GradScaler {
       this._pendingInfBuffer = null;
       this._pendingInfBackend = null;
       this._applyScaleAdjustment();
+    } else if (this._fusedInfBackend) {
+      // [scaler-as-tensor] HIT path (fused initialized, but the body did NOT run
+      // last step — a tape HIT). The scale mirror must still ADVANCE so a
+      // growth/backoff flows through hits as DATA. Do it WITHOUT a markStep: an
+      // extra boundary on a hit perturbs the implied-boundary fp regime (and
+      // resets the recorder). If the loop opted into per-step `snapshotDeferred()`
+      // (the growth/ring probes), drain the oldest found-inf report via the
+      // hit-safe ring (self-synchronizing mapAsync, no boundary); otherwise
+      // advance with foundInf=false (growth still flows; inf-on-hit detection
+      // then needs the loop to snapshot). The ring path (runahead) resolves via
+      // resolveOldestDeferred directly.
+      if (this._pendingInfSnapshots.length > 0) {
+        await this.resolveOldestDeferred();
+      } else {
+        this._foundInfThisStep = false;
+        this._applyScaleAdjustment();
+      }
     } else if (this._pendingInfAccum) {
       // Elementwise path: should have been resolved in update().
       // Fallback if update() wasn't called or wasn't awaited.
@@ -209,6 +270,7 @@ export class GradScaler {
 
   /** Adjust scale based on whether inf was found this step. */
   private _applyScaleAdjustment(): void {
+    const prev = this._scale;
     if (this._foundInfThisStep) {
       this._scale *= this.backoffFactor;
       this._growthTracker = 0;
@@ -219,6 +281,21 @@ export class GradScaler {
         this._growthTracker = 0;
       }
     }
+    // [scaler-as-tensor] Push the new scale into the LIVE tensor so the NEXT
+    // replayed step reads it as DATA (growth/backoff flows through hits; invScale
+    // is derived in-graph from it). The JS `_scale` is now a stats-only mirror.
+    //
+    // Only write on an ACTUAL change. Every `.set()` mints a per-step scatter
+    // that CHAINS onto the scale tensor's ref (copy-on-write when the tensor is
+    // still pending) — during the lowered warmup that chain strands an earlier
+    // scatter's source, read after reclaim (STRICT_LIFETIME; the setLR
+    // driver-scalar KNOWN OPEN's warmup transient). Since the scale holds
+    // constant across the vast majority of steps (growthInterval apart), gating
+    // on change makes the write RARE — the scale tensor is materialized by the
+    // time the next change lands, so its scatter is a clean true-in-place DMA
+    // with a same-step source. The buffer already holds `prev` (the live tensor
+    // is the single source), so skipping an unchanged write is exact.
+    if (this._scaleLive && this._scale !== prev) this._scaleLive.set(this._scale);
   }
 
   /**
@@ -232,7 +309,11 @@ export class GradScaler {
     if (!this.enabled) {
       return loss;
     }
-    return this.api.mul(loss, this._scale);
+    // [scaler-as-tensor] Multiply by the LIVE scale TENSOR (not the JS number),
+    // so a growth/backoff rescale flows through a replayed step as DATA. The
+    // 1-element scale broadcasts against the (scalar) loss.
+    this._ensureLive(loss.device);
+    return this.api.mul(loss, this._scaleLive!.tensor);
   }
 
   /**
@@ -256,7 +337,6 @@ export class GradScaler {
     this._unscaleCalled = true;
 
     const params = optimizer.getParams();
-    const invScale = 1.0 / this._scale;
     const runtime = this.api._runtime();
 
     // Determine device from first param with a grad
@@ -267,6 +347,11 @@ export class GradScaler {
         break;
       }
     }
+
+    // [scaler-as-tensor] the scale flows as the LIVE tensor; keep the JS number
+    // for the elementwise (CPU) fallback path only.
+    this._ensureLive(device);
+    const invScale = 1.0 / this._scale;
 
     const backend = runtime.getBackend(device);
 
@@ -279,7 +364,7 @@ export class GradScaler {
     // but it does so from the graph instead of via an out-of-band optimizer
     // config that broke param.grad's semantics.
     if (backend.ops.unscaleGrad) {
-      this._unscaleFused(params, invScale, backend, device);
+      this._unscaleFused(params, backend, device);
     } else {
       this._unscaleElementwise(params, invScale, runtime, device);
     }
@@ -288,15 +373,23 @@ export class GradScaler {
   /**
    * Fused unscale path: one kernel dispatch per parameter.
    * All dispatches share a single infFlagBuffer (4 bytes, atomic).
+   *
+   * [scaler-as-tensor] The SCALE is delivered as a graph INPUT (node.inputs[1] =
+   * the LiveScalar's persistent 1-element tensor, read LIVE from a storage
+   * binding; invScale = 1/scale reciprocated in-kernel), not a frozen payload
+   * number — so a growth/backoff rescale flows through a replayed step as DATA.
+   * Passing the scale tensor DIRECTLY (no in-graph `div` node) avoids the div's
+   * step-temporary output, which added compiled-plan fp drift over a trajectory.
+   * infFlagBuffer stays on the payload (a raw GPU buffer, not a graph tensor).
    */
   private _unscaleFused(
     params: Tensor[],
-    invScale: number,
     backend: Backend,
     device: DeviceKind,
   ): void {
     const infFlagBuffer = backend.ops.createInfCountBuffer?.();
-    const sharedPayload = { invScale, infFlagBuffer };
+    const sharedPayload = { infFlagBuffer };
+    const scaleRef = this._scaleLive!.tensor._unwrap().lazyRef;
 
     for (const param of params) {
       const grad = param.grad;
@@ -304,10 +397,10 @@ export class GradScaler {
 
       const gradInner = grad._unwrap();
 
-      // Create unscaleGrad lazy node: single input (grad), single output (unscaled grad)
+      // Create unscaleGrad lazy node: [grad, scale] inputs, single output.
       const node = createLazyIRNode(
         "unscaleGrad",
-        [gradInner.lazyRef],
+        [gradInner.lazyRef, scaleRef],
         grad.shape,
         "f32",
         device,
@@ -318,9 +411,11 @@ export class GradScaler {
       gradInner._updateLazyRef(createPendingRef(node));
     }
 
-    // Store for deferred readback
+    // Store for deferred readback. `_fusedInfBackend` is the PERSISTENT ref the
+    // driver uses to advance the CPU mirror on HITS (where this body never runs).
     this._pendingInfBuffer = infFlagBuffer;
     this._pendingInfBackend = backend;
+    this._fusedInfBackend = backend;
   }
 
   /**

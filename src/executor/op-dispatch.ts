@@ -642,16 +642,16 @@ function buildOpTable(): Map<string, OpHandler> {
     return backend.ops.clamp(backendInputs[0], p?.min ?? null, p?.max ?? null);
   });
 
-  // unscaleGrad: outlier signature (payload fields spread as separate args)
+  // unscaleGrad: outlier signature. inputs[0]=grad, inputs[1]=scale (persistent
+  // 1-element LiveScalar tensor read LIVE; invScale=1/scale reciprocated
+  // in-kernel); infFlagBuffer rides the payload (a raw GPU buffer, not a graph
+  // tensor).
   t.set("unscaleGrad", (node, backendInputs, backend) => {
-    const payload = requirePayload<{
-      invScale: number;
-      infFlagBuffer: unknown;
-    }>(node);
+    const payload = requirePayload<{ infFlagBuffer: unknown }>(node);
     assertOpSupported("unscaleGrad", backend.ops.unscaleGrad);
     return backend.ops.unscaleGrad(
       backendInputs[0],
-      payload.invScale,
+      backendInputs[1],
       payload.infFlagBuffer,
     );
   });

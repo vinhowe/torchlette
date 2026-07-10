@@ -424,6 +424,31 @@ export async function executeRowProgram(
     return;
   }
 
+  // [scaler-as-tensor] Stale recorded external: the action's inputRefs are
+  // captured at TEMPLATE RECORD time, and executeLoweredPlan's reuse remap
+  // only covers PENDING refs (a materialized ref got position -1 — "no
+  // remapping needed" assumed persistent storage). A materialized ref to a
+  // STEP-TEMP (e.g. the 0-d grad seed of scale(loss) = mul(loss, scaleTensor),
+  // whose producer ran in an earlier plan of the recording step) is destroyed
+  // by the next sweep — every template reuse would then read the RECLAIMED
+  // record-era storage: stale bytes on the silent path (a wrong grad seed the
+  // step after a scale growth), a [lifetime] throw under STRICT. Detect it
+  // up front and take the established safe sequential fallback, which
+  // resolves the CURRENT nodes' own refs.
+  const { storageTracker } = await import("../graph/storage-tracker");
+  for (const ref of inputRefs) {
+    if (
+      ref.kind === "materialized" &&
+      storageTracker.isDestroyed(ref.storage.id)
+    ) {
+      recordFusionFallback("row-program-stale-external", coveredNodes.length);
+      for (const node of coveredNodes) {
+        if (!node.result) await executeNode(node, backend);
+      }
+      return;
+    }
+  }
+
   try {
     const { dispatchRowProgram } = await import(
       "../backend/webgpu/row-program-dispatch"

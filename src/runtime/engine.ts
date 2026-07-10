@@ -1089,7 +1089,7 @@ export class RuntimeEngine {
    * the recorded `tensorFromArray` scatter-source from the noted value each
    * replay (clause 3 — LIVE READS). `dst` MUST be a persistent, materializable
    * f32[1]; `LiveScalar.set` notes the host value at this same seam. */
-  setScalarInPlace(dst: Tensor, value: number): void {
+  setScalarInPlace(dst: Tensor, value: number): Tensor {
     // Deliver `value` into dst's fixed buffer via an in-place, graph-ordered
     // scatter from a per-step `tensorFromArray` source. The scatter's
     // TRUE-IN-PLACE DMA keeps dst's buffer identity stable across record/replay
@@ -1098,7 +1098,15 @@ export class RuntimeEngine {
     // readers, measured on the 124M model). Graph-ordered (clause 1). The
     // step-tape's `scalarDresses` re-dress re-executes this recorded scatter's
     // tensorFromArray source from the noted host value each replay (clause 3 —
-    // LIVE READS). `dst` MUST be a persistent, materializable f32[1]. */
+    // LIVE READS). `dst` MUST be a persistent, materializable f32[1].
+    //
+    // Returns the SOURCE as a TRACKED tensor the caller (LiveScalar) must hold
+    // until the scatter has certainly executed. Untracked, the source storage
+    // has no owner (rc=0 once its plan claim drops): under RUNAHEAD the source
+    // can execute in an EARLY force while the scatter's execution rides the
+    // DEFERRED boundary commit — reachability destroys the ownerless source
+    // in between and the deferred scatter reads a RECLAIMED storage (the
+    // setLR-under-ringK2 STRICT transient that kept the scheduler NOSCHED). */
     const srcNode = createLazyIRNode(
       "tensorFromArray",
       [],
@@ -1107,7 +1115,9 @@ export class RuntimeEngine {
       dst.device,
       { values: Float32Array.of(value), dtype: "f32" },
     );
+    const srcT = this.trackNode(srcNode, dst.shape.slice(), dst.device, "f32");
     this._scatterFromNode(dst, srcNode);
+    return srcT;
   }
 
   full(

@@ -2264,22 +2264,30 @@ function generateNarrowBackward(
   };
 }
 
-/** unscaleGrad: ALLOC(kind 1, power-of-two bytes) + volatile UNIFORM repack
- *  + tile dispatch [grad_in, grad_out, inf_flag, config]. */
+/** unscaleGrad: ALLOC(kind 1, power-of-two bytes) + tile dispatch
+ *  [grad_in, grad_out, inf_flag, scale, config].
+ *  scaler-as-tensor: scale is a persistent 1-element storage input (the
+ *  LiveScalar buffer, node.inputs[1]) read LIVE (invScale reciprocated
+ *  in-kernel), and the config is fully STATIC — so there is NO TAG_UNIFORM
+ *  volatile repack (the retired inv_scale-frozen class). The config buffer is
+ *  bound once via `tilePlanBindings` (name===null → planned.plan.configBuffer,
+ *  baked at plan() time). */
 function generateUnscaleGrad(
   node: LazyIRNode,
   slots: SlotSource[],
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
 ): { commands: GpuCommand[]; outSlot: Slot } | string {
-  const payload = node.payload as
-    | { invScale?: number; infFlagBuffer?: unknown }
-    | undefined;
-  if (!payload || payload.invScale === undefined || !payload.infFlagBuffer) {
+  const payload = node.payload as { infFlagBuffer?: unknown } | undefined;
+  if (!payload || !payload.infFlagBuffer) {
     return "payload";
   }
   const ref = node.inputs[0];
   if (!ref || ref.kind === "scalar") return "arity";
+  const scaleRef = node.inputs[1];
+  if (!scaleRef || scaleRef.kind === "scalar") return "arity";
+  const scaleSlot = resolveRefSlot(scaleRef);
+  if (scaleSlot === undefined) return "untracked-scale";
   const storage =
     ref.kind === "materialized"
       ? ref.storage
@@ -2298,7 +2306,7 @@ function generateUnscaleGrad(
   } else {
     return "no-storage";
   }
-  const planned = planUnscaleGradDispatch(size, payload.invScale);
+  const planned = planUnscaleGradDispatch(size);
   if (!planned) return "chunked";
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
@@ -2306,10 +2314,10 @@ function generateUnscaleGrad(
     grad_in: inSlot,
     grad_out: outSlot,
     inf_flag: bufferSlot(payload.infFlagBuffer, "persistent"),
+    scale: scaleSlot,
   };
   const bindings = tilePlanBindings(planned.plan, named, bufferSlot);
   if (!bindings) return "config-missing";
-  const configSlot = bufferSlot(planned.plan.configBuffer, "persistent");
   return {
     commands: [
       {
@@ -2318,12 +2326,6 @@ function generateUnscaleGrad(
         bytes: planned.alignedBytes,
         allocKind: 1,
         inputSlots: [],
-      },
-      {
-        tag: TAG_UNIFORM,
-        slot: configSlot,
-        nodeIndex: -1, // patched by the caller (walker knows the action index)
-        pack: () => new Uint32Array(0),
       },
       {
         tag: TAG_DISPATCH,
