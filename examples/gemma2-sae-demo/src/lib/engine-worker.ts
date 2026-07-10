@@ -239,11 +239,64 @@ async function handleGenerate(
   });
 }
 
+/** Debug (#59 gibberish hunt): read back raw embedding-table values and a
+ *  gather result so the browser GPU table can be diffed against checkpoint
+ *  ground truth. Driven via CDP: self.onmessage({data:{type:"readback"}}). */
+async function handleReadback(row: number, n: number) {
+  if (!api || !model) throw new Error("Not loaded");
+  const w = model.embedTokens.weight;
+  const table = await w.narrow(0, row, 1).narrow(1, 0, n).cpu();
+  const idx = api.tensorFromArray([row], [1]);
+  const gathered = await model.embedTokens
+    .forward(idx)
+    .narrow(1, 0, n)
+    .cpu();
+  const out = { row, dtype: w.dtype, table, gathered };
+  (self as unknown as { __readback: unknown }).__readback = out;
+  console.log("READBACK", JSON.stringify(out));
+}
+
+/** Synthetic f16-gather probe (no model needed): row r holds r + col/10, so a
+ *  correct gather of row r reads [r.0, r.1, ...] and the Metal 2× bug reads
+ *  [2r.0, ...]. Driven via CDP: self.onmessage({data:{type:"synthetic"}}). */
+async function handleSynthetic() {
+  if (!api) {
+    const ok = await initWebGPU();
+    if (!ok) throw new Error(getWebGPUInitError() || "WebGPU init failed");
+    api = new Torchlette("webgpu", { enableFusion: true });
+  }
+  const rows = 1000;
+  const hidden = 8;
+  const data = new Float32Array(rows * hidden);
+  for (let r = 0; r < rows; r++)
+    for (let col = 0; col < hidden; col++) data[r * hidden + col] = r + col / 10;
+  const results: Record<string, number[]> = {};
+  for (const dt of ["f16", "f32"] as const) {
+    const table = api.tensorFromArray(data, [rows, hidden], {
+      dtype: dt,
+      device: "webgpu",
+    });
+    for (const r of [1, 5, 100]) {
+      const idxT = api.tensorFromArray([r], [1]);
+      results[`${dt}_row${r}`] = await api
+        .embedding(table, idxT)
+        .narrow(1, 0, 4)
+        .cpu();
+    }
+  }
+  (self as unknown as { __synthetic: unknown }).__synthetic = results;
+  console.log("SYNTHETIC", JSON.stringify(results));
+}
+
 self.onmessage = async (e: MessageEvent) => {
   const msg = e.data;
   try {
     if (msg.type === "load") {
       await handleLoad(msg.modelId, msg.saeBaseUrl, msg.weightDtype);
+    } else if (msg.type === "readback") {
+      await handleReadback(msg.row ?? 0, msg.n ?? 16);
+    } else if (msg.type === "synthetic") {
+      await handleSynthetic();
     } else if (msg.type === "inspect") {
       await handleInspect(msg.id, msg.prompt, msg.topK);
     } else if (msg.type === "generate") {
