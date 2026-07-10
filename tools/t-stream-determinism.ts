@@ -19,6 +19,26 @@ const CFG: GPT2Config = {
 };
 
 async function main() {
+  // This gate measures the RECORDED build source (record a template twice →
+  // diff the compiled streams). Under the build-from-IR DEFAULT no recording
+  // happens, so getCompiledStreams() returns a different set on the second pass
+  // and the tool reports a spurious "STREAM COUNT differs" (pre-existing rot in
+  // the default flag state, #84). The in-suite gate
+  // (test/compiled-plan-parity.spec.ts "stream recording is deterministic")
+  // ALWAYS spawns this with TORCHLETTE_BUILD_FROM_IR=0; require it explicitly so
+  // a bare invocation fails with an actionable message instead of a cryptic
+  // count mismatch. (BUILD_FROM_IR=0 is a named sunset — when it dies, so does
+  // this recorded-stream gate; the in-suite spec is the surviving determinism
+  // check either way.)
+  if (process.env.TORCHLETTE_BUILD_FROM_IR !== "0") {
+    console.log(
+      "SKIP: this gate requires TORCHLETTE_BUILD_FROM_IR=0 (it measures the " +
+        "recorded build source, which the build-from-IR default does not " +
+        "produce). Re-run as: TORCHLETTE_BUILD_FROM_IR=0 npx tsx " +
+        "tools/t-stream-determinism.ts",
+    );
+    process.exit(2);
+  }
   if (!(await initWebGPU())) process.exit(1);
   const api = new Torchlette("webgpu", { enableFusion: true, enableMemoryPlanning: true });
   const model = new GPT2(api, CFG, { device: "webgpu" });
