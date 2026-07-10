@@ -1178,6 +1178,16 @@ export function dispatchFlashAttentionBackwardDKV(
   return { dKBuffer, dVBuffer };
 }
 
+/** SPIKE-ONLY re-export of the private forward spec factory so the schedule-
+ *  record spike can diff its lifted WGSL against the real kernel's WGSL
+ *  (CPU-only, no GPU). Throwaway — remove with the spike. */
+export function __spikeMakeForwardAttentionSpec(
+  headDim: number,
+  mod?: AttnModifierSpec,
+): TileKernelSpec {
+  return makeForwardAttentionSpec(headDim, mod);
+}
+
 /** Reset all module-local mutable state (pipeline cache, config buffer cache). */
 export function resetAttentionKernelState(): void {
   configCache.clear();
