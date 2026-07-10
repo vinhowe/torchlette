@@ -493,10 +493,13 @@ export interface BackendOps {
    * dispatches. Returns results in input order.
    */
   adamStepBatch?(items: AdamBatchItem[]): AdamBatchResult[];
-  /** Fused unscale + inf-check + zero-mask for GradScaler. */
+  /** Fused unscale + inf-check + zero-mask for GradScaler.
+   *  scaler-as-tensor: `scale` is a persistent 1-element f32 tensor (the
+   *  GradScaler's LiveScalar buffer) read LIVE from a storage binding, not a
+   *  frozen uniform number (invScale = 1/scale reciprocated in-kernel). */
   unscaleGrad?(
     grad: BackendTensor,
-    invScale: number,
+    scale: BackendTensor,
     infFlagBuffer: unknown,
   ): BackendTensor;
   /** Fused attention forward: Q,K,V [B,H,N,D] → O [B,H,N,D] + logsumexp [B,H,N]. */

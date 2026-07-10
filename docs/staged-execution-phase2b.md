@@ -1797,3 +1797,89 @@ net; Adam's per-optimizer copy_+note deleted (net-neutral). No new env flags.
 Retirements: the ad-hoc per-optimizer `copy_(lrT, tensorFromArray)+noteScalarSlot`
 delivery (now the ONE primitive). scalar-slots.ts + scalarDresses are KEPT (the
 primitive rides them — the proven INC-2B seam — rather than a parallel one).
+
+---
+
+## SCALER-AS-TENSOR (Consumer 2) — LANDED; setLR ringK2 STRICT un-NOSCHED'd
+
+The `t-scaler-growth-probe` retirement gate is GREEN: a growth-interval
+crossing under capture keeps HITTING and the captured trajectory is
+BIT-EXACT against the uncaptured control (maxLossΔ 0.00e+0, scale 4→128 in
+lockstep). The last known frozen-scalar exposure (TORCHLETTE_STEP_TAPE=1 +
+capture + GradScaler + growth crossing) is retired.
+
+**Design (one live tensor, reciprocal in-kernel):**
+- `GradScaler._scaleLive` (a `LiveScalar`) is THE scale. `scale(loss)` =
+  `mul(loss, scaleLive.tensor)`; the fused `unscaleGrad` takes the SAME tensor
+  as `node.inputs[1]` and reciprocates `invScale = 1/scale` IN-KERNEL (the
+  adam inc-2a `t`/`lr` storage-read treatment). RETIRED: the `inv_scale`
+  config-uniform field + its volatileRepack closure (unscale-kernel.ts) + the
+  TAG_UNIFORM repack in stream-generate — the unscale config is now fully
+  STATIC. The CPU `_scale` number is a stats-only mirror.
+- REJECTED alternates (measured): a SECOND live invScale tensor (two driver
+  scatters per body; the re-dress covers one — the second's recorded source
+  goes stale); an in-graph `div(1, scale)` node (its step-temp output becomes
+  a row-program external and added ~5x compiled-plan fp drift on the
+  train-capture gate).
+- Driver-resolved found-inf: `resolveDeferred` splits MISS (old
+  markStep+readback — forms the tape in implied-boundary loops) from HIT
+  (advance the mirror via the inc-3 snapshot ring or growth-only bookkeeping,
+  NO markStep — an extra boundary on hits perturbs the implied-boundary fp
+  regime and resets the recorder). K-behind ring cadence preserved; found-inf
+  never rides the per-step critical path.
+- `_applyScaleAdjustment` writes the live tensor only on an ACTUAL change
+  (scale holds constant between growth/backoff events; every write mints a
+  per-step scatter).
+
+**setLR ringK2 STRICT — the NOSCHED caveat is CLOSED.** The warmup transient
+(`:1497`/`:1589`/`:1784` above) was TWO short-lived storages of the driver
+write chain destroyed between the driver's `set()` and the ring's DEFERRED
+boundary commit: (1) the scatter SOURCE (ownerless `tensorFromArray`, rc=0
+after its plan claim), (2) the PRE-WRITE dst handle (the write's
+`_updateLazyRef` releases the owner claim while deferred consumers — the
+ring's adamStep — still hold materialized refs to it). `LiveScalar` now PINS
+both across the ring window (`_pinRing`, FIFO 8; `setScalarInPlace` returns
+the tracked source). Gate: `RING_MEASURE_ARM=ringK2` + CosineAnnealingLR +
+STRICT_LIFETIME + STRICT_GPU = ZERO events, hits=18, sane trajectory.
+
+**Two structural fixes this surfaced (both landed):**
+- **rc retain/release LEDGER** (node-factory.ts): `releaseNodeInputRefs` now
+  releases EXACTLY the ids `retainPlanInputRefs` recorded on the node
+  (`_retainedInputIds`), not an inputs-derived recomputation — mid-force graph
+  rewrites (`redirectConsumers`: CSE, identity-cast/mul-by-1 bypass, re-applied
+  on template hits) substitute MATERIALIZED refs between retain and release,
+  and the phantom release destroyed rc=1 persistent scalars under their
+  readers. Single source of truth at the seam.
+- **row-program stale-external fallback** (segment-executors.ts): a
+  row-program action's recorded inputRefs only remap PENDING refs on template
+  reuse (materialized got pos=-1, "no remapping needed" — false for step-temp
+  externals, e.g. the 0-d grad seed of scale-as-tensor's mul). A reclaimed
+  materialized external now takes the established safe sequential fallback
+  instead of silently reading the dead record-era storage.
+
+**KNOWN OPEN (named, root-caused, out of this campaign's seam):**
+- `t-train-capture-probe` maxDelta ~2.1e-2 (deterministic) vs the 2.5e-3
+  threshold. The threshold is not reliably achievable on this box even on
+  main (measured main: FAIL 4.7e-2 / PASS alternating, plus zero-loss
+  control-arm episodes — the documented plain-path memory-pressure flake).
+  hits/refusals/bodyFrozen are unchanged and both arms are STRICT-clean; the
+  residual is honest replay-vs-fresh drift plus (suspected) a recorded
+  compiled slot binding a record-era step-temp 0-d external on the tape arm
+  — the same class the sequential fallback fixes on the lowered path; the
+  compiled/tape-side freshness for recorded step-temp externals belongs to
+  the executor/islands surface.
+- `t-scaler-growth-probe` under STRICT_LIFETIME: ONE warmup-era transient
+  remains (uncaptured CONTROL run, step ~2). Root cause fully traced: the
+  storage-tracker's single-slot owner backref (`tensorWeakRefs`) is HIJACKED
+  by the autograd retention clone (`_cloneForRetention`) materializing into
+  the persistent scale tensor's storage; the demotion sweep then judges the
+  storage by the (disposed, not-in-snapshot) clone and releases the owner's
+  claim (`stepScoped`) under its readers. Bytes stay correct (fixed buffer;
+  trajectory Δ=0) — the throw is a defensive true-positive on claim
+  attribution, not data. THREE surgical fixes were built and measured — clone
+  noTrack, yield-to-live-claimant tracking, disposed-target sweep skip — each
+  cures this probe and each breaks `test/implied-step-boundary.spec.ts`
+  (mixed-usage values 0.48 / [8,16] STRICT trio): the sweeps' claim
+  attribution via last-tracker-wins is LOAD-BEARING in contradictory
+  directions. Needs a claim-attribution repair in the storage tracker (owner
+  set or claim-holder-aware sweeps) — a dedicated campaign, not a patch.

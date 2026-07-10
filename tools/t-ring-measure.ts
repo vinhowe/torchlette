@@ -38,10 +38,14 @@ const MODEL = process.env.MODEL ?? "distilgpt2";
 const SEQ = parseInt(process.env.SEQ_LEN ?? "512", 10);
 const BATCH = parseInt(process.env.BATCH ?? "1", 10);
 const STEPS = parseInt(process.env.STEPS ?? "30", 10);
-// NOSCHED=1: drop the per-step driver-level LR scheduler. KNOWN ISSUE: under
-// RUNAHEAD a per-step scheduler write has a warmup-era transient [lifetime]
-// warn (the [2b-sched]/dangling-copy_ family; trajectory impact below noise) —
-// the STRICT gate runs NOSCHED=1 until that follow-on lands.
+// NOSCHED=1: drop the per-step driver-level LR scheduler. The KNOWN ISSUE that
+// forced STRICT runs to NOSCHED=1 is CLOSED (scaler-as-tensor campaign): the
+// ringK2 transient was the write chain's short-lived storages — the scatter
+// SOURCE (ownerless tensorFromArray) and the PRE-WRITE dst handle — destroyed
+// between the driver's set() and the ring's DEFERRED boundary commit that
+// executes/reads them. LiveScalar now pins both across the ring window
+// (core/live-scalar.ts `_pinRing`). STRICT + ringK2 + CosineAnnealingLR runs
+// clean; NOSCHED remains only as a manual isolation knob.
 const NOSCHED = process.env.NOSCHED === "1";
 const log = (m: string) => console.error(`[t-ring-measure] ${m}`);
 

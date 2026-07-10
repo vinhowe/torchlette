@@ -32,7 +32,7 @@ import {
   type TileKernelInstance,
 } from "./tile-dispatch";
 import type { TileKernelSpec } from "./tile-ir";
-import { onTeardown } from "./webgpu-state";
+import { onTeardown, trackSharedEncoderWrite } from "./webgpu-state";
 
 // ============================================================================
 // Tile-IR Unscale Spec
@@ -46,14 +46,24 @@ function makeUnscaleSpec(): TileKernelSpec {
       grad_in: { storage: "read", type: "f32" },
       grad_out: { storage: "read_write", type: "f32" },
       inf_flag: { storage: "atomic", type: "u32" },
+      // scaler-as-tensor: the SCALE flows as a persistent 1-element f32 tensor
+      // DATA (the GradScaler's `_scaleLive` LiveScalar buffer), not a
+      // per-step-varying uniform. The recorder sees a stable buffer, so a
+      // growth/backoff rescale flows through tape HITS as DATA — killing the
+      // frozen-scalar / volatile-repack class for the scaler. Mirrors the
+      // adam-kernel inc-2a `lr`/`t` storage-read treatment. invScale = 1/scale
+      // is reciprocated IN-KERNEL (one op) rather than via a separate `div`
+      // PLAN NODE — the div node's step-temporary output added compiled-plan
+      // fp drift over a trajectory (measured ~5x on the train-capture gate).
+      scale: { storage: "read", type: "f32" },
     },
     uniforms: {
-      inv_scale: "f32",
       num_elements: "u32",
       grid_stride: "u32",
       _pad0: "u32",
+      _pad1: "u32",
     },
-    uniformBindingIndex: 3,
+    uniformBindingIndex: 4,
     grid: (u) => {
       const wg = Math.ceil(u.num_elements / WORKGROUP_SIZE);
       if (wg <= MAX_WORKGROUPS_PER_DIM) return [wg];
@@ -73,7 +83,11 @@ function makeUnscaleSpec(): TileKernelSpec {
         ctx.emitReturn();
       });
 
-      const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
+      // scale read from the persistent 1-element storage input (LIVE DATA);
+      // invScale = 1/scale reciprocated in-kernel (matches PyTorch's
+      // grad * (1/scale) — exact for the power-of-two scales the scaler uses).
+      const scale = ctx.load("scale", ctx.u32(0));
+      const invScale = ctx.emitLet("inv_scale", ctx.f32(1.0).div(scale));
       const g = ctx.emitLet("g", ctx.load("grad_in", idx).mul(invScale));
 
       // Check finite via bit pattern
@@ -321,7 +335,7 @@ interface UnscaleGradResult {
 export function dispatchUnscaleGrad(
   gradBuffer: GPUBuffer,
   numElements: number,
-  invScale: number,
+  scaleBuffer: GPUBuffer,
   infFlagBuffer: GPUBuffer,
 ): UnscaleGradResult {
   const bytesPerElement = 4; // f32
@@ -344,50 +358,45 @@ export function dispatchUnscaleGrad(
   const gridSizeX = Math.min(workgroups, MAX_WORKGROUPS_PER_DIM);
   const gridStride = gridSizeX * WORKGROUP_SIZE;
 
+  // scale is read from a 1-element storage input bound at index 0 by every
+  // chunk (scaler-as-tensor). The pool must not hand it back as output within
+  // this shared-encoder scope.
+  trackSharedEncoderWrite(scaleBuffer);
+
   const dispatcher = getUnscaleDispatcher();
   const buffers = {
     grad_in: gradBuffer,
     grad_out: gradOut,
     inf_flag: infFlagBuffer,
+    scale: scaleBuffer,
   };
   const uniforms = {
-    inv_scale: invScale,
     num_elements: numElements,
     grid_stride: gridStride,
     _pad0: 0,
+    _pad1: 0,
   };
 
-  // Volatile repack for compiled-plan replays: inv_scale changes whenever the
-  // GradScaler rescales (overflow backoff / growth). Re-derive it from the
-  // CURRENT step's unscaleGrad node payload so replays never unscale with a
-  // frozen record-time scale.
-  const volatileRepack = (node: {
-    op?: string;
-    payload?: unknown;
-  }): Record<string, number> => {
-    if (node.op !== "unscaleGrad" || !node.payload) {
-      throw new Error(
-        `[unscale-kernel] volatile repack expected an unscaleGrad node, got '${node.op}' — compiled plan / node-index mismatch`,
-      );
-    }
-    const payload = node.payload as { invScale: number };
-    return { ...uniforms, inv_scale: payload.invScale };
-  };
-
+  // scaler-as-tensor: the config is now FULLY STATIC (num_elements/grid_stride
+  // never vary per step). scale flows as the `scale` storage-buffer DATA input
+  // (invScale reciprocated in-kernel), so there is NO volatile repack — the
+  // config buffer is bound once and never rewritten across compiled-plan
+  // replays. The retired volatile-repack closure (re-deriving inv_scale from the
+  // node payload) lived here.
   if (needsChunking) {
-    dispatcher.dispatchChunked(
-      buffers,
-      uniforms,
-      {
-        modes: { grad_in: "chunked", grad_out: "chunked", inf_flag: "scalar" },
-        sizeUniform: "num_elements",
-        totalElements: numElements,
-        maxBytesPerElement: bytesPerElement,
+    dispatcher.dispatchChunked(buffers, uniforms, {
+      modes: {
+        grad_in: "chunked",
+        grad_out: "chunked",
+        inf_flag: "scalar",
+        scale: "scalar",
       },
-      volatileRepack,
-    );
+      sizeUniform: "num_elements",
+      totalElements: numElements,
+      maxBytesPerElement: bytesPerElement,
+    });
   } else {
-    dispatcher.dispatch(buffers, uniforms, volatileRepack);
+    dispatcher.dispatch(buffers, uniforms);
   }
 
   return { gradOutBuffer: gradOut };
@@ -413,19 +422,21 @@ function roundUpToPowerOfTwo(size: number): number {
  *  on the chunked route. */
 export function planUnscaleGradDispatch(
   numElements: number,
-  invScale: number,
 ): { plan: import("./tile-dispatch").TileKernelPlan; alignedBytes: number } | null {
   const totalBytes = numElements * 4;
   if (totalBytes > getMaxStorageBufferBindingSize()) return null;
   const workgroups = Math.ceil(numElements / WORKGROUP_SIZE);
   const gridSizeX = Math.min(workgroups, MAX_WORKGROUPS_PER_DIM);
   const gridStride = gridSizeX * WORKGROUP_SIZE;
+  // scaler-as-tensor: config is fully STATIC (inv_scale is a storage-buffer
+  // DATA input now, not a uniform), so the generated stream binds the config
+  // buffer once (no TAG_UNIFORM repack for inv_scale).
   return {
     plan: getUnscaleDispatcher().plan({
-      inv_scale: invScale,
       num_elements: numElements,
       grid_stride: gridStride,
       _pad0: 0,
+      _pad1: 0,
     }),
     alignedBytes: roundUpToPowerOfTwo(totalBytes),
   };

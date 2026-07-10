@@ -52,21 +52,34 @@ export function retainPlanInputRefs(nodes: readonly LazyIRNode[]): void {
   for (const node of nodes) {
     if (node._inputsRetained) continue;
     node._inputsRetained = true;
+    // Record the retained ids on the node — the release LEDGER. The release
+    // must NOT re-derive this set from `inputs`: mid-force graph rewrites
+    // (`redirectConsumers` — CSE, identity-cast / mul-by-1 bypass, re-applied
+    // inside _dispatchForcePlan on a template hit) substitute a consumer's
+    // pending input with a MATERIALIZED ref between retain and release, so an
+    // inputs-derived release freed a storage that was never retained (a phantom
+    // release — destroyed the GradScaler's rc=1 live scale tensor while its
+    // owner still read it). Single source of truth at the retain/release seam.
+    let ids: number[] | null = null;
     for (const input of node.inputs) {
       if (input.kind === "materialized") {
         rcRetain(input.storage.id, "plan.input");
+        (ids ??= []).push(input.storage.id);
       }
     }
+    node._retainedInputIds = ids;
   }
 }
 
-/** Release retained refs on a node's materialized inputs (idempotent). */
+/** Release EXACTLY the refs retainPlanInputRefs recorded (idempotent). */
 export function releaseNodeInputRefs(node: LazyIRNode): void {
   if (!node._inputsRetained) return;
   node._inputsRetained = false;
-  for (const input of node.inputs) {
-    if (input.kind === "materialized") {
-      rcRelease(input.storage.id, "plan.inputConsumed");
+  const ids = node._retainedInputIds;
+  node._retainedInputIds = null;
+  if (ids) {
+    for (const id of ids) {
+      rcRelease(id, "plan.inputConsumed");
     }
   }
 }

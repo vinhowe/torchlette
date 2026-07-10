@@ -36,6 +36,7 @@
 
 import type { Tensor } from "../frontend/tensor";
 import type { Torchlette } from "../frontend/torchlette";
+import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import { noteScalarSlotValue } from "./scalar-slots";
 
 /**
@@ -47,6 +48,20 @@ export class LiveScalar {
   /** The persistent, buffer-stable f32[1] tensor consumers read. */
   readonly tensor: Tensor;
   private _value: number;
+  // Pin the write chain's short-lived storages across the RUNAHEAD window
+  // (the setLR-under-ringK2 STRICT transient that kept the scheduler NOSCHED):
+  //  - the scatter SOURCE (setScalarInPlace returns it TRACKED): ownerless it
+  //    is rc=0 once its plan claim drops, and it can execute in an EARLY force
+  //    while its scatter rides the DEFERRED boundary commit — reachability
+  //    destroys it in between and the deferred scatter reads RECLAIMED storage;
+  //  - the PRE-WRITE dst handle: consumers queued behind the deferred boundary
+  //    (the ring's adamStep) hold materialized refs to it, but the write's
+  //    `_updateLazyRef` releases the owner claim immediately — a sweep between
+  //    the driver write and the deferred force destroys it under the readers.
+  // A short FIFO spans the ring's in-flight window (K≤2, two pins per set,
+  // plus slack); drained entries are disposed back to reachability.
+  private static readonly PIN_KEEP = 8;
+  private readonly _pinRing: RuntimeTensor[] = [];
 
   constructor(
     private readonly api: Torchlette,
@@ -74,10 +89,34 @@ export class LiveScalar {
    */
   set(v: number): void {
     this._value = v;
-    this.api._runtime().setScalarInPlace(this.tensor._unwrap(), v);
+    const rt = this.api._runtime();
+    const inner = this.tensor._unwrap();
+    // Pin the PRE-WRITE handle before the write moves the owner claim off it
+    // (see `_pinRing` — deferred consumers still read it under runahead).
+    const prev = inner.lazyRef;
+    if (prev.kind === "materialized") {
+      this._pin(
+        rt.createFromStorageHandle(
+          prev.storage,
+          inner.shape,
+          inner.device,
+          inner.dtype,
+        ),
+      );
+    }
+    // Pin the tracked source so a scatter whose execution rides a DEFERRED
+    // boundary still finds it alive.
+    this._pin(rt.setScalarInPlace(inner, v));
     // Note the host value for the step-tape re-dress (single source at the
     // seam): the recorded in-plan scatter re-executes its tensorFromArray
     // source from THIS value each replay, keyed by the owning tensor identity.
-    noteScalarSlotValue(this.tensor._unwrap(), v);
+    noteScalarSlotValue(inner, v);
+  }
+
+  private _pin(t: RuntimeTensor): void {
+    this._pinRing.push(t);
+    if (this._pinRing.length > LiveScalar.PIN_KEEP) {
+      this._pinRing.shift()?.dispose();
+    }
   }
 }

@@ -138,6 +138,16 @@ export class LazyIRNode {
   results?: (StorageHandle | undefined)[];
   /** True while input rc is retained by the plan executor (prevents double-retain). */
   _inputsRetained?: boolean;
+  /** Storage ids retained by retainPlanInputRefs — the release LEDGER.
+   *  releaseNodeInputRefs releases EXACTLY these (single source of truth at the
+   *  retain/release seam): mid-force graph rewrites (`redirectConsumers` — CSE,
+   *  identity-cast / mul-by-1 bypass, re-applied inside _dispatchForcePlan on a
+   *  template hit) substitute a consumer's pending input with a MATERIALIZED
+   *  ref BETWEEN retain and release, so re-deriving the release set from
+   *  `inputs` released a storage that was never retained — a phantom release
+   *  that destroyed an rc=1 persistent scalar (the GradScaler's live scale
+   *  tensor) while its owner still read it (STRICT_LIFETIME's RECLAIMED-read). */
+  _retainedInputIds?: number[] | null;
   /**
    * Set after execution. Survives node.result cleanup so buildMergedPlan's
    * skipExecuted can distinguish "executed but result cleared" from "never executed".
