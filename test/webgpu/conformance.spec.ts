@@ -33,20 +33,16 @@ describe.skipIf(cpuOnly)("op conformance (WebGPU, vs CPU differential)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // Catalogued expected-failures (visible debt, not silence).
+  // #59 dtype-parametrization fixes (formerly catalogued it.fails; the fixed
+  // markers flipped red → removed per the visible-debt protocol).
   // -------------------------------------------------------------------------
 
-  // FINDING #A (surfaced by this harness, #59-class dtype-oblivious): the fused
-  // isfinite codegen emits `bitcast<u32>(a[i])` on the input element, valid WGSL
-  // only for f32. On an f16 input the shader fails to compile, the enclosing
-  // submit is DROPPED, and the readback returns stale buffer data (all-zeros in
-  // isolation; coincidentally the correct all-ones when a prior isfinite[f32]
-  // left 1.0s in the reused buffer — which is exactly how a naive value-only
-  // differential missed it). CPU isfinite[f16] is correct. Not fixed here (the
-  // fix is in the fusion codegen's dtype handling, not a one-liner). `it.fails`
-  // documents the live bug and flips green→red the moment it is fixed.
-  it.fails(
-    "isfinite on f16 input emits invalid WGSL → dropped submit (FINDING #A, #59)",
+  // #59 FINDING #A: the fused isfinite codegen bitcast<u32> assumed f32; an f16
+  // input now upcasts to f32 first (exact, preserves inf/nan), and the unary
+  // out-binding is f32 (always_f32) rather than the input's f16. Guards the
+  // dropped-submit hazard via the GPU error counter.
+  it(
+    "isfinite on f16 input is correct (no dropped submit) (#59 FINDING #A)",
     async () => {
       const gpu = new Torchlette("webgpu");
       const before = getGpuUncapturedErrorCount();
@@ -61,14 +57,11 @@ describe.skipIf(cpuOnly)("op conformance (WebGPU, vs CPU differential)", () => {
     30_000,
   );
 
-  // FINDING #B (surfaced by this harness, #59-class dtype-oblivious): max/min
-  // GPU reductions read an f16 input's storage as f32, returning garbage (e.g.
-  // max over dim=-1 of an f16 [4,6] gives [25.59, 0.0027, 0, 0]). sum/mean f16
-  // reductions are correct, so this is specific to the max/min reduction kernel.
-  // CPU is correct. Not fixed here (reduction-kernel dtype handling, not a
-  // one-liner). `it.fails` documents the live bug.
-  it.fails(
-    "max reduction on f16 input is dtype-oblivious (FINDING #B, #59)",
+  // #59 FINDING #B: max/min reductions now upcast f16→f32 before reducing (the
+  // f32_required rule, exactly like sum/mean), so the kernel's f32 input binding
+  // reads the right lanes. GPU must match CPU (both take the same f16 rounding).
+  it(
+    "max reduction on f16 input matches CPU (#59 FINDING #B)",
     async () => {
       const gpu = new Torchlette("webgpu");
       const cpu = new Torchlette("cpu");
@@ -84,12 +77,10 @@ describe.skipIf(cpuOnly)("op conformance (WebGPU, vs CPU differential)", () => {
     30_000,
   );
 
-  // #59 dtype-oblivious kernels: gather reads f32 lanes even for an f16 source,
-  // returning garbage. The CPU backend is correct (see the assertion), so this
-  // is a GPU-only wrongness. `it.fails` documents the live bug and flips to a
-  // failure the moment #59 is fixed (prompting removal of this marker).
-  it.fails(
-    "gather on f16 source is dtype-oblivious (#59)",
+  // #59 PRIMARY: gather is now dtype-parametrized (f16 source → f16 output). An
+  // f16 embedding table both halves residency and stops chunking sooner.
+  it(
+    "gather on f16 source is dtype-correct (#59)",
     async () => {
       const gpu = new Torchlette("webgpu");
       const src = gpu
@@ -97,7 +88,7 @@ describe.skipIf(cpuOnly)("op conformance (WebGPU, vs CPU differential)", () => {
         .toDtype("f16");
       const idx = gpu.tensorFromArray([0, 2], [2, 1], { device: "webgpu" });
       const got = Array.from(await gpu.gather(src, idx, { dim: 1 }).cpu());
-      // Correct result is [1, 6]; GPU currently returns dtype-oblivious garbage.
+      // Correct result is [1, 6].
       expect(Math.abs(got[0] - 1)).toBeLessThan(0.05);
       expect(Math.abs(got[1] - 6)).toBeLessThan(0.05);
     },

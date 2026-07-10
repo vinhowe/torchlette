@@ -189,10 +189,9 @@ export const UNARY_OPS: UnaryOp[] = [
   // NOTE: gelu_erf is in OP_REGISTRY but has no table-installed method (reached
   // only via gelu(a, {approximate:"erf"})) — a metadata/dispatch gap, not swept
   // here. softplus likewise lacks a table method. See report's "metadata gaps".
-  // isfinite swept f32-only: the fused isfinite codegen bitcasts the input
-  // element as u32, invalid WGSL for f16 (dropped submit → stale/zero result).
-  // Catalogued as an explicit expected-fail in the webgpu spec (FINDING #A).
-  { name: "isfinite", domain: "any", tol: "exact", dtypes: ["f32"], ref: (x) => (Number.isFinite(x) ? 1 : 0) },
+  // isfinite swept f32+f16: an f16 input upcasts to f32 before the bitmask test
+  // and the output binding is f32 (always_f32) (#59 FINDING #A fixed).
+  { name: "isfinite", domain: "any", tol: "exact", dtypes: ["f32", "f16"], ref: (x) => (Number.isFinite(x) ? 1 : 0) },
 ];
 
 interface BinaryOp {
@@ -560,13 +559,12 @@ export function registerConformance(cfg: ConformanceCfg): void {
   });
 
   // ---- Reductions -------------------------------------------------------
-  // sum/mean swept f32+f16; max/min swept f32 only — their f16 GPU reduction is
-  // dtype-oblivious (reads f16 storage as f32 → garbage). Catalogued as an
-  // explicit expected-fail in the webgpu spec (FINDING #B, #59).
+  // All reductions swept f32+f16. sum/mean/max/min all upcast f16→f32 before
+  // reducing (the f32_required rule), so the kernel's f32 input binding reads
+  // the right lanes (#59 FINDING #B fixed).
   describe("reduction", () => {
     for (const name of REDUCTION_OPS) {
-      const dtypes: DType[] =
-        name === "max" || name === "min" ? ["f32"] : ["f32", "f16"];
+      const dtypes: DType[] = ["f32", "f16"];
       for (const dtype of dtypes) {
         it(
           `${name} [${dtype}]`,

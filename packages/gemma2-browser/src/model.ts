@@ -531,15 +531,27 @@ export class Gemma2 extends Module {
     // Union of modifier kinds across layers → structural tape discriminator.
     this.attnModKey = `gemma2.sc${config.attnLogitSoftcap}.w${config.slidingWindow}`;
 
+    // Embedding dtype follows weightDtype: f16 halves the 2.36GB f32 table to
+    // 1.18GB (#59 — gather is now dtype-parametrized, so an f16 table produces
+    // an f16 lookup that × sqrt(hiddenSize) flows through the f16 forward). The
+    // embedding × √d scaling and downstream consumers are dtype-agnostic.
+    const embedDtype = config.weightDtype ?? "f32";
     this.embedTokens = new Embedding(api, config.vocabSize, config.hiddenSize, {
       device,
+      dtype: embedDtype,
     });
-    // The 256k×2304 f32 embedding is 2.36GB. nn.Embedding randn-inits f32
-    // tables, and randn binds the whole buffer (> the 2GB storage-buffer
-    // binding limit) → a dropped submit. This is a pretrained-load path, so
-    // replace the randn'd weight with a zeros buffer (clearBuffer — no binding)
-    // BEFORE the randn node is ever forced; the loader overwrites it.
-    if (config.vocabSize * config.hiddenSize * 4 > (1 << 31) - 4) {
+    // The 256k×2304 embedding is 2.36GB (f32) / 1.18GB (f16). nn.Embedding
+    // randn-inits f32 tables, and randn binds the whole buffer (> the 2GB
+    // storage-buffer binding limit) → a dropped submit. This is a pretrained-
+    // load path, so replace the randn'd weight (created only in the f32 case)
+    // with a zeros buffer (clearBuffer — no binding) BEFORE the randn node is
+    // ever forced; the loader overwrites it. The f16 embedding is already zeros
+    // (Embedding skips randn for non-f32), so no replacement is needed there.
+    const embedElemBytes = embedDtype === "f16" ? 2 : 4;
+    if (
+      embedDtype === "f32" &&
+      config.vocabSize * config.hiddenSize * embedElemBytes > (1 << 31) - 4
+    ) {
       const randnWeight = this.embedTokens.weight;
       this.embedTokens.registerParameter(
         "weight",
@@ -598,12 +610,18 @@ export class Gemma2 extends Module {
    *  Null → single-matmul path (small vocab). */
   lmHeadChunks: Tensor[] | null = null;
 
-  /** Number of vocab rows per lm_head chunk (~1GB → 2 chunks for 2B). */
+  /** Number of vocab rows per lm_head chunk (~1GB → 2 chunks for 2B f32; f16
+   *  packs twice the rows per chunk). Sized from the embedding element bytes so
+   *  each chunk buffer stays under the ~1GB target regardless of dtype. */
   lmHeadChunkRows(): number {
-    return Math.floor((1 << 30) / (this.config.hiddenSize * 4));
+    const elemBytes = (this.config.weightDtype ?? "f32") === "f16" ? 2 : 4;
+    return Math.floor((1 << 30) / (this.config.hiddenSize * elemBytes));
   }
 
-  /** Tied lm_head: x @ W^T. Uses the pre-split chunks when present. */
+  /** Tied lm_head: x @ W^T. Uses the pre-split chunks when present. The
+   *  activation x is f32 (the residual stream stays f32 — see forward()), so a
+   *  tied f16 weight (#59) enters mixed-dtype matmul and ACCUMULATES in f32
+   *  (weight bound f16, cast on load — no second 2.36GB f32 table). */
   private lmHead(x: Tensor): Tensor {
     if (this.lmHeadChunks === null) {
       return this.api.linear(x, this.embedTokens.weight, null);
@@ -643,8 +661,20 @@ export class Gemma2 extends Module {
       sin: this.api.gather(this.ropeSin, ropeIdx, { dim: 0 }),
     };
 
-    // Embedding output scaled by sqrt(hiddenSize) (Gemma normalizer).
-    let x = this.api.mul(this.embedTokens.forward(idx), this.embedScale);
+    // Embedding output scaled by sqrt(hiddenSize) (Gemma normalizer). The
+    // resident table may be f16 (#59, residency win), but the RESIDUAL STREAM
+    // must stay f32 to match the reference: an f16 residual entering layer 0
+    // makes the per-layer RMSNorm/attention diverge catastrophically (hidden[1]
+    // maxAbs jumped 1e-6 → 60, top-5 scrambled). f16 activations inside the
+    // linears are fine (mixed-dtype matmul upcasts); it is the f32-accumulating
+    // residual that must be preserved. The gather already read f16 (the win);
+    // upcasting the small [seq,hidden] lookup to f32 costs nothing resident.
+    const embedLookup = this.embedTokens.forward(idx);
+    const embedF32 =
+      embedLookup.dtype === "f16"
+        ? this.api.toDtype(embedLookup, "f32")
+        : embedLookup;
+    let x = this.api.mul(embedF32, this.embedScale);
     const hidden: Tensor[] | undefined = options?.collectHidden
       ? [x]
       : undefined;

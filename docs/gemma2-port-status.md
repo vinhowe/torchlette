@@ -45,14 +45,26 @@ the environment; this mirror needs none. Reference dumped with conda torch
 ## Loader specifics (the Gemma-2-specific load path)
 - f16 linears via a bf16→f16-raw-bits fast upload (`bf16BufferToF16Bits` +
   `tensorFromArray(Uint16Array, f16)`), skipping the slow f32 `Array.from` in the
-  creation route — load 5min → ~45s. Norms + embedding stay f32.
-- The 2.36GB f32 embedding exceeds the 2GB storage-buffer BINDING limit, so:
+  creation route — load 5min → ~45s. Norms stay f32.
+- **The embedding table is now f16 when the model is f16 (#59).** Gather became
+  dtype-parametrized (`src/backend/webgpu/ops/gather-scatter.ts`), so an f16
+  table produces a correct f16 lookup. Resident memory: **2.36GB f32 → 1.18GB
+  f16** (the single biggest lever on a 16GB Mac). The model then upcasts the
+  small [seq,hidden] lookup to f32 so the RESIDUAL STREAM stays f32 — an f16
+  residual entering layer 0 diverges catastrophically (hidden[1] maxAbs 1e-6 →
+  60, top-5 scrambled); activations inside the linears stay f16 (mixed-dtype
+  matmul). f16-embedding M1 parity: top-5 EXACT, logits maxAbs 1.05e-4 / 3.86e-4
+  (vs f32-embed 9.35e-5 / 1.39e-4 — the honest f16 rounding; ref is HF f32 eager,
+  deployment gates on top-5).
+- The f32 embedding (2.36GB) still exceeds the 2GB storage-buffer BINDING limit:
   - Construction randn-init (binds whole) is replaced with a `zeros` (clearBuffer,
-    no binding) BEFORE the randn node forces.
+    no binding) BEFORE the randn node forces (f32 only; f16 Embedding is zeros).
   - It's uploaded via chunked `writeBuffer` (no binding) + re-registered; the
     embedding-forward gather auto-chunks its READ.
-  - The tied lm_head is pre-split into 3 sub-2GB vocab chunks (`Gemma2.lmHeadChunks`,
-    built at load from the same CPU data), matmul'd separately + concat.
+  - The tied lm_head is pre-split into 3 sub-2GB vocab chunks (`Gemma2.lmHeadChunks`)
+    matmul'd separately + concat. The **f16 table (1.18GB) is UNDER the 2GB
+    binding limit**, so the tied lm_head reads `embedTokens.weight` directly —
+    no chunks (`lmHeadChunks` stays null).
 
 ## Engine gaps found (the #64 audit claimed "essentially none" — TWO were missed)
 Both are the same failure class: a Gemma-2 dimension the audit didn't model.
@@ -108,8 +120,13 @@ generate-smoke: 30 tok @ 17.9 tok/s (V100), tape hits=26/30, ready=true.
 - **Browser wiring**: a gemma2-browser chat/steering app (mirror
   examples/qwen3-chat / qwen3-steering). The model + generateChat-shape decode
   are ready; needs the SvelteKit shell + browser weight loader (the qwen3
-  browser-loader/idb-cache pattern; f16 weights ~6.4GB + f32 embed 2.36GB — IDB
-  cache + streaming). The residualHook seam is in place for SAE steering.
+  browser-loader/idb-cache pattern). Resident memory (f16 deployment, #59):
+  f16 weights ~6.4GB + **f16 embed 1.18GB** (was 2.36GB f32) + norms — the tied
+  lm_head reuses the f16 embedding (no separate chunks). Total resident ~7.6GB,
+  down ~1.18GB from the pre-#59 f16-lm-head-chunks config; on a 16GB Mac this
+  drops gemma-2's ~8.7GB residency toward fully-resident (~6.3GB embed-side),
+  which is what unblocks sub-second decode (the owner's Mac re-measure is the
+  real acceptance). The residualHook seam is in place for SAE steering.
 - **Gemma Scope SAEs**: load + wire an SAE at a chosen layer via residualHook
   (encode activations → steer → decode). Not started.
 - **#83 consolidation**: gemma2-browser mirrors qwen3-browser's shape rather than

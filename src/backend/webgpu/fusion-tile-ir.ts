@@ -172,7 +172,13 @@ export function applyFusedOp(
 
     // -- isfinite: (bits & 0x7F800000) != 0x7F800000 → 1.0, else 0.0 --
     case "isfinite": {
-      const bits = a.bitcastTo("u32");
+      // The bitmask test is written for f32's 32-bit layout. bitcast<u32> on an
+      // f16 value is INVALID WGSL (widths mismatch) → shader fails to compile →
+      // the whole submit is DROPPED and the readback returns stale buffer data
+      // (the #59 FINDING #A class). f16→f32 is exact and preserves inf/nan, so
+      // upcasting first gives the identical finiteness result at trivial cost.
+      const af = a.dtype === "f32" ? a : a.toF32();
+      const bits = af.bitcastTo("u32");
       const exponentMask = ctx.u32(0x7f800000);
       const masked = bits.and(exponentMask);
       return masked.ne(exponentMask).select(ctx.f32(1), ctx.f32(0));
