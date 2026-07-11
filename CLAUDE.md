@@ -12,6 +12,8 @@ A WebGPU-accelerated tensor library for TypeScript with PyTorch-like semantics.
 
 WebGPU is auto-detected at runtime. Use `TORCHLETTE_CPU_ONLY=1` to force CPU-only mode.
 
+**Strict lifetime is the DEFAULT (task #73).** The `[lifetime]` reclaimed/released-read guard THROWS on every test and training run, arming a silent-UAF detector. The temporary opt-out `TORCHLETTE_STRICT_LIFETIME=0` downgrades it to warn-only during the soak window (sunset ~2026-08: the opt-out is removed once the soak completes).
+
 For WebGPU backend changes, also run the relevant integration test (e.g. `npx tsx examples/gpt2/finetune-demo.ts` for training-related fixes).
 
 **The load-bearing GPU correctness gates are now in-suite** (`test/compiled-plan-parity.spec.ts`, in the webgpu project — run `npm run test:gates` for just these): (1) compiled-plan trajectory == lowered trajectory over the full inner step (the frozen-step_size / clip-divergence class), (2) stage-4 stream generation matches the recording (no divergence), (3) stream recording is deterministic, (4) the chunked full-reduction sum (>128MB input) is correct AND fully generated (the lone chunked op the 124M plan hits; small-model gates never allocate >128MB, so this path is otherwise untested). They were previously manual-only `tools/` scripts that could silently rot. **CI (`ci.yml`) runs GPU-less so the whole webgpu project auto-skips there** — these gates only actually execute on a GPU box: locally via `npm run test`, or in CI via the `gpu-nightly.yml` workflow (needs a self-hosted `[self-hosted, gpu]` runner). If you change the executor / compiled plan / optimizer dispatch, run `npm run test:gates` before committing.

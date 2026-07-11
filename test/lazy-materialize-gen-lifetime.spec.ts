@@ -45,44 +45,37 @@ beforeAll(async () => {
 describe("lazily-materialized persistent param lifetime (task #86)", () => {
   it("minimal SGD loop reads the param across implied boundaries under STRICT_LIFETIME", async () => {
     if (!hasGPU) return;
-    // Force the reclaimed-read guard to THROW so a mis-attributed persistent
-    // param is a HARD failure here, not a swallowed warning.
-    const prevStrict = process.env.TORCHLETTE_STRICT_LIFETIME;
-    process.env.TORCHLETTE_STRICT_LIFETIME = "1";
-    try {
-      resetNodeIdCounter();
-      resetStorageIdCounter();
-      resetBaseIdCounter();
-      const api = new Torchlette("webgpu");
+    // The reclaimed-read guard THROWS by default (task #73), so a
+    // mis-attributed persistent param is a HARD failure here, not a swallowed
+    // warning — no explicit TORCHLETTE_STRICT_LIFETIME=1 needed.
+    resetNodeIdCounter();
+    resetStorageIdCounter();
+    resetBaseIdCounter();
+    const api = new Torchlette("webgpu");
 
-      const w = api.tensorFromArray([10, 10, 10, 10], [4], {
-        requiresGrad: true,
-      });
-      const optimizer = new SGD([w], { lr: 1.0 }, api);
+    const w = api.tensorFromArray([10, 10, 10, 10], [4], {
+      requiresGrad: true,
+    });
+    const optimizer = new SGD([w], { lr: 1.0 }, api);
 
-      // Three implied-boundary steps: zeroGrad → sum → backward → step().
-      // Pre-fix, step 2's read of `w` throws (its storage was reaped at the
-      // step-1 boundary because `w`'s late materialize-time gen filtered it out
-      // of the persistent snapshot).
-      for (let i = 0; i < 3; i++) {
-        optimizer.zeroGrad();
-        const currentW = optimizer.getParams()[0];
-        const loss = currentW.sum();
-        if (typeof loss === "number") throw new Error("Expected tensor");
-        await loss.backward();
-        optimizer.step();
-      }
+    // Three implied-boundary steps: zeroGrad → sum → backward → step().
+    // Pre-fix, step 2's read of `w` throws (its storage was reaped at the
+    // step-1 boundary because `w`'s late materialize-time gen filtered it out
+    // of the persistent snapshot).
+    for (let i = 0; i < 3; i++) {
+      optimizer.zeroGrad();
+      const currentW = optimizer.getParams()[0];
+      const loss = currentW.sum();
+      if (typeof loss === "number") throw new Error("Expected tensor");
+      await loss.backward();
+      optimizer.step();
+    }
 
-      const finalW = optimizer.getParams()[0];
-      const finalWeights = await finalW.cpu();
-      // lr=1, grad=1 (d/dw of sum(w)), 3 steps → 10 - 3 = 7.
-      for (let k = 0; k < 4; k++) {
-        expect(finalWeights[k]).toBeCloseTo(7, 4);
-      }
-    } finally {
-      if (prevStrict === undefined)
-        delete process.env.TORCHLETTE_STRICT_LIFETIME;
-      else process.env.TORCHLETTE_STRICT_LIFETIME = prevStrict;
+    const finalW = optimizer.getParams()[0];
+    const finalWeights = await finalW.cpu();
+    // lr=1, grad=1 (d/dw of sum(w)), 3 steps → 10 - 3 = 7.
+    for (let k = 0; k < 4; k++) {
+      expect(finalWeights[k]).toBeCloseTo(7, 4);
     }
   }, 60_000);
 });

@@ -19,9 +19,9 @@
  *   - TORCHLETTE_RC_TRACE=1  -> refcount.ts logs "DOUBLE-RELEASE: <id> @ site"
  *     whenever any rc goes negative. A ledger over-release lands here as
  *     "@ plan.inputConsumed". We parse our own stderr for it.
- *   - TORCHLETTE_STRICT_LIFETIME=1 -> a read of a reclaimed storage THROWS.
- *     A phantom release that destroys a live input surfaces as a thrown
- *     RECLAIMED read (loud, not silent).
+ *   - A read of a reclaimed storage THROWS by default (task #73;
+ *     TORCHLETTE_STRICT_LIFETIME=0 downgrades to warn). A phantom release that
+ *     destroys a live input surfaces as a thrown RECLAIMED read (loud, not silent).
  *   - storageTracker.stats() per step -> reachable/total trajectory. A LEDGER
  *     LEAK (retain-without-release: _retainedInputIds pins forever) shows as a
  *     monotonically climbing reachable/total. Flat == no leak.
@@ -132,7 +132,7 @@ async function main() {
   log(
     `START steps=${STEPS} L=${L} H=${H} E=${E} seq=${SEQ} batch=${BATCH} ` +
       `autocast=${USE_AUTOCAST} ckpt=${CHECKPOINT} scaler=${USE_SCALER} clip=${GRAD_CLIP} ` +
-      `STRICT=${process.env.TORCHLETTE_STRICT_LIFETIME ?? "0"} ` +
+      `STRICT=${process.env.TORCHLETTE_STRICT_LIFETIME ?? "1 (default)"} ` +
       `RC_TRACE=${process.env.TORCHLETTE_RC_TRACE ?? "0"} ` +
       `TAPE=${process.env.TORCHLETTE_STEP_TAPE ?? "0"} ` +
       `COMPILED=${process.env.TORCHLETTE_COMPILED_PLAN ?? "default"}`,

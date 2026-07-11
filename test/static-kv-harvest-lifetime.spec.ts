@@ -81,29 +81,22 @@ beforeAll(async () => {
 
     it("captured static-KV decode == golden, with STRICT_LIFETIME (no reclaimed-read throw)", async () => {
       if (!hasGPU) return;
-      // Live-read at the guard site → force the strict THROW so a reclaimed read
-      // is a hard failure, not a swallowed warning.
-      const prevStrict = process.env.TORCHLETTE_STRICT_LIFETIME;
-      process.env.TORCHLETTE_STRICT_LIFETIME = "1";
-      try {
-        const api = new Torchlette("webgpu", { enableFusion: true });
-        const golden = await runTrajectory(api, false);
-        const captured = await runTrajectory(api, true);
-        // The harvest/replay path must actually activate, or the gate is vacuous.
-        expect(captured.hits).toBeGreaterThan(0);
-        // Any stale/reclaimed harvest read shows as a trajectory divergence
-        // (and pre-fix the strict guard would have thrown before reaching here).
-        for (let p = 0; p < NSTEPS; p++) {
-          for (let i = 0; i < golden.sums[p].length; i++) {
-            expect(
-              Math.abs(captured.sums[p][i] - golden.sums[p][i]),
-            ).toBeLessThan(1e-3);
-          }
+      // The reclaimed-read guard THROWS by default (task #73), so a reclaimed
+      // read at the guard site is a hard failure here, not a swallowed warning —
+      // no explicit TORCHLETTE_STRICT_LIFETIME=1 needed.
+      const api = new Torchlette("webgpu", { enableFusion: true });
+      const golden = await runTrajectory(api, false);
+      const captured = await runTrajectory(api, true);
+      // The harvest/replay path must actually activate, or the gate is vacuous.
+      expect(captured.hits).toBeGreaterThan(0);
+      // Any stale/reclaimed harvest read shows as a trajectory divergence
+      // (and pre-fix the strict guard would have thrown before reaching here).
+      for (let p = 0; p < NSTEPS; p++) {
+        for (let i = 0; i < golden.sums[p].length; i++) {
+          expect(
+            Math.abs(captured.sums[p][i] - golden.sums[p][i]),
+          ).toBeLessThan(1e-3);
         }
-      } finally {
-        if (prevStrict === undefined)
-          delete process.env.TORCHLETTE_STRICT_LIFETIME;
-        else process.env.TORCHLETTE_STRICT_LIFETIME = prevStrict;
       }
     }, 120_000);
   },
