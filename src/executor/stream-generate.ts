@@ -58,10 +58,17 @@ import {
   planMeanDivDispatch,
 } from "../backend/webgpu/ops/reductions";
 import {
+  deriveNodeOffset,
+  type MetaNodeLike,
+  VIEW_META_OPS,
+  type ViewMeta,
+} from "../backend/webgpu/ops/view-meta";
+import {
   planCastDirect,
   planContiguousDirect,
   planNarrowBackward,
 } from "../backend/webgpu/ops/views";
+import { planRowProgramDispatch } from "../backend/webgpu/row-program-dispatch";
 import { alignBufferSize, dtypeBytes } from "../backend/webgpu/shape-utils";
 import type { WebGPUTensor } from "../backend/webgpu/tensor";
 import type { TileKernelPlan } from "../backend/webgpu/tile-dispatch";
@@ -85,12 +92,6 @@ import {
 import type { AttnInputContig, LoweredPlan } from "./lowered-plan";
 import { getInputStorage } from "./op-dispatch";
 import { lookupScalarStorage } from "./scalar-table";
-import {
-  deriveNodeOffset,
-  type MetaNodeLike,
-  VIEW_META_OPS,
-  type ViewMeta,
-} from "../backend/webgpu/ops/view-meta";
 
 export interface GeneratedStream {
   /** Per-covered-action command segments, in action order. Verified against
@@ -554,6 +555,36 @@ export function generateStream(
           mapNodeResult(planNodes[o.nodeIndex], o.slot, bufferToSlot);
           nodeSlot.set(o.nodeIndex, o.slot);
         }
+        coveredActions++;
+        break;
+      }
+      case "row-program": {
+        const rp = action as {
+          program: import("../compiler/row-program-types").RowProgram;
+          inputRefs: LazyIRNode["inputs"];
+          outputNodeIndex: number;
+          numRows: number;
+          dimSize: number;
+        };
+        const gen = generateRowProgram(
+          rp,
+          planNodes,
+          slots,
+          resolveRefSlot,
+          bufferSlot,
+        );
+        if (typeof gen === "string") {
+          miss(`row-program[${gen}]`);
+          phantom(planNodes[rp.outputNodeIndex], rp.outputNodeIndex);
+          break;
+        }
+        commands.push(...gen.commands);
+        segments.push({
+          nodeIndex: rp.outputNodeIndex,
+          commands: gen.commands,
+        });
+        mapNodeResult(planNodes[rp.outputNodeIndex], gen.outSlot, bufferToSlot);
+        nodeSlot.set(rp.outputNodeIndex, gen.outSlot);
         coveredActions++;
         break;
       }
@@ -1088,6 +1119,92 @@ function tilePlanBindings(
     }
   }
   return out;
+}
+
+/**
+ * Row-program (multi-reduction + elementwise → single perRowKernel): ONE
+ * dispatch. Single-sourced with `dispatchRowProgram` via `planRowProgramDispatch`
+ * — the kernel is keyed by `program.cacheKey` (structural, stable across steps),
+ * the uniforms {num_rows, feature_dim} come from the action, and the output size
+ * comes from the consumer's shape (`sizeOf(outputNode.shape)` — the same seam the
+ * dispatcher asserts). Bindings are `in0..inN` (input order matching inputRefs),
+ * `output`, and the cached uniform config slot. The absorbed `coveredNodeIndices`
+ * produce NO individual result (only the output node), mirroring the fused case;
+ * they are already excluded from the harvest (covered-internal). Bails when an
+ * input isn't tracked (a released strided producer) or the config buffer is
+ * absent (uniform key never dispatched — shouldn't happen post-execution). */
+function generateRowProgram(
+  action: {
+    program: import("../compiler/row-program-types").RowProgram;
+    inputRefs: LazyIRNode["inputs"];
+    outputNodeIndex: number;
+    numRows: number;
+    dimSize: number;
+  },
+  planNodes: LazyIRNode[],
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  const inSlots: Slot[] = [];
+  for (const ref of action.inputRefs) {
+    if (ref.kind === "scalar") return "scalar-input";
+    // A MATERIALIZED 0-d scalar step-temp input (e.g. the clip/scaler scale
+    // multiplicand feeding a `mul` preamble) is exactly the stale-external
+    // condition executeRowProgram detects (a materialized ref to a per-step
+    // temp): it takes the SEQUENTIAL FALLBACK and runs the covered nodes as
+    // separate dispatches (mul then sum), NOT the fused row-program kernel. If
+    // the generator emitted the fused kernel it would DIVERGE from the recorded
+    // fallback (one dispatch vs two) AND risk freezing the step-varying scalar.
+    // Bail whenever a materialized inputRef is a 0-d scalar — the executor's
+    // own fallback path, mirrored. (Non-scalar materialized inputs are stable
+    // params / prior-plan results the fused kernel handles.)
+    if (
+      ref.kind === "materialized" &&
+      (ref.storage.backendTensor as WebGPUTensor).shape.length === 0
+    ) {
+      return "scalar-steptemp-input";
+    }
+    const s = resolveRefSlot(ref);
+    if (s === undefined) return "untracked-input";
+    inSlots.push(s);
+  }
+  const outputNode = planNodes[action.outputNodeIndex];
+  if (!outputNode) return "no-output-node";
+  const expectedOutElements = sizeOf(outputNode.shape);
+  const plan = planRowProgramDispatch(
+    action.program,
+    action.numRows,
+    action.dimSize,
+    expectedOutElements,
+  );
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  // Bindings: in0..inN → their slots, output → outSlot, config (null) → uniform.
+  const named: Record<string, Slot> = { output: outSlot };
+  for (let i = 0; i < inSlots.length; i++) named[`in${i}`] = inSlots[i];
+  const bindings = tilePlanBindings(plan as TileKernelPlan, named, bufferSlot);
+  if (!bindings) return "config-missing";
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: plan.outBytes,
+        allocKind: 0,
+        inputSlots: inSlots,
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: plan.pipeline,
+        bindings,
+        gx: plan.grid[0],
+        gy: plan.grid[1],
+        gz: plan.grid[2],
+      },
+    ],
+    outSlot,
+  };
 }
 
 /** sum with no dim (FULL reduction): ALLOC(4 bytes, kind 0) + tile dispatch
@@ -1676,7 +1793,13 @@ function generateGather(
   const a = refShapeDtype(aRef);
   const idx = refShapeDtype(idxRef);
   if (!a || !idx) return "no-shape";
-  const plan = planGatherDirect(a.shape, idx.shape, cfg.dim, idx.dtype, a.dtype);
+  const plan = planGatherDirect(
+    a.shape,
+    idx.shape,
+    cfg.dim,
+    idx.dtype,
+    a.dtype,
+  );
   if (!plan) return "chunked";
   const pipeline = getPipeline(requireContext(), plan.key, plan.shader);
   const outSlot = slots.length;
@@ -3333,6 +3456,17 @@ function generateDataSource(
         { tag: TAG_WRITE, slot, nodeIndex },
       ];
     }
+    // NOTE (2026-07-11): full / arange / rand / randn / bernoulli are NOT
+    // generated here. They are pure shape+payload creation ops, but their
+    // TAG_WRITE replay takes the LEGACY executeOpSync path (compiled-plan.ts),
+    // which ALLOCATES A FRESH buffer each replay (designed for one-time weight
+    // loading, not per-step recurring creation). That fresh-per-replay storage
+    // is not planner-managed → a storage-ledger LEAK (rc-ledger drift
+    // reachable+13/total+8 on the clip/scaler trainer; tools/t-ledger-attack-probe.ts).
+    // tensorFromArray is safe (small stable-upload fast path, plan-owned buffer)
+    // and zeros is safe (TAG_CLEAR into the slot). Covering full/rand/etc. needs
+    // the TAG_WRITE legacy path to write INTO the planned slot instead of
+    // allocating fresh — a separate executor change. They stay bailed (lowered).
     case "zeros": {
       const slot = slots.length;
       slots.push({ kind: "arena" });

@@ -2145,6 +2145,119 @@ work. Stage-3 mechanism work closes here: phys 6712 vs bar 6209 (+8%),
 with the residual named (dup-casts ~260, size-class rounding, sibling
 variant, unclaimed releasables).
 
+## Task #43 4.4-COVERAGE — stream-generator coverage extension (2026-07-11)
+
+Extended `generateStream` until no RECURRING plan needs the recorded-build
+fallback for a *coverable* reason. Method: instrument the bail-class frequency
+FIRST (measured-frequency-order, per the charter), on the three real workloads,
+THEN cover only the classes that actually fire; skip phantom classes.
+
+**The census tool** (`tools/t-coverage-census.ts`, flag `TORCHLETTE_COVERAGE_CENSUS=1`,
+exports `dumpCoverageCensus`/`resetCoverageCensus` from `executor.ts`) runs
+distilgpt2-class training, gpt2 decode, and the 124M DiLoCo class, aggregating
+build-from-IR bail classes by fingerprint and separating RECURRING bails (a
+fingerprint that re-enters the build-from-IR block ≥3× and keeps bailing — a
+real gap) from TRANSIENT warmup plans (reach 1–2×, run lowered once — fine) and
+covered-and-compiled plans (reach the block once, then compile).
+
+**KEY MEASUREMENT FINDING — the coverage question is config-gated.** The
+production DiLoCo trainer runs `checkpointing=true`, which ties the buffer arena
+OFF (commit b66ead7) → those plans run LOWERED (no compiled replay, no
+build-from-IR, no recorded build). Build-from-IR (and thus the coverage
+question) is only live in the arena-enabled / compiled-replay configuration —
+the canonical `parity-fullstack-tl` / gate config (raw GPT-2 + manual optimizer,
+model-level checkpoint but arena ON). So the census measures training with
+`CHECKPOINTING=0`, the config that actually exercises the generator.
+
+**BEFORE (recurring bails, arena-enabled):**
+- distil-train / 124M-diloco: `row-program` (nodes 479 / 925, reaches 5) +
+  `data-source:full` (nodes 296 / 566, reaches 3).
+- gpt2-decode: `fused[no-storage]` + `op:max` (nodes 339, reaches 4).
+- (All `*[config-missing]` / `matmul-epilogue[no-config]` / `fused[no-input-pattern]`
+  classes co-occur on TRANSIENT warmup plans — the tile-kernel config buffer is
+  cached only post-execution, so build-from-IR's FIRST attempt at a template
+  bails, runs lowered+caches, and the 2nd+ execution COVERS. Self-healing, not a
+  stream-generator gap.)
+
+**COVERED:**
+1. **Row-programs** (multi-reduction+elementwise → one `perRowKernel`) —
+   `planRowProgramDispatch` (row-program-dispatch.ts, single-sourced with
+   `dispatchRowProgram` via `kernel.plan({num_rows,feature_dim})`) +
+   `generateRowProgram` (stream-generate.ts). One ALLOC(output)+DISPATCH; kernel
+   keyed by `program.cacheKey` (structural), uniforms from the action, output
+   size from the consumer's shape (the same seam the dispatcher asserts). The
+   largest recurring training bail (nodes 479 / 925). Ledger-verified flat
+   (`t-ledger-attack-probe.ts` reachDrift/totalDrift = 0 with it ON).
+
+**ATTEMPTED THEN REVERTED — data-source creation ops (`full`/`arange`/`rand`/
+`randn`/`bernoulli`):** they LOOK generatable (pure shape+payload, NO tensor
+inputs — like `tensorFromArray`, emit ALLOC+WRITE, RNG seed baked in payload).
+But UNLIKE `tensorFromArray` (small stable-upload fast path, plan-owned buffer)
+and `zeros` (TAG_CLEAR into the slot), their `TAG_WRITE` replay takes the LEGACY
+`executeOpSync` path (`compiled-plan.ts`), which ALLOCATES A FRESH buffer EACH
+replay (that path was built for one-time weight loading, not per-step recurring
+creation). The fresh-per-replay storage is not planner-managed → a real
+storage-LEDGER LEAK: `rc-ledger.spec.ts` / `t-ledger-attack-probe.ts` on the
+clip/scaler trainer went reachDrift +13 / totalDrift +8; bisected to exactly
+this generation (drift → 0 when reverted, unchanged by row-program). Covering
+them correctly needs the TAG_WRITE legacy path to write INTO the planned slot
+instead of allocating fresh — a separate executor change, out of scope. They
+stay bailed (lowered). **Lesson: "no tensor inputs → safe to generate" is FALSE
+— the REPLAY buffer lifecycle is the seam, and the differential that catches it
+is the LEDGER probe, not the stream diff (the stream diff was byte-clean).**
+
+**DELIBERATELY BAILED (correctness, the ONE remaining recurring training bail):**
+- `row-program[scalar-steptemp-input]` — a row-program whose external input is a
+  MATERIALIZED 0-d scalar step-temp (the clip/scaler scale multiplicand fused as
+  a `mul` preamble, e.g. `sum(mul(loss, scale))`). This is EXACTLY the
+  stale-external condition `executeRowProgram` detects: it takes the SEQUENTIAL
+  FALLBACK and runs the covered nodes as separate dispatches (mul then sum), NOT
+  the fused kernel. Emitting the fused kernel would DIVERGE from the recorded
+  fallback (one dispatch vs two) AND risk freezing the step-varying scale
+  (silent corruption). The generator bails whenever a materialized inputRef is a
+  0-d scalar — the executor's own fallback path, mirrored. This is a
+  captured-state case analogous to `mean`'s invCount; closing it needs per-step
+  scalar delivery (scalar-table-style) for materialized 0-d row-program inputs.
+  The stream-generate gate caught it: covering the clean row-programs flipped the
+  GradScaler-update plan to fully-covered, exposing this preamble; the bail
+  restores that plan to the recorded path (baseline behaviour) while the clean
+  row-programs generate.
+
+**SKIPPED (deferred, evidence per class):**
+- `fused[no-storage]` (gpt2-decode) — a fused kernel with a released strided
+  (expand/broadcast) input; the strided-view class the doc already documents as
+  "correctly excluded — layout not shape-derivable." Hard-deferred.
+- `op:max` (gpt2-decode) — max/min reductions aren't routed to the reduction
+  generators (only `sum` is). Coverable in principle (planFull/DimReduction take
+  a reduceOp), but the SAME decode plan also carries `fused[no-storage]`, so
+  covering max alone can't fully-cover it — partial value, deferred with the
+  strided class. Decode is inference-only (noGrad), not the training path.
+
+**AFTER:** row-programs cover (the largest recurring training bail); the
+remaining recurring training bails are the deliberate `row-program[scalar-steptemp-input]`
+(correctness) and the reverted `data-source:full`/etc. (ledger-unsafe, needs the
+executor TAG_WRITE change). gpt2-decode's one recurring plan stays uncovered
+(strided-view + max), inference-only.
+
+**Gates (all green):** `npm run build`; `test:gates` 6/6; `t-stream-generate`
+PASS (3 plans FULLY GENERATED 0 diverged, 1 plan partial-covered with the
+deliberate row-program bail); `t-ledger-attack-probe` reachDrift/totalDrift = 0
+(the data-source revert restored ledger balance); `parity-fullstack-tl`
+compiled-vs-lowered max |Δ| = 2e-6 / 30 steps.
+
+**Deletion-readiness verdict:** the recorded build is NOT deletable yet. It
+still serves (a) the deliberate `row-program[scalar-steptemp-input]` bail
+(needs scalar-table delivery for materialized 0-d row-program inputs), (b) the
+decode strided-view + max class (inference), and (c) the build-from-IR
+FIRST-execution `config-missing` transients (the tile-kernel config is cached
+only post-execution, so the first attempt at every config-bearing template bails
+to lowered and the 2nd+ covers — this is a build-from-IR cold-start property,
+not a stream-generator gap, but it means the recorder still fires on template
+warmup). The remaining recurring gap (a) is small and well-characterized; (c)
+would need config-buffer geometry derivable pre-execution (a phase-3-style
+capture). Until (a) and the decode class close AND the config-missing transient
+is addressed, the recorded build stays as the correctness fallback.
+
 ## Task #43 recorded-build sunset — deletion MAP + STOP (2026-07-11)
 
 A dedicated deletion pass was authorized to "delete the recorded-build path
