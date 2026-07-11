@@ -101,6 +101,7 @@ async function handleLoad(
   modelId: string,
   saeBaseUrl: string,
   requestedDtype?: "f16" | "f32",
+  weightFormat?: "int8-64" | "int8-128",
 ) {
   if (!("gpu" in self.navigator)) {
     throw new Error(
@@ -153,6 +154,7 @@ async function handleLoad(
     {
       maxSeqLen: 1024,
       weightDtype,
+      weightFormat,
       onProgress: (loaded, total, status) => {
         const errs = getGpuUncapturedErrorCount();
         post({
@@ -461,7 +463,12 @@ self.onmessage = async (e: MessageEvent) => {
   const msg = e.data;
   try {
     if (msg.type === "load") {
-      await handleLoad(msg.modelId, msg.saeBaseUrl, msg.weightDtype);
+      await handleLoad(
+        msg.modelId,
+        msg.saeBaseUrl,
+        msg.weightDtype,
+        msg.weightFormat,
+      );
     } else if (msg.type === "readback") {
       await handleReadback(msg.row ?? 0, msg.n ?? 16);
     } else if (msg.type === "synthetic") {

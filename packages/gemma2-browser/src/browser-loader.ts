@@ -20,14 +20,19 @@
  * static host with the same layout.
  */
 
-import type { Tensor, Torchlette } from "torchlette";
+import type { Tensor, Torchlette, WeightFormatName } from "torchlette";
+import { quantizeLinearWeight, resolveWeightFormat } from "torchlette";
+import type { Linear } from "torchlette/nn";
 import {
   CachedShardSource,
+  getCachedPacked,
   getCachedShardMeta,
+  packedKey,
+  putCachedPacked,
   requestPersistentStorage,
   ShardCacheWriter,
 } from "./idb-cache";
-import { configFromHF, Gemma2 } from "./model";
+import { configFromHF, Gemma2, type Gemma2Block } from "./model";
 import {
   bf16SliceToF16Bits,
   bf16SliceToF32,
@@ -35,6 +40,36 @@ import {
   isNormWeight,
   resolveDest,
 } from "./weights-map";
+
+/**
+ * The Linear projection module owning a given HF weight name, or null if the
+ * weight is not a quantizable projection (norms/embedding/lm-head stay
+ * unquantized — docs/quantization-design.md scope). Used by the weightFormat
+ * path to REPLACE a projection's f16 weight with a packed-int operand.
+ */
+function resolveProjModule(model: Gemma2, hfName: string): Linear | null {
+  const m = hfName.match(/^model\.layers\.(\d+)\.(.+)$/);
+  if (!m) return null;
+  const block = model.layers.get(Number(m[1])) as Gemma2Block;
+  switch (m[2]) {
+    case "self_attn.q_proj.weight":
+      return block.attn.qProj;
+    case "self_attn.k_proj.weight":
+      return block.attn.kProj;
+    case "self_attn.v_proj.weight":
+      return block.attn.vProj;
+    case "self_attn.o_proj.weight":
+      return block.attn.oProj;
+    case "mlp.gate_proj.weight":
+      return block.mlp.gateProj;
+    case "mlp.up_proj.weight":
+      return block.mlp.upProj;
+    case "mlp.down_proj.weight":
+      return block.mlp.downProj;
+    default:
+      return null;
+  }
+}
 
 /** Anything that yields byte chunks (network stream or IndexedDB cache). */
 type ByteSource = { next(): Promise<Uint8Array | null> };
@@ -412,6 +447,9 @@ export async function loadGemma2FromUrl(
   options?: {
     maxSeqLen?: number;
     weightDtype?: "f32" | "f16";
+    /** Quantize projection weights to a packed-int operand (default OFF).
+     *  docs/quantization-design.md phase 2. Norms/embedding/lm-head stay f16. */
+    weightFormat?: WeightFormatName;
     onProgress?: LoadProgress;
     onTensorEvent?: (ev: TensorLoadEvent) => void;
   },
@@ -419,6 +457,7 @@ export async function loadGemma2FromUrl(
   const base = baseUrl.replace(/\/$/, "");
   const progress = options?.onProgress ?? (() => {});
   const tensorEvent = options?.onTensorEvent ?? (() => {});
+  const weightFormat = options?.weightFormat;
 
   progress(0, 0, "Fetching config…");
   const hfConfig = await (await fetch(`${base}/config.json`)).json();
@@ -610,6 +649,54 @@ export async function loadGemma2FromUrl(
         currentTensor = name;
         emitProgress();
         continue;
+      }
+
+      // weightFormat: quantize a projection weight to a packed-int operand and
+      // REPLACE the module's f16 param. The packed form is cached in IDB keyed
+      // by url+name+format (conversion is expensive). The forward's api.linear
+      // is unchanged (format-blind).
+      const projModule = weightFormat ? resolveProjModule(model, name) : null;
+      if (projModule && weightFormat) {
+        const [N, K] = info.shape;
+        const format = resolveWeightFormat(weightFormat, "f16");
+        const G = format.packing!.groupSize;
+        if (K % 4 === 0 && K % G === 0) {
+          const key = packedKey(url, name, format.packing!.scheme, G);
+          let cached = await getCachedPacked(key);
+          if (!cached) {
+            // Stream as f32 (quantizer needs f32 host data), quantize, cache.
+            const wf32 = (await streamTensor(
+              cursor,
+              info.dtype,
+              end - start,
+              "f32",
+              (fraction) => {
+                emitProgress();
+                tensorEvent({ type: "progress", name, fraction });
+              },
+            )) as Float32Array;
+            const q = quantizeLinearWeight(wf32, N, K, G);
+            await putCachedPacked(key, q.packed, q.scales, N, K);
+            cached = { packed: q.packed, scales: q.scales, n: N, k: K };
+          } else {
+            // Cache hit: skip the tensor's bytes in the stream.
+            await cursor.discard(end - start);
+          }
+          const qWeight = await api.createQuantizedWeight(
+            cached.packed,
+            cached.scales,
+            N,
+            K,
+            format,
+          );
+          projModule.registerParameter("weight", qWeight as unknown as Tensor);
+          tensorEvent({ type: "done", name });
+          loadedTensors++;
+          await api.markStep();
+          currentTensor = name;
+          emitProgress();
+          continue;
+        }
       }
 
       const data = await streamTensor(cursor, info.dtype, end - start, dest.dtype, (fraction) => {

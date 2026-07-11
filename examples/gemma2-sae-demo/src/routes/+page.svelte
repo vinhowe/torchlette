@@ -22,6 +22,18 @@
   // The SAE .bin files are served as static assets (see static/sae/).
   const SAE_BASE_URL = `${import.meta.env.BASE_URL}sae`;
 
+  // Optional quantization opt-in (default OFF this wave): ?weightFormat=int8-64.
+  // A URL/config flag, NOT a TORCHLETTE_* env. When set, projection weights load
+  // as packed-int operands (docs/quantization-design.md phase 2).
+  const weightFormatParam =
+    typeof window !== "undefined"
+      ? new URLSearchParams(window.location.search).get("weightFormat")
+      : null;
+  const WEIGHT_FORMAT =
+    weightFormatParam === "int8-64" || weightFormatParam === "int8-128"
+      ? (weightFormatParam as "int8-64" | "int8-128")
+      : undefined;
+
   // ---- Model load state ----
   let engine = $state<SAEEngine | null>(null);
   let info = $state<ModelInfo | null>(null);
@@ -60,6 +72,7 @@
         },
         onTensorEvent,
         (e) => (error = e),
+        WEIGHT_FORMAT,
       );
       info = engine.info;
     } catch (e) {

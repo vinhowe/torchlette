@@ -84,6 +84,8 @@ export async function createSAEEngine(
   onProgress: LoadProgress,
   onTensorEvent?: (ev: TensorLoadEvent) => void,
   onEngineError?: (error: string) => void,
+  /** Opt-in packed-int projection weights (default OFF). URL/config flag. */
+  weightFormat?: "int8-64" | "int8-128",
 ): Promise<SAEEngine> {
   const worker = new Worker(new URL("./engine-worker.ts", import.meta.url), {
     type: "module",
@@ -114,7 +116,7 @@ export async function createSAEEngine(
         });
       else if (msg.type === "error") reject(new Error(msg.error));
     };
-    worker.postMessage({ type: "load", modelId, saeBaseUrl });
+    worker.postMessage({ type: "load", modelId, saeBaseUrl, weightFormat });
   });
 
   worker.onmessage = (e) => {

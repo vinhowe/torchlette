@@ -2089,13 +2089,26 @@ export class RuntimeEngine {
     packedBT.format = format;
     packedBT.scales = scalesT.backendTensor;
     packedStorage.format = format;
+    // Both the packed buffer and the scales companion are PERSISTENT inference
+    // state — never a step temporary. Register them so markStep's step-scoped
+    // demotion never pools their buffers out from under a live forward (the
+    // "used in submit while destroyed" class). The scales tensor must also stay
+    // referenced (its only graph link is packedBT.scales, a bare backendTensor
+    // pointer) — stash it on the logical weight so GC can't collect it.
+    this.registerState(packedT);
+    this.registerState(scalesT);
     // Logical [N,K] tensor over the packed storage; logical dtype = elementType.
-    return this.createFromStorageHandle(
+    const logical = this.createFromStorageHandle(
       packedStorage,
       [n, k],
       packedStorage.device,
       format.elementType,
     );
+    this.registerState(logical);
+    (logical as unknown as { _quantScales?: Tensor; _quantPacked?: Tensor })._quantScales =
+      scalesT;
+    (logical as unknown as { _quantPacked?: Tensor })._quantPacked = packedT;
+    return logical;
   }
 
   /** Create a fused kernel op node and track it as a new Tensor. */
