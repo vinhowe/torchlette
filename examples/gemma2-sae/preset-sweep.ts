@@ -16,7 +16,7 @@
  */
 
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   getWebGPUInitError,
   initWebGPU,
@@ -144,7 +144,13 @@ async function main() {
   const { config, params } = loadSAEFromDir(SAE_DIR);
   const sae = GemmaScopeSAE.load(api, config, params, { dtype: "f32" });
 
-  const { AutoTokenizer } = await import("@huggingface/transformers");
+  const { createRequire } = await import("node:module");
+  const req = createRequire(
+    path.join(__dirname, "../gemma2-sae-demo/package.json"),
+  );
+  const { AutoTokenizer } = await import(
+    pathToFileURL(req.resolve("@huggingface/transformers")).href
+  );
   const tk = (await AutoTokenizer.from_pretrained(MODEL_DIR)) as never;
   const tokenizer = {
     encode: (t: string) => (tk as { encode(t: string): number[] }).encode(t),
@@ -161,7 +167,7 @@ async function main() {
     // Skip the always-on high-frequency features (fire on every prompt).
     const HIGH_FREQ = new Set([6631, 743, 5052, 16057, 9479]);
     const themed = top.filter((t) => !HIGH_FREQ.has(t.feature));
-    candidates.set(theme.name, themed.slice(0, 4).map((t) => t.feature));
+    candidates.set(theme.name, themed.slice(0, 6).map((t) => t.feature));
     console.log(`\n[${theme.name}] ${JSON.stringify(theme.prompt.slice(0, 50))}`);
     for (const t of top)
       console.log(
@@ -169,20 +175,24 @@ async function main() {
       );
   }
 
-  // ---- Phase 2: SWEEP α on the top candidate of each theme ----
+  // ---- Phase 2: SWEEP α — for golden-gate, sweep the TOP-6 candidates (the
+  // shipped #3124 was candidate[0] and does NOT steer to SF at any coherent α);
+  // for other themes just the top candidate. ----
   console.log("\n========== SWEEP: baseline vs steered ==========");
-  const genPrompt = "I want to tell you about something interesting.";
-  const alphas = [0, 100, 200, 400];
+  const genPrompt = "I want to tell you about a place I love.";
+  const alphas = [0, 100, 150, 200];
   for (const [theme, feats] of candidates) {
-    const feature = feats[0];
-    if (feature === undefined) continue;
-    console.log(`\n##### theme=${theme} feature=#${feature} #####`);
-    console.log(`  neuronpedia: ${neuronpediaUrl(sae.config.neuronpediaSaeId, feature)}`);
-    for (const alpha of alphas) {
-      const steer = alpha === 0 ? [] : [{ feature, alpha }];
-      // Greedy (temp 0) for a reproducible baseline-vs-steered comparison.
-      const out = await generate(api, model, sae, tokenizer, genPrompt, steer, 40, 0);
-      console.log(`  α=${alpha.toString().padStart(4)}: ${JSON.stringify(out.slice(0, 220))}`);
+    const featsToSweep = theme === "golden-gate" ? feats.slice(0, 6) : feats.slice(0, 1);
+    for (const feature of featsToSweep) {
+      if (feature === undefined) continue;
+      console.log(`\n##### theme=${theme} feature=#${feature} #####`);
+      console.log(`  neuronpedia: ${neuronpediaUrl(sae.config.neuronpediaSaeId, feature)}`);
+      for (const alpha of alphas) {
+        const steer = alpha === 0 ? [] : [{ feature, alpha }];
+        // Greedy (temp 0) for a reproducible baseline-vs-steered comparison.
+        const out = await generate(api, model, sae, tokenizer, genPrompt, steer, 40, 0);
+        console.log(`  α=${alpha.toString().padStart(4)}: ${JSON.stringify(out.slice(0, 220))}`);
+      }
     }
   }
 

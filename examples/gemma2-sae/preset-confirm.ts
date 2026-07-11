@@ -8,7 +8,7 @@
  */
 
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { getWebGPUInitError, initWebGPU, setGPUMemoryLimit } from "../../src/backend/webgpu";
 import { Torchlette } from "../../src/frontend/torchlette";
 import type { ResidualHook } from "../../packages/gemma2-browser/src/model";
@@ -23,7 +23,7 @@ const SAE_DIR = path.join(__dirname, "../../ckpts/gemma-scope-2b-pt-res/sae-laye
 
 const PRESETS = [
   { name: "Dogs", feature: 12082, alpha: 120, prompt: "My favorite thing to do on the weekend is" },
-  { name: "San Francisco", feature: 3124, alpha: 120, prompt: "I want to tell you about a place I love." },
+  { name: "Golden Gate (#12887 @ 150)", feature: 12887, alpha: 150, prompt: "I want to tell you about a place I love." },
   { name: "Banking", feature: 8993, alpha: 100, prompt: "I want to tell you about something interesting." },
 ];
 
@@ -39,7 +39,17 @@ async function main() {
   const layer = sae.config.layer;
   const dModel = sae.config.dModel;
 
-  const { AutoTokenizer } = await import("@huggingface/transformers");
+  // Resolve @huggingface/transformers from the demo package (only dep there;
+  // not hoisted to root, and tsx's TS-path resolver mis-resolves the bare
+  // specifier from this non-workspace example dir).
+  const { createRequire } = await import("node:module");
+  const req = createRequire(
+    path.join(__dirname, "../gemma2-sae-demo/package.json"),
+  );
+  const hfMain = req.resolve("@huggingface/transformers");
+  const { AutoTokenizer } = await import(
+    pathToFileURL(hfMain).href
+  );
   const tk = (await AutoTokenizer.from_pretrained(MODEL_DIR)) as never;
   const tokenizer = {
     encode: (t: string) => (tk as { encode(t: string): number[] }).encode(t),
