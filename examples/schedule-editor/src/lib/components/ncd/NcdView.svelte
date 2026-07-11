@@ -16,6 +16,7 @@ import {
   termHash,
   toDiagram,
 } from "../../ncd/model";
+import type { SurfaceEquivalence, SurfaceJam } from "../../ncd/surface-layout";
 import type {
   NapkinCost,
   NcdHistoryEntry,
@@ -38,6 +39,13 @@ let groupSize = $state(64);
 let streamSize = $state(32);
 let faStep = $state(0);
 let loadError = $state("");
+let paintLevel = $state<NcdLevel>("l1");
+let previewTerm = $state<NcdTerm | null>(null);
+let jam = $state<SurfaceJam | null>(null);
+let equivalence = $state<SurfaceEquivalence | null>(null);
+let equivalenceNonce = 0;
+let equivalenceTimer: ReturnType<typeof setTimeout> | undefined;
+let replayRunning = $state(false);
 
 const cost = $derived(current ? napkinCost(current) : null);
 const baseCost = $derived(
@@ -109,12 +117,30 @@ function resetTo(nextFixture: "attention" | "matmul" = fixture): void {
   history = [];
   redoStack = [];
   faStep = 0;
+  previewTerm = null;
+  jam = null;
+  equivalence = null;
   refusal = `Restored ${base.name}.`;
+}
+
+function showEquivalence(before: NcdTerm, after: NcdTerm, label: string): void {
+  if (equivalenceTimer) clearTimeout(equivalenceTimer);
+  equivalence = { before, after, label, nonce: ++equivalenceNonce };
+  equivalenceTimer = setTimeout(() => {
+    equivalence = null;
+  }, 1050);
+}
+
+function refuse(reason: string, target: Omit<SurfaceJam, "reason">): void {
+  previewTerm = null;
+  jam = { ...target, reason };
+  refusal = `Refused: ${reason}`;
 }
 
 function commit(label: string, move: NcdMove): void {
   if (!current) return;
   try {
+    const before = cloneTerm(current);
     const next = applyMove(current, move);
     const entry: NcdHistoryEntry = {
       label,
@@ -124,9 +150,12 @@ function commit(label: string, move: NcdMove): void {
       cost: napkinCost(next),
     };
     current = next;
+    previewTerm = null;
+    jam = null;
     history = [...history, entry];
     redoStack = [];
     refusal = `${label} applied as an invertible term relabeling.`;
+    showEquivalence(before, next, label);
   } catch (error) {
     refusal = `Refused: ${error instanceof Error ? error.message : String(error)}`;
   }
@@ -135,20 +164,28 @@ function commit(label: string, move: NcdMove): void {
 function undo(): void {
   const entry = history.at(-1);
   if (!entry || !current) return;
+  const before = cloneTerm(current);
   current = applyMove(current, entry.inverse);
   history = history.slice(0, -1);
   redoStack = [...redoStack, entry];
   faStep = Math.min(faStep, history.length);
   refusal = `Undo applied inverse ${entry.inverse.op} relabeling.`;
+  previewTerm = null;
+  jam = null;
+  showEquivalence(before, current, `undo · ${entry.label}`);
 }
 
 function redo(): void {
   const entry = redoStack.at(-1);
   if (!entry || !current) return;
+  const before = cloneTerm(current);
   current = applyMove(current, entry.forward);
   redoStack = redoStack.slice(0, -1);
   history = [...history, entry];
   refusal = `Redo applied ${entry.forward.op} relabeling.`;
+  previewTerm = null;
+  jam = null;
+  showEquivalence(before, current, `redo · ${entry.label}`);
 }
 
 function attemptPartition(axisId: string, kind: PartitionKind): void {
@@ -163,10 +200,45 @@ function attemptPartition(axisId: string, kind: PartitionKind): void {
   };
   const legal = partitionLegality(current, after);
   if (!legal.legal) {
-    refusal = `Refused: ${legal.reason}`;
+    const blockedBox =
+      kind === "stream"
+        ? current.semantic.boxes.find(
+            (box) => box.streamability.kind === "none",
+          )
+        : undefined;
+    refuse(
+      legal.reason,
+      blockedBox
+        ? { target: "box", id: blockedBox.id }
+        : { target: "axis", id: axisId },
+    );
     return;
   }
   commit(`${kind}-partition ${axis.label}=${size}`, {
+    op: "partition",
+    axisId,
+    before: current.decorations.partitions.find(
+      (item) => item.axisId === axisId,
+    ),
+    after,
+  });
+}
+
+function previewPartition(axisId: string, kind: PartitionKind): void {
+  if (!current) return;
+  const axis = axisById(current, axisId);
+  const size = kind === "group" ? groupSize : streamSize;
+  const after: PartitionDecoration = {
+    axisId,
+    kind,
+    size,
+    label: `${kind === "group" ? "g" : "s"}_${axis.label}`,
+  };
+  if (!partitionLegality(current, after).legal) {
+    previewTerm = null;
+    return;
+  }
+  previewTerm = applyMove(current, {
     op: "partition",
     axisId,
     before: current.decorations.partitions.find(
@@ -188,7 +260,15 @@ function attemptResidency(
   if (!state) return;
   const legal = recolorLegality(current, wireId, column, level);
   if (!legal.legal) {
-    refusal = `Refused: ${legal.reason}`;
+    const blockedBox = current.semantic.boxes.find(
+      (box) => box.streamability.kind === "none",
+    );
+    refuse(
+      legal.reason,
+      legal.reason.includes("softmax") && blockedBox
+        ? { target: "box", id: blockedBox.id }
+        : { target: "residency", id: wireId, column },
+    );
     return;
   }
   commit(`recolor ${wireId}@${column} ${state.level}→${level}`, {
@@ -200,13 +280,56 @@ function attemptResidency(
   });
 }
 
+function previewResidency(
+  wireId: string,
+  column: number,
+  level: NcdLevel,
+): void {
+  if (!current) return;
+  const state = current.decorations.residency.find(
+    (item) => item.wireId === wireId && item.column === column,
+  );
+  if (!state || !recolorLegality(current, wireId, column, level).legal) {
+    previewTerm = null;
+    return;
+  }
+  previewTerm = applyMove(current, {
+    op: "recolor",
+    wireId,
+    column,
+    before: state.level,
+    after: level,
+  });
+}
+
+function clearPreview(): void {
+  previewTerm = null;
+}
+
 function admitLemma(): void {
   if (!current) return;
   if (current.decorations.admittedLemmas.includes("online-softmax-rescaling")) {
-    refusal = "Refused: online-softmax rescaling is already admitted.";
+    refuse("online-softmax rescaling is already admitted.", {
+      target: "box",
+      id: "softmax",
+    });
     return;
   }
   commit("admit online-softmax rescaling", onlineSoftmaxLemma(current));
+}
+
+function dropLemma(boxId: string): void {
+  if (boxId !== "softmax") {
+    refuse(
+      "This lemma rewrites softmax only; the selected function does not match.",
+      {
+        target: "box",
+        id: boxId,
+      },
+    );
+    return;
+  }
+  admitLemma();
 }
 
 function nextFaStep(): void {
@@ -220,40 +343,62 @@ function nextFaStep(): void {
   }
   if (!current) return;
   try {
+    const before = cloneTerm(current);
     const result = applyFaStep(current, faStep);
     current = result.term;
     history = [...history, result.entry];
     redoStack = [];
     refusal = `Walkthrough ${faStep + 1}/${FA_STEPS.length}: ${result.entry.label}`;
     faStep += 1;
+    jam = null;
+    previewTerm = null;
+    showEquivalence(before, current, result.entry.label);
   } catch (error) {
     refusal = `Refused: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 
-function deriveAll(): void {
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function deriveAll(): Promise<void> {
+  if (replayRunning) return;
+  replayRunning = true;
   resetTo("attention");
-  if (!attentionBase) return;
-  let next = cloneTerm(attentionBase);
-  const entries: NcdHistoryEntry[] = [];
-  for (let index = 0; index < FA_STEPS.length; index += 1) {
-    const result = applyFaStep(next, index);
-    next = result.term;
-    entries.push(result.entry);
+  if (!attentionBase) {
+    replayRunning = false;
+    return;
   }
-  current = next;
-  history = entries;
-  redoStack = [];
-  faStep = FA_STEPS.length;
-  refusal =
-    "FlashAttention derivation replayed: lemma → fuse → fuse → tile → stream.";
+  try {
+    let next = cloneTerm(attentionBase);
+    const entries: NcdHistoryEntry[] = [];
+    for (let index = 0; index < FA_STEPS.length; index += 1) {
+      const before = cloneTerm(next);
+      const result = applyFaStep(next, index);
+      next = result.term;
+      entries.push(result.entry);
+      current = next;
+      history = [...entries];
+      redoStack = [];
+      faStep = index + 1;
+      refusal = `Replay ${index + 1}/${FA_STEPS.length}: ${result.entry.label}`;
+      showEquivalence(before, next, result.entry.label);
+      await delay(760);
+    }
+    refusal =
+      "FlashAttention derivation replayed: lemma → fuse → fuse → tile → stream.";
+  } finally {
+    replayRunning = false;
+  }
 }
 
 function dragPayload(
   event: DragEvent,
   payload:
     | { type: "partition"; kind: PartitionKind }
-    | { type: "level"; level: NcdLevel },
+    | { type: "level"; level: NcdLevel }
+    | { type: "lemma"; lemmaId: string },
 ): void {
   event.dataTransfer?.setData(
     "application/x-torchlette-ncd",
@@ -266,12 +411,6 @@ function formatElements(value: number): string {
   if (value >= 1e6) return `${(value / 1e6).toFixed(3)} M`;
   if (value >= 1e3) return `${(value / 1e3).toFixed(3)} K`;
   return value.toLocaleString();
-}
-
-function formatBytes(value: number): string {
-  if (value >= 1e6) return `${(value / 1e6).toFixed(3)} MB`;
-  if (value >= 1e3) return `${(value / 1e3).toFixed(3)} KB`;
-  return `${value} B`;
 }
 </script>
 
@@ -298,63 +437,73 @@ function formatBytes(value: number): string {
           <button class={controlClass()} onclick={() => resetTo()}><RotateCcw size={11} /> Reset</button>
         </div>
       </div>
-      <div class="grid grid-cols-[auto_1fr] gap-1 border border-border bg-card pad-box">
-        <span class="type-label">Term identity</span><span class="type-value">{termHash(current)}</span>
-        <span class="type-label">Round trip</span><span class={roundTrips ? "type-tag text-success" : "type-tag text-destructive-strong"}>{roundTrips ? "TERM = DIAGRAM = TERM" : "ROUND-TRIP FAILURE"}</span>
-        <span class="type-label">Gesture status</span><span class={refusal.startsWith("Refused") ? "type-body text-destructive-strong" : "type-body text-muted-foreground"}>{refusal}</span>
+      <div class="grid grid-cols-[auto_1fr_auto] items-center gap-1 border border-border bg-card pad-box">
+        <span class={roundTrips ? "type-tag text-success" : "type-tag text-destructive-strong"}>{roundTrips ? "TERM ≡ DIAGRAM ≡ TERM" : "ROUND-TRIP FAILURE"}</span>
+        <span class={refusal.startsWith("Refused") ? "type-body text-destructive-strong" : "type-body text-muted-foreground"}>{refusal}</span>
+        <span class="type-value">{termHash(current)}</span>
       </div>
     </section>
 
     <section class="stack-field border-b border-border pad-box">
-      <div class="flex flex-wrap items-end justify-between gap-2">
+      <div class="grid grid-cols-[auto_1fr_auto] items-end gap-2 max-[900px]:grid-cols-1">
+        <div class="flex items-center gap-2 border border-border bg-card pad-box" aria-label="Memory level graph">
+          <svg class="h-14 w-24" viewBox="0 0 96 56" aria-label="WGSL memory level graph">
+            <line x1="18" y1="13" x2="47" y2="29" stroke="currentColor" stroke-width="1" />
+            <line x1="47" y1="29" x2="28" y2="47" stroke="currentColor" stroke-width="1" />
+            <line x1="47" y1="29" x2="73" y2="47" stroke="currentColor" stroke-width="1" />
+            <circle cx="18" cy="13" r="7" class="fill-foreground" />
+            <circle cx="47" cy="29" r="7" style="fill:var(--ncd-level-one-ink)" />
+            <circle cx="28" cy="47" r="6" class="fill-success" />
+            <circle cx="73" cy="47" r="6" class="fill-primary" />
+          </svg>
+          <div class="stack-tight">
+            <span class="type-label">Level graph</span>
+            <span class="type-fine text-muted-foreground">ℓ0 global → ℓ1 workgroup → register / invocation</span>
+          </div>
+        </div>
         <div class="flex flex-wrap items-end gap-2">
           <div class="stack-tight">
             <span class="type-label">Relabeling palette</span>
             <div class="flex items-center gap-1">
-              <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "partition", kind: "group" })}>g · Group</button>
+              <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "partition", kind: "group" })}>gₐ · Group</button>
               <input class="h-control w-16 border border-input bg-card px-1 type-value" type="number" min="1" bind:value={groupSize} aria-label="Group size" />
-              <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "partition", kind: "stream" })}>s · Stream</button>
+              <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "partition", kind: "stream" })}>sₐ · Stream</button>
               <input class="h-control w-16 border border-input bg-card px-1 type-value" type="number" min="1" bind:value={streamSize} aria-label="Stream size" />
-              <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "level", level: "l0" })}>ℓ0 · Global</button>
-              <button class={controlClass(true)} draggable="true" ondragstart={(event) => dragPayload(event, { type: "level", level: "l1" })}>ℓ1 · Lower</button>
+              <button class={controlClass(paintLevel === "l0")} draggable="true" aria-pressed={paintLevel === "l0"} onclick={() => (paintLevel = "l0")} ondragstart={(event) => dragPayload(event, { type: "level", level: "l0" })}>ℓ0 · Global brush</button>
+              <button class={controlClass(paintLevel === "l1")} draggable="true" aria-pressed={paintLevel === "l1"} onclick={() => (paintLevel = "l1")} ondragstart={(event) => dragPayload(event, { type: "level", level: "l1" })}>ℓ1 · Lower brush</button>
             </div>
           </div>
           {#if fixture === "attention"}
-            <button class={controlClass()} onclick={admitLemma}>Admit online-softmax lemma</button>
+            <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "lemma", lemmaId: "online-softmax-rescaling" })} onclick={admitLemma}>Lemma · online softmax</button>
           {/if}
         </div>
-        <p class="type-fine text-muted-foreground">Drag g/s onto an axis wire. Drag ℓ0/ℓ1 onto a residency cell.</p>
+        <p class="max-w-52 type-fine text-muted-foreground">Drop gₐ/sₐ on axes. Select ℓ0/ℓ1, then paint a region. Drop the lemma on a function.</p>
       </div>
 
-      <NcdRenderer term={current} onPartitionDrop={attemptPartition} onResidencyDrop={attemptResidency} />
+      <NcdRenderer
+        term={current}
+        {previewTerm}
+        {paintLevel}
+        {jam}
+        {equivalence}
+        onPartitionDrop={attemptPartition}
+        onPartitionPreview={previewPartition}
+        onResidencyDrop={attemptResidency}
+        onResidencyPreview={previewResidency}
+        onLemmaDrop={dropLemma}
+        onPreviewClear={clearPreview}
+      />
     </section>
 
     <section class="grid grid-cols-[minmax(18rem,0.8fr)_minmax(20rem,1.2fr)] items-start gap-1 border-b border-border pad-box max-[900px]:grid-cols-1">
-      <div class="stack-group">
-        <section class="stack-field border border-border">
-          <header class="flex items-center justify-between gap-2 border-b border-border bg-panel px-1 py-0.5"><h2 class="type-title">Napkin cost</h2><span class="type-tag">READ FROM WIRES</span></header>
-          <div class="stack-field pad-box">
-            <div class="grid grid-cols-[1fr_auto_auto] gap-1 border border-border bg-card pad-box">
-              <span class="type-label">Level</span><span class="type-tag">H TRANSFER</span><span class="type-tag">M MAX COLUMN</span>
-              {#each ["l0", "l1"] as level}
-                <span class="type-tag">{level}</span>
-                <span class="type-value">{formatElements(cost.transferByLevel[level as NcdLevel])} · {formatBytes(cost.transferBytesByLevel[level as NcdLevel])}</span>
-                <span class="type-value">{formatElements(cost.memoryByLevel[level as NcdLevel])} · {formatBytes(cost.memoryBytesByLevel[level as NcdLevel])}</span>
-              {/each}
-            </div>
-            {#if baseCost}
-              <div class="grid grid-cols-[1fr_auto] gap-1">
-                <span class="type-label">H₁ vs base</span><span class="type-value">{((cost.transferByLevel.l1 / baseCost.transferByLevel.l1) * 100).toFixed(2)}%</span>
-                <span class="type-label">M₁ vs base</span><span class="type-value">{((cost.memoryByLevel.l1 / baseCost.memoryByLevel.l1) * 100).toFixed(2)}%</span>
-              </div>
-            {/if}
-            <p class="type-fine text-muted-foreground">H sums each array whose residency color changes. M is the maximum sum of live arrays in any column at that level; lower-level axis sizes use their g/s labels.</p>
-          </div>
-        </section>
-
-        <section class="stack-field border border-border">
+      <section class="stack-field border border-border">
           <header class="flex items-center justify-between gap-2 border-b border-border bg-panel px-1 py-0.5"><h2 class="type-title">Cost-annotated proof history</h2><span class="type-value">{trace.length}</span></header>
           <div class="stack-field pad-box">
+            <div class="grid grid-cols-3 gap-1 border border-border bg-card pad-box">
+              <span class="type-label">Current</span>
+              <span class="type-value">H₁ {formatElements(cost.transferByLevel.l1)}</span>
+              <span class="type-value">M₁ {formatElements(cost.memoryByLevel.l1)}</span>
+            </div>
             <svg class="h-8 w-full border border-border bg-card text-primary" viewBox="0 0 100 32" preserveAspectRatio="none" aria-label="NCD transfer history">
               <polyline points={tracePoints} fill="none" stroke="currentColor" stroke-width="1" vector-effect="non-scaling-stroke" />
             </svg>
@@ -366,8 +515,7 @@ function formatBytes(value: number): string {
               {/each}
             </div>
           </div>
-        </section>
-      </div>
+      </section>
 
       <section class="stack-field border border-border">
         <header class="flex items-center justify-between gap-2 border-b border-border bg-panel px-1 py-0.5"><h2 class="type-title">Derived streamable-normal-form projection</h2><span class={projection.ok ? "type-tag text-success" : "type-tag text-destructive-strong"}>{projection.ok ? "DERIVED" : "AMBIGUOUS"}</span></header>
@@ -380,12 +528,12 @@ function formatBytes(value: number): string {
     </section>
 
     {#if fixture === "attention"}
-      <section class="stack-field pad-box">
+      <section class="stack-field pad-box" aria-busy={replayRunning}>
         <div class="flex flex-wrap items-center justify-between gap-2">
           <div class="stack-tight"><h2 class="type-title">FlashAttention by gestures</h2><p class="type-body text-muted-foreground">A replayable proof script over the same semantic boxes and wires.</p></div>
           <div class="flex gap-1">
-            <button class={controlClass()} onclick={nextFaStep}><StepForward size={11} /> Next step</button>
-            <button class={controlClass(true)} onclick={deriveAll}><Play size={11} /> Derive FA</button>
+            <button class={controlClass()} disabled={replayRunning} onclick={nextFaStep}><StepForward size={11} /> Next step</button>
+            <button class={controlClass(true)} disabled={replayRunning} onclick={deriveAll}><Play size={11} /> {replayRunning ? "Replaying…" : "Derive FA"}</button>
           </div>
         </div>
         <div class="grid grid-cols-[repeat(auto-fit,minmax(12rem,1fr))] gap-1">

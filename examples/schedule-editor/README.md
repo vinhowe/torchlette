@@ -108,3 +108,11 @@ fusion recolorings, `g_q=64`, and `s_x=32`. H/M are read directly from the wire
 residency and partition labels, and the loop/pseudocode pane is mechanically
 projected from the same term. See [ncd-findings.md](./ncd-findings.md) for the
 consumer-side failures and ambiguities exposed by making the notation editable.
+
+The primary NCD surface follows the paper notation rather than Sequence UI:
+stacked italic axis columns, overbars and dashed tuple separators, smooth
+term-derived composition curves, translucent load/save/sub-algorithm regions,
+and a semantic-column-aligned M/H table. Sequence UI remains the surrounding
+palette, history, and projection chrome. The canvas pans and zooms; no x/y is
+stored in the term. Review captures and the honest reference comparison live in
+[review/SIDE-BY-SIDE.md](./review/SIDE-BY-SIDE.md).
