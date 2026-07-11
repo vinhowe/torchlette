@@ -1,0 +1,2851 @@
+{
+  "meta": {
+    "model": "gpt2-tiny-2l-64d",
+    "step": "cold-forward",
+    "planFingerprint": "0xd86144e1:0xb33234a8"
+  },
+  "partition": {
+    "islands": [
+      {
+        "kind": "sequential",
+        "members": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55,
+          56
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          23,
+          24,
+          25,
+          35,
+          57
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          58,
+          59,
+          60,
+          61,
+          62,
+          63,
+          64,
+          65,
+          66,
+          67,
+          68,
+          69,
+          70,
+          71,
+          72,
+          73
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          74,
+          75
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          76,
+          77,
+          78,
+          79
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          80,
+          81
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          82,
+          83,
+          84,
+          85,
+          86,
+          87,
+          88,
+          89,
+          90,
+          91,
+          92,
+          93,
+          94,
+          95,
+          96,
+          97
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          99,
+          100
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          98,
+          101
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          102
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          103,
+          104
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          105,
+          106,
+          107,
+          108,
+          109,
+          110
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          111,
+          112
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          113,
+          114,
+          115
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          116,
+          117
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          118
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          119,
+          120
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          121,
+          122,
+          123,
+          124
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          125,
+          126,
+          127,
+          128,
+          129
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          130,
+          131
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          132,
+          133,
+          134
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          135,
+          136
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          137
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          138,
+          139
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          140,
+          141
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          142,
+          143,
+          144
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          145,
+          146
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          147
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          148,
+          149
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          150,
+          151,
+          152,
+          153
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          154,
+          155,
+          156,
+          157,
+          158
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          159,
+          160
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          161,
+          162,
+          163
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          164,
+          165
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          166,
+          167,
+          168,
+          169,
+          170,
+          171,
+          172,
+          173,
+          174,
+          175,
+          176,
+          177,
+          178,
+          179,
+          180,
+          181
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          182,
+          183
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          184
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          185,
+          186
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          187,
+          188,
+          189,
+          190,
+          191,
+          192
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          193,
+          194
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          195,
+          196,
+          197
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          198,
+          199
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          200
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          201,
+          202
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          203,
+          204,
+          205,
+          206
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          207,
+          208,
+          209,
+          210,
+          211
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          212,
+          213
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          214,
+          215,
+          216
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          217,
+          218
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          219
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          220,
+          221
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          222,
+          223
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          224,
+          225,
+          226
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          227,
+          228
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          229
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          230,
+          231
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          232,
+          233,
+          234,
+          235
+        ]
+      },
+      {
+        "kind": "fused",
+        "members": [
+          236,
+          237,
+          238,
+          239,
+          240
+        ]
+      },
+      {
+        "kind": "sequential",
+        "members": [
+          241
+        ]
+      }
+    ],
+    "boundaryHash": 1990990962
+  },
+  "nodes": [
+    {
+      "pos": 0,
+      "op": "randn",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 1,
+      "op": "randn",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 2,
+      "op": "tensorFromArray",
+      "shape": [
+        1,
+        32
+      ],
+      "dtype": "i32"
+    },
+    {
+      "pos": 3,
+      "op": "reshape",
+      "shape": [
+        32
+      ],
+      "dtype": "i32"
+    },
+    {
+      "pos": 4,
+      "op": "reshape",
+      "shape": [
+        32,
+        1
+      ],
+      "dtype": "i32"
+    },
+    {
+      "pos": 5,
+      "op": "expand",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "i32"
+    },
+    {
+      "pos": 6,
+      "op": "contiguous",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "i32"
+    },
+    {
+      "pos": 7,
+      "op": "gather",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 8,
+      "op": "reshape",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 9,
+      "op": "arange",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 10,
+      "op": "reshape",
+      "shape": [
+        1,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 11,
+      "op": "narrow",
+      "shape": [
+        1,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 12,
+      "op": "reshape",
+      "shape": [
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 13,
+      "op": "reshape",
+      "shape": [
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 14,
+      "op": "expand",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 15,
+      "op": "contiguous",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 16,
+      "op": "gather",
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 17,
+      "op": "reshape",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 18,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 19,
+      "op": "mean",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 20,
+      "op": "sub",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 21,
+      "op": "mul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 22,
+      "op": "mean",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 23,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 24,
+      "op": "sqrt",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 25,
+      "op": "div",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 26,
+      "op": "full",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 27,
+      "op": "full",
+      "shape": [],
+      "dtype": "f32"
+    },
+    {
+      "pos": 28,
+      "op": "full",
+      "shape": [
+        1,
+        1,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 29,
+      "op": "full",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 30,
+      "op": "full",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 31,
+      "op": "full",
+      "shape": [],
+      "dtype": "f32"
+    },
+    {
+      "pos": 32,
+      "op": "full",
+      "shape": [
+        1,
+        1,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 33,
+      "op": "full",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 34,
+      "op": "full",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 35,
+      "op": "mul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 36,
+      "op": "zeros",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 37,
+      "op": "zeros",
+      "shape": [
+        192,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 38,
+      "op": "zeros",
+      "shape": [
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 39,
+      "op": "zeros",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 40,
+      "op": "zeros",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 41,
+      "op": "zeros",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 42,
+      "op": "zeros",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 43,
+      "op": "zeros",
+      "shape": [
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 44,
+      "op": "zeros",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 45,
+      "op": "zeros",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 46,
+      "op": "zeros",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 47,
+      "op": "zeros",
+      "shape": [
+        192,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 48,
+      "op": "zeros",
+      "shape": [
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 49,
+      "op": "zeros",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 50,
+      "op": "zeros",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 51,
+      "op": "zeros",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 52,
+      "op": "zeros",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 53,
+      "op": "zeros",
+      "shape": [
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 54,
+      "op": "zeros",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 55,
+      "op": "zeros",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 56,
+      "op": "zeros",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 57,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 58,
+      "op": "rand",
+      "shape": [
+        192,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 59,
+      "op": "rand",
+      "shape": [
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 60,
+      "op": "rand",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 61,
+      "op": "rand",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 62,
+      "op": "rand",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 63,
+      "op": "rand",
+      "shape": [
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 64,
+      "op": "rand",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 65,
+      "op": "rand",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 66,
+      "op": "rand",
+      "shape": [
+        192,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 67,
+      "op": "rand",
+      "shape": [
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 68,
+      "op": "rand",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 69,
+      "op": "rand",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 70,
+      "op": "rand",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 71,
+      "op": "rand",
+      "shape": [
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 72,
+      "op": "rand",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 73,
+      "op": "rand",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 74,
+      "op": "mul",
+      "shape": [
+        192,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 75,
+      "op": "add",
+      "shape": [
+        192,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 76,
+      "op": "stridedScatterCopy",
+      "shape": [
+        192,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 77,
+      "op": "transpose",
+      "shape": [
+        64,
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 78,
+      "op": "transpose",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 79,
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 80,
+      "op": "mul",
+      "shape": [
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 81,
+      "op": "add",
+      "shape": [
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 82,
+      "op": "stridedScatterCopy",
+      "shape": [
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 83,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 84,
+      "op": "narrow",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 85,
+      "op": "narrow",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 86,
+      "op": "narrow",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 87,
+      "op": "reshape",
+      "shape": [
+        1,
+        32,
+        2,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 88,
+      "op": "reshape",
+      "shape": [
+        1,
+        32,
+        2,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 89,
+      "op": "reshape",
+      "shape": [
+        1,
+        32,
+        2,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 90,
+      "op": "permute",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 91,
+      "op": "permute",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 92,
+      "op": "permute",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 93,
+      "op": "contiguous",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 94,
+      "op": "contiguous",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 95,
+      "op": "contiguous",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 96,
+      "op": "transpose",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 97,
+      "op": "matmul",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 98,
+      "op": "mul",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 99,
+      "op": "triu",
+      "shape": [
+        1,
+        1,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 100,
+      "op": "triu",
+      "shape": [
+        1,
+        1,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 101,
+      "op": "add",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 102,
+      "op": "max",
+      "shape": [
+        1,
+        2,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 103,
+      "op": "sub",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 104,
+      "op": "exp",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 105,
+      "op": "sum",
+      "shape": [
+        1,
+        2,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 106,
+      "op": "div",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 107,
+      "op": "matmul",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 108,
+      "op": "permute",
+      "shape": [
+        1,
+        32,
+        2,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 109,
+      "op": "contiguous",
+      "shape": [
+        1,
+        32,
+        2,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 110,
+      "op": "reshape",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 111,
+      "op": "mul",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 112,
+      "op": "add",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 113,
+      "op": "stridedScatterCopy",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 114,
+      "op": "transpose",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 115,
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 116,
+      "op": "mul",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 117,
+      "op": "add",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 118,
+      "op": "stridedScatterCopy",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 119,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 120,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 121,
+      "op": "mean",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 122,
+      "op": "sub",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 123,
+      "op": "mul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 124,
+      "op": "mean",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 125,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 126,
+      "op": "sqrt",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 127,
+      "op": "div",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 128,
+      "op": "mul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 129,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 130,
+      "op": "mul",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 131,
+      "op": "add",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 132,
+      "op": "stridedScatterCopy",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 133,
+      "op": "transpose",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 134,
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 135,
+      "op": "mul",
+      "shape": [
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 136,
+      "op": "add",
+      "shape": [
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 137,
+      "op": "stridedScatterCopy",
+      "shape": [
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 138,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 139,
+      "op": "gelu",
+      "shape": [
+        1,
+        32,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 140,
+      "op": "mul",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 141,
+      "op": "add",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 142,
+      "op": "stridedScatterCopy",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 143,
+      "op": "transpose",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 144,
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 145,
+      "op": "mul",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 146,
+      "op": "add",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 147,
+      "op": "stridedScatterCopy",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 148,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 149,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 150,
+      "op": "mean",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 151,
+      "op": "sub",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 152,
+      "op": "mul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 153,
+      "op": "mean",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 154,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 155,
+      "op": "sqrt",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 156,
+      "op": "div",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 157,
+      "op": "mul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 158,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 159,
+      "op": "mul",
+      "shape": [
+        192,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 160,
+      "op": "add",
+      "shape": [
+        192,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 161,
+      "op": "stridedScatterCopy",
+      "shape": [
+        192,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 162,
+      "op": "transpose",
+      "shape": [
+        64,
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 163,
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 164,
+      "op": "mul",
+      "shape": [
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 165,
+      "op": "add",
+      "shape": [
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 166,
+      "op": "stridedScatterCopy",
+      "shape": [
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 167,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        192
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 168,
+      "op": "narrow",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 169,
+      "op": "narrow",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 170,
+      "op": "narrow",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 171,
+      "op": "reshape",
+      "shape": [
+        1,
+        32,
+        2,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 172,
+      "op": "reshape",
+      "shape": [
+        1,
+        32,
+        2,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 173,
+      "op": "reshape",
+      "shape": [
+        1,
+        32,
+        2,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 174,
+      "op": "permute",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 175,
+      "op": "permute",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 176,
+      "op": "permute",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 177,
+      "op": "contiguous",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 178,
+      "op": "contiguous",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 179,
+      "op": "contiguous",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 180,
+      "op": "transpose",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 181,
+      "op": "matmul",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 182,
+      "op": "mul",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 183,
+      "op": "add",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 184,
+      "op": "max",
+      "shape": [
+        1,
+        2,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 185,
+      "op": "sub",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 186,
+      "op": "exp",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 187,
+      "op": "sum",
+      "shape": [
+        1,
+        2,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 188,
+      "op": "div",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 189,
+      "op": "matmul",
+      "shape": [
+        1,
+        2,
+        32,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 190,
+      "op": "permute",
+      "shape": [
+        1,
+        32,
+        2,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 191,
+      "op": "contiguous",
+      "shape": [
+        1,
+        32,
+        2,
+        32
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 192,
+      "op": "reshape",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 193,
+      "op": "mul",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 194,
+      "op": "add",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 195,
+      "op": "stridedScatterCopy",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 196,
+      "op": "transpose",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 197,
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 198,
+      "op": "mul",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 199,
+      "op": "add",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 200,
+      "op": "stridedScatterCopy",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 201,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 202,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 203,
+      "op": "mean",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 204,
+      "op": "sub",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 205,
+      "op": "mul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 206,
+      "op": "mean",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 207,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 208,
+      "op": "sqrt",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 209,
+      "op": "div",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 210,
+      "op": "mul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 211,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 212,
+      "op": "mul",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 213,
+      "op": "add",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 214,
+      "op": "stridedScatterCopy",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 215,
+      "op": "transpose",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 216,
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 217,
+      "op": "mul",
+      "shape": [
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 218,
+      "op": "add",
+      "shape": [
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 219,
+      "op": "stridedScatterCopy",
+      "shape": [
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 220,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 221,
+      "op": "gelu",
+      "shape": [
+        1,
+        32,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 222,
+      "op": "mul",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 223,
+      "op": "add",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 224,
+      "op": "stridedScatterCopy",
+      "shape": [
+        64,
+        256
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 225,
+      "op": "transpose",
+      "shape": [
+        256,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 226,
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 227,
+      "op": "mul",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 228,
+      "op": "add",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 229,
+      "op": "stridedScatterCopy",
+      "shape": [
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 230,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 231,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 232,
+      "op": "mean",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 233,
+      "op": "sub",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 234,
+      "op": "mul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 235,
+      "op": "mean",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 236,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 237,
+      "op": "sqrt",
+      "shape": [
+        1,
+        32,
+        1
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 238,
+      "op": "div",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 239,
+      "op": "mul",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 240,
+      "op": "add",
+      "shape": [
+        1,
+        32,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
+      "pos": 241,
+      "op": "matmul",
+      "shape": [
+        1,
+        32,
+        256
+      ],
+      "dtype": "f32"
+    }
+  ]
+}
