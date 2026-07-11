@@ -4,6 +4,20 @@
 Written at the end of the cycle that landed stages 0–3; every claim about
 existing machinery refers to code in-tree at commit ed779c6.*
 
+> **TASK #43 "recorded-build sunset" STATUS (2026-07-11, deletion-attempt pass):
+> STOPPED at the map — the recorded build is NOT deletable yet, and the named
+> flag it targeted is already dead.** See the full map at the bottom of this doc
+> (§ "Task #43 recorded-build sunset — deletion MAP + STOP"). One-line summary:
+> `TORCHLETTE_GENERATED_PLAN` (the flag this pass was asked to sunset) died on
+> 2026-07-08 (B5, inc-3c) and appears in ZERO live code — the sunset is already
+> executed. The recorded build (`buildCompiledPlan` + the `record*` hooks) has
+> three live masters on the DEFAULT path — the uncovered-plan census fallback
+> (correctness, fires for real generator gaps), the `STREAM_GENERATE=1` verify
+> gates (2 of the 4 load-bearing gates), and the `BUILD_FROM_IR=0`/`COMPILED_PLAN=0`
+> opt-outs (separate flags, out of this campaign's scope). Deletion is gated on
+> 4.4-coverage (full generator coverage) + stage-3 rematerialization unification,
+> both designed-but-not-built. Per the campaign's STOP rule, no deletion forced.
+
 ## Why (tied to the ledger)
 
 The compiled plan today is a **trace**: one normal execution runs with a
@@ -2130,4 +2144,86 @@ op-consulted caches become planner-visible), alongside the deferred peak
 work. Stage-3 mechanism work closes here: phys 6712 vs bar 6209 (+8%),
 with the residual named (dup-casts ~260, size-class rounding, sibling
 variant, unclaimed releasables).
+
+## Task #43 recorded-build sunset — deletion MAP + STOP (2026-07-11)
+
+A dedicated deletion pass was authorized to "delete the recorded-build path
+(~−800 SLOC) and sunset `TORCHLETTE_GENERATED_PLAN`." Phase-A mapping against
+the live tree (HEAD `715c30aa`) found the mission's precondition already
+satisfied and its main body blocked by a still-open coverage gate. **Result:
+STOPPED after the map — no deletion forced** (the campaign's explicit STOP rule:
+if a recurring plan class still NEEDS the recorded replay for correctness, map
+and report rather than force). This section IS that map.
+
+### A1 — flag-family inventory (only GENERATED_PLAN was in this campaign's scope)
+Live `TORCHLETTE_*` flags in this family (grep over `src/`):
+- **`TORCHLETTE_GENERATED_PLAN` — ALREADY DEAD.** Zero occurrences in live code
+  (`src/`, `test/`, `tools/`); only historical narrative in this doc. Killed
+  2026-07-08 (B5, inc-3c) — after inc-3a deleted the recorded→generated cutover
+  swap, the flag was an exact behavioral twin of `BUILD_FROM_IR=0`, so it was
+  retired as debt. **The named sunset this pass was asked to execute is already
+  executed.** Nothing to delete.
+- **`TORCHLETTE_BUILD_FROM_IR`** — opt-out default-on (`!== "0"`). `=0` restores
+  the record-then-replay build everywhere. NOT in scope (different flag); it is
+  the recorded-build reference arm and dies WITH the recorded build, not before.
+- **`TORCHLETTE_COMPILED_PLAN`** — opt-out default-on; `=0` = lowered reference.
+  NOT in scope. The `parity-fullstack-tl.ts` gate is `COMPILED_PLAN=0` vs default
+  and survives untouched.
+- **`TORCHLETTE_MEMORY_PLANNER`, `TORCHLETTE_COMPILED_PLANNED`,
+  `TORCHLETTE_STREAM_GENERATE`, `TORCHLETTE_ARENA_LIVENESS`** — all out of scope;
+  semantics unchanged. `STREAM_GENERATE=1` is a verify mode that consumes the
+  recorded build (below).
+
+### A2 — what the RECORDING still serves on the default path (`BUILD_FROM_IR` on)
+`buildFromIRActive()` (`executor.ts:540`) makes build-from-IR the default build
+source. But recording is NOT dead under the default — three live masters:
+1. **Uncovered-plan census fallback (CORRECTNESS, default path).** When
+   `generateStream` returns `fullyCovered=false` (or `harvestGenResults` returns
+   `genOk=false`), the build-from-IR block (`executor.ts:1831–…`) resets its
+   captures and falls through to the lowered path with zero residue; the plan
+   then **records on its next execution**. The generator has many genuine bail
+   points (`stream-generate.ts`): strided/non-derivable views, chunked buffers
+   `>maxStorageBufferBindingSize` (128 MB), batched dispatch `>64`, non-f32
+   typed-buffer ops, copy-on-write dispatch, contiguous-copy prologues. These
+   are real plan classes (the 124M plan hits the chunked-sum path), so the
+   recorded build is load-bearing for correctness until 4.4-coverage closes the
+   gaps. This is the STOP trigger.
+2. **Verify-mode gates (2 of the 4 load-bearing gates).** `STREAM_GENERATE=1`
+   builds BOTH the recorded and generated streams and diffs them
+   (`compiled-plan-parity.spec.ts` gates 2–3; `t-stream-generate.ts`,
+   `t-stream-determinism.ts` pins `BUILD_FROM_IR=0`). Deleting the recorded
+   build removes the reference these gates diff against.
+3. **The opt-outs** `BUILD_FROM_IR=0` / `COMPILED_PLAN=0` — separate flags,
+   product-decision sunsets, not this campaign's.
+
+### A3 — 4.3 residue (logsumexp oi=1): ALREADY CLOSED, verified, not re-done
+The phase-4 A1 residue ("expose fusedAttentionForward oi=1 like grad_bias") is
+landed: `generateAttention` returns `outputs:[{oi:0},{oi:1 lse}]`
+(`stream-generate.ts:~1981`), the walker maps forward-attention non-primary
+outputs into `nodeSlotExtra`, and `executor.ts:1186` exposes the payload. The
+harvest bail rule (`harvestGenResults` hard-bails on any missing harvested pair)
+is the safe superset of the designed "non-primary miss = bail." Full no-record
+correctness is therefore NOT blocked on the logsumexp residue — it is blocked on
+the broader generator-coverage gaps in A2(1).
+
+### A4 — tests/tools referencing the recorded-build machinery (would move on deletion)
+Not deleted this pass (deletion not executed); listed so the eventual harvest
+names them: `test/compiled-plan-parity.spec.ts` (STREAM_GENERATE + BUILD_FROM_IR=0
+arms), `test/observed-liveness.spec.ts` (BUILD_FROM_IR=0 cutover ref),
+`tools/t-stream-generate.ts`, `tools/t-stream-determinism.ts` (pins
+BUILD_FROM_IR=0), `tools/t-compiled-parity-probe.ts`, `tools/t-chunked-sum-probe.ts`,
+`tools/t-observed-liveness-mem.ts`, `tools/t-observed-liveness-probe.ts`. All of
+these are gates/probes for the surviving recorded build; they stay until it
+sunsets.
+
+### Verdict
+The recorded-build sunset is gated (per the stage-3 coordinator ruling above:
+"the deletions queue behind 4.4-coverage or a peak-acceptability measurement at
+target scales"). 4.4-coverage — full generator coverage so no plan needs the
+recorded fallback — is the prerequisite and is not yet built. **No `src/`
+deletion is warranted or safe in this pass.** The one thing genuinely in scope
+(the `GENERATED_PLAN` flag) was already sunset. Net SLOC delta of this pass: 0
+in `src/` (docs-only). When 4.4-coverage lands, the deletion harvest (B2/B3: the
+~80 `record*` refs + params-sequence cache + `buildCompiledPlan` + BUILD_FROM_IR=0
+opt-out) becomes safe and is the ~−800–1200 SLOC win the original estimate named.
 
