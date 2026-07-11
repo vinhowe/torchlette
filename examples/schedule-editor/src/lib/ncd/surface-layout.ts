@@ -14,6 +14,20 @@ export interface WireSurfaceLane {
   height: number;
 }
 
+export interface SurfaceJam {
+  target: "axis" | "box" | "residency";
+  id: string;
+  column?: number;
+  reason: string;
+}
+
+export interface SurfaceEquivalence {
+  before: NcdTerm;
+  after: NcdTerm;
+  label: string;
+  nonce: number;
+}
+
 export const SURFACE_COLUMN_WIDTH = 176;
 export const SURFACE_LEFT_GUTTER = 112;
 export const SURFACE_TOP = 172;

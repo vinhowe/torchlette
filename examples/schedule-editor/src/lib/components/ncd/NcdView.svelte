@@ -16,6 +16,7 @@ import {
   termHash,
   toDiagram,
 } from "../../ncd/model";
+import type { SurfaceEquivalence, SurfaceJam } from "../../ncd/surface-layout";
 import type {
   NapkinCost,
   NcdHistoryEntry,
@@ -38,6 +39,12 @@ let groupSize = $state(64);
 let streamSize = $state(32);
 let faStep = $state(0);
 let loadError = $state("");
+let paintLevel = $state<NcdLevel>("l1");
+let previewTerm = $state<NcdTerm | null>(null);
+let jam = $state<SurfaceJam | null>(null);
+let equivalence = $state<SurfaceEquivalence | null>(null);
+let equivalenceNonce = 0;
+let equivalenceTimer: ReturnType<typeof setTimeout> | undefined;
 
 const cost = $derived(current ? napkinCost(current) : null);
 const baseCost = $derived(
@@ -109,12 +116,30 @@ function resetTo(nextFixture: "attention" | "matmul" = fixture): void {
   history = [];
   redoStack = [];
   faStep = 0;
+  previewTerm = null;
+  jam = null;
+  equivalence = null;
   refusal = `Restored ${base.name}.`;
+}
+
+function showEquivalence(before: NcdTerm, after: NcdTerm, label: string): void {
+  if (equivalenceTimer) clearTimeout(equivalenceTimer);
+  equivalence = { before, after, label, nonce: ++equivalenceNonce };
+  equivalenceTimer = setTimeout(() => {
+    equivalence = null;
+  }, 1050);
+}
+
+function refuse(reason: string, target: Omit<SurfaceJam, "reason">): void {
+  previewTerm = null;
+  jam = { ...target, reason };
+  refusal = `Refused: ${reason}`;
 }
 
 function commit(label: string, move: NcdMove): void {
   if (!current) return;
   try {
+    const before = cloneTerm(current);
     const next = applyMove(current, move);
     const entry: NcdHistoryEntry = {
       label,
@@ -124,9 +149,12 @@ function commit(label: string, move: NcdMove): void {
       cost: napkinCost(next),
     };
     current = next;
+    previewTerm = null;
+    jam = null;
     history = [...history, entry];
     redoStack = [];
     refusal = `${label} applied as an invertible term relabeling.`;
+    showEquivalence(before, next, label);
   } catch (error) {
     refusal = `Refused: ${error instanceof Error ? error.message : String(error)}`;
   }
@@ -135,20 +163,28 @@ function commit(label: string, move: NcdMove): void {
 function undo(): void {
   const entry = history.at(-1);
   if (!entry || !current) return;
+  const before = cloneTerm(current);
   current = applyMove(current, entry.inverse);
   history = history.slice(0, -1);
   redoStack = [...redoStack, entry];
   faStep = Math.min(faStep, history.length);
   refusal = `Undo applied inverse ${entry.inverse.op} relabeling.`;
+  previewTerm = null;
+  jam = null;
+  showEquivalence(before, current, `undo · ${entry.label}`);
 }
 
 function redo(): void {
   const entry = redoStack.at(-1);
   if (!entry || !current) return;
+  const before = cloneTerm(current);
   current = applyMove(current, entry.forward);
   redoStack = redoStack.slice(0, -1);
   history = [...history, entry];
   refusal = `Redo applied ${entry.forward.op} relabeling.`;
+  previewTerm = null;
+  jam = null;
+  showEquivalence(before, current, `redo · ${entry.label}`);
 }
 
 function attemptPartition(axisId: string, kind: PartitionKind): void {
@@ -163,10 +199,45 @@ function attemptPartition(axisId: string, kind: PartitionKind): void {
   };
   const legal = partitionLegality(current, after);
   if (!legal.legal) {
-    refusal = `Refused: ${legal.reason}`;
+    const blockedBox =
+      kind === "stream"
+        ? current.semantic.boxes.find(
+            (box) => box.streamability.kind === "none",
+          )
+        : undefined;
+    refuse(
+      legal.reason,
+      blockedBox
+        ? { target: "box", id: blockedBox.id }
+        : { target: "axis", id: axisId },
+    );
     return;
   }
   commit(`${kind}-partition ${axis.label}=${size}`, {
+    op: "partition",
+    axisId,
+    before: current.decorations.partitions.find(
+      (item) => item.axisId === axisId,
+    ),
+    after,
+  });
+}
+
+function previewPartition(axisId: string, kind: PartitionKind): void {
+  if (!current) return;
+  const axis = axisById(current, axisId);
+  const size = kind === "group" ? groupSize : streamSize;
+  const after: PartitionDecoration = {
+    axisId,
+    kind,
+    size,
+    label: `${kind === "group" ? "g" : "s"}_${axis.label}`,
+  };
+  if (!partitionLegality(current, after).legal) {
+    previewTerm = null;
+    return;
+  }
+  previewTerm = applyMove(current, {
     op: "partition",
     axisId,
     before: current.decorations.partitions.find(
@@ -188,7 +259,15 @@ function attemptResidency(
   if (!state) return;
   const legal = recolorLegality(current, wireId, column, level);
   if (!legal.legal) {
-    refusal = `Refused: ${legal.reason}`;
+    const blockedBox = current.semantic.boxes.find(
+      (box) => box.streamability.kind === "none",
+    );
+    refuse(
+      legal.reason,
+      legal.reason.includes("softmax") && blockedBox
+        ? { target: "box", id: blockedBox.id }
+        : { target: "residency", id: wireId, column },
+    );
     return;
   }
   commit(`recolor ${wireId}@${column} ${state.level}→${level}`, {
@@ -200,13 +279,56 @@ function attemptResidency(
   });
 }
 
+function previewResidency(
+  wireId: string,
+  column: number,
+  level: NcdLevel,
+): void {
+  if (!current) return;
+  const state = current.decorations.residency.find(
+    (item) => item.wireId === wireId && item.column === column,
+  );
+  if (!state || !recolorLegality(current, wireId, column, level).legal) {
+    previewTerm = null;
+    return;
+  }
+  previewTerm = applyMove(current, {
+    op: "recolor",
+    wireId,
+    column,
+    before: state.level,
+    after: level,
+  });
+}
+
+function clearPreview(): void {
+  previewTerm = null;
+}
+
 function admitLemma(): void {
   if (!current) return;
   if (current.decorations.admittedLemmas.includes("online-softmax-rescaling")) {
-    refusal = "Refused: online-softmax rescaling is already admitted.";
+    refuse("online-softmax rescaling is already admitted.", {
+      target: "box",
+      id: "softmax",
+    });
     return;
   }
   commit("admit online-softmax rescaling", onlineSoftmaxLemma(current));
+}
+
+function dropLemma(boxId: string): void {
+  if (boxId !== "softmax") {
+    refuse(
+      "This lemma rewrites softmax only; the selected function does not match.",
+      {
+        target: "box",
+        id: boxId,
+      },
+    );
+    return;
+  }
+  admitLemma();
 }
 
 function nextFaStep(): void {
@@ -253,7 +375,8 @@ function dragPayload(
   event: DragEvent,
   payload:
     | { type: "partition"; kind: PartitionKind }
-    | { type: "level"; level: NcdLevel },
+    | { type: "level"; level: NcdLevel }
+    | { type: "lemma"; lemmaId: string },
 ): void {
   event.dataTransfer?.setData(
     "application/x-torchlette-ncd",
@@ -320,22 +443,34 @@ function formatElements(value: number): string {
           <div class="stack-tight">
             <span class="type-label">Relabeling palette</span>
             <div class="flex items-center gap-1">
-              <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "partition", kind: "group" })}>g · Group</button>
+              <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "partition", kind: "group" })}>gₐ · Group</button>
               <input class="h-control w-16 border border-input bg-card px-1 type-value" type="number" min="1" bind:value={groupSize} aria-label="Group size" />
-              <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "partition", kind: "stream" })}>s · Stream</button>
+              <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "partition", kind: "stream" })}>sₐ · Stream</button>
               <input class="h-control w-16 border border-input bg-card px-1 type-value" type="number" min="1" bind:value={streamSize} aria-label="Stream size" />
-              <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "level", level: "l0" })}>ℓ0 · Global</button>
-              <button class={controlClass(true)} draggable="true" ondragstart={(event) => dragPayload(event, { type: "level", level: "l1" })}>ℓ1 · Lower</button>
+              <button class={controlClass(paintLevel === "l0")} draggable="true" aria-pressed={paintLevel === "l0"} onclick={() => (paintLevel = "l0")} ondragstart={(event) => dragPayload(event, { type: "level", level: "l0" })}>ℓ0 · Global brush</button>
+              <button class={controlClass(paintLevel === "l1")} draggable="true" aria-pressed={paintLevel === "l1"} onclick={() => (paintLevel = "l1")} ondragstart={(event) => dragPayload(event, { type: "level", level: "l1" })}>ℓ1 · Lower brush</button>
             </div>
           </div>
           {#if fixture === "attention"}
-            <button class={controlClass()} onclick={admitLemma}>Admit online-softmax lemma</button>
+            <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "lemma", lemmaId: "online-softmax-rescaling" })} onclick={admitLemma}>Lemma · online softmax</button>
           {/if}
         </div>
-        <p class="max-w-52 type-fine text-muted-foreground">Drag the paper to pan; wheel to zoom. Labels and regions are derived from the term.</p>
+        <p class="max-w-52 type-fine text-muted-foreground">Drop gₐ/sₐ on axes. Select ℓ0/ℓ1, then paint a region. Drop the lemma on a function.</p>
       </div>
 
-      <NcdRenderer term={current} onPartitionDrop={attemptPartition} onResidencyDrop={attemptResidency} />
+      <NcdRenderer
+        term={current}
+        {previewTerm}
+        {paintLevel}
+        {jam}
+        {equivalence}
+        onPartitionDrop={attemptPartition}
+        onPartitionPreview={previewPartition}
+        onResidencyDrop={attemptResidency}
+        onResidencyPreview={previewResidency}
+        onLemmaDrop={dropLemma}
+        onPreviewClear={clearPreview}
+      />
     </section>
 
     <section class="grid grid-cols-[minmax(18rem,0.8fr)_minmax(20rem,1.2fr)] items-start gap-1 border-b border-border pad-box max-[900px]:grid-cols-1">
