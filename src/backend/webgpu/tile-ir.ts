@@ -2470,6 +2470,70 @@ export class KernelContext {
   }
 
   /**
+   * Pair-valued workgroup argmax/argmin: reduce (value, index) PAIRS across the
+   * workgroup, returning the winning `{ value, index }` — the scalar `wgReduce`
+   * that carries an index alongside its extremum. This is the primitive the
+   * top-K / arg-reduce (argmax/argmin) class of ops needs that scalar reduce
+   * lacks: scalar `wgReduce("max", …)` finds the extreme VALUE but drops which
+   * lane produced it, and a separate index reduction can't reproduce the
+   * extremum's tie-break atomically.
+   *
+   * Each lane contributes its already-accumulated candidate pair (typically a
+   * per-lane strided argmax over the lane's slice). `op="max"` selects the
+   * larger value; `op="min"` the smaller. Ties (equal value) resolve to the
+   * SMALLER index — deterministic, and the convention argmax/topk require
+   * (matches a CPU linear scan taking the FIRST extremum). NO_IDX
+   * (0xffffffffu) marks an empty lane and always loses (it pairs with an
+   * identity value the caller supplies).
+   *
+   * Composition-only: builds on `sharedArray`/`barrier`/`ifThen`/`select` — no
+   * new IR node or compiler emit. Uses the shared-memory tree path (no subgroup
+   * dependency) for a deterministic, platform-uniform tie-break, mirroring the
+   * old hand-WGSL topk tree. The returned pair is broadcast to every lane
+   * (smem[0], like `wgReduce`'s smem[0] read); must be called in uniform
+   * control flow. `value` is f32, `index` is u32.
+   */
+  pairArgReduce(
+    op: "max" | "min",
+    tid: BlockExpr,
+    wgSize: number,
+    value: BlockExpr,
+    index: BlockExpr,
+  ): { value: BlockExpr; index: BlockExpr } {
+    const id = this.reduceCounter++;
+    const sVal = this.sharedArray(`_par${id}_v`, wgSize, "f32");
+    const sIdx = this.sharedArray(`_par${id}_i`, wgSize, "u32");
+    sVal.write(tid, value);
+    sIdx.write(tid, index);
+    this.barrier();
+    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
+      this.ifThen(tid.lt(this.u32(stride)), () => {
+        const other = tid.add(this.u32(stride));
+        // Snapshot BOTH candidates into lets before writing either shared
+        // slot — the two-array update must not read a value it just wrote
+        // (the `sIdx` write's tie-break would otherwise read the already-
+        // overwritten `sVal[tid]`).
+        const av = this.emitLet(`_par${id}_av`, sVal.read(tid));
+        const ai = this.emitLet(`_par${id}_ai`, sIdx.read(tid));
+        const bv = this.emitLet(`_par${id}_bv`, sVal.read(other));
+        const bi = this.emitLet(`_par${id}_bi`, sIdx.read(other));
+        // Is candidate b better than a? Extremum on value; smaller index
+        // wins ties.
+        const take = this.emitLet(
+          `_par${id}_take`,
+          op === "max"
+            ? bv.gt(av).or(bv.eq(av).and(bi.lt(ai)))
+            : bv.lt(av).or(bv.eq(av).and(bi.lt(ai))),
+        );
+        sVal.write(tid, take.select(bv, av));
+        sIdx.write(tid, take.select(bi, ai));
+      });
+      this.barrier();
+    }
+    return { value: sVal.read(this.u32(0)), index: sIdx.read(this.u32(0)) };
+  }
+
+  /**
    * Segmented workgroup reduction: reduce independently within GROUPS of
    * contiguous lanes. A workgroup of `wgSize` lanes is split into `groups`
    * segments of `wgSize / groups` lanes each; segment g covers lanes

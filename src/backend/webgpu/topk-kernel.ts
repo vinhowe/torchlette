@@ -7,14 +7,22 @@
  * CPU per token on the Qwen3-1.7B decode path. This kernel reduces the
  * readback to K (value, index) pairs (512B for K=64).
  *
- * Two passes, both iterative selection with a workgroup-level argmax tree
- * reduction (deterministic tie-break: smaller index wins, matching a CPU
- * linear scan that takes the FIRST maximum — greedy argmax is bit-identical
- * to the full-logits argmax):
+ * Two passes, both iterative selection with a workgroup-level argmax reduction
+ * (deterministic tie-break: smaller index wins, matching a CPU linear scan that
+ * takes the FIRST maximum — greedy argmax is bit-identical to the full-logits
+ * argmax):
  *   pass 1: NW workgroups each select the top-K of their contiguous chunk
  *           → partial (value, index) pairs [NW*K]
  *   pass 2: one workgroup merges the NW*K partials → final top-K, sorted
  *           descending (by construction of iterative selection)
+ *
+ * Both passes are AUTHORED ON TILE-IR (#65 — the last hand-WGSL kernel migrated
+ * onto the substrate). The workgroup argmax is `ctx.pairArgReduce`, the shared
+ * value+index reduction primitive added for this migration; the per-thread
+ * slice lives in a private register array (`emitVarArray`); the K-round
+ * selection loop, winner store and winner removal are the imperative tile-IR
+ * statement API (forRange/ifThen/emitVar). Future compression: argmax/argmin
+ * could ride pairArgReduce too (deliberately NOT migrated here).
  *
  * Runs OUTSIDE the lazy plan, at readback level (like read()): the input is
  * an already-forced contiguous f32 buffer; passes are encoded on the shared
@@ -29,188 +37,195 @@ import type { GPUBuffer, WebGPUTensor } from "./gpu-types";
 import { asGPUTensor, GPUBufferUsage, GPUMapMode } from "./gpu-types";
 import { ensureContiguous } from "./ops/views";
 import { flushSharedEncoder, getSharedEncoderInstance } from "./shared-encoder";
+import { compileTileKernel } from "./tile-compiler";
+import type { KernelContext, TileKernelSpec } from "./tile-ir";
+import { singleWorkgroup } from "./tile-ir";
 import { onTeardown, requireContext } from "./webgpu-state";
 
 const WG = 256; // workgroup size
 const NW = 64; // pass-1 workgroups
+const NEG_INF = -3.4028234e38;
+const NO_IDX = 0xffffffff;
 
 // ============================================================================
-// WGSL
+// Tile-IR kernel specs
 // ============================================================================
 
-/** Pass 1: per-chunk top-K selection. maxPT = ceil(ceil(length/NW)/WG). */
-function pass1WGSL(k: number, maxPT: number): string {
-  return `
-const WGS: u32 = ${WG}u;
-const K: u32 = ${k}u;
-const NW: u32 = ${NW}u;
-const MAX_PT: u32 = ${maxPT}u;
-const NEG_INF: f32 = -3.4028234e38;
-const NO_IDX: u32 = 0xffffffffu;
+/**
+ * Pass 1: per-chunk top-K selection. Each of NW workgroups owns a contiguous
+ * chunk of the input; each thread holds a strided register slice of maxPT
+ * elements; K rounds of workgroup argmax (pairArgReduce) drain the top-K,
+ * writing (value, index) partials for the chunk. maxPT = ceil(ceil(len/NW)/WG).
+ */
+function pass1Spec(k: number, maxPT: number): TileKernelSpec {
+  return {
+    name: `topkPass1_k${k}_pt${maxPT}`,
+    workgroupSize: WG,
+    bindings: {
+      input: { storage: "read", type: "f32" },
+      pvals: { storage: "read_write", type: "f32" },
+      pidx: { storage: "read_write", type: "u32" },
+    },
+    uniforms: { offset: "u32", length: "u32" },
+    grid: () => [NW],
+    kernel(ctx: KernelContext) {
+      const w = ctx.programId(0);
+      const tid = ctx.localIndex();
+      const off = ctx.uniform("offset");
+      const len = ctx.uniform("length");
+      const chunk = len.add(ctx.u32(NW - 1)).div(ctx.u32(NW));
+      const start = w.mul(chunk);
+      const end = start.add(chunk).min(len);
 
-struct Params { offset: u32, length: u32 }
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> pvals: array<f32>;
-@group(0) @binding(2) var<storage, read_write> pidx: array<u32>;
-@group(0) @binding(3) var<uniform> params: Params;
-
-var<workgroup> sVal: array<f32, WGS>;
-var<workgroup> sIdx: array<u32, WGS>;
-
-@compute @workgroup_size(${WG})
-fn main(
-  @builtin(workgroup_id) wid: vec3<u32>,
-  @builtin(local_invocation_id) lid: vec3<u32>,
-) {
-  let w = wid.x;
-  let tid = lid.x;
-  let len = params.length;
-  let chunk = (len + NW - 1u) / NW;
-  let start = w * chunk;
-  let end = min(start + chunk, len);
-
-  // Load this thread's strided slice of the chunk into registers.
-  // Element index of private slot s: e = start + s*WGS + tid.
-  var vals: array<f32, MAX_PT>;
-  for (var s = 0u; s < MAX_PT; s = s + 1u) {
-    let e = start + s * WGS + tid;
-    if (e < end) {
-      vals[s] = input[params.offset + e];
-    } else {
-      vals[s] = NEG_INF;
-    }
-  }
-
-  for (var kk = 0u; kk < K; kk = kk + 1u) {
-    // Thread-local argmax (ascending s → ascending e, so strict '>' keeps
-    // the SMALLEST index among equal values).
-    var bv = NEG_INF;
-    var bi = NO_IDX;
-    for (var s = 0u; s < MAX_PT; s = s + 1u) {
-      if (vals[s] > bv) {
-        bv = vals[s];
-        bi = start + s * WGS + tid;
+      // Load this thread's strided slice of the chunk into registers.
+      // Element index of private slot s: e = start + s*WG + tid.
+      const vals = ctx.emitVarArray("vals", "f32", maxPT, true);
+      for (let s = 0; s < maxPT; s++) {
+        const e = start.add(ctx.u32(s * WG)).add(tid);
+        vals.set(
+          ctx.u32(s),
+          e.lt(end).select(ctx.load("input", off.add(e)), ctx.f32(NEG_INF)),
+        );
       }
-    }
-    sVal[tid] = bv;
-    sIdx[tid] = bi;
-    workgroupBarrier();
-    // Tree reduction; ties resolve to the smaller index.
-    var step = WGS / 2u;
-    while (step > 0u) {
-      if (tid < step) {
-        let ov = sVal[tid + step];
-        let oi = sIdx[tid + step];
-        if (ov > sVal[tid] || (ov == sVal[tid] && oi < sIdx[tid])) {
-          sVal[tid] = ov;
-          sIdx[tid] = oi;
+
+      ctx.forRange(ctx.u32(0), ctx.u32(k), (kk) => {
+        // Thread-local argmax (ascending s → ascending e, so strict '>' keeps
+        // the SMALLEST index among equal values).
+        const bv = ctx.emitVar("bv", "f32", ctx.f32(NEG_INF));
+        const bi = ctx.emitVar("bi", "u32", ctx.u32(NO_IDX));
+        for (let s = 0; s < maxPT; s++) {
+          const v = vals.get(ctx.u32(s));
+          ctx.ifThen(v.gt(bv.get()), () => {
+            bv.set(v);
+            bi.set(start.add(ctx.u32(s * WG)).add(tid));
+          });
         }
-      }
-      workgroupBarrier();
-      step = step / 2u;
-    }
-    let winV = sVal[0];
-    let winI = sIdx[0];
-    workgroupBarrier(); // everyone has read the winner before sVal is reused
+        // Workgroup argmax over the per-thread candidate pairs.
+        const win = ctx.pairArgReduce("max", tid, WG, bv.get(), bi.get());
+        const winV = ctx.emitLet("winV", win.value);
+        const winI = ctx.emitLet("winI", win.index);
+        ctx.barrier(); // all lanes read the winner before smem is reused
 
-    if (tid == 0u) {
-      pvals[w * K + kk] = winV;
-      pidx[w * K + kk] = winI;
-    }
-    // Owner thread removes the winner from its private slice.
-    if (winI != NO_IDX) {
-      let r = winI - start;
-      if (r % WGS == tid) {
-        vals[r / WGS] = NEG_INF;
-      }
-    }
-  }
-}
-`;
+        const slot = w.mul(ctx.u32(k)).add(kk);
+        ctx.guardedStore("pvals", tid.eq(ctx.u32(0)), slot, winV);
+        ctx.guardedStore("pidx", tid.eq(ctx.u32(0)), slot, winI);
+
+        // Owner thread removes the winner from its private slice.
+        ctx.ifThen(winI.ne(ctx.u32(NO_IDX)), () => {
+          const r = winI.sub(start);
+          ctx.ifThen(r.mod(ctx.u32(WG)).eq(tid), () => {
+            // r / WG is a dynamic slot index into the register array.
+            vals.set(r.div(ctx.u32(WG)), ctx.f32(NEG_INF));
+          });
+        });
+      });
+    },
+  };
 }
 
-/** Pass 2: merge NW*K partials → final top-K. ptTwo = (NW*K)/WG. */
-function pass2WGSL(k: number): string {
+/**
+ * Pass 2: merge NW*K partials → final top-K. Each thread holds a strided
+ * register slice of ptTwo (value, ORIGINAL-index) pairs; K rounds of workgroup
+ * argmax drain the final top-K. ptTwo = ceil((NW*K)/WG).
+ */
+function pass2Spec(k: number): TileKernelSpec {
   const count = NW * k;
   const ptTwo = Math.ceil(count / WG);
-  return `
-const WGS: u32 = ${WG}u;
-const K: u32 = ${k}u;
-const COUNT: u32 = ${count}u;
-const PT: u32 = ${ptTwo}u;
-const NEG_INF: f32 = -3.4028234e38;
-const NO_IDX: u32 = 0xffffffffu;
+  return {
+    name: `topkPass2_k${k}`,
+    workgroupSize: WG,
+    bindings: {
+      pvals: { storage: "read", type: "f32" },
+      pidx: { storage: "read", type: "u32" },
+      outVals: { storage: "read_write", type: "f32" },
+      outIdx: { storage: "read_write", type: "u32" },
+    },
+    uniforms: {},
+    grid: singleWorkgroup(),
+    kernel(ctx: KernelContext) {
+      const tid = ctx.localIndex();
 
-@group(0) @binding(0) var<storage, read> pvals: array<f32>;
-@group(0) @binding(1) var<storage, read> pidx: array<u32>;
-@group(0) @binding(2) var<storage, read_write> outVals: array<f32>;
-@group(0) @binding(3) var<storage, read_write> outIdx: array<u32>;
-
-var<workgroup> sVal: array<f32, WGS>;
-var<workgroup> sIdx: array<u32, WGS>;
-
-@compute @workgroup_size(${WG})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
-  let tid = lid.x;
-
-  // Private copy of this thread's strided slice (value + ORIGINAL index).
-  var vals: array<f32, PT>;
-  var idxs: array<u32, PT>;
-  for (var s = 0u; s < PT; s = s + 1u) {
-    let e = s * WGS + tid;
-    if (e < COUNT) {
-      vals[s] = pvals[e];
-      idxs[s] = pidx[e];
-    } else {
-      vals[s] = NEG_INF;
-      idxs[s] = NO_IDX;
-    }
-  }
-
-  for (var kk = 0u; kk < K; kk = kk + 1u) {
-    var bv = NEG_INF;
-    var bi = NO_IDX;
-    for (var s = 0u; s < PT; s = s + 1u) {
-      // Tie-break on the ORIGINAL index (all original indices are distinct).
-      if (vals[s] > bv || (vals[s] == bv && idxs[s] < bi)) {
-        bv = vals[s];
-        bi = idxs[s];
+      // Private copy of this thread's strided slice (value + ORIGINAL index).
+      const vals = ctx.emitVarArray("vals", "f32", ptTwo, true);
+      const idxs = ctx.emitVarArray("idxs", "u32", ptTwo, true);
+      for (let s = 0; s < ptTwo; s++) {
+        const e = ctx.u32(s * WG).add(tid);
+        const inRange = e.lt(ctx.u32(count));
+        vals.set(
+          ctx.u32(s),
+          inRange.select(ctx.load("pvals", e), ctx.f32(NEG_INF)),
+        );
+        idxs.set(
+          ctx.u32(s),
+          inRange.select(ctx.load("pidx", e), ctx.u32(NO_IDX)),
+        );
       }
-    }
-    sVal[tid] = bv;
-    sIdx[tid] = bi;
-    workgroupBarrier();
-    var step = WGS / 2u;
-    while (step > 0u) {
-      if (tid < step) {
-        let ov = sVal[tid + step];
-        let oi = sIdx[tid + step];
-        if (ov > sVal[tid] || (ov == sVal[tid] && oi < sIdx[tid])) {
-          sVal[tid] = ov;
-          sIdx[tid] = oi;
+
+      ctx.forRange(ctx.u32(0), ctx.u32(k), (kk) => {
+        const bv = ctx.emitVar("bv", "f32", ctx.f32(NEG_INF));
+        const bi = ctx.emitVar("bi", "u32", ctx.u32(NO_IDX));
+        for (let s = 0; s < ptTwo; s++) {
+          const v = vals.get(ctx.u32(s));
+          const i = idxs.get(ctx.u32(s));
+          // Tie-break on the ORIGINAL index (all original indices distinct).
+          ctx.ifThen(
+            v.gt(bv.get()).or(v.eq(bv.get()).and(i.lt(bi.get()))),
+            () => {
+              bv.set(v);
+              bi.set(i);
+            },
+          );
         }
-      }
-      workgroupBarrier();
-      step = step / 2u;
-    }
-    let winV = sVal[0];
-    let winI = sIdx[0];
-    workgroupBarrier();
+        const win = ctx.pairArgReduce("max", tid, WG, bv.get(), bi.get());
+        const winV = ctx.emitLet("winV", win.value);
+        const winI = ctx.emitLet("winI", win.index);
+        ctx.barrier();
 
-    if (tid == 0u) {
-      outVals[kk] = winV;
-      outIdx[kk] = winI;
-    }
-    // Removal: the thread holding the winning ORIGINAL index clears it.
-    for (var s = 0u; s < PT; s = s + 1u) {
-      if (idxs[s] == winI && winI != NO_IDX) {
-        vals[s] = NEG_INF;
-      }
-    }
-  }
+        ctx.guardedStore("outVals", tid.eq(ctx.u32(0)), kk, winV);
+        ctx.guardedStore("outIdx", tid.eq(ctx.u32(0)), kk, winI);
+
+        // Removal: the thread holding the winning ORIGINAL index clears it.
+        for (let s = 0; s < ptTwo; s++) {
+          ctx.ifThen(
+            idxs
+              .get(ctx.u32(s))
+              .eq(winI)
+              .and(winI.ne(ctx.u32(NO_IDX))),
+            () => {
+              vals.set(ctx.u32(s), ctx.f32(NEG_INF));
+            },
+          );
+        }
+      });
+    },
+  };
 }
-`;
+
+// ============================================================================
+// Compiled kernel cache (WGSL compiled once per (k, maxPT) / k)
+// ============================================================================
+
+/** Pass-1 WGSL keyed by `${k}:${maxPT}`, pass-2 WGSL keyed by `${k}`. */
+const pass1WGSLCache = new Map<string, string>();
+const pass2WGSLCache = new Map<number, string>();
+
+function pass1WGSL(k: number, maxPT: number): string {
+  const key = `${k}:${maxPT}`;
+  let wgsl = pass1WGSLCache.get(key);
+  if (!wgsl) {
+    wgsl = compileTileKernel(pass1Spec(k, maxPT));
+    pass1WGSLCache.set(key, wgsl);
+  }
+  return wgsl;
+}
+
+function pass2WGSL(k: number): string {
+  let wgsl = pass2WGSLCache.get(k);
+  if (!wgsl) {
+    wgsl = compileTileKernel(pass2Spec(k));
+    pass2WGSLCache.set(k, wgsl);
+  }
+  return wgsl;
 }
 
 // ============================================================================
@@ -258,10 +273,12 @@ function getOrCreateBuffers(k: number): TopKBuffers {
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     }),
     params: device.createBuffer({
-      size: 8,
+      // Packed as a TileConfig { offset, length } uniform. tile-IR pads the
+      // struct to 16 bytes, so the buffer is 16 bytes (offset, length, pad×2).
+      size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     }),
-    paramsData: new Uint32Array(2),
+    paramsData: new Uint32Array(4),
   };
   buffersCache.set(k, b);
   return b;
@@ -277,6 +294,8 @@ export function resetTopKKernelState(): void {
     b.params.destroy();
   }
   buffersCache.clear();
+  pass1WGSLCache.clear();
+  pass2WGSLCache.clear();
 }
 onTeardown(resetTopKKernelState);
 
@@ -321,9 +340,13 @@ export async function readTopK(
   bufs.paramsData[1] = length;
   ctx.queue.writeBuffer(bufs.params, 0, bufs.paramsData);
 
-  const p1 = getPipeline(ctx, `topkPass1:${k}:${maxPT}`, pass1WGSL(k, maxPT));
-  const p2 = getPipeline(ctx, `topkPass2:${k}`, pass2WGSL(k));
+  const wgsl1 = pass1WGSL(k, maxPT);
+  const wgsl2 = pass2WGSL(k);
+  const p1 = getPipeline(ctx, wgsl1, wgsl1);
+  const p2 = getPipeline(ctx, wgsl2, wgsl2);
 
+  // Bind groups: storage bindings in spec declaration order, then the uniform
+  // config (tile-IR appends the config after all storage bindings by default).
   const bg1 = cachedCreateBindGroup(ctx.device, p1, [
     tensor.buffer,
     bufs.pvals,
