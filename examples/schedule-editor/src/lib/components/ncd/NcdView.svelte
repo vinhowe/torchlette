@@ -267,12 +267,6 @@ function formatElements(value: number): string {
   if (value >= 1e3) return `${(value / 1e3).toFixed(3)} K`;
   return value.toLocaleString();
 }
-
-function formatBytes(value: number): string {
-  if (value >= 1e6) return `${(value / 1e6).toFixed(3)} MB`;
-  if (value >= 1e3) return `${(value / 1e3).toFixed(3)} KB`;
-  return `${value} B`;
-}
 </script>
 
 {#if loadError}
@@ -298,15 +292,30 @@ function formatBytes(value: number): string {
           <button class={controlClass()} onclick={() => resetTo()}><RotateCcw size={11} /> Reset</button>
         </div>
       </div>
-      <div class="grid grid-cols-[auto_1fr] gap-1 border border-border bg-card pad-box">
-        <span class="type-label">Term identity</span><span class="type-value">{termHash(current)}</span>
-        <span class="type-label">Round trip</span><span class={roundTrips ? "type-tag text-success" : "type-tag text-destructive-strong"}>{roundTrips ? "TERM = DIAGRAM = TERM" : "ROUND-TRIP FAILURE"}</span>
-        <span class="type-label">Gesture status</span><span class={refusal.startsWith("Refused") ? "type-body text-destructive-strong" : "type-body text-muted-foreground"}>{refusal}</span>
+      <div class="grid grid-cols-[auto_1fr_auto] items-center gap-1 border border-border bg-card pad-box">
+        <span class={roundTrips ? "type-tag text-success" : "type-tag text-destructive-strong"}>{roundTrips ? "TERM ≡ DIAGRAM ≡ TERM" : "ROUND-TRIP FAILURE"}</span>
+        <span class={refusal.startsWith("Refused") ? "type-body text-destructive-strong" : "type-body text-muted-foreground"}>{refusal}</span>
+        <span class="type-value">{termHash(current)}</span>
       </div>
     </section>
 
     <section class="stack-field border-b border-border pad-box">
-      <div class="flex flex-wrap items-end justify-between gap-2">
+      <div class="grid grid-cols-[auto_1fr_auto] items-end gap-2 max-[900px]:grid-cols-1">
+        <div class="flex items-center gap-2 border border-border bg-card pad-box" aria-label="Memory level graph">
+          <svg class="h-14 w-24" viewBox="0 0 96 56" aria-label="WGSL memory level graph">
+            <line x1="18" y1="13" x2="47" y2="29" stroke="currentColor" stroke-width="1" />
+            <line x1="47" y1="29" x2="28" y2="47" stroke="currentColor" stroke-width="1" />
+            <line x1="47" y1="29" x2="73" y2="47" stroke="currentColor" stroke-width="1" />
+            <circle cx="18" cy="13" r="7" class="fill-foreground" />
+            <circle cx="47" cy="29" r="7" style="fill:var(--ncd-level-one-ink)" />
+            <circle cx="28" cy="47" r="6" class="fill-success" />
+            <circle cx="73" cy="47" r="6" class="fill-primary" />
+          </svg>
+          <div class="stack-tight">
+            <span class="type-label">Level graph</span>
+            <span class="type-fine text-muted-foreground">ℓ0 global → ℓ1 workgroup → register / invocation</span>
+          </div>
+        </div>
         <div class="flex flex-wrap items-end gap-2">
           <div class="stack-tight">
             <span class="type-label">Relabeling palette</span>
@@ -323,38 +332,21 @@ function formatBytes(value: number): string {
             <button class={controlClass()} onclick={admitLemma}>Admit online-softmax lemma</button>
           {/if}
         </div>
-        <p class="type-fine text-muted-foreground">Drag g/s onto an axis wire. Drag ℓ0/ℓ1 onto a residency cell.</p>
+        <p class="max-w-52 type-fine text-muted-foreground">Drag the paper to pan; wheel to zoom. Labels and regions are derived from the term.</p>
       </div>
 
       <NcdRenderer term={current} onPartitionDrop={attemptPartition} onResidencyDrop={attemptResidency} />
     </section>
 
     <section class="grid grid-cols-[minmax(18rem,0.8fr)_minmax(20rem,1.2fr)] items-start gap-1 border-b border-border pad-box max-[900px]:grid-cols-1">
-      <div class="stack-group">
-        <section class="stack-field border border-border">
-          <header class="flex items-center justify-between gap-2 border-b border-border bg-panel px-1 py-0.5"><h2 class="type-title">Napkin cost</h2><span class="type-tag">READ FROM WIRES</span></header>
-          <div class="stack-field pad-box">
-            <div class="grid grid-cols-[1fr_auto_auto] gap-1 border border-border bg-card pad-box">
-              <span class="type-label">Level</span><span class="type-tag">H TRANSFER</span><span class="type-tag">M MAX COLUMN</span>
-              {#each ["l0", "l1"] as level}
-                <span class="type-tag">{level}</span>
-                <span class="type-value">{formatElements(cost.transferByLevel[level as NcdLevel])} · {formatBytes(cost.transferBytesByLevel[level as NcdLevel])}</span>
-                <span class="type-value">{formatElements(cost.memoryByLevel[level as NcdLevel])} · {formatBytes(cost.memoryBytesByLevel[level as NcdLevel])}</span>
-              {/each}
-            </div>
-            {#if baseCost}
-              <div class="grid grid-cols-[1fr_auto] gap-1">
-                <span class="type-label">H₁ vs base</span><span class="type-value">{((cost.transferByLevel.l1 / baseCost.transferByLevel.l1) * 100).toFixed(2)}%</span>
-                <span class="type-label">M₁ vs base</span><span class="type-value">{((cost.memoryByLevel.l1 / baseCost.memoryByLevel.l1) * 100).toFixed(2)}%</span>
-              </div>
-            {/if}
-            <p class="type-fine text-muted-foreground">H sums each array whose residency color changes. M is the maximum sum of live arrays in any column at that level; lower-level axis sizes use their g/s labels.</p>
-          </div>
-        </section>
-
-        <section class="stack-field border border-border">
+      <section class="stack-field border border-border">
           <header class="flex items-center justify-between gap-2 border-b border-border bg-panel px-1 py-0.5"><h2 class="type-title">Cost-annotated proof history</h2><span class="type-value">{trace.length}</span></header>
           <div class="stack-field pad-box">
+            <div class="grid grid-cols-3 gap-1 border border-border bg-card pad-box">
+              <span class="type-label">Current</span>
+              <span class="type-value">H₁ {formatElements(cost.transferByLevel.l1)}</span>
+              <span class="type-value">M₁ {formatElements(cost.memoryByLevel.l1)}</span>
+            </div>
             <svg class="h-8 w-full border border-border bg-card text-primary" viewBox="0 0 100 32" preserveAspectRatio="none" aria-label="NCD transfer history">
               <polyline points={tracePoints} fill="none" stroke="currentColor" stroke-width="1" vector-effect="non-scaling-stroke" />
             </svg>
@@ -366,8 +358,7 @@ function formatBytes(value: number): string {
               {/each}
             </div>
           </div>
-        </section>
-      </div>
+      </section>
 
       <section class="stack-field border border-border">
         <header class="flex items-center justify-between gap-2 border-b border-border bg-panel px-1 py-0.5"><h2 class="type-title">Derived streamable-normal-form projection</h2><span class={projection.ok ? "type-tag text-success" : "type-tag text-destructive-strong"}>{projection.ok ? "DERIVED" : "AMBIGUOUS"}</span></header>
