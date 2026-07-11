@@ -51,6 +51,9 @@ const lanes = $derived(surfaceLanes(term));
 const world = $derived(surfaceWorldSize(term));
 const costs = $derived(surfaceColumnCosts(previewTerm ?? term));
 const committedCosts = $derived(surfaceColumnCosts(term));
+const priorCosts = $derived(
+  equivalence ? surfaceColumnCosts(equivalence.before) : committedCosts,
+);
 const orderedColumns = $derived(
   [...term.semantic.columns].sort((a, b) => a.index - b.index),
 );
@@ -228,6 +231,9 @@ function wheelZoom(event: WheelEvent): void {
         <div
           class:cost-preview={columnCost.memory.l1 !==
             committedCosts[index]?.memory.l1}
+          class:cost-pulse={!previewTerm &&
+            Boolean(equivalence) &&
+            columnCost.memory.l1 !== priorCosts[index]?.memory.l1}
           class="ncd-cost-cell"
         >{formatCost(columnCost.memory.l1)}</div>
       {/each}
@@ -236,6 +242,9 @@ function wheelZoom(event: WheelEvent): void {
         <div
           class:cost-preview={columnCost.transfer.l1 !==
             committedCosts[index]?.transfer.l1}
+          class:cost-pulse={!previewTerm &&
+            Boolean(equivalence) &&
+            columnCost.transfer.l1 !== priorCosts[index]?.transfer.l1}
           class="ncd-cost-cell"
         >
           {formatCost(columnCost.transfer.l1)}
@@ -506,6 +515,9 @@ function wheelZoom(event: WheelEvent): void {
     outline: 1px solid var(--ncd-level-one-ink);
     outline-offset: -2px;
   }
+  .ncd-cost-cell.cost-pulse {
+    animation: ncd-cost-pulse 620ms ease-out 1 !important;
+  }
   .ncd-cumulative {
     position: absolute;
     right: 7px;
@@ -708,6 +720,10 @@ function wheelZoom(event: WheelEvent): void {
   }
   @keyframes ncd-jam {
     50% { transform: translateX(-4px); }
+  }
+  @keyframes ncd-cost-pulse {
+    0% { background: var(--ncd-level-one); outline: 2px solid var(--ncd-level-one-ink); }
+    100% { background: transparent; outline: 0 solid transparent; }
   }
   @keyframes ncd-equivalence {
     0% { opacity: 0; transform: translate(-50%, 8px) scale(0.98); }

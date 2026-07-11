@@ -45,6 +45,7 @@ let jam = $state<SurfaceJam | null>(null);
 let equivalence = $state<SurfaceEquivalence | null>(null);
 let equivalenceNonce = 0;
 let equivalenceTimer: ReturnType<typeof setTimeout> | undefined;
+let replayRunning = $state(false);
 
 const cost = $derived(current ? napkinCost(current) : null);
 const baseCost = $derived(
@@ -342,33 +343,54 @@ function nextFaStep(): void {
   }
   if (!current) return;
   try {
+    const before = cloneTerm(current);
     const result = applyFaStep(current, faStep);
     current = result.term;
     history = [...history, result.entry];
     redoStack = [];
     refusal = `Walkthrough ${faStep + 1}/${FA_STEPS.length}: ${result.entry.label}`;
     faStep += 1;
+    jam = null;
+    previewTerm = null;
+    showEquivalence(before, current, result.entry.label);
   } catch (error) {
     refusal = `Refused: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 
-function deriveAll(): void {
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function deriveAll(): Promise<void> {
+  if (replayRunning) return;
+  replayRunning = true;
   resetTo("attention");
-  if (!attentionBase) return;
-  let next = cloneTerm(attentionBase);
-  const entries: NcdHistoryEntry[] = [];
-  for (let index = 0; index < FA_STEPS.length; index += 1) {
-    const result = applyFaStep(next, index);
-    next = result.term;
-    entries.push(result.entry);
+  if (!attentionBase) {
+    replayRunning = false;
+    return;
   }
-  current = next;
-  history = entries;
-  redoStack = [];
-  faStep = FA_STEPS.length;
-  refusal =
-    "FlashAttention derivation replayed: lemma → fuse → fuse → tile → stream.";
+  try {
+    let next = cloneTerm(attentionBase);
+    const entries: NcdHistoryEntry[] = [];
+    for (let index = 0; index < FA_STEPS.length; index += 1) {
+      const before = cloneTerm(next);
+      const result = applyFaStep(next, index);
+      next = result.term;
+      entries.push(result.entry);
+      current = next;
+      history = [...entries];
+      redoStack = [];
+      faStep = index + 1;
+      refusal = `Replay ${index + 1}/${FA_STEPS.length}: ${result.entry.label}`;
+      showEquivalence(before, next, result.entry.label);
+      await delay(760);
+    }
+    refusal =
+      "FlashAttention derivation replayed: lemma → fuse → fuse → tile → stream.";
+  } finally {
+    replayRunning = false;
+  }
 }
 
 function dragPayload(
@@ -506,12 +528,12 @@ function formatElements(value: number): string {
     </section>
 
     {#if fixture === "attention"}
-      <section class="stack-field pad-box">
+      <section class="stack-field pad-box" aria-busy={replayRunning}>
         <div class="flex flex-wrap items-center justify-between gap-2">
           <div class="stack-tight"><h2 class="type-title">FlashAttention by gestures</h2><p class="type-body text-muted-foreground">A replayable proof script over the same semantic boxes and wires.</p></div>
           <div class="flex gap-1">
-            <button class={controlClass()} onclick={nextFaStep}><StepForward size={11} /> Next step</button>
-            <button class={controlClass(true)} onclick={deriveAll}><Play size={11} /> Derive FA</button>
+            <button class={controlClass()} disabled={replayRunning} onclick={nextFaStep}><StepForward size={11} /> Next step</button>
+            <button class={controlClass(true)} disabled={replayRunning} onclick={deriveAll}><Play size={11} /> {replayRunning ? "Replaying…" : "Derive FA"}</button>
           </div>
         </div>
         <div class="grid grid-cols-[repeat(auto-fit,minmax(12rem,1fr))] gap-1">

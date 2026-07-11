@@ -40,3 +40,13 @@ It is not a facsimile. Important remaining deltas are:
 Those are term-expressivity findings, not reasons to persist layout coordinates.
 All positions in this checkpoint are derived at render time from semantic
 column order, wire order, box composition, tuple membership, and decorations.
+
+## Interaction and walkthrough checkpoints
+
+- Checkpoint B: [paint/cost preview](./checkpoint-b-mid-gesture.png),
+  [streamability refusal jam](./checkpoint-b-refusal-jam.png), and
+  [diagram ≡ diagram rewrite](./checkpoint-b-equivalence.png).
+- Checkpoint C: FlashAttention replay
+  [start](./checkpoint-c-fa-start.png) → [mid-fusion with pulsing cost cells](./checkpoint-c-fa-mid.png)
+  → [fused/tiled/streamed end](./checkpoint-c-fa-end.png), plus the
+  [dark-token discrimination check](./checkpoint-c-dark.png).

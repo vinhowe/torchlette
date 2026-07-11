@@ -157,3 +157,62 @@ boxes/wires/axes plus explicit columns so H/M and editing are direct. Importing
 pyncd terms would require a normalization pass that preserves weave/broadcast
 semantics and stable IDs. Copying the one-way serialized format verbatim would
 not by itself produce an editable cost-complete term.
+
+## Surface round — findings forced by faithful notation
+
+### F19 — faithful weave routing needs an algebraic weave node
+
+The paper's overbars, crossings, open/closed connector dots, and recursive
+sub-algorithm expansion are consequences of explicit weave, concatenate, and
+rearrange operations. Our flat box/wire term does not contain those operations.
+The surface can conservatively overbar an axis that occurs on multiple wires and
+draw smooth composition curves, but it cannot derive the paper's exact topology.
+This is the largest remaining fidelity gap; persisted Bezier control points would
+hide the missing algebra rather than fix it.
+
+### F20 — one semantic wire has several visual array occurrences
+
+An array is shown before a load, inside a lower-level region, and after a save.
+Those are distinct diagram occurrences of one semantic wire. Residency samples
+already identify the occurrences well enough for this spike, but a canonical NCD
+term should distinguish value identity from array occurrence explicitly so a
+gesture can name an occurrence without borrowing the cost sampler's columns.
+
+### F21 — columns have become observable notation structure
+
+The cost table, array occurrences, function placement, and liveness are all
+aligned to semantic columns. Although no x/y is persisted, column order is now
+more than a cost implementation detail: it is the composition spine of the
+notation. The future schema should name this as ordinal composition structure
+rather than treating `columns` as an untyped renderer convenience.
+
+### F22 — vertical tensor product is only inferred from wire order
+
+Horizontal composition is present through box columns. Vertical parallel
+composition (⊗) is not. The renderer stacks wire lanes in document order and uses
+tuple membership for dashed separators, which is deterministic but cannot tell a
+true tensor product from several independent inputs to one function. A typed
+parallel/composition tree is required for literal Figure-10 expansion.
+
+### F23 — symbolic cost cells need shape expressions, not only sizes
+
+The faithful table exposes another loss: the current cost model evaluates sizes
+immediately, so it can display `3.15m` but not retain the paper's `q̄x̄ + x̄d`
+derivation. Debuggable authoring needs both a symbolic semiring expression and its
+evaluated device value. Reconstructing expressions from integers is ambiguous.
+
+### F24 — load, save, and fuse are different meanings on one level edge
+
+Teal and magenta regions make direction visible, but an interior recolor removes a
+materialization boundary while an endpoint color change is an unavoidable external
+load/save. The sampled level path identifies direction; it still does not type the
+transition's semantic role. This repeats F9 with stronger evidence from the actual
+surface: transition role belongs in the term or a derivable proof object.
+
+### F25 — tactile state is properly outside the document
+
+Pan, zoom, active paint brush, hover preview, refusal jam, cost pulse, and the brief
+diagram-equivalence overlay are all ephemeral surface state. Keeping them out of
+the serialized term preserved round-trip identity and made acceptance #3 directly
+testable. Selection may eventually be shareable presence, but it should not become
+schedule semantics.
