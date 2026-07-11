@@ -80,3 +80,18 @@ installed verbatim from their registry JSON items (including the transitive
 the existing Sequence-style torchlette examples in this worktree.
 
 See [contract.md](./contract.md) for the proposed engine message.
+
+## Intra-island workbench
+
+Selecting an island opens the P3 consumer-side ScheduleState workbench. The two
+proposal fixtures and schema live under `public/data/schedule-states/` and
+`public/data/schedule-state.schema.json`. The tiled matmul exposes a full loop,
+staging, and role skeleton. The fused attention forward state is deliberately
+authored/opaque, so macro structure is locked while its real BR=64, BC=32,
+WG=64, vec4-oriented decorations remain editable.
+
+The static performance tier updates from the state plus adapter limits and
+documented fallback architecture/roofline constants. The measured tier declares
+its RPC in [workbench-contract.md](./workbench-contract.md) and remains visibly
+awaiting the engine. Consumer-side schema findings are recorded in
+[workbench-findings.md](./workbench-findings.md).

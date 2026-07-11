@@ -47,4 +47,10 @@ export type PartitionMove = MergeMove | SplitMove;
 export interface HistoryEntry {
   forward: PartitionMove;
   inverse: PartitionMove;
+  staticCost?: {
+    stateHash: string;
+    predictedMs: number;
+    arithmeticIntensity: number;
+    rooflineBound: "bandwidth" | "compute";
+  };
 }

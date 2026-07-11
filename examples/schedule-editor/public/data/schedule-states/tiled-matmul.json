@@ -1,0 +1,124 @@
+{
+  "schemaVersion": "1-proposal",
+  "id": "matmul-1024-f32-tile32",
+  "name": "Tiled matmul 1024³",
+  "authored": false,
+  "algorithm": {
+    "id": "torchlette.matmul",
+    "semanticRef": "tile-ir:block-matmul",
+    "workload": {
+      "kind": "matmul",
+      "m": 1024,
+      "n": 1024,
+      "k": 1024,
+      "batch": 1,
+      "inputBytes": 4,
+      "outputBytes": 4
+    }
+  },
+  "skeleton": {
+    "visibility": "derived",
+    "grammar": "tiled-matmul",
+    "loopNest": [
+      {
+        "id": "grid-m",
+        "axis": "output M tiles",
+        "extent": "ceil(M / tile.m)",
+        "execution": "parallel",
+        "children": [
+          {
+            "id": "grid-n",
+            "axis": "output N tiles",
+            "extent": "ceil(N / tile.n)",
+            "execution": "parallel",
+            "children": [
+              {
+                "id": "k-tiles",
+                "axis": "reduction K tiles",
+                "extent": "ceil(K / tile.k)",
+                "execution": "sequential"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "stagingEdges": [
+      {
+        "operand": "A",
+        "from": "global",
+        "to": "workgroup-shared",
+        "scope": "one M×K tile",
+        "synchronization": "workgroup"
+      },
+      {
+        "operand": "A",
+        "from": "workgroup-shared",
+        "to": "register",
+        "scope": "one invocation thread tile",
+        "synchronization": "none"
+      },
+      {
+        "operand": "B",
+        "from": "global",
+        "to": "workgroup-shared",
+        "scope": "one K×N tile",
+        "synchronization": "workgroup"
+      },
+      {
+        "operand": "B",
+        "from": "workgroup-shared",
+        "to": "register",
+        "scope": "one invocation thread tile",
+        "synchronization": "none"
+      }
+    ],
+    "rolePartition": [
+      {
+        "role": "load-A",
+        "participants": "all invocations, linear strided assignment",
+        "responsibility": "cooperatively stage tile.m × tile.k values"
+      },
+      {
+        "role": "load-B",
+        "participants": "all invocations, linear strided assignment",
+        "responsibility": "cooperatively stage tile.k × tile.n values"
+      },
+      {
+        "role": "accumulate",
+        "participants": "every invocation",
+        "responsibility": "own one threadM × threadN register accumulator"
+      },
+      {
+        "role": "store-C",
+        "participants": "every invocation",
+        "responsibility": "store its output thread tile"
+      }
+    ]
+  },
+  "decorations": {
+    "tileSizes": {
+      "m": 32,
+      "n": 32,
+      "k": 16,
+      "threadM": 4,
+      "threadN": 4
+    },
+    "workgroup": { "x": 8, "y": 8, "z": 1 },
+    "vectorWidth": 1,
+    "unrollFactor": 1,
+    "pipelineDepth": 1,
+    "memorySpaces": ["global", "workgroup-shared"],
+    "syncScopes": ["workgroup"],
+    "threadHierarchy": ["invocation", "workgroup"],
+    "operandResidency": {
+      "A": "workgroup-shared",
+      "B": "workgroup-shared",
+      "accumulator": "register",
+      "C": "global"
+    }
+  },
+  "atoms": [],
+  "admittedLemmas": [],
+  "realizerId": "tile-ir-wgsl"
+}

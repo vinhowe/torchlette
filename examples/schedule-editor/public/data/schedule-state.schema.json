@@ -1,0 +1,266 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://torchlette.dev/schema/schedule-state.proposal.json",
+  "title": "torchlette ScheduleState proposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "name",
+    "authored",
+    "algorithm",
+    "skeleton",
+    "decorations",
+    "atoms",
+    "admittedLemmas",
+    "realizerId"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1-proposal" },
+    "id": { "type": "string", "minLength": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "authored": { "type": "boolean" },
+    "algorithm": { "$ref": "#/$defs/algorithm" },
+    "skeleton": { "$ref": "#/$defs/skeleton" },
+    "decorations": { "$ref": "#/$defs/decorations" },
+    "atoms": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/atom" }
+    },
+    "admittedLemmas": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/lemma" }
+    },
+    "realizerId": { "enum": ["tile-ir-wgsl"] }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "authored": { "const": true } },
+        "required": ["authored"]
+      },
+      "then": {
+        "properties": {
+          "skeleton": {
+            "properties": { "visibility": { "const": "opaque" } },
+            "required": ["visibility"]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "skeleton": {
+            "properties": { "visibility": { "const": "derived" } },
+            "required": ["visibility"]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "positiveInteger": { "type": "integer", "minimum": 1 },
+    "memorySpace": {
+      "enum": ["global", "workgroup-shared", "register"]
+    },
+    "algorithm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "semanticRef", "workload"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "semanticRef": { "type": "string", "minLength": 1 },
+        "workload": {
+          "oneOf": [
+            { "$ref": "#/$defs/matmulWorkload" },
+            { "$ref": "#/$defs/attentionWorkload" }
+          ]
+        }
+      }
+    },
+    "matmulWorkload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "m", "n", "k", "batch", "inputBytes", "outputBytes"],
+      "properties": {
+        "kind": { "const": "matmul" },
+        "m": { "$ref": "#/$defs/positiveInteger" },
+        "n": { "$ref": "#/$defs/positiveInteger" },
+        "k": { "$ref": "#/$defs/positiveInteger" },
+        "batch": { "$ref": "#/$defs/positiveInteger" },
+        "inputBytes": { "enum": [2, 4] },
+        "outputBytes": { "enum": [2, 4] }
+      }
+    },
+    "attentionWorkload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "batch", "heads", "sequence", "headDimension", "inputBytes", "outputBytes"],
+      "properties": {
+        "kind": { "const": "attention-forward" },
+        "batch": { "$ref": "#/$defs/positiveInteger" },
+        "heads": { "$ref": "#/$defs/positiveInteger" },
+        "sequence": { "$ref": "#/$defs/positiveInteger" },
+        "headDimension": { "$ref": "#/$defs/positiveInteger" },
+        "inputBytes": { "enum": [2, 4] },
+        "outputBytes": { "enum": [2, 4] }
+      }
+    },
+    "skeleton": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["visibility", "grammar", "loopNest", "stagingEdges", "rolePartition"],
+          "properties": {
+            "visibility": { "const": "derived" },
+            "grammar": {
+              "enum": ["elementwise", "row-reduction", "tiled-matmul", "attention-shaped"]
+            },
+            "loopNest": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/loop" }
+            },
+            "stagingEdges": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/stagingEdge" }
+            },
+            "rolePartition": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/role" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["visibility", "kernelRef", "reason"],
+          "properties": {
+            "visibility": { "const": "opaque" },
+            "kernelRef": { "type": "string", "minLength": 1 },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "loop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "axis", "extent", "execution"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "axis": { "type": "string", "minLength": 1 },
+        "extent": { "type": "string", "minLength": 1 },
+        "execution": { "enum": ["parallel", "sequential"] },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/loop" }
+        }
+      }
+    },
+    "stagingEdge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operand", "from", "to", "scope", "synchronization"],
+      "properties": {
+        "operand": { "type": "string", "minLength": 1 },
+        "from": { "$ref": "#/$defs/memorySpace" },
+        "to": { "$ref": "#/$defs/memorySpace" },
+        "scope": { "type": "string", "minLength": 1 },
+        "synchronization": { "enum": ["none", "workgroup"] }
+      }
+    },
+    "role": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "participants", "responsibility"],
+      "properties": {
+        "role": { "type": "string", "minLength": 1 },
+        "participants": { "type": "string", "minLength": 1 },
+        "responsibility": { "type": "string", "minLength": 1 }
+      }
+    },
+    "decorations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tileSizes",
+        "workgroup",
+        "vectorWidth",
+        "unrollFactor",
+        "pipelineDepth",
+        "memorySpaces",
+        "syncScopes",
+        "threadHierarchy",
+        "operandResidency"
+      ],
+      "properties": {
+        "tileSizes": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/positiveInteger" }
+        },
+        "workgroup": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["x", "y", "z"],
+          "properties": {
+            "x": { "$ref": "#/$defs/positiveInteger" },
+            "y": { "$ref": "#/$defs/positiveInteger" },
+            "z": { "$ref": "#/$defs/positiveInteger" }
+          }
+        },
+        "vectorWidth": { "enum": [1, 2, 4] },
+        "unrollFactor": { "$ref": "#/$defs/positiveInteger" },
+        "pipelineDepth": { "enum": [1] },
+        "memorySpaces": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/memorySpace" }
+        },
+        "syncScopes": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "items": { "enum": ["workgroup"] }
+        },
+        "threadHierarchy": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "items": { "enum": ["invocation", "subgroup", "workgroup"] }
+        },
+        "operandResidency": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/memorySpace" }
+        }
+      }
+    },
+    "atom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "semanticRef", "footprintBytes", "syncBehavior"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["atomicAddF32-CAS", "subgroup-op"] },
+        "semanticRef": { "type": "string", "minLength": 1 },
+        "footprintBytes": { "type": "integer", "minimum": 0 },
+        "syncBehavior": { "type": "string", "minLength": 1 }
+      }
+    },
+    "lemma": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "role"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "version": { "$ref": "#/$defs/positiveInteger" },
+        "role": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

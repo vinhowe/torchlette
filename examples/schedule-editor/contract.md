@@ -97,3 +97,8 @@ The first live RPC can be request/response over the existing engine channel.
 For genuinely live editing, the engine should additionally emit plan-change
 events carrying a new dump and invalidating the editor's undo stack whenever
 final-plan positions or the plan fingerprint change.
+
+The intra-island workbench adds a separate state-hash-in, samples-and-median-out
+benchmark RPC. See [workbench-contract.md](./workbench-contract.md). Schedule
+measurements attach to provenance entries rather than changing ScheduleState
+identity.

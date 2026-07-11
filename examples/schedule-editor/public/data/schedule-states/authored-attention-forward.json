@@ -1,0 +1,57 @@
+{
+  "schemaVersion": "1-proposal",
+  "id": "attention-forward-authored-d64",
+  "name": "Fused attention forward D64",
+  "authored": true,
+  "algorithm": {
+    "id": "torchlette.fused-attention-forward",
+    "semanticRef": "QKᵀ → scale/mask → online-softmax → PV",
+    "workload": {
+      "kind": "attention-forward",
+      "batch": 1,
+      "heads": 12,
+      "sequence": 512,
+      "headDimension": 64,
+      "inputBytes": 4,
+      "outputBytes": 4
+    }
+  },
+  "skeleton": {
+    "visibility": "opaque",
+    "kernelRef": "src/backend/webgpu/attention-kernel.ts::makeForwardAttentionSpec",
+    "reason": "authored — not yet re-derived"
+  },
+  "decorations": {
+    "tileSizes": {
+      "qRows": 64,
+      "kvRows": 32,
+      "headDimension": 64
+    },
+    "workgroup": { "x": 64, "y": 1, "z": 1 },
+    "vectorWidth": 4,
+    "unrollFactor": 1,
+    "pipelineDepth": 1,
+    "memorySpaces": ["global", "workgroup-shared"],
+    "syncScopes": ["workgroup"],
+    "threadHierarchy": ["invocation", "workgroup"],
+    "operandResidency": {
+      "Q": "register",
+      "K": "workgroup-shared",
+      "V": "workgroup-shared",
+      "scores": "register",
+      "softmaxState": "register",
+      "outputAccumulator": "register",
+      "O": "global",
+      "L": "global"
+    }
+  },
+  "atoms": [],
+  "admittedLemmas": [
+    {
+      "id": "online-softmax-rescaling",
+      "version": 1,
+      "role": "rescale partial output by exp(m_old - m_new)"
+    }
+  ],
+  "realizerId": "tile-ir-wgsl"
+}
