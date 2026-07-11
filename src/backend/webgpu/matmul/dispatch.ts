@@ -843,6 +843,78 @@ function packGemvParams(
   return u32View;
 }
 
+let quantGemvDispatchCount = 0;
+/** Count of quantized (int8) GEMV dispatches (probe/gate hook). */
+export function getQuantGemvDispatchCount(): number {
+  return quantGemvDispatchCount;
+}
+
+/**
+ * Weight-only int8-grouped GEMV: y[1,N] = a[1,K] @ dequant(packedW[N,K], scales).
+ * The B operand is a packed int8 weight ([N,K/4] u32) + per-group f16 scales
+ * ([N,K/G] u32-packed). Dequant is fused into the NT row-dot load path — no
+ * dequantized weight tensor is ever materialized (the residency win). This is
+ * a self-contained eager dispatch (like matmulChunked): inference-only, noGrad,
+ * so it stays out of the autograd/compiled-plan replay machinery.
+ * See docs/quantization-design.md. Binds [a, b, out, params, b_scales].
+ */
+export function dispatchQuantizedGemvNT(
+  device: GPUDevice,
+  aBuffer: GPUBuffer,
+  packedWeight: GPUBuffer,
+  scales: GPUBuffer,
+  outBuffer: GPUBuffer,
+  n: number,
+  k: number,
+  groupSize: number,
+  outputDtype: DType = "f32",
+  alpha = 1.0,
+): void {
+  // NT route geometry (single source: computeGemvRoute). Quant path is scalar
+  // (no vec4) and never K-splits (a scale is per K-group, not per partial).
+  const route = computeGemvRoute(n, k, /* transB */ true);
+  if (!route) {
+    throw new Error(`dispatchQuantizedGemvNT: no NT route for N=${n} K=${k}`);
+  }
+  const kernelOpts: GemvKernelOptions = {
+    mode: "nt",
+    dtypeA: "f32",
+    dtypeB: "f16", // logical weight dtype (informational; packed as u32)
+    outputDtype,
+    kSplit: false,
+    rowsPerWg: route.rowsPerWg, // wgSize defaults to GEMV_DEFAULT_WG_SIZE
+    vec4: false,
+    quantB: { scheme: "int8-grouped", groupSize },
+  };
+  const pipeline = cachedPipeline(
+    device,
+    pipelineCache,
+    getGemvShaderCacheKey(kernelOpts),
+    () => generateGemvShaderTileIR(kernelOpts),
+  );
+  const paramsBuffer = sharedCreateParamsBuffer(
+    device,
+    packGemvParams(n, k, alpha, 1),
+  );
+  const bindGroup = cachedCreateBindGroup(device, pipeline, [
+    aBuffer,
+    packedWeight,
+    outBuffer,
+    paramsBuffer,
+    scales,
+  ]);
+  quantGemvDispatchCount++;
+  dispatchComputePass(
+    pipeline,
+    bindGroup,
+    route.dispatch[0],
+    route.dispatch[1],
+    route.dispatch[2],
+    (getCurrentOpLabel() ?? "matmul") + "_gemv_q8",
+  );
+  releaseParamsBuffer(paramsBuffer);
+}
+
 /**
  * Route an M=1, batch=1, no-epilogue matmul to the dedicated GEMV tile-IR
  * kernels. Returns a plan shaped exactly like the tiled paths (standard
