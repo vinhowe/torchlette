@@ -121,6 +121,39 @@ export async function withProfileContext<T>(
   }
 }
 
+/**
+ * A "reclaimed" VIEW handle is NOT a use-after-free when its base storage is
+ * still alive AND its backing GPU buffer is that live base's buffer. This is
+ * the compiled-plan HARVEST-view class (`planOwnedBaseRetain`): the harvest
+ * re-creates a view handle over a persistent base each replay and the PLAN,
+ * not the handle, owns the base retain. When the per-replay view handle is
+ * reaped at markStep (rc 0), `isDestroyed(viewId)` is true even though its
+ * buffer aliases the live base the plan keeps alive — the read returns correct
+ * bytes. (Static-KV decode's `copy_(kSlot, kSlot.scatterAdd(...))` makes the
+ * scatterAdd `dst` such a view over the persistent KV base — the [1,4,H,D]
+ * reclaimed-read false positive; same class as the GPT2.posIndices FP.)
+ *
+ * Single-source-of-truth seam: the base's live buffer is the one source; we
+ * ASSERT the view's buffer equals it (`viewBuf === baseBuf`) before exonerating
+ * the read. A genuinely-dangling view — base destroyed, or buffer already
+ * recycled to a different buffer — fails this and the guard still fires.
+ */
+function viewAliasesLiveBase(storage: StorageHandle): boolean {
+  if (storage.baseStorageId === undefined) return false;
+  // Flatten the base chain to its live root (harvest chains are depth-1 but be
+  // robust to nesting: a destroyed intermediate must not exonerate the read).
+  let base = storageTracker.getStorage(storage.baseStorageId);
+  while (base?.baseStorageId !== undefined) {
+    const parent = storageTracker.getStorage(base.baseStorageId);
+    if (!parent) break;
+    base = parent;
+  }
+  if (!base) return false; // base itself reclaimed → truly dangling
+  const viewBuf = (storage.backendTensor as { buffer?: unknown }).buffer;
+  const baseBuf = (base.backendTensor as { buffer?: unknown }).buffer;
+  return viewBuf !== undefined && viewBuf === baseBuf;
+}
+
 export function getInputStorage(
   ref: LazyRef,
   backend?: Backend,
@@ -151,7 +184,11 @@ export function getInputStorage(
         console.warn(msg);
       }
     }
-    if (storageTracker.isDestroyed(ref.storage.id) && !declaredReplay) {
+    if (
+      storageTracker.isDestroyed(ref.storage.id) &&
+      !declaredReplay &&
+      !viewAliasesLiveBase(ref.storage)
+    ) {
       const msg =
         `[lifetime] reading RECLAIMED storage id=${ref.storage.id} ` +
         `(shape=${JSON.stringify(ref.storage.backendTensor.shape)}). A tensor created ` +
