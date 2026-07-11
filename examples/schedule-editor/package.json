@@ -1,0 +1,29 @@
+{
+  "name": "torchlette-schedule-editor",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json --compiler-warnings \"state_referenced_locally:ignore\"",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@lucide/svelte": "^1.24.0",
+    "@sveltejs/kit": "^2.48.5",
+    "svelte": "^5.45.6",
+    "tailwind-merge": "^3.4.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^6.2.1",
+    "@tailwindcss/vite": "^4.2.2",
+    "svelte-check": "^4.3.4",
+    "tailwindcss": "4",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.6",
+    "vitest": "^3.2.4"
+  }
+}
