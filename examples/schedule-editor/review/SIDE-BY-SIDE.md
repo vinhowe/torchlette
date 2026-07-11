@@ -50,3 +50,8 @@ column order, wire order, box composition, tuple membership, and decorations.
   [start](./checkpoint-c-fa-start.png) → [mid-fusion with pulsing cost cells](./checkpoint-c-fa-mid.png)
   → [fused/tiled/streamed end](./checkpoint-c-fa-end.png), plus the
   [dark-token discrimination check](./checkpoint-c-dark.png).
+- Checkpoint D: [persistent gesture palette](./checkpoint-d-palette.png),
+  [live valid/invalid drop targets](./checkpoint-d-valid-targets.png), and the
+  [`?` keyboard reference](./checkpoint-d-help.png). See
+  [CHECKPOINT-D.md](./CHECKPOINT-D.md) for controller conventions and the
+  aggressive-user protocol.

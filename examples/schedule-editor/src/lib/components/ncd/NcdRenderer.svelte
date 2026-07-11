@@ -1,6 +1,11 @@
 <script lang="ts">
-import { axisById } from "../../ncd/model";
-import type { SurfaceEquivalence, SurfaceJam } from "../../ncd/surface-layout";
+import { onMount } from "svelte";
+import { axisById, partitionLegality, recolorLegality } from "../../ncd/model";
+import type {
+  SurfaceEquivalence,
+  SurfaceGesture,
+  SurfaceJam,
+} from "../../ncd/surface-layout";
 import {
   orderedResidencies,
   residencyAt,
@@ -19,6 +24,7 @@ type Props = {
   paintLevel: NcdLevel;
   jam?: SurfaceJam | null;
   equivalence?: SurfaceEquivalence | null;
+  activeGesture?: SurfaceGesture | null;
   onPartitionDrop: (axisId: string, kind: PartitionKind) => void;
   onPartitionPreview: (axisId: string, kind: PartitionKind) => void;
   onResidencyDrop: (wireId: string, column: number, level: NcdLevel) => void;
@@ -33,6 +39,7 @@ let {
   paintLevel,
   jam = null,
   equivalence = null,
+  activeGesture = null,
   onPartitionDrop,
   onPartitionPreview,
   onResidencyDrop,
@@ -41,11 +48,33 @@ let {
   onPreviewClear,
 }: Props = $props();
 
+const MIN_ZOOM = 0.36;
+const MAX_ZOOM = 2.5;
+const ZOOM_SENSITIVITY = 0.0028;
+
+let viewportElement: HTMLDivElement;
 let zoom = $state(0.72);
 let panX = $state(18);
 let panY = $state(12);
 let dragging = $state(false);
 let pointerStart = $state({ x: 0, y: 0, panX: 0, panY: 0 });
+let activePointerId: number | null = null;
+let panSnapshot: { panX: number; panY: number; zoom: number } | null = null;
+let paintCandidate: {
+  wireId: string;
+  column: number;
+  level: NcdLevel;
+} | null = null;
+let wheelFrame = 0;
+let pointerFrame = 0;
+let pendingPointer: { x: number; y: number } | null = null;
+let pendingWheel = {
+  panX: 0,
+  panY: 0,
+  zoomLog: 0,
+  clientX: 0,
+  clientY: 0,
+};
 
 const lanes = $derived(surfaceLanes(term));
 const world = $derived(surfaceWorldSize(term));
@@ -159,6 +188,28 @@ function miniAxes(candidate: NcdTerm): string[] {
     );
 }
 
+function axisTargetValid(axisId: string): boolean {
+  if (activeGesture?.type !== "partition") return false;
+  const axis = axisById(term, axisId);
+  return partitionLegality(term, {
+    axisId,
+    kind: activeGesture.kind,
+    size: activeGesture.size,
+    label: `${activeGesture.kind === "group" ? "g" : "s"}_${axis.label}`,
+  }).legal;
+}
+
+function residencyTargetValid(wireId: string, column: number): boolean {
+  return (
+    activeGesture?.type === "level" &&
+    recolorLegality(term, wireId, column, activeGesture.level).legal
+  );
+}
+
+function boxTargetValid(boxId: string): boolean {
+  return activeGesture?.type === "lemma" && boxId === "softmax";
+}
+
 function dropAxis(event: DragEvent, axisId: string): void {
   event.preventDefault();
   event.stopPropagation();
@@ -174,46 +225,214 @@ function dropResidency(event: DragEvent, wireId: string, column: number): void {
 }
 
 function beginPan(event: PointerEvent): void {
-  if ((event.target as HTMLElement).closest("[data-ncd-target]")) return;
+  if (
+    event.button !== 0 ||
+    activeGesture ||
+    (event.target as HTMLElement).closest("[data-ncd-target]")
+  )
+    return;
+  event.preventDefault();
   dragging = true;
+  activePointerId = event.pointerId;
+  panSnapshot = { panX, panY, zoom };
   pointerStart = {
     x: event.clientX,
     y: event.clientY,
     panX,
     panY,
   };
-  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+  viewportElement.setPointerCapture(event.pointerId);
 }
 
 function movePan(event: PointerEvent): void {
-  if (!dragging) return;
-  panX = pointerStart.panX + event.clientX - pointerStart.x;
-  panY = pointerStart.panY + event.clientY - pointerStart.y;
-}
-
-function endPan(): void {
-  dragging = false;
-}
-
-function wheelZoom(event: WheelEvent): void {
+  if (!dragging || event.pointerId !== activePointerId) return;
   event.preventDefault();
-  zoom = Math.min(1.6, Math.max(0.42, zoom * (event.deltaY > 0 ? 0.92 : 1.08)));
+  pendingPointer = { x: event.clientX, y: event.clientY };
+  if (pointerFrame) return;
+  pointerFrame = requestAnimationFrame(() => {
+    pointerFrame = 0;
+    if (!pendingPointer || !dragging) return;
+    panX = pointerStart.panX + pendingPointer.x - pointerStart.x;
+    panY = pointerStart.panY + pendingPointer.y - pointerStart.y;
+    pendingPointer = null;
+  });
 }
+
+function endPan(event?: PointerEvent): void {
+  if (event && activePointerId !== null && event.pointerId !== activePointerId)
+    return;
+  dragging = false;
+  pendingPointer = null;
+  activePointerId = null;
+  panSnapshot = null;
+}
+
+function cancelCanvasInteraction(): void {
+  if (panSnapshot) {
+    panX = panSnapshot.panX;
+    panY = panSnapshot.panY;
+    zoom = panSnapshot.zoom;
+  }
+  if (
+    activePointerId !== null &&
+    viewportElement?.hasPointerCapture(activePointerId)
+  ) {
+    viewportElement.releasePointerCapture(activePointerId);
+  }
+  dragging = false;
+  activePointerId = null;
+  panSnapshot = null;
+  pendingPointer = null;
+  paintCandidate = null;
+  onPreviewClear();
+}
+
+function normalizeWheelDelta(event: WheelEvent, value: number): number {
+  if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) return value * 16;
+  if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE)
+    return value * viewportElement.clientHeight;
+  return value;
+}
+
+function zoomResistance(logDelta: number): number {
+  const remaining =
+    logDelta > 0
+      ? (MAX_ZOOM - zoom) / (MAX_ZOOM - MIN_ZOOM)
+      : (zoom - MIN_ZOOM) / (MAX_ZOOM - MIN_ZOOM);
+  return 0.16 + 0.84 * Math.min(1, Math.max(0, remaining * 5));
+}
+
+function flushWheel(): void {
+  wheelFrame = 0;
+  if (!viewportElement) return;
+
+  panX -= pendingWheel.panX;
+  panY -= pendingWheel.panY;
+
+  if (pendingWheel.zoomLog !== 0) {
+    const rect = viewportElement.getBoundingClientRect();
+    const anchorX = pendingWheel.clientX - rect.left;
+    const anchorY = pendingWheel.clientY - rect.top;
+    const worldX = (anchorX - panX) / zoom;
+    const worldY = (anchorY - panY) / zoom;
+    const boundedLog = Math.min(0.45, Math.max(-0.45, pendingWheel.zoomLog));
+    const factor = Math.exp(boundedLog * zoomResistance(boundedLog));
+    const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom * factor));
+    panX = anchorX - worldX * nextZoom;
+    panY = anchorY - worldY * nextZoom;
+    zoom = nextZoom;
+  }
+
+  pendingWheel = {
+    panX: 0,
+    panY: 0,
+    zoomLog: 0,
+    clientX: 0,
+    clientY: 0,
+  };
+}
+
+function handleWheel(event: WheelEvent): void {
+  event.preventDefault();
+  const deltaX = normalizeWheelDelta(event, event.deltaX);
+  const deltaY = normalizeWheelDelta(event, event.deltaY);
+  if (event.ctrlKey || event.metaKey) {
+    pendingWheel.zoomLog += -deltaY * ZOOM_SENSITIVITY;
+    pendingWheel.clientX = event.clientX;
+    pendingWheel.clientY = event.clientY;
+  } else if (event.shiftKey) {
+    pendingWheel.panX += deltaX || deltaY;
+  } else {
+    pendingWheel.panX += deltaX;
+    pendingWheel.panY += deltaY;
+  }
+  if (!wheelFrame) wheelFrame = requestAnimationFrame(flushWheel);
+}
+
+function startPaint(event: PointerEvent, wireId: string, column: number): void {
+  if (event.button !== 0 || activeGesture) return;
+  event.preventDefault();
+  event.stopPropagation();
+  paintCandidate = { wireId, column, level: paintLevel };
+  onResidencyPreview(wireId, column, paintLevel);
+}
+
+function finishPaint(event: PointerEvent): void {
+  if (!paintCandidate) return;
+  const candidate = paintCandidate;
+  paintCandidate = null;
+  const target = document
+    .elementFromPoint(event.clientX, event.clientY)
+    ?.closest<HTMLElement>("[data-wire][data-column]");
+  if (
+    target?.dataset.wire === candidate.wireId &&
+    Number(target.dataset.column) === candidate.column
+  ) {
+    onResidencyDrop(candidate.wireId, candidate.column, candidate.level);
+  } else {
+    onPreviewClear();
+  }
+}
+
+function handleKeyDown(event: KeyboardEvent): void {
+  if (event.key === "Escape" && (dragging || paintCandidate)) {
+    event.preventDefault();
+    cancelCanvasInteraction();
+  }
+}
+
+function blockSelection(event: Event): void {
+  event.preventDefault();
+}
+
+onMount(() => {
+  let lastWidth = viewportElement.clientWidth;
+  let lastHeight = viewportElement.clientHeight;
+  const observer = new ResizeObserver(() => {
+    const nextWidth = viewportElement.clientWidth;
+    const nextHeight = viewportElement.clientHeight;
+    if (!nextWidth || !nextHeight) return;
+    const centerWorldX = (lastWidth / 2 - panX) / zoom;
+    const centerWorldY = (lastHeight / 2 - panY) / zoom;
+    panX = nextWidth / 2 - centerWorldX * zoom;
+    panY = nextHeight / 2 - centerWorldY * zoom;
+    lastWidth = nextWidth;
+    lastHeight = nextHeight;
+  });
+  observer.observe(viewportElement);
+  return () => {
+    observer.disconnect();
+    if (wheelFrame) cancelAnimationFrame(wheelFrame);
+    if (pointerFrame) cancelAnimationFrame(pointerFrame);
+  };
+});
 </script>
 
+<svelte:window onpointerup={finishPaint} onkeydown={handleKeyDown} />
+
 <div
+  bind:this={viewportElement}
   class:dragging
   class="ncd-viewport"
+  data-pan-x={panX}
+  data-pan-y={panY}
+  data-scale={zoom}
   role="application"
   tabindex="-1"
   aria-label="Pannable neural circuit diagram"
   onpointerdown={beginPan}
   onpointermove={movePan}
   onpointerup={endPan}
-  onpointercancel={endPan}
-  onwheel={wheelZoom}
+  onpointercancel={cancelCanvasInteraction}
+  onwheel={handleWheel}
+  onselectstart={blockSelection}
+  ondragstart={blockSelection}
+  ondblclick={blockSelection}
 >
   <div class="ncd-zoom-readout" aria-hidden="true">{Math.round(zoom * 100)}%</div>
+  <div class="ncd-empty-hint" class:hidden={Boolean(activeGesture)}>
+    Drag empty space to pan · scroll to pan · Ctrl/⌘ + scroll to zoom · ? for help
+  </div>
   <div
     class="ncd-world"
     style={`width:${world.width}px;height:${world.height}px;transform:translate(${panX}px,${panY}px) scale(${zoom})`}
@@ -325,6 +544,11 @@ function wheelZoom(event: WheelEvent): void {
         {@const region = transitionKind(displayTerm, lane.wire.id, state.column)}
         <div
           class:jammed={jamMatches("residency", lane.wire.id, state.column)}
+          class:drop-valid={Boolean(activeGesture) &&
+            residencyTargetValid(lane.wire.id, state.column)}
+          class:drop-invalid={Boolean(activeGesture) &&
+            activeGesture?.type !== "partition" &&
+            !residencyTargetValid(lane.wire.id, state.column)}
           class={`ncd-array ncd-region-${region}`}
           data-ncd-target
           data-wire={lane.wire.id}
@@ -338,12 +562,8 @@ function wheelZoom(event: WheelEvent): void {
           onpointerenter={() =>
             onResidencyPreview(lane.wire.id, state.column, paintLevel)}
           onpointerleave={onPreviewClear}
-          onpointerdown={(event) => {
-            if (event.button === 0) {
-              event.stopPropagation();
-              onResidencyDrop(lane.wire.id, state.column, paintLevel);
-            }
-          }}
+          onpointerdown={(event) =>
+            startPaint(event, lane.wire.id, state.column)}
         >
           <span class="ncd-region-caption">
             {region === "load"
@@ -361,6 +581,8 @@ function wheelZoom(event: WheelEvent): void {
               {@const divisor = divisibility(axisId)}
               <div
                 class:jammed={jamMatches("axis", axisId)}
+                class:drop-valid={Boolean(activeGesture) && axisTargetValid(axisId)}
+                class:drop-invalid={Boolean(activeGesture) && !axisTargetValid(axisId)}
                 class="ncd-axis"
                 data-axis={axisId}
                 class:weaved={isWeaved(axisId)}
@@ -400,6 +622,8 @@ function wheelZoom(event: WheelEvent): void {
       <div
         class:opaque={box.streamability.kind === "none"}
         class:jammed={jamMatches("box", box.id)}
+        class:drop-valid={Boolean(activeGesture) && boxTargetValid(box.id)}
+        class:drop-invalid={Boolean(activeGesture) && !boxTargetValid(box.id)}
         class={`ncd-function ncd-function-${box.kind}`}
         data-ncd-target
         data-box={box.id}
@@ -447,13 +671,23 @@ function wheelZoom(event: WheelEvent): void {
     color: var(--ncd-ink);
     border: 1px solid var(--border);
     touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
   }
-  .ncd-viewport.dragging { cursor: grabbing; }
+  .ncd-viewport *,
+  .ncd-viewport *::before,
+  .ncd-viewport *::after {
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
+  }
+  .ncd-viewport.dragging,
+  .ncd-viewport.dragging * { cursor: grabbing !important; }
   .ncd-world {
     position: absolute;
     transform-origin: 0 0;
     font-family: Georgia, "Times New Roman", serif;
-    transition: transform 80ms linear !important;
   }
   .ncd-zoom-readout {
     position: absolute;
@@ -466,6 +700,20 @@ function wheelZoom(event: WheelEvent): void {
     color: var(--ncd-annotation);
     font: 10px/1 ui-monospace, monospace;
   }
+  .ncd-empty-hint {
+    position: absolute;
+    z-index: 12;
+    bottom: 8px;
+    left: 50%;
+    padding: 3px 7px;
+    border: 1px solid var(--ncd-rule-faint);
+    background: color-mix(in oklab, var(--ncd-paper) 90%, transparent);
+    color: var(--ncd-annotation);
+    font: 10px/1 ui-monospace, monospace;
+    pointer-events: none;
+    transform: translateX(-50%);
+  }
+  .ncd-empty-hint.hidden { display: none; }
   .ncd-cost-table {
     position: absolute;
     top: 20px;
@@ -592,6 +840,7 @@ function wheelZoom(event: WheelEvent): void {
     border-bottom: 1px solid var(--ncd-ink);
     font-size: 14px;
     line-height: 16px;
+    cursor: copy;
   }
   .ncd-axis.weaved i { text-decoration: overline; text-decoration-thickness: 1px; }
   .ncd-axis:hover { background: color-mix(in oklab, var(--ncd-level-one) 15%, transparent); }
@@ -628,6 +877,26 @@ function wheelZoom(event: WheelEvent): void {
     justify-content: center;
     border: 1.25px solid var(--ncd-ink);
     background: color-mix(in oklab, var(--ncd-paper) 92%, transparent);
+    cursor: copy;
+  }
+  .ncd-array.drop-valid,
+  .ncd-axis.drop-valid,
+  .ncd-function.drop-valid {
+    opacity: 1;
+    outline: 2px solid var(--ncd-level-one-ink);
+    outline-offset: 3px;
+    cursor: copy;
+  }
+  .ncd-array.drop-invalid,
+  .ncd-axis.drop-invalid,
+  .ncd-function.drop-invalid {
+    color: var(--ncd-rule-faint);
+    border-color: var(--ncd-rule-faint);
+    cursor: not-allowed;
+  }
+  .ncd-array.drop-invalid,
+  .ncd-function.drop-invalid {
+    background: color-mix(in oklab, var(--ncd-paper) 88%, var(--ncd-rule-faint));
   }
   .ncd-function::before {
     position: absolute;

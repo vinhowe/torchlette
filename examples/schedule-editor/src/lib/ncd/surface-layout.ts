@@ -28,6 +28,11 @@ export interface SurfaceEquivalence {
   nonce: number;
 }
 
+export type SurfaceGesture =
+  | { type: "partition"; kind: "group" | "stream"; size: number }
+  | { type: "level"; level: NcdLevel }
+  | { type: "lemma"; lemmaId: string };
+
 export const SURFACE_COLUMN_WIDTH = 176;
 export const SURFACE_LEFT_GUTTER = 112;
 export const SURFACE_TOP = 172;

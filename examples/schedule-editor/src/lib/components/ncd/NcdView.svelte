@@ -1,5 +1,12 @@
 <script lang="ts">
-import { Play, Redo2, RotateCcw, StepForward, Undo2 } from "@lucide/svelte";
+import {
+  CircleHelp,
+  Play,
+  Redo2,
+  RotateCcw,
+  StepForward,
+  Undo2,
+} from "@lucide/svelte";
 import { onMount } from "svelte";
 import { applyFaStep, FA_STEPS } from "../../ncd/fa-script";
 import {
@@ -16,7 +23,11 @@ import {
   termHash,
   toDiagram,
 } from "../../ncd/model";
-import type { SurfaceEquivalence, SurfaceJam } from "../../ncd/surface-layout";
+import type {
+  SurfaceEquivalence,
+  SurfaceGesture,
+  SurfaceJam,
+} from "../../ncd/surface-layout";
 import type {
   NapkinCost,
   NcdHistoryEntry,
@@ -46,6 +57,8 @@ let equivalence = $state<SurfaceEquivalence | null>(null);
 let equivalenceNonce = 0;
 let equivalenceTimer: ReturnType<typeof setTimeout> | undefined;
 let replayRunning = $state(false);
+let activeGesture = $state<SurfaceGesture | null>(null);
+let helpOpen = $state(false);
 
 const cost = $derived(current ? napkinCost(current) : null);
 const baseCost = $derived(
@@ -120,6 +133,7 @@ function resetTo(nextFixture: "attention" | "matmul" = fixture): void {
   previewTerm = null;
   jam = null;
   equivalence = null;
+  activeGesture = null;
   refusal = `Restored ${base.name}.`;
 }
 
@@ -400,11 +414,43 @@ function dragPayload(
     | { type: "level"; level: NcdLevel }
     | { type: "lemma"; lemmaId: string },
 ): void {
+  document.getSelection()?.removeAllRanges();
+  event.stopPropagation();
   event.dataTransfer?.setData(
     "application/x-torchlette-ncd",
     JSON.stringify(payload),
   );
-  if (event.dataTransfer) event.dataTransfer.effectAllowed = "copy";
+  if (event.dataTransfer) {
+    event.dataTransfer.setData("text/plain", "");
+    event.dataTransfer.effectAllowed = "copy";
+  }
+  activeGesture =
+    payload.type === "partition"
+      ? {
+          type: "partition",
+          kind: payload.kind,
+          size: payload.kind === "group" ? groupSize : streamSize,
+        }
+      : payload;
+}
+
+function finishGesture(): void {
+  activeGesture = null;
+  previewTerm = null;
+}
+
+function handleGlobalKeydown(event: KeyboardEvent): void {
+  if (event.key === "?" && !event.repeat) {
+    event.preventDefault();
+    helpOpen = !helpOpen;
+    return;
+  }
+  if (event.key === "Escape") {
+    helpOpen = false;
+    activeGesture = null;
+    previewTerm = null;
+    jam = null;
+  }
 }
 
 function formatElements(value: number): string {
@@ -413,6 +459,8 @@ function formatElements(value: number): string {
   return value.toLocaleString();
 }
 </script>
+
+<svelte:window onkeydown={handleGlobalKeydown} />
 
 {#if loadError}
   <main class="pad-box stack-field min-h-0 flex-1 overflow-y-auto">
@@ -432,9 +480,13 @@ function formatElements(value: number): string {
         <div class="flex items-center gap-1">
           <button class={controlClass(fixture === "attention")} onclick={() => resetTo("attention")}>Attention</button>
           <button class={controlClass(fixture === "matmul")} onclick={() => resetTo("matmul")}>Matmul</button>
+          {#if fixture === "attention"}
+            <button class={controlClass(true)} disabled={replayRunning} onclick={deriveAll}><Play size={11} /> {replayRunning ? "Replaying FA…" : "Derive FlashAttention"}</button>
+          {/if}
           <button class={controlClass()} disabled={!history.length} onclick={undo}><Undo2 size={11} /> Undo</button>
           <button class={controlClass()} disabled={!redoStack.length} onclick={redo}><Redo2 size={11} /> Redo</button>
           <button class={controlClass()} onclick={() => resetTo()}><RotateCcw size={11} /> Reset</button>
+          <button class={controlClass(helpOpen)} aria-label="Open gesture help" aria-pressed={helpOpen} onclick={() => (helpOpen = !helpOpen)}><CircleHelp size={12} /> ?</button>
         </div>
       </div>
       <div class="grid grid-cols-[auto_1fr_auto] items-center gap-1 border border-border bg-card pad-box">
@@ -445,8 +497,13 @@ function formatElements(value: number): string {
     </section>
 
     <section class="stack-field border-b border-border pad-box">
-      <div class="grid grid-cols-[auto_1fr_auto] items-end gap-2 max-[900px]:grid-cols-1">
-        <div class="flex items-center gap-2 border border-border bg-card pad-box" aria-label="Memory level graph">
+      <div class="stack-tight">
+        <div class="flex items-center justify-between gap-2">
+          <span class="type-label">Gesture palette</span>
+          <span class="type-fine text-muted-foreground">Drag a chip to a highlighted target; select a brush and press a region to paint.</span>
+        </div>
+        <div class="grid grid-cols-[minmax(13rem,1.3fr)_repeat(4,minmax(10rem,1fr))] border border-border max-[1100px]:grid-cols-2">
+        <div class="flex items-center gap-2 border-r border-border bg-card pad-box" aria-label="Memory level graph">
           <svg class="h-14 w-24" viewBox="0 0 96 56" aria-label="WGSL memory level graph">
             <line x1="18" y1="13" x2="47" y2="29" stroke="currentColor" stroke-width="1" />
             <line x1="47" y1="29" x2="28" y2="47" stroke="currentColor" stroke-width="1" />
@@ -461,23 +518,40 @@ function formatElements(value: number): string {
             <span class="type-fine text-muted-foreground">ℓ0 global → ℓ1 workgroup → register / invocation</span>
           </div>
         </div>
-        <div class="flex flex-wrap items-end gap-2">
-          <div class="stack-tight">
-            <span class="type-label">Relabeling palette</span>
-            <div class="flex items-center gap-1">
-              <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "partition", kind: "group" })}>gₐ · Group</button>
-              <input class="h-control w-16 border border-input bg-card px-1 type-value" type="number" min="1" bind:value={groupSize} aria-label="Group size" />
-              <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "partition", kind: "stream" })}>sₐ · Stream</button>
-              <input class="h-control w-16 border border-input bg-card px-1 type-value" type="number" min="1" bind:value={streamSize} aria-label="Stream size" />
-              <button class={controlClass(paintLevel === "l0")} draggable="true" aria-pressed={paintLevel === "l0"} onclick={() => (paintLevel = "l0")} ondragstart={(event) => dragPayload(event, { type: "level", level: "l0" })}>ℓ0 · Global brush</button>
-              <button class={controlClass(paintLevel === "l1")} draggable="true" aria-pressed={paintLevel === "l1"} onclick={() => (paintLevel = "l1")} ondragstart={(event) => dragPayload(event, { type: "level", level: "l1" })}>ℓ1 · Lower brush</button>
-            </div>
+        <div class="stack-tight border-r border-border bg-card pad-box">
+          <span class="type-label">Tile an axis</span>
+          <div class="flex items-center gap-1">
+            <button class={controlClass(activeGesture?.type === "partition" && activeGesture.kind === "group")} draggable="true" ondragstart={(event) => dragPayload(event, { type: "partition", kind: "group" })} ondragend={finishGesture}>gₐ · Group</button>
+            <input class="h-control min-w-0 flex-1 border border-input bg-card px-1 type-value" type="number" min="1" bind:value={groupSize} aria-label="Group size" />
           </div>
+          <span class="type-fine text-muted-foreground">Drop on a divisible axis.</span>
+        </div>
+        <div class="stack-tight border-r border-border bg-card pad-box">
+          <span class="type-label">Stream an axis</span>
+          <div class="flex items-center gap-1">
+            <button class={controlClass(activeGesture?.type === "partition" && activeGesture.kind === "stream")} draggable="true" ondragstart={(event) => dragPayload(event, { type: "partition", kind: "stream" })} ondragend={finishGesture}>sₐ · Stream</button>
+            <input class="h-control min-w-0 flex-1 border border-input bg-card px-1 type-value" type="number" min="1" bind:value={streamSize} aria-label="Stream size" />
+          </div>
+          <span class="type-fine text-muted-foreground">Only head/body axes light up.</span>
+        </div>
+        <div class="stack-tight border-r border-border bg-card pad-box">
+          <span class="type-label">Paint residency</span>
+          <div class="flex items-center gap-1">
+            <button class={controlClass(paintLevel === "l0")} draggable="true" aria-pressed={paintLevel === "l0"} onclick={() => (paintLevel = "l0")} ondragstart={(event) => dragPayload(event, { type: "level", level: "l0" })} ondragend={finishGesture}>ℓ0 · Global</button>
+            <button class={controlClass(paintLevel === "l1")} draggable="true" aria-pressed={paintLevel === "l1"} onclick={() => (paintLevel = "l1")} ondragstart={(event) => dragPayload(event, { type: "level", level: "l1" })} ondragend={finishGesture}>ℓ1 · Lower</button>
+          </div>
+          <span class="type-fine text-muted-foreground">Select, then press a colored region.</span>
+        </div>
+        <div class="stack-tight bg-card pad-box">
+          <span class="type-label">Rewrite a function</span>
           {#if fixture === "attention"}
-            <button class={controlClass()} draggable="true" ondragstart={(event) => dragPayload(event, { type: "lemma", lemmaId: "online-softmax-rescaling" })} onclick={admitLemma}>Lemma · online softmax</button>
+            <button class={controlClass(activeGesture?.type === "lemma")} draggable="true" ondragstart={(event) => dragPayload(event, { type: "lemma", lemmaId: "online-softmax-rescaling" })} ondragend={finishGesture} onclick={admitLemma}>Lemma · online softmax</button>
+            <span class="type-fine text-muted-foreground">Drop on the matching σ box.</span>
+          {:else}
+            <span class="type-fine text-muted-foreground">No admitted lemma for this term.</span>
           {/if}
         </div>
-        <p class="max-w-52 type-fine text-muted-foreground">Drop gₐ/sₐ on axes. Select ℓ0/ℓ1, then paint a region. Drop the lemma on a function.</p>
+        </div>
       </div>
 
       <NcdRenderer
@@ -486,6 +560,7 @@ function formatElements(value: number): string {
         {paintLevel}
         {jam}
         {equivalence}
+        {activeGesture}
         onPartitionDrop={attemptPartition}
         onPartitionPreview={previewPartition}
         onResidencyDrop={attemptResidency}
@@ -547,4 +622,26 @@ function formatElements(value: number): string {
       </section>
     {/if}
   </main>
+{/if}
+
+{#if helpOpen}
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-background/70" role="presentation" onclick={() => (helpOpen = false)}>
+    <div class="stack-field w-[34rem] max-w-[calc(100vw-2rem)] border border-border bg-card pad-box" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="ncd-help-title" onclick={(event) => event.stopPropagation()} onkeydown={(event) => event.stopPropagation()}>
+      <header class="flex items-center justify-between gap-2 border-b border-border pb-1">
+        <h2 id="ncd-help-title" class="type-heading">NCD canvas controls</h2>
+        <button class={controlClass()} onclick={() => (helpOpen = false)}>Esc · Close</button>
+      </header>
+      <div class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+        <span class="type-button">Drag empty canvas</span><span class="type-body">Pan with grab/grabbing feedback.</span>
+        <span class="type-button">Trackpad / wheel</span><span class="type-body">Pan vertically and horizontally.</span>
+        <span class="type-button">Shift + wheel</span><span class="type-body">Pan horizontally.</span>
+        <span class="type-button">Ctrl/⌘ + wheel</span><span class="type-body">Zoom toward the pointer; pinch uses the same path.</span>
+        <span class="type-button">gₐ / sₐ chip</span><span class="type-body">Drag to a highlighted axis to tile or stream.</span>
+        <span class="type-button">ℓ0 / ℓ1 brush</span><span class="type-body">Select a level, then press and release on a valid residency region.</span>
+        <span class="type-button">Lemma chip</span><span class="type-body">Drop on the matching function box.</span>
+        <span class="type-button">Escape</span><span class="type-body">Cancel the active pan, paint, or drag without committing.</span>
+        <span class="type-button">?</span><span class="type-body">Toggle this reference.</span>
+      </div>
+    </div>
+  </div>
 {/if}
