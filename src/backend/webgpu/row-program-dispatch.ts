@@ -7,6 +7,11 @@
 
 import type { RowProgram } from "../../compiler/row-program-types";
 import { resolveOutputBuffer } from "./buffer-arena";
+import {
+  describeWgslMismatch,
+  makeCacheKeyGuard,
+  wgslContentEqual,
+} from "./cache-key-guard";
 import type { GPUBuffer } from "./gpu-types";
 import { rowProgramToSpec } from "./row-program-codegen";
 import { dtypeBytes } from "./shape-utils";
@@ -22,12 +27,32 @@ import { onTeardown, requireContext } from "./webgpu-state";
 
 const kernelCache = new Map<string, TileKernelInstance>();
 
+// Cache-key ⇔ content coherence guard (#92). `program.cacheKey` is a cheap
+// structural key; the cached kernel's WGSL comes from rowProgramToSpec(program)
+// → compileTileKernel. If the key omits a field the spec/codegen bakes in, two
+// different row-programs collide on one entry → a stale kernel served silently.
+// On a hit we (strict/sampled) recompile the WGSL and assert it matches.
+const rowProgramGuard = makeCacheKeyGuard<string>(
+  "row-program kernelCache",
+  wgslContentEqual,
+  describeWgslMismatch,
+);
+
 function getOrCreateKernel(program: RowProgram): TileKernelInstance {
   let kernel = kernelCache.get(program.cacheKey);
   if (!kernel) {
     const spec = rowProgramToSpec(program);
     kernel = createTileKernelDispatcher(spec);
     kernelCache.set(program.cacheKey, kernel);
+  } else {
+    // Seam guard: on a hit, (strict/sampled) recompile the WGSL from the
+    // program and assert it matches the cached kernel's WGSL. A mismatch = the
+    // cacheKey under-spans rowProgramToSpec's codegen (#92); throw rather than
+    // dispatch a stale kernel. getWGSL + createTileKernelDispatcher are pure
+    // string codegen (no device/GPU), so this is GPU-free.
+    rowProgramGuard.check(program.cacheKey, kernel.getWGSL(), () =>
+      createTileKernelDispatcher(rowProgramToSpec(program)).getWGSL(),
+    );
   }
   return kernel;
 }
