@@ -319,3 +319,28 @@ the missing traversal case is the exact "two sides of a seam silently disagree"
 pattern the house rules warn about. Also: `unpack4x8snorm` is the chosen builtin
 (q/127, ·127 folded into the stored scale = group abs-max — the quantizer is the
 single source for that mapping).
+
+## Phase 2 altitude decision (2026-07-11, review ruling)
+
+Phase 1's integration altitude is scaffolding, not the target form. Review verdict
+(Vin: "generally, abstracted, invisible in the right places?"): the kernel, the
+QuantB-not-a-DType call, and the fused dequant are the platonic pieces; the
+CALLER-side wiring is not. The target form:
+
+- **Quantization is a STORAGE-FORMAT attribute of the operand** — the
+  generalization of #59's dtype arc: `StorageFormat { elementType,
+  packing?: { scheme, groupSize, scalesDtype } }`, with plain dtype as the
+  degenerate (no-packing) case. The lazy graph carries the format on the
+  tensor/storage; the packed+scales pair-ness is invisible above the backend.
+- **Consumers declare accepted formats** as variant-registry capability
+  predicates (selection-as-data). A consumer lacking support gets an EXPLICIT
+  dequant inserted — never a silent one, never a caller-side special case.
+- **Not a `quantized-linear` custom op** — that is special-casing at the wrong
+  level of abstraction (the adamGroupKey class). Phase 2 DELETES the phase-1
+  eager lm_head splice when the operand-altitude path lands.
+- **int4 later = a new VALUE on the format axis** (scheme entry + kernel
+  support), zero new mechanism — the test of whether the axis was built right.
+- User surface: `loadCheckpoint(..., { weightFormat: "int8-64" })`; nothing
+  downstream mentions quantization.
+
+Tracked as task #93.
