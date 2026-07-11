@@ -724,17 +724,28 @@ function gatherTileIRImpl(
     uniforms.chunkEnd = "u32";
   }
 
+  // f16 data: read the input through an `array<u32>` binding (two packed f16s
+  // per word) and extract the half via `unpack2x16float`, instead of an
+  // `array<f16>` binding. On Apple Metal (Chrome/Tint→MSL) the array<f16>
+  // read returned the WRONG ROW (index effectively doubled) inside the real
+  // dispatch context, while the identical dispatch with a u32 binding reads
+  // the same bytes correctly (#59). The shader text alone is correct when
+  // dispatched raw on Metal — the failure is dispatch-context-sensitive and
+  // not fully attributed upstream; the binding element type is the one factor
+  // demonstrated to flip wrong→right. This is the SINGLE f16 gather path on
+  // ALL platforms; the `out` binding stays f16 (f16 stores are proven correct
+  // on Metal), so enableF16 remains on.
+  const f16Data = dataDtype === "f16";
+
   return compileTileKernel(
     elementwiseKernel({
       name: chunked
         ? `gather_chunked_d${dim}_${indexDtype}_${dataDtype}`
         : `gather_d${dim}_${indexDtype}_${dataDtype}`,
-      // f16 data storage needs the shader-f16 extension enabled (typed bindings
-      // otherwise emit `array<f16>` against a shader that never declared it →
-      // compile failure → DROPPED submit → stale readback, the #59 class).
-      enableF16: dataDtype === "f16",
+      enableF16: f16Data,
       bindings: {
-        input: { storage: "read", type: dataDtype },
+        // f16 input bound as u32 (two f16s per word); f32 input bound directly.
+        input: { storage: "read", type: f16Data ? "u32" : dataDtype },
         indices: { storage: "read", type: indexDtype },
         out: { storage: "read_write", type: dataDtype },
       },
@@ -748,11 +759,22 @@ function gatherTileIRImpl(
 
         const coords = ctx.decomposeIndex(idx, indexShape);
         const inputCoords = coords.map((c, d) => (d === dim ? dimIdx : c));
-        ctx.emitStore(
-          "out",
-          idx,
-          ctx.load("input", ctx.linearizeIndex(inputCoords, inputStrides)),
+        const e = ctx.emitLet(
+          "e",
+          ctx.linearizeIndex(inputCoords, inputStrides),
         );
+
+        if (f16Data) {
+          // e is the f16 ELEMENT index; the u32 binding holds two per word.
+          // word = input[e >> 1]; value = unpack2x16float(word)[e & 1]
+          // (little-endian: component 0 is the low 16 bits). Buffers are
+          // 4-byte multiples, so `e >> 1` on the last odd element is in bounds.
+          const word = ctx.load("input", e.shr(1));
+          const value = word.unpackHalf(e.and(1));
+          ctx.emitStore("out", idx, value.toF16());
+        } else {
+          ctx.emitStore("out", idx, ctx.load("input", e));
+        }
       },
     }),
   );

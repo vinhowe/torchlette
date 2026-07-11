@@ -100,6 +100,35 @@ describe.skipIf(cpuOnly)("Chunked gather for large tensors", () => {
       const values = await webgpuBackend.ops.read(result);
       expect(Array.from(values)).toEqual([1, 6]);
     });
+
+    // #59 Metal guard: the f16 gather reads its input through an
+    // `array<u32>` binding (unpack2x16float), not `array<f16>`, because on
+    // Apple Metal (Chrome/Tint→MSL) the array<f16> gather read the WRONG ROW
+    // (row term doubled) in the real dispatch context — dispatch-context-
+    // sensitive, not the shader text itself. Dawn is correct on both
+    // paths, so these assert the value-correctness the u32 path must preserve:
+    // odd rows, high rows, and the odd-D case that forces high-half (e&1==1)
+    // selection within a packed word. All values are f16-exact.
+    it("gathers the exact f16 row (odd + high rows, packed-word halves)", async () => {
+      // Table [N, D], row r col c = r + c/8 (multiples of 1/8 are f16-exact).
+      const N = 200;
+      const D = 3; // odd D → row starts alternate between low/high halves
+      const data: number[] = [];
+      for (let r = 0; r < N; r++)
+        for (let c = 0; c < D; c++) data.push(r + c / 8);
+      const table = tensorFromArrayWithDtype(data, [N, D], "f16");
+
+      const rows = [1, 100, 101, 199, 50];
+      const indices = webgpuBackend.ops.tensorFromArray(
+        rows.flatMap((r) => Array(D).fill(r)),
+        [rows.length, D],
+      );
+      const result = webgpuBackend.ops.gather(table, indices, { dim: 0 });
+      expect(result.dtype).toBe("f16");
+      const values = Array.from(await webgpuBackend.ops.read(result));
+      const expected = rows.flatMap((r) => [r + 0 / 8, r + 1 / 8, r + 2 / 8]);
+      expect(values).toEqual(expected);
+    });
   });
 
   describe("large tensor gather (chunked path)", () => {
