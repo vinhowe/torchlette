@@ -294,3 +294,12 @@ bounded nearby memory. That made query tiling in the attention capstone feel
 unmotivated. Showing both physical quantities fixed the lesson, but exposed that
 a scalar `target: {h,m}` lacks explanatory binding: the challenge should name
 which gesture is expected to relieve which resource and on what hardware limit.
+
+### F35 — lesson guidance needs stable action identity outside the term
+
+The schedule term identifies semantic relabelings, but it does not identify the
+current pedagogical action or its rendered control. Selector-driven tests hid
+this gap. The rebuilt game now binds a lesson-phase instruction to a stable
+`actionId`, and the surface binds the same ID to a visibly marked affordance.
+These IDs belong to challenge/attempt state, not `NcdTerm`; putting them in the
+term would make instructional sequencing part of the engine schedule contract.

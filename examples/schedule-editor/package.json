@@ -8,9 +8,10 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json --compiler-warnings \"state_referenced_locally:ignore\"",
-    "test": "vitest run && vite build && node tests/ncd-interaction.mjs && node tests/ncd-game.mjs",
+    "test": "vitest run && vite build && node tests/ncd-interaction.mjs && node tests/ncd-game.mjs && node tests/ncd-human-path.mjs",
     "test:interaction": "node tests/ncd-interaction.mjs",
-    "test:game": "node tests/ncd-game.mjs"
+    "test:game": "node tests/ncd-game.mjs",
+    "test:human": "node tests/ncd-human-path.mjs"
   },
   "dependencies": {
     "@lucide/svelte": "^1.24.0",

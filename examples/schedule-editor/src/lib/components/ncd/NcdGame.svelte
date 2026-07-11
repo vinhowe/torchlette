@@ -94,7 +94,7 @@
     <div class="lesson-heading">
       <p class="kicker">A 10-second experiment</p>
       <h1>{solved ? "That was the shortcut." : "Can you shorten this trip?"}</h1>
-      <p class="instruction">
+      <p class="instruction" data-testid="lesson-guidance" data-target-action={solved ? "intro-reveal" : "intro-drag"}>
         {#if solved}
           Watch where the bright parcel travels now.
         {:else}
@@ -116,7 +116,7 @@
         <small>quick arithmetic</small>
       </div>
 
-      <div class="nearby-zone" data-nearby-drop="true" onclick={solve} role="button" tabindex="0" onkeydown={(event) => (event.key === "Enter" || event.key === " ") && solve()}>
+      <div class="nearby-zone" data-nearby-drop="true" data-game-affordance="drop-target" data-action-id="intro-nearby" data-current-target={!solved} onclick={solve} role="button" tabindex="0" onkeydown={(event) => (event.key === "Enter" || event.key === " ") && solve()}>
         <span>KEEP NEARBY</span>
         <div class="nearby-shelf"></div>
       </div>
@@ -143,6 +143,9 @@
         <button
           class="parcel"
           class:dragging
+          data-game-affordance="drag-source"
+          data-action-id="intro-drag"
+          data-current-target={!solved}
           aria-label="Temporary result parcel. Drag to Keep Nearby."
           onpointerdown={beginDrag}
           style={dragging ? `position:fixed;left:${dragX - 34}px;top:${dragY - 28}px` : ""}
@@ -165,7 +168,7 @@
           <h2>You removed one round trip.</h2>
           <p>The temporary result stays close, so it is not written to slow memory and immediately read back.</p>
         </div>
-        <button class="reveal-button" onclick={() => (showNotation = !showNotation)}>
+        <button class="reveal-button" data-game-affordance="action" data-action-id="intro-reveal" data-current-target={solved && !showNotation} onclick={() => (showNotation = !showNotation)}>
           {showNotation ? "Hide the shorthand" : "Show me the shorthand"}
         </button>
       </div>
@@ -185,8 +188,8 @@
           <span class="notation-caption">nearby memory</span>
         </div>
         <div class="reveal-actions">
-          <button class="primary-button" onclick={onComplete}>Continue to the chain <span>→</span></button>
-          <button class="text-button" onclick={reset}>Run it again</button>
+          <button class="primary-button" data-game-affordance="action" data-action-id="intro-continue" data-current-target={showNotation} onclick={onComplete}>Continue to the chain <span>→</span></button>
+          <button class="text-button" data-game-affordance="action" data-action-id="intro-reset" onclick={reset}>Run it again</button>
         </div>
       </div>
     {/if}
@@ -285,6 +288,8 @@
   .notation-caption { position: absolute; bottom: 12px; color: #9a632b; font-family: Inter, sans-serif; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .12em; }
   .reveal-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 16px; border-top: 1px solid #e5ddce; padding-top: 20px; }
   .text-button { border: 0; color: #5b6472; background: transparent; cursor: pointer; text-decoration: underline; text-underline-offset: 4px; }
+  [data-game-affordance]:not(:disabled) { cursor: pointer; }
+  [data-current-target="true"]:not(:disabled) { outline: 3px solid var(--warm); outline-offset: 5px; box-shadow: 0 0 0 9px rgba(255,189,89,.1), 0 0 32px rgba(255,189,89,.34); }
   @keyframes route-flow { to { stroke-dashoffset: -21; } }
   @keyframes parcel-pulse { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); box-shadow: 0 17px 42px rgba(255,189,89,.5); } }
   @keyframes breathe { 50% { border-color: rgba(255,189,89,.85); background: rgba(255,189,89,.1); } }

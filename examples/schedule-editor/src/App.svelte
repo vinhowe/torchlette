@@ -380,6 +380,8 @@ function boundaryTone(left: number, right: number): string {
       >Island schedule</button>
       <button
         class="border-r border-border px-2 type-body hover:bg-muted active:bg-border/50"
+        data-game-affordance="navigation"
+        data-action-id="enter-game"
         onclick={() => (mode = "ncd")}
       >NCD diagram</button>
     </nav>

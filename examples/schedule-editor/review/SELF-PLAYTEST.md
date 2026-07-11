@@ -61,3 +61,20 @@ The remaining limitation is representational, not a hidden UI rule: the small La
 ## Verdict
 
 This pass is pedagogically coherent enough to hand to a real first-time tester. The first action needs no domain vocabulary; each later technical name compresses an experience; the two lemmas are necessary repairs demonstrated on numbers; and the capstone asks for composition rather than recollection of an arbitrary gesture order. It is still a short authored lesson, not proof that the interaction vocabulary generalizes to arbitrary schedules. A human study should next test whether players can explain the online correction and diagnose a new, near-neighbor streaming obstruction without prompts.
+
+## Discoverability addendum — lessons 1+ (`proto/ncd-game-3`)
+
+Trigger: direct user report that only the opening lesson worked and every later lesson lacked an obvious action.
+
+I replayed lessons 1, 3, 8, and 9 from a fresh production-preview context using ordinary pointer input and, on the first pass, stopped at each entry screen without consulting the DOM. The before verdicts are recorded with screenshots in `DISCOVERABILITY-AUDIT.md`. The short version: Level 1’s gates looked like passive diagram groups; Levels 3/8 had conventional orange buttons but no common guidance system; Level 9’s actual buttons looked like a static legend. Lower map entries also retained scroll position.
+
+After the fix I replayed the full path while following only the visible yellow “YOUR NEXT MOVE” panel and orange target halo:
+
+- **Level 1:** the panel named the blue `A` gate and its exact location. Both gates now carry `CLICK` badges and button surfaces. After A, the panel changed to B without covering the cost feedback.
+- **Level 3:** the entry panel named the orange continuous-pass button. Each state transition then named the four-number experiment, current feed button, Welford install, nearby step, and stream step. I never had to scan for a newly appeared control.
+- **Level 8:** the same grammar survived a branch. At the subtotal choice it recommended the pedagogically correct rescale path while leaving the deliberately wrong option available.
+- **Level 9:** the panel named one valid first action—Carry `m,ℓ`—and that tool was moved to the top of a visibly button-like stack. Subsequent guidance followed the same learned order. The capstone no longer asks the player to infer that a legend is clickable.
+
+The map/lesson scroll position reset to zero on every entry, including the bottom capstone card. I also tightened the first-pass scenes so their highlighted button remains visible at ordinary laptop heights.
+
+Self-critique after replay: this version is intentionally more directive. That is the right correction for a surface whose controls were undiscoverable, but the guidance should eventually become collapsible after a player demonstrates fluency. For v1 it remains persistent because reliable action discovery matters more than preserving puzzle ambiguity.

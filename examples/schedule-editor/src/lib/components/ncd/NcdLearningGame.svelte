@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import NcdGame from "./NcdGame.svelte";
   import NcdRenderer from "./NcdRenderer.svelte";
   import NcdView from "./NcdView.svelte";
@@ -24,7 +25,9 @@
   type LessonPhase = "notice" | "failure" | "lab" | "build" | "complete";
   type HistoryGroup = { label: string; forward: NcdMove[]; inverse: NcdMove[] };
   type Completion = { traffic: number; nearby: number; actions: number };
+  type LessonGuidance = { actionId: string; instruction: string; why: string };
 
+  let learningGameElement = $state<HTMLElement>();
   let screen = $state<Screen>("intro");
   let selectedId = $state<GameLevelId | null>(null);
   let term = $state<NcdTerm | null>(null);
@@ -47,6 +50,53 @@
   const targetNearbyBytes = $derived(
     level?.target.m ? level.target.m * 4 : 0,
   );
+  const guidance = $derived.by((): LessonGuidance | null => {
+    if (!level) return null;
+    if (phase === "complete") {
+      return {
+        actionId: "lesson-map",
+        instruction: "Click “Back to lesson map” when you are ready.",
+        why: "This machine is complete; the map records your result.",
+      };
+    }
+    if (level.id === "fuse-chain") {
+      return hasLocal("mid1", 2)
+        ? {
+            actionId: "fuse-boundary-b",
+            instruction: "Click the glowing blue B gate between GELU and + residual.",
+            why: "B is the remaining 16 MB round trip.",
+          }
+        : {
+            actionId: "fuse-boundary-a",
+            instruction: "Click the glowing blue A gate between + bias and GELU.",
+            why: "This folds A’s write-and-read detour into a nearby shortcut.",
+          };
+    }
+    if (level.id === "layernorm") {
+      if (phase === "notice") return { actionId: "layernorm-try-flow", instruction: "Click the orange “Try one continuous pass” button below the row.", why: "Run the natural idea first so the exact dependency becomes visible." };
+      if (phase === "failure") return { actionId: "layernorm-open-lab", instruction: "Click “Open the 4-number experiment.”", why: "The small example will show what variance must remember." };
+      if (phase === "lab" && labStep === 0) return { actionId: "welford-feed", instruction: "Click the orange button to feed [2, 4] into the backpack.", why: "Watch which three numbers summarize the block." };
+      if (phase === "lab" && labStep === 1) return { actionId: "welford-feed", instruction: "Click the orange button again to feed [8, 10].", why: "The same three slots should summarize all four values." };
+      if (phase === "lab") return { actionId: "welford-install", instruction: "Click “Carry this backpack through LayerNorm.”", why: "Install the running summary you just verified." };
+      if (!hasLocal("mid1", 2)) return { actionId: "layernorm-keep-nearby", instruction: "Click step 1: “Keep each chunk nearby.”", why: "This removes both whole-row round trips." };
+      return { actionId: "layernorm-stream", instruction: "Click step 2: “Flow 128 values at a time.”", why: "The Welford backpack can now travel between blocks." };
+    }
+    if (level.id === "softmax") {
+      if (phase === "notice") return { actionId: "softmax-try-flow", instruction: "Click the orange “Try one continuous pass” button below the row.", why: "Run the obvious idea first and watch where its scale breaks." };
+      if (phase === "failure") return { actionId: "softmax-open-lab", instruction: "Click “Try it with [2, 1] then [4].”", why: "Three scores are enough to see the maximum move." };
+      if (phase === "lab" && labStep < 2) return { actionId: "softmax-reveal", instruction: `Click the orange button to reveal the ${labStep === 0 ? "first" : "next"} block.`, why: "Compare each subtotal with the maximum used as its ruler." };
+      if (phase === "lab" && softmaxChoice === "none") return { actionId: "softmax-rescale", instruction: "Click “Shrink it to the new ruler.”", why: "The earlier subtotal was measured against max 2, not max 4." };
+      if (phase === "lab" && softmaxChoice === "wrong") return { actionId: "softmax-rescale", instruction: "Click “Rescale the old subtotal.”", why: "Repair the deliberately wrong 2.368 result." };
+      if (phase === "lab") return { actionId: "softmax-install", instruction: "Click “Carry the ruler m and subtotal ℓ.”", why: "Install the two values whose update you just checked." };
+      if (!hasLocal("mid1", 2)) return { actionId: "softmax-keep-nearby", instruction: "Click step 1: “Keep score chunks nearby.”", why: "This removes both full-row round trips." };
+      return { actionId: "softmax-stream", instruction: "Click step 2: “Flow 128 scores at a time.”", why: "The m,ℓ state can now repair each arriving block." };
+    }
+    if (!faDone("admit-online-softmax")) return { actionId: "fa-carry", instruction: "Start by clicking the orange “Carry m and ℓ” tool on the right.", why: "You already proved that softmax needs this state before key blocks can flow." };
+    if (!faDone("fuse-qk-softmax")) return { actionId: "fa-scores", instruction: "Click “Keep score blocks nearby.”", why: "This removes the first giant N×N parcel from slow memory." };
+    if (!faDone("fuse-softmax-pv")) return { actionId: "fa-probabilities", instruction: "Click “Keep probability blocks nearby.”", why: "This removes the second giant N×N parcel." };
+    if (!faDone("tile-q")) return { actionId: "fa-tile", instruction: "Click “Work on 64 query rows.”", why: "Smaller query groups fit the nearby-workbench limit." };
+    return { actionId: "fa-stream", instruction: "Click “Flow 32 key columns.”", why: "Finish the schedule by moving keys and values through the carried state." };
+  });
 
   function workloadScale(id: GameLevelId): number {
     return id === "attention" ? 1 : 2048;
@@ -62,7 +112,17 @@
     return `${bytes} B`;
   }
 
-  function startLevel(id: GameLevelId): void {
+  async function resetView(): Promise<void> {
+    await tick();
+    learningGameElement?.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  }
+
+  async function showMap(): Promise<void> {
+    screen = "map";
+    await resetView();
+  }
+
+  async function startLevel(id: GameLevelId): Promise<void> {
     const next = levelById(id);
     selectedId = id;
     term = cloneTerm(next.baseline);
@@ -76,6 +136,7 @@
     capstoneMoves = [];
     blockedTool = null;
     screen = "lesson";
+    await resetView();
   }
 
   function openingFeedback(id: GameLevelId): string {
@@ -283,20 +344,20 @@
 </script>
 
 {#if screen === "intro"}
-  <NcdGame {onExit} onComplete={() => (screen = "map")} />
+  <NcdGame {onExit} onComplete={showMap} />
 {:else if screen === "sandbox"}
   <div class="sandbox-shell">
-    <button class="sandbox-back" onclick={() => (screen = "map")}>← Back to lessons</button>
+    <button class="sandbox-back" data-game-affordance="navigation" data-action-id="sandbox-back" onclick={showMap}>← Back to lessons</button>
     <NcdView startInSandbox />
   </div>
 {:else}
-  <main class="learning-game" data-testid="learning-game">
+  <main class="learning-game" data-testid="learning-game" bind:this={learningGameElement}>
     <header class="world-header">
-      <button class="brand-button" onclick={() => (screen = "map")}><span>↝</span> Memory Garden</button>
+      <button class="brand-button" data-game-affordance="navigation" data-action-id="brand-map" onclick={showMap}><span>↝</span> Memory Garden</button>
       <nav>
-        <button class:active={screen === "map"} onclick={() => (screen = "map")}>Lesson map</button>
-        <button onclick={() => (screen = "sandbox")}>Advanced sandbox</button>
-        <button onclick={onExit}>Schedule editor</button>
+        <button class:active={screen === "map"} data-game-affordance="navigation" data-action-id="nav-map" onclick={showMap}>Lesson map</button>
+        <button data-game-affordance="navigation" data-action-id="nav-sandbox" onclick={() => (screen = "sandbox")}>Advanced sandbox</button>
+        <button data-game-affordance="navigation" data-action-id="nav-schedule" onclick={onExit}>Schedule editor</button>
       </nav>
     </header>
 
@@ -309,7 +370,7 @@
         </div>
         <div class="map-path">
           {#each GAME_LEVELS as item, index}
-            <button class="map-card" class:complete={Boolean(progress[item.id])} onclick={() => startLevel(item.id)} aria-label={`Open ${item.title}`}>
+            <button class="map-card" class:complete={Boolean(progress[item.id])} data-game-affordance="navigation" data-action-id={`open-${item.id}`} onclick={() => startLevel(item.id)} aria-label={`Open ${item.title}`}>
               <span class="map-index">{index + 1}</span>
               <span class="map-copy">
                 <small>{index === 0 ? "KEEP VALUES CLOSE" : index === 1 ? "CARRY A SUMMARY" : index === 2 ? "REPAIR THE SCALE" : "COMPOSE EVERYTHING"}</small>
@@ -327,13 +388,13 @@
         <aside class="map-note">
           <strong>What you already discovered</strong>
           <span>A warm segment means a temporary value stayed near the compute.</span>
-          <button onclick={() => (screen = "intro")}>Replay the 10-second experiment</button>
+          <button data-game-affordance="navigation" data-action-id="replay-intro" onclick={() => (screen = "intro")}>Replay the 10-second experiment</button>
         </aside>
       </section>
     {:else if level && term && cost}
       <section class="lesson" data-level={level.id}>
         <div class="lesson-topline">
-          <button class="back-button" onclick={() => (screen = "map")}>← Lesson map</button>
+          <button class="back-button" data-game-affordance="navigation" data-action-id="lesson-map-top" onclick={showMap}>← Lesson map</button>
           <span>Lesson {GAME_LEVELS.findIndex((item) => item.id === level.id) + 1} of 4</span>
           <button class="undo-button" disabled={!history.length || phase === "complete"} onclick={undo}>Undo last change</button>
         </div>
@@ -355,28 +416,36 @@
           </div>
         </header>
 
+        {#if guidance}
+          <section class="action-guide" data-testid="lesson-guidance" data-target-action={guidance.actionId}>
+            <span class="guide-kicker">YOUR NEXT MOVE</span>
+            <div><strong>{guidance.instruction}</strong><p>{guidance.why}</p></div>
+            <span class="guide-arrow">↘</span>
+          </section>
+        {/if}
+
         <div class="feedback" data-testid="teaching-feedback"><span>↳</span><p>{feedback}</p></div>
 
         {#if level.id === "fuse-chain"}
           <section class="chain-machine" data-testid="level-chain-machine">
             <div class="operation">+ bias<small>0.03 ms work</small></div>
-            <button class="boundary" class:local={hasLocal("mid1", 2)} disabled={hasLocal("mid1", 2)} onclick={() => fuseChainBoundary("mid1", 2)} data-testid="boundary-a">
+            <button class="boundary" class:local={hasLocal("mid1", 2)} data-game-affordance="action" data-action-id="fuse-boundary-a" data-current-target={guidance?.actionId === "fuse-boundary-a"} disabled={hasLocal("mid1", 2)} onclick={() => fuseChainBoundary("mid1", 2)} data-testid="boundary-a">
               <span class="parcel-mini">A</span><strong>{hasLocal("mid1", 2) ? "stays nearby" : "send away + fetch back"}</strong><small>{hasLocal("mid1", 2) ? "shortcut active" : "16 MB round trip"}</small>
             </button>
             <div class="operation">GELU<small>0.05 ms work</small></div>
-            <button class="boundary" class:local={hasLocal("mid2", 4)} disabled={hasLocal("mid2", 4)} onclick={() => fuseChainBoundary("mid2", 4)} data-testid="boundary-b">
+            <button class="boundary" class:local={hasLocal("mid2", 4)} data-game-affordance="action" data-action-id="fuse-boundary-b" data-current-target={guidance?.actionId === "fuse-boundary-b"} disabled={hasLocal("mid2", 4)} onclick={() => fuseChainBoundary("mid2", 4)} data-testid="boundary-b">
               <span class="parcel-mini">B</span><strong>{hasLocal("mid2", 4) ? "stays nearby" : "send away + fetch back"}</strong><small>{hasLocal("mid2", 4) ? "shortcut active" : "16 MB round trip"}</small>
             </button>
             <div class="operation">+ residual<small>0.03 ms work</small></div>
           </section>
-          <p class="touch-prompt">Touch a blue delivery gate to fold it into a warm shortcut.</p>
+          <p class="touch-prompt">The orange halo marks the recommended click; every dotted gate is interactive.</p>
         {:else if level.id === "layernorm"}
           {#if phase === "notice"}
             <section class="passes-scene">
               <div class="row-ribbon"><span>1,024 values</span></div>
               <div class="pass-list"><span>① find mean</span><span>② find variance</span><span>③ normalize</span></div>
               <div class="trip-count">same row parked and fetched <strong>3×</strong></div>
-              <button class="big-action" onclick={tryLayernormFlow}>Try one continuous pass →</button>
+              <button class="big-action" data-game-affordance="action" data-action-id="layernorm-try-flow" data-current-target={guidance?.actionId === "layernorm-try-flow"} onclick={tryLayernormFlow}>Try one continuous pass →</button>
             </section>
           {:else if phase === "failure"}
             <section class="dependency-scene" data-testid="layernorm-failure">
@@ -385,7 +454,7 @@
               <div class="changing-number">mean so far <strong>3</strong><i>becomes</i><strong>6</strong></div>
               <h2>The future changes what “distance from the mean” means.</h2>
               <p>Instead of hiding this obstruction, let’s try it on four numbers.</p>
-              <button class="big-action" onclick={openWelfordLab}>Open the 4-number experiment</button>
+              <button class="big-action" data-game-affordance="action" data-action-id="layernorm-open-lab" data-current-target={guidance?.actionId === "layernorm-open-lab"} onclick={openWelfordLab}>Open the 4-number experiment</button>
             </section>
           {:else if phase === "lab"}
             <section class="backpack-lab" data-testid="welford-lab">
@@ -397,14 +466,14 @@
               </div>
               {#if labStep === 2}<div class="moment-proof"><span>distances from mean 6</span><strong>(−4)² + (−2)² + 2² + 4² = 40</strong><small>M2 is the running sum of squared distances.</small></div>{/if}
               <p>{labStep < 2 ? "The backpack has three slots. Feed the next block." : "Four input values are gone, but these three numbers preserve exactly what variance needs."}</p>
-              {#if labStep < 2}<button class="big-action" onclick={feedMomentBlock}>Feed {labStep === 0 ? "[2, 4]" : "[8, 10]"} →</button>{:else}<button class="big-action" onclick={installWelford}>Carry this backpack through LayerNorm</button>{/if}
+              {#if labStep < 2}<button class="big-action" data-game-affordance="action" data-action-id="welford-feed" data-current-target={guidance?.actionId === "welford-feed"} onclick={feedMomentBlock}>Feed {labStep === 0 ? "[2, 4]" : "[8, 10]"} →</button>{:else}<button class="big-action" data-game-affordance="action" data-action-id="welford-install" data-current-target={guidance?.actionId === "welford-install"} onclick={installWelford}>Carry this backpack through LayerNorm</button>{/if}
             </section>
           {:else}
             <section class="build-scene">
               <div class="earned-tool"><span>🎒</span><div><small>NOW IT HAS A NAME</small><strong>Welford running moments</strong><p>The carried state is (count, mean, M2).</p></div></div>
               <div class="build-actions">
-                <button disabled={hasLocal("mid1", 2)} onclick={keepPassesNearby}><span>1</span><strong>Keep each chunk nearby</strong><small>remove both row round trips</small></button>
-                <button disabled={!hasLocal("mid1", 2) || hasRowStream()} onclick={streamRows}><span>2</span><strong>Flow 128 values at a time</strong><small>carry the backpack between blocks</small></button>
+                <button data-game-affordance="action" data-action-id="layernorm-keep-nearby" data-current-target={guidance?.actionId === "layernorm-keep-nearby"} disabled={hasLocal("mid1", 2)} onclick={keepPassesNearby}><span>1</span><strong>Keep each chunk nearby</strong><small>remove both row round trips</small></button>
+                <button data-game-affordance="action" data-action-id="layernorm-stream" data-current-target={guidance?.actionId === "layernorm-stream"} disabled={!hasLocal("mid1", 2) || hasRowStream()} onclick={streamRows}><span>2</span><strong>Flow 128 values at a time</strong><small>carry the backpack between blocks</small></button>
               </div>
             </section>
           {/if}
@@ -414,7 +483,7 @@
               <div class="row-ribbon"><span>2,048 scores</span></div>
               <div class="pass-list"><span>① find max</span><span>② sum exponentials</span><span>③ normalize</span></div>
               <div class="trip-count">whole score row crossed <strong>3×</strong></div>
-              <button class="big-action" onclick={trySoftmaxFlow}>Try one continuous pass →</button>
+              <button class="big-action" data-game-affordance="action" data-action-id="softmax-try-flow" data-current-target={guidance?.actionId === "softmax-try-flow"} onclick={trySoftmaxFlow}>Try one continuous pass →</button>
             </section>
           {:else if phase === "failure"}
             <section class="dependency-scene ruler-scene" data-testid="softmax-failure">
@@ -422,7 +491,7 @@
               <div class="moving-ruler"><span>current max 2</span><i>→</i><strong>future max 4</strong></div>
               <h2>A later maximum moves the ruler.</h2>
               <p>Exponentials counted against max 2 cannot simply be added to values counted against max 4.</p>
-              <button class="big-action" onclick={openSoftmaxLab}>Try it with [2, 1] then [4]</button>
+              <button class="big-action" data-game-affordance="action" data-action-id="softmax-open-lab" data-current-target={guidance?.actionId === "softmax-open-lab"} onclick={openSoftmaxLab}>Try it with [2, 1] then [4]</button>
             </section>
           {:else if phase === "lab"}
             <section class="softmax-lab" data-testid="softmax-lab">
@@ -431,24 +500,24 @@
                 <div class:visible={labStep >= 2}><small>BLOCK 2</small><strong>[4]</strong><span>new m = 4</span></div>
               </div>
               {#if labStep < 2}
-                <button class="big-action" onclick={revealSoftmaxBlock}>Reveal {labStep === 0 ? "first" : "next"} block</button>
+                <button class="big-action" data-game-affordance="action" data-action-id="softmax-reveal" data-current-target={guidance?.actionId === "softmax-reveal"} onclick={revealSoftmaxBlock}>Reveal {labStep === 0 ? "first" : "next"} block</button>
               {:else if softmaxChoice === "none"}
                 <h2>What should happen to the old subtotal?</h2>
-                <div class="choice-row"><button onclick={chooseOldSubtotal}>Keep 1.368 and add</button><button onclick={chooseRescale}>Shrink it to the new ruler</button></div>
+                <div class="choice-row"><button data-game-affordance="action" data-action-id="softmax-keep-wrong" onclick={chooseOldSubtotal}>Keep 1.368 and add</button><button data-game-affordance="action" data-action-id="softmax-rescale" data-current-target={guidance?.actionId === "softmax-rescale"} onclick={chooseRescale}>Shrink it to the new ruler</button></div>
               {:else if softmaxChoice === "wrong"}
                 <div class="wrong-result"><strong>2.368 ✕</strong><span>The old bars were measured from max 2, not max 4.</span></div>
-                <button class="big-action" onclick={chooseRescale}>Rescale the old subtotal</button>
+                <button class="big-action" data-game-affordance="action" data-action-id="softmax-rescale" data-current-target={guidance?.actionId === "softmax-rescale"} onclick={chooseRescale}>Rescale the old subtotal</button>
               {:else}
                 <div class="correction-card" data-testid="softmax-correction"><span>old subtotal</span><strong>1.368 × exp(2 − 4) + 1 = 1.185</strong><p>The factor 0.135 shrinks every earlier contribution into the new maximum’s coordinate system.</p></div>
-                <button class="big-action" onclick={installOnlineSoftmax}>Carry the ruler m and subtotal ℓ</button>
+                <button class="big-action" data-game-affordance="action" data-action-id="softmax-install" data-current-target={guidance?.actionId === "softmax-install"} onclick={installOnlineSoftmax}>Carry the ruler m and subtotal ℓ</button>
               {/if}
             </section>
           {:else}
             <section class="build-scene">
               <div class="earned-tool"><span>📏</span><div><small>NOW IT HAS A NAME</small><strong>Online softmax</strong><p><b>m</b> is the moving ruler. <b>ℓ</b> is the repaired subtotal. Earlier work scales by exp(m_old − m_new).</p></div></div>
               <div class="build-actions">
-                <button disabled={hasLocal("mid1", 2)} onclick={keepPassesNearby}><span>1</span><strong>Keep score chunks nearby</strong><small>remove both full-row round trips</small></button>
-                <button disabled={!hasLocal("mid1", 2) || hasRowStream()} onclick={streamRows}><span>2</span><strong>Flow 128 scores at a time</strong><small>carry m and ℓ between blocks</small></button>
+                <button data-game-affordance="action" data-action-id="softmax-keep-nearby" data-current-target={guidance?.actionId === "softmax-keep-nearby"} disabled={hasLocal("mid1", 2)} onclick={keepPassesNearby}><span>1</span><strong>Keep score chunks nearby</strong><small>remove both full-row round trips</small></button>
+                <button data-game-affordance="action" data-action-id="softmax-stream" data-current-target={guidance?.actionId === "softmax-stream"} disabled={!hasLocal("mid1", 2) || hasRowStream()} onclick={streamRows}><span>2</span><strong>Flow 128 scores at a time</strong><small>carry m and ℓ between blocks</small></button>
               </div>
             </section>
           {/if}
@@ -464,11 +533,11 @@
             <div class="earned-toolbox">
               <h2>Your four earned ideas</h2>
               <p>No new mechanic here. Apply each idea to the bottleneck it describes.</p>
-              <button class:done={faDone("fuse-qk-softmax")} onclick={() => performCapstone(1)} disabled={faDone("fuse-qk-softmax")}><span>↝</span><strong>Keep score blocks nearby</strong><small>the first giant parcel</small></button>
-              <button class:done={faDone("fuse-softmax-pv")} onclick={() => performCapstone(2)} disabled={faDone("fuse-softmax-pv")}><span>↝</span><strong>Keep probability blocks nearby</strong><small>the second giant parcel</small></button>
-              <button class:done={faDone("tile-q")} onclick={() => performCapstone(3)} disabled={faDone("tile-q")}><span>▦</span><strong>Work on 64 query rows</strong><small>fit the nearby workbench</small></button>
-              <button class:done={faDone("admit-online-softmax")} onclick={() => performCapstone(0)} disabled={faDone("admit-online-softmax")}><span>📏</span><strong>Carry m and ℓ</strong><small>reuse the moving-ruler lesson</small></button>
-              <button class:done={faDone("stream-x")} class:blocked={blockedTool === "stream-x"} onclick={() => performCapstone(4)} disabled={faDone("stream-x")}><span>≈</span><strong>Flow 32 key columns</strong><small>continue block by block</small></button>
+              <button class:done={faDone("admit-online-softmax")} data-game-affordance="action" data-action-id="fa-carry" data-current-target={guidance?.actionId === "fa-carry"} onclick={() => performCapstone(0)} disabled={faDone("admit-online-softmax")}><span>📏</span><strong>Carry m and ℓ</strong><small>reuse the moving-ruler lesson</small></button>
+              <button class:done={faDone("fuse-qk-softmax")} data-game-affordance="action" data-action-id="fa-scores" data-current-target={guidance?.actionId === "fa-scores"} onclick={() => performCapstone(1)} disabled={faDone("fuse-qk-softmax")}><span>↝</span><strong>Keep score blocks nearby</strong><small>the first giant parcel</small></button>
+              <button class:done={faDone("fuse-softmax-pv")} data-game-affordance="action" data-action-id="fa-probabilities" data-current-target={guidance?.actionId === "fa-probabilities"} onclick={() => performCapstone(2)} disabled={faDone("fuse-softmax-pv")}><span>↝</span><strong>Keep probability blocks nearby</strong><small>the second giant parcel</small></button>
+              <button class:done={faDone("tile-q")} data-game-affordance="action" data-action-id="fa-tile" data-current-target={guidance?.actionId === "fa-tile"} onclick={() => performCapstone(3)} disabled={faDone("tile-q")}><span>▦</span><strong>Work on 64 query rows</strong><small>fit the nearby workbench</small></button>
+              <button class:done={faDone("stream-x")} class:blocked={blockedTool === "stream-x"} data-game-affordance="action" data-action-id="fa-stream" data-current-target={guidance?.actionId === "fa-stream"} onclick={() => performCapstone(4)} disabled={faDone("stream-x")}><span>≈</span><strong>Flow 32 key columns</strong><small>continue block by block</small></button>
             </div>
           </section>
         {/if}
@@ -483,8 +552,8 @@
               <div class="completion-numbers"><span><b>{formatBytes(trafficBytes(level.baseline, level.id))}</b> before</span><i>→</i><span><b>{formatBytes(trafficBytes(term, level.id))}</b> now</span></div>
             </div>
             <div class="completion-actions">
-              <button class="paper-button" onclick={() => (notationOpen = !notationOpen)}>{notationOpen ? "Hide" : "Read"} the paper shorthand</button>
-              <button class="next-button" onclick={() => (screen = "map")}>Back to lesson map →</button>
+              <button class="paper-button" data-game-affordance="action" data-action-id="read-notation" onclick={() => (notationOpen = !notationOpen)}>{notationOpen ? "Hide" : "Read"} the paper shorthand</button>
+              <button class="next-button" data-game-affordance="action" data-action-id="lesson-map" data-current-target={guidance?.actionId === "lesson-map"} onclick={showMap}>Back to lesson map →</button>
             </div>
           </section>
           {#if notationOpen}
@@ -567,20 +636,28 @@
   .physical-score.won strong, .physical-score.won small { color: var(--mint); }
   .physical-score .space-row { margin-top: 5px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,.08); }
   .physical-score .space-row strong { color: #b9e9db; font-size: 15px; }
+  .action-guide { position: relative; display: grid; grid-template-columns: auto minmax(0,1fr) auto; gap: 16px; align-items: center; margin-bottom: 14px; padding: 17px 20px; color: var(--ink); background: linear-gradient(110deg,#fff2bd,#ffcf72); border: 2px solid #ffb33b; border-radius: 18px; box-shadow: 0 12px 32px rgba(255,179,59,.13); }
+  .guide-kicker { padding: 6px 9px; color: #5d3900; background: rgba(255,255,255,.55); border-radius: 8px; font-size: 9px; font-weight: 950; letter-spacing: .14em; }
+  .action-guide strong { display: block; font-size: 17px; line-height: 1.3; }
+  .action-guide p { margin: 3px 0 0; color: #70521e; font-size: 12px; }
+  .guide-arrow { font-size: 28px; animation: guide-nudge 1.8s ease-in-out infinite; }
   .feedback { min-height: 64px; display: flex; align-items: center; gap: 14px; margin-bottom: 18px; padding: 14px 18px; color: #cad6e5; background: rgba(114,183,255,.08); border: 1px solid rgba(114,183,255,.16); border-radius: 16px; }
   .feedback span { color: var(--blue); font-size: 23px; }
   .feedback p { margin: 0; line-height: 1.45; }
   .chain-machine { min-height: 330px; display: grid; grid-template-columns: 1fr 1.15fr 1fr 1.15fr 1fr; gap: 14px; align-items: center; padding: 44px; background: rgba(255,255,255,.035); border: 1px solid rgba(255,255,255,.08); border-radius: 28px; }
   .operation, .attn-op { display: grid; place-items: center; min-height: 110px; padding: 16px; color: var(--ink); background: var(--paper); border-radius: 20px; font-size: 22px; font-weight: 850; box-shadow: 0 15px 35px rgba(0,0,0,.22); }
   .operation small { color: #778091; font-size: 10px; font-weight: 600; }
-  .boundary { min-height: 170px; display: grid; place-items: center; align-content: center; gap: 4px; color: #d9ebff; background: rgba(83,142,206,.12); border: 2px dashed rgba(114,183,255,.42); border-radius: 24px; cursor: pointer; }
-  .boundary:hover { background: rgba(83,142,206,.22); transform: translateY(-3px); }
+  .boundary { position: relative; min-height: 170px; display: grid; place-items: center; align-content: center; gap: 4px; color: #eaf5ff; background: linear-gradient(180deg,rgba(83,142,206,.2),rgba(83,142,206,.1)); border: 2px solid rgba(114,183,255,.68); border-radius: 24px; cursor: pointer; box-shadow: inset 0 0 0 1px rgba(255,255,255,.05); }
+  .boundary::before { content: "CLICK"; position: absolute; top: 10px; right: 11px; padding: 3px 6px; color: #bfe0ff; background: rgba(8,28,51,.65); border-radius: 6px; font-size: 8px; font-weight: 950; letter-spacing: .12em; }
+  .boundary:hover { background: rgba(83,142,206,.3); border-color: #a4d4ff; transform: translateY(-3px); }
   .boundary.local { color: #3d2b0a; background: rgba(255,189,89,.92); border-color: var(--warm); cursor: default; animation: pop .45s both; }
+  .boundary.local::before { content: "DONE"; color: #5c3700; background: rgba(255,255,255,.48); }
   .boundary small { opacity: .75; }
   .parcel-mini { display: grid; place-items: center; width: 44px; height: 38px; color: var(--ink); background: var(--warm); border-radius: 11px; font-size: 20px; font-weight: 900; }
   .boundary.local .parcel-mini { background: #fff3bc; }
   .touch-prompt { color: #8392a8; text-align: center; }
   .passes-scene, .dependency-scene, .backpack-lab, .softmax-lab, .build-scene { min-height: 390px; padding: 42px; background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08); border-radius: 28px; }
+  .passes-scene { min-height: 310px; padding: 28px 42px; }
   .row-ribbon { height: 76px; display: grid; place-items: center; color: var(--ink); background: repeating-linear-gradient(90deg,#ffda79 0 28px,#f7c75e 28px 56px); border-radius: 18px; font-weight: 900; }
   .pass-list { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; margin: 22px 0; }
   .pass-list span { padding: 14px; color: #c9d5e5; background: rgba(255,255,255,.06); border-radius: 13px; text-align: center; }
@@ -652,11 +729,11 @@
   .giant-parcel.removed span { font-size: 13px; }
   .earned-toolbox h2 { margin: 0; }
   .earned-toolbox > p { color: #91a0b6; }
-  .earned-toolbox > button { width: 100%; display: grid; grid-template-columns: 35px 1fr; padding: 12px 8px; color: white; text-align: left; background: transparent; border: 0; border-bottom: 1px solid rgba(255,255,255,.08); cursor: pointer; }
+  .earned-toolbox > button { width: 100%; display: grid; grid-template-columns: 35px 1fr; margin-top: 7px; padding: 12px; color: white; text-align: left; background: rgba(255,255,255,.055); border: 1px solid rgba(255,255,255,.13); border-radius: 12px; cursor: pointer; }
   .earned-toolbox > button span { grid-row: 1 / 3; font-size: 20px; }
   .earned-toolbox > button strong, .earned-toolbox > button small { display: block; }
   .earned-toolbox > button small { color: #8796ac; }
-  .earned-toolbox > button:hover { background: rgba(255,255,255,.05); }
+  .earned-toolbox > button:hover { background: rgba(255,255,255,.12); border-color: rgba(255,189,89,.7); transform: translateX(-3px); }
   .earned-toolbox > button.done { opacity: .4; }
   .earned-toolbox > button.blocked { color: #ffc9c0; background: rgba(180,61,66,.2); animation: shake .35s 2; }
   .completion { margin-top: 18px; display: grid; grid-template-columns: auto 1fr auto; gap: 22px; align-items: center; padding: 25px; color: var(--ink); background: #dcf9ee; border-radius: 24px; animation: rise .5s both; }
@@ -684,9 +761,14 @@
   .notation-ledger small { grid-column: 1 / -1; }
   .sandbox-shell { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; color: var(--foreground); background: var(--background); }
   .sandbox-back { height: 36px; flex: none; border: 0; border-bottom: 1px solid var(--border); color: var(--foreground); background: var(--panel); cursor: pointer; }
+  [data-game-affordance]:not(:disabled) { cursor: pointer; }
+  [data-game-affordance="action"]:not(:disabled) { transition: transform .18s, box-shadow .18s, border-color .18s, background .18s; }
+  [data-current-target="true"]:not(:disabled) { position: relative; z-index: 4; outline: 3px solid var(--warm); outline-offset: 4px; box-shadow: 0 0 0 8px rgba(255,189,89,.12), 0 0 30px rgba(255,189,89,.32); animation: target-breathe 1.9s ease-in-out infinite; }
   @keyframes pop { from { transform: scale(.85); opacity: .4; } }
   @keyframes shake { 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
   @keyframes rise { from { opacity: 0; transform: translateY(12px); } }
+  @keyframes target-breathe { 50% { outline-color: #ffe199; box-shadow: 0 0 0 12px rgba(255,189,89,.06), 0 0 38px rgba(255,189,89,.42); } }
+  @keyframes guide-nudge { 50% { transform: translate(4px,4px); } }
   @media (max-width: 850px) {
     .world-header nav button:last-child { display: none; }
     .mission { grid-template-columns: 1fr; gap: 12px; }
