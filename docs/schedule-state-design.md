@@ -160,6 +160,24 @@ scatter-add (NOT authored: composed around the atomicAddF32 atom from P0).
 
 ## 7. Phases (each independently shippable, stage-4 style)
 
+### P0 entry criteria (the prereq runway — task numbers from the board)
+
+**Correctness floor:** #43 recorded-path deletions land FIRST (one codegen path for the
+null differential to hold invariant, not two); #92 key≠content seam-guard (scheduleHash
+is a new key of that class and P0 rewires FusionKernelCache); #73 strict-lifetime default
+via #86 + #74 (live kernel swapping needs loud, FP-free guards); #67 executor transpose
+bug (user-shaped graphs); #85 characterized (uncharacterized noise poisons differential
+gates — understand, not necessarily fix).
+**IR completeness:** #65 topk→tile-IR (or a written exemption); #71 offsets→volatile
+uniforms (stabilize what template identity MEANS before scheduleHash joins it); #87.
+**Absorbed, not sequenced:** #78 I3/I4 (I3 is a MOVE under this design — do not build the
+bespoke pass) and #83's structural-generator tranche (P0's deletions discharge it).
+**Live-loop gates (P3/channel, not P0):** #89 tape guard-miss; the schedule request
+channel (contract.md's shape extended); browser timestamp-query timing RPC.
+**Coordination:** #76's quantized-operand format must be expressible as named
+ScheduleStates (§2's registry-as-catalog) — checked at its phase-1 design review.
+**Orthogonal:** #66 lands or parks cleanly before P0's src churn.
+
 - **P0 — reify + null differential.** Derive ScheduleState from every existing tile-IR
   kernel; regenerate; byte-diff against today's WGSL across the full kernel corpus
   (gates + suite as the executable check). No behavior change. Null-stability proven.
