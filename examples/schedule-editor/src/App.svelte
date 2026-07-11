@@ -9,7 +9,7 @@ import {
   Undo2,
 } from "@lucide/svelte";
 import { onMount } from "svelte";
-import NcdView from "./lib/components/ncd/NcdView.svelte";
+import NcdGame from "./lib/components/ncd/NcdGame.svelte";
 import AppBar from "./lib/components/primitives/AppBar.svelte";
 import ThemeProvider from "./lib/components/theme/ThemeProvider.svelte";
 import ThemeToggle from "./lib/components/theme/ThemeToggle.svelte";
@@ -364,26 +364,27 @@ function boundaryTone(left: number, right: number): string {
 }
 </script>
 
+{#if mode === "ncd"}
+  <NcdGame onExit={() => (mode = "schedule")} />
+{:else}
 <ThemeProvider>
   <div class="fixed inset-0 flex flex-col overflow-hidden bg-background text-foreground">
-    <AppBar title="torchlette" context={mode === "ncd" ? "NCD calculus" : "Schedule editor"}>
+    <AppBar title="torchlette" context="Schedule editor">
       <ThemeToggle integrated />
     </AppBar>
 
     <nav class="flex h-control shrink-0 items-stretch border-b border-border bg-panel" aria-label="Editor mode">
       <button
-        class={mode === "schedule" ? "border-r border-border bg-primary/12 px-2 type-body text-primary-accent" : "border-r border-border px-2 type-body hover:bg-muted active:bg-border/50"}
+        class="border-r border-border bg-primary/12 px-2 type-body text-primary-accent"
         onclick={() => (mode = "schedule")}
       >Island schedule</button>
       <button
-        class={mode === "ncd" ? "border-r border-border bg-primary/12 px-2 type-body text-primary-accent" : "border-r border-border px-2 type-body hover:bg-muted active:bg-border/50"}
+        class="border-r border-border px-2 type-body hover:bg-muted active:bg-border/50"
         onclick={() => (mode = "ncd")}
       >NCD diagram</button>
     </nav>
 
-    {#if mode === "ncd"}
-      <NcdView />
-    {:else if loadError}
+    {#if loadError}
       <main class="pad-box stack-field min-h-0 flex-1 overflow-y-auto">
         <h1 class="type-heading">Ground-truth plan failed to load</h1>
         <p class="prose text-destructive-strong">{loadError}</p>
@@ -595,3 +596,4 @@ function boundaryTone(left: number, right: number): string {
     {/if}
   </div>
 </ThemeProvider>
+{/if}
