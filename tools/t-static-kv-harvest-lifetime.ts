@@ -13,12 +13,12 @@
  * per-replay view handle is reaped at markStep (rc 0) so `isDestroyed(viewId)`
  * is true even though its GPU buffer aliases the live base the PLAN keeps
  * alive — the scatterAdd `dst` external-leaf read then trips the [lifetime]
- * reclaimed-read guard. Pre-fix, TORCHLETTE_STRICT_LIFETIME=1 THROWS here; the
- * read is provably safe (view buffer === live base buffer), so the fix
- * exonerates it and this probe runs clean.
+ * reclaimed-read guard. Pre-fix, the strict guard (throw-by-default since task
+ * #73) THROWS here; the read is provably safe (view buffer === live base
+ * buffer), so the fix exonerates it and this probe runs clean.
  *
  * Run: VULKAN_DEVICE_INDEX=N LD_LIBRARY_PATH=tools/vk-shim \
- *      TORCHLETTE_STEP_TAPE=1 TORCHLETTE_STRICT_LIFETIME=1 \
+ *      TORCHLETTE_STEP_TAPE=1 \
  *      npx tsx tools/t-static-kv-harvest-lifetime.ts
  */
 import { getWebGPUInitError, initWebGPU } from "../src/backend/webgpu";

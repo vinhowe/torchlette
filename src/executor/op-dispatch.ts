@@ -29,6 +29,24 @@ import { lookupScalarStorage } from "./scalar-table";
 let _warnedReclaimedRead = false;
 let _warnedReleasedRead = false;
 
+/**
+ * The [lifetime] reclaimed/released-read guard THROWS by DEFAULT (task #73):
+ * every test and training run is armed as a silent-UAF detector. The temporary
+ * opt-out `TORCHLETTE_STRICT_LIFETIME=0` downgrades to warn-only during the
+ * soak window (house policy: the opt-out is removed once the soak completes,
+ * sunset ~2026-08).
+ */
+const strictLifetime = (storage: { device: DeviceKind }): boolean => {
+  if (ENV.TORCHLETTE_STRICT_LIFETIME === "0") return false; // soak opt-out
+  // The reclaimed/released-read UAF is the WebGPU buffer-pool aliasing class:
+  // a demoted storage's buffer returns to the pool and a later op lands in it.
+  // On CPU there is NO pool — a backendTensor is a plain typed array that stays
+  // valid after its tracker entry is marked destroyed, so an isDestroyed read
+  // returns correct bytes (proven: the CPU training-loop / oracle specs converge
+  // correctly under warn-mode). Throwing there is a false positive; warn only.
+  return storage.device === "webgpu";
+};
+
 // ---------------------------------------------------------------------------
 // Multi-output op protocol
 // ---------------------------------------------------------------------------
@@ -163,7 +181,8 @@ export function getInputStorage(
     // means a tensor outlived its buffer — the silent-UAF class (markStep's
     // step-scoped demotion reclaiming a mid-step-created tensor that user
     // code still holds; the buffer is back in the pool and may carry another
-    // op's data). Warn by default; TORCHLETTE_STRICT_LIFETIME=1 throws.
+    // op's data). Throws by DEFAULT (task #73); TORCHLETTE_STRICT_LIFETIME=0
+    // downgrades to warn-only during the soak window (opt-out sunsets ~2026-08).
     // [2b §5] Inside a multi-plan TAPE replay the whole step's dataflow is
     // DECLARED: cross-plan buffers re-bound by the planner are reachable for
     // the replay even though their recording-era handle was demoted at the
@@ -178,7 +197,7 @@ export function getInputStorage(
         `(shape=${JSON.stringify(ref.storage.backendTensor.shape)}). Its registry entry was ` +
         `overlaid by the last observed reader's temps (stage-3 B); the bytes ` +
         `may be garbage. This read was invisible to observation — report it.`;
-      if (ENV.TORCHLETTE_STRICT_LIFETIME === "1") throw new Error(msg);
+      if (strictLifetime(ref.storage)) throw new Error(msg);
       if (!_warnedReleasedRead) {
         _warnedReleasedRead = true;
         console.warn(msg);
@@ -196,7 +215,7 @@ export function getInputStorage(
         `its buffer may have been reused. Create persistent state outside ` +
         `the step, update it in place via copy_, or mark it with ` +
         `runtime.persist().`;
-      if (ENV.TORCHLETTE_STRICT_LIFETIME === "1") {
+      if (strictLifetime(ref.storage)) {
         throw new Error(msg);
       }
       if (!_warnedReclaimedRead) {
@@ -232,7 +251,7 @@ export function getInputStorage(
   if (sh) {
     if (sh.releasedOverlay) {
       const msg = `[lifetime] reading step-globally RELEASED result node=${ref.node.id} op=${ref.node.op}[${idx}] — overlaid by the last observed reader's temps (stage-3 B).`;
-      if (ENV.TORCHLETTE_STRICT_LIFETIME === "1") throw new Error(msg);
+      if (strictLifetime(sh)) throw new Error(msg);
       if (!_warnedReleasedRead) {
         _warnedReleasedRead = true;
         console.warn(msg);

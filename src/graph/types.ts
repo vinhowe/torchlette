@@ -91,8 +91,8 @@ export interface StorageHandle {
   stamp?: { fp: number; ni: number; oi: number };
   /** [stage-3 B] This harvested value's registry entry was step-globally
    *  RELEASED and claimed by its last reader's temps — the bytes may be
-   *  overlaid. Any later read through this handle must be LOUD (warn;
-   *  TORCHLETTE_STRICT_LIFETIME=1 throws), never silent. Set by the
+   *  overlaid. Any later read through this handle must be LOUD (throws by
+   *  default; TORCHLETTE_STRICT_LIFETIME=0 downgrades to warn), never silent. Set by the
    *  claimant's post-replay clear seam each step. */
   releasedOverlay?: boolean;
 }
