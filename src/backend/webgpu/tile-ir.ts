@@ -1993,9 +1993,16 @@ export class KernelContext {
   linearizeIndex(
     coords: BlockExpr[],
     strides: number[],
-    offset = 0,
+    offset: number | BlockExpr = 0,
   ): BlockExpr {
-    let result: BlockExpr = this.u32(offset);
+    // `offset` may be a compile-time constant (baked as a u32 literal — the
+    // default) OR a BlockExpr reading a uniform (`ctx.uniform("base_offset")`).
+    // The uniform form is how a view's element offset (narrow start·stride)
+    // rides into the kernel as DATA instead of baked template identity — the
+    // strides still specialize codegen, only the offset scalar is volatile
+    // (task #71, mirroring rope-kernel's cos_offset/sin_offset).
+    let result: BlockExpr =
+      typeof offset === "number" ? this.u32(offset) : offset;
     for (let d = 0; d < coords.length; d++) {
       result = result.add(coords[d].mul(this.u32(strides[d])));
     }
@@ -2855,7 +2862,7 @@ export class KernelContext {
     flatIdx: BlockExpr,
     indexShape: number[],
     strides: number[],
-    baseOffset = 0,
+    baseOffset: number | BlockExpr = 0,
   ): BlockExpr {
     const coords = this.decomposeIndex(flatIdx, indexShape);
     return this.linearizeIndex(coords, strides, baseOffset);
@@ -3188,7 +3195,7 @@ export class KernelContext {
     flatIdx: BlockExpr,
     indexShape: number[],
     strides: number[],
-    baseOffset = 0,
+    baseOffset: number | BlockExpr = 0,
   ): BlockExpr {
     return this.load(
       binding,
