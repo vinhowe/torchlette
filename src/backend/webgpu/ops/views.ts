@@ -166,7 +166,6 @@ export function planCastDirectCore(
 ): ElementwiseDirectPlan {
   const totalWorkgroups = Math.ceil(tensor.size / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
   const shader = castTileIR(
     tensor.dtype as "f32" | "f16" | "i32" | "u32",
     dtype as "f32" | "f16" | "i32" | "u32",
@@ -174,9 +173,12 @@ export function planCastDirectCore(
     tensor.strides,
     tensor.offset,
   );
-  const key = `cast:${tensor.dtype}->${dtype}:${tensor.shape.join("x")}:${tensor.strides.join(",")}:${tensor.offset}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   return {
-    key,
+    // Pipeline cache key IS the WGSL (tile-dispatch canonical). A separate
+    // structural key can drift from codegen and serve a stale pipeline
+    // (single-source-at-seams). This plan is consumed by BOTH cast() and the
+    // stream generator, so keying on code keeps both sides identical.
+    key: shader,
     shader,
     outputSizeBytes: tensor.size * dtypeBytes(dtype),
     paramsData: params(tensor.size),
@@ -518,16 +520,16 @@ export function planContiguousDirectCore(
   const bytesPerElement = dtypeBytes(dtype);
   const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
   const shader = contiguousTileIR(
     shape,
     tensor.strides,
     tensor.offset,
     dtype as "f32" | "f16" | "i32" | "u32",
   );
-  const key = `contiguous:${shape.join(",")}:${tensor.strides.join(",")}:${tensor.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   return {
-    key,
+    // Key IS the WGSL (single-source-at-seams; consumed by contiguous() and
+    // the stream generator). See planCastDirectCore.
+    key: shader,
     shader,
     outputSizeBytes: outSize * bytesPerElement,
     paramsData: params(outSize),
@@ -607,8 +609,8 @@ function contiguousChunked(
     // Generate shader via tile-IR
     const code = chunkedTransposeTileIR(wgslType as "f32" | "u32" | "i32");
 
-    const key = `contiguous_chunked_transpose_tiled:${K}:${N}:${dtype}`;
-    const pipeline = getPipeline(ctx, key, code);
+    // Key IS the WGSL (single-source-at-seams; tile-dispatch canonical).
+    const pipeline = getPipeline(ctx, code, code);
 
     for (let rowChunk = 0; rowChunk < numOutputRowChunks; rowChunk++) {
       const rowStart = rowChunk * alignedOutputRows;
@@ -809,16 +811,15 @@ export function planNarrowBackward(
   const gradDimSize = gradShape[dim]; // = length from narrow
   const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
-  const gridSizeX = dispatch.x * WORKGROUP_SIZE;
   const shader = narrowBackwardTileIR(
     originalLength,
     outSize,
     dtype as "f32" | "f16" | "i32" | "u32",
   );
-  const key = `narrowBackward:${originalLength}:${gradDimSize}:${start}:${outSize}:${dtype}:${use2D ? `2d:${gridSizeX}` : "1d"}`;
   return {
-    key,
+    // Key IS the WGSL (single-source-at-seams). gradDimSize/start flow through
+    // params, not the shader, so they must NOT be part of the pipeline key.
+    key: shader,
     shader,
     outputSizeBytes: outSize * bytesPerElement,
     paramsData: params(outerSize, innerSize, gradDimSize, start),

@@ -235,7 +235,6 @@ export function planBinaryDirectCore(
   const bStrides = computeEffectiveBroadcastStrides(b, indexShape);
   const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
   const shader = binaryBroadcastTileIR(
     op,
     indexShape,
@@ -245,9 +244,11 @@ export function planBinaryDirectCore(
     b.offset,
     dtype as "f32" | "f16" | "u32" | "i32",
   );
-  const key = `binary:${op}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${a.offset}:${b.offset}:${dtype}:${use2D ? dispatch.gridSizeX : "1d"}`;
   return {
-    key,
+    // Key IS the WGSL (single-source-at-seams). dispatchBinary's direct tail
+    // and the stream generator BOTH consume this plan; keying on code keeps
+    // them from silently disagreeing. See planCastDirectCore.
+    key: shader,
     shader,
     outputSizeBytes: outSize * bytesPerElement,
     paramsData: params(outSize),
@@ -464,7 +465,6 @@ export function planUnaryDirectCore(
     outDtype === dtype ? bytesPerElement : dtypeBytes(outDtype);
   const totalWorkgroups = Math.ceil(a.size / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
   const shader = unaryStridedTileIR(
     opKey,
     a.shape,
@@ -473,9 +473,10 @@ export function planUnaryDirectCore(
     dtype as "f32" | "f16" | "u32" | "i32",
     outDtype as "f32" | "f16" | "u32" | "i32",
   );
-  const key = `unary:${opKey}:${a.shape.join("x")}:${a.strides.join(",")}:${a.offset}:${dtype}:${outDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   return {
-    key,
+    // Key IS the WGSL (single-source-at-seams; consumed by dispatchUnary and
+    // the stream generator). See planCastDirectCore.
+    key: shader,
     shader,
     outputSizeBytes: a.size * outBytesPerElement,
     paramsData: params(a.size),
