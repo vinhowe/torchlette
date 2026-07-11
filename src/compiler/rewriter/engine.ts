@@ -88,11 +88,13 @@ export function applyRules(
     maxPasses?: number;
     replaced?: Set<number>;
     killed?: Set<LazyIRNode>;
+    externalNodeIds?: Set<number>;
   },
 ): ApplyStats {
   const maxPasses = options?.maxPasses ?? 10;
   const replaced = options?.replaced ?? new Set<number>();
   const killed = options?.killed ?? new Set<LazyIRNode>();
+  const externalNodeIds = options?.externalNodeIds;
   const stats: ApplyStats = {
     applied: 0,
     byRule: new Map(),
@@ -128,8 +130,13 @@ export function applyRules(
         // inputs to correctly decrement consumer counts on the old producers.
         const preInputs = node.inputs.slice();
 
-        // Build replacement nodes + ref.
-        const { ctx, newNodes, killedNodes } = makeRewriteContext();
+        // Build replacement nodes + ref. `maps` lets a rule consult live
+        // consumer counts (e.g. double-transpose must not markDead a SHARED
+        // inner view).
+        const { ctx, newNodes, killedNodes } = makeRewriteContext(
+          maps,
+          externalNodeIds,
+        );
         const replacement = rule.rewrite(bindings, ctx, node);
         for (const k of killedNodes) killed.add(k);
 
@@ -140,10 +147,7 @@ export function applyRules(
         applySubstitution(plan, node, replacement, newNodes, maps, preInputs);
         replaced.add(node.id);
         stats.applied++;
-        stats.byRule.set(
-          rule.name,
-          (stats.byRule.get(rule.name) ?? 0) + 1,
-        );
+        stats.byRule.set(rule.name, (stats.byRule.get(rule.name) ?? 0) + 1);
         // After a successful rewrite, don't try more rules on the now-orphan
         // node. Break out and let the next iteration handle the new nodes.
         break;

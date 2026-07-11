@@ -51,10 +51,20 @@ export const doubleTransposeRule: Rule = {
   },
   rewrite: (bindings, _ctx, node) => {
     // The outer transpose is redundant. Replace this node with X (the grand-
-    // input). Mark the inner transpose dead so it's removed too.
+    // input). Mark the inner transpose dead so it's removed too — but ONLY
+    // when THIS outer transpose is its sole consumer. A SHARED inner view
+    // (e.g. `kT` in `matmul(q, kT)` whose backward emits `transpose(kT)`)
+    // still feeds other live nodes; killing it makes them read a removed node
+    // ("Input not ready: transpose", task #67). markDead ignores external
+    // refs, so this consumer-count guard is the only thing keeping a shared
+    // inner alive.
     const X = bindings.get("X")!;
     const innerRef = bindings.get("inner")!;
-    if (innerRef.kind === "pending") {
+    if (
+      innerRef.kind === "pending" &&
+      _ctx.consumerCount(innerRef.node) <= 1 &&
+      !_ctx.isExternal(innerRef.node)
+    ) {
       _ctx.markDead(innerRef.node);
     }
     // Return X as replacement. The engine will rewire consumers of `node`

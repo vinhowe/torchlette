@@ -9,16 +9,10 @@
  * drops the consumer links. Dead-code elimination (a separate pass) removes
  * orphaned nodes afterward, decrementing consumer counts along the way.
  */
+
+import type { DeviceKind, DType } from "../../backend/types";
 import { createLazyIRNode } from "../../graph/node-factory";
-import type {
-  DeviceKind,
-  DType,
-} from "../../backend/types";
-import type {
-  LazyIRNode,
-  LazyOpCode,
-  LazyRef,
-} from "../../graph/types";
+import type { LazyIRNode, LazyOpCode, LazyRef } from "../../graph/types";
 import type { Bindings } from "./pattern";
 
 // ============================================================================
@@ -42,6 +36,19 @@ export interface RewriteContext {
    *  longer needed. Used by in-place mutation rules to mark the upstream
    *  chain (e.g., the original matmul/transpose nodes) as removable. */
   markDead(node: LazyIRNode): void;
+  /** How many plan nodes consume `node`'s output (before this rewrite). A rule
+   *  that wants to markDead a MATCHED-SUBPATTERN node (not the rewrite root)
+   *  must first confirm the root is its only consumer — a shared producer with
+   *  other live consumers must survive (else those consumers read a removed
+   *  node → "Input not ready"). */
+  consumerCount(node: LazyIRNode): number;
+  /** True if `node` is externally referenced (a live pending RuntimeTensor
+   *  holds it, or another plan consumes it). Such a node MUST NOT be markDead'd
+   *  by a rule that only removes an unrelated consumer — its external readers /
+   *  sibling plans still need its result (task #67: a shared forward view whose
+   *  backward re-transposed it, consumed within THIS plan only once, but held
+   *  live for the forward graph). */
+  isExternal(node: LazyIRNode): boolean;
 }
 
 /** A rewrite receives bindings from the matcher and returns the ref that
@@ -57,7 +64,10 @@ export type RewriteFn = (
 // ============================================================================
 
 /** Internal: builds a RewriteContext that records all created nodes. */
-export function makeRewriteContext(): {
+export function makeRewriteContext(
+  maps?: ConsumerMaps,
+  externalNodeIds?: Set<number>,
+): {
   ctx: RewriteContext;
   newNodes: LazyIRNode[];
   killedNodes: Set<LazyIRNode>;
@@ -77,6 +87,12 @@ export function makeRewriteContext(): {
     },
     markDead(node) {
       killedNodes.add(node);
+    },
+    consumerCount(node) {
+      return maps?.consumerCount.get(node.id) ?? 0;
+    },
+    isExternal(node) {
+      return externalNodeIds?.has(node.id) ?? false;
     },
   };
   return { ctx, newNodes, killedNodes };

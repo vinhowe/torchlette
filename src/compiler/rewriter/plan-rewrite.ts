@@ -42,7 +42,11 @@ export function rewritePlan(
   const maps: ConsumerMaps = { consumers, consumerCount };
   const killed = new Set<LazyIRNode>();
   const replaced = new Set<number>();
-  const stats = applyRules(plan.nodes, rules, maps, { killed, replaced });
+  const stats = applyRules(plan.nodes, rules, maps, {
+    killed,
+    replaced,
+    externalNodeIds,
+  });
   if (stats.applied === 0) return 0;
 
   // Compact: physically remove dead nodes. Seed the worklist from two sources:
