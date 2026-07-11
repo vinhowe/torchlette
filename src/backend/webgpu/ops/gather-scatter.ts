@@ -85,11 +85,14 @@ export function planGatherDirect(
   const outShape = indexShape.slice();
   const outSize = sizeOf(outShape);
   const dispatch = compute2DDispatch(Math.ceil(outSize / WORKGROUP_SIZE));
-  const use2D = dispatch.y > 1;
   const shader = gatherTileIR(inputShape, indexShape, dim, indexDtype, dataDtype);
-  const key = `gather:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${indexDtype}:${dataDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   return {
-    key,
+    // Pipeline cache key IS the WGSL text (tile-dispatch's canonical
+    // `getPipeline(ctx, wgsl, wgsl)`). A structural key that bakes the shader
+    // in a separate string can silently drift from codegen and serve a stale
+    // pipeline (the single-source-at-seams rule). `use2D` is folded into the
+    // shader by gatherTileIR, so the code already distinguishes the variants.
+    key: shader,
     shader,
     paramsData: params(outSize),
     dispatchX: dispatch.x,
@@ -140,7 +143,6 @@ export function gather(
   const outSize = sizeOf(outShape);
   const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
 
   // Index dtype: gather kernel reads indices as native i32/u32/f32 to avoid
   // round-trip casts at call sites (e.g. i32 token ids from embedding).
@@ -187,8 +189,8 @@ export function gather(
     indexDtype,
     dataDtype,
   );
-  const pipelineKey = `gatherChunked:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${indexDtype}:${dataDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
-  const pipeline = getPipeline(ctx, pipelineKey, code);
+  // Key IS the code (see planGatherDirect) — no structural key to drift.
+  const pipeline = getPipeline(ctx, code, code);
 
   // --- Chunked path ---
   const dimSize = inputShape[dim];
@@ -283,11 +285,10 @@ export function planScatterAddDirect(
   }
   const srcSize = sizeOf(srcShape);
   const dispatch = compute2DDispatch(Math.ceil(srcSize / WORKGROUP_SIZE));
-  const use2D = dispatch.y > 1;
   const shader = scatterAddTileIR(inputShape, srcShape, dim, indexDtype);
-  const key = `scatterAdd:${inputShape.join(",")}:${srcShape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   return {
-    key,
+    // Key IS the WGSL text (see planGatherDirect) — single-source at the seam.
+    key: shader,
     shader,
     paramsData: params(srcSize),
     dispatchX: dispatch.x,
@@ -347,7 +348,6 @@ export function scatterAdd(
   const srcSize = sizeOf(tensorSrc.shape);
   const totalWorkgroups = Math.ceil(srcSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
 
   // Index dtype: scatterAdd kernel reads indices as native i32/u32/f32.
   const indexDtype = tensorIndex.dtype;
@@ -417,8 +417,8 @@ export function scatterAdd(
     dim,
     indexDtype,
   );
-  const pipelineKey = `scatterAddChunked:${inputShape.join(",")}:${tensorSrc.shape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
-  const pipeline = getPipeline(ctx, pipelineKey, code);
+  // Key IS the code (see planScatterAddDirect) — no structural key to drift.
+  const pipeline = getPipeline(ctx, code, code);
 
   // Chunked uses createTrackedBuffer for out (untracked → the executor
   // invalidates the compiled plan → lowered path), so the seed copy below

@@ -31,7 +31,6 @@ import { createTensor, createTrackedBuffer } from "../tensor";
 import { argReduceWGSL, comparisonWGSL } from "./ops-tile-ir";
 
 function comparisonOp(
-  opName: string,
   wgslOp: string,
   a: BackendTensor,
   b: BackendTensor,
@@ -61,10 +60,9 @@ function comparisonOp(
     bTensor.dtype,
   );
 
-  const key = `${opName}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${aTensor.offset}:${bTensor.offset}:${aTensor.dtype}:${bTensor.dtype}`;
-
   const outBuffer = dispatchElementwise({
-    key,
+    // Key IS the WGSL (single-source-at-seams; tile-dispatch canonical).
+    key: code,
     shader: code,
     inputs: [aTensor.buffer, bTensor.buffer],
     outputSizeBytes: outSize * 4,
@@ -83,16 +81,16 @@ type ComparisonFn = (
   options?: { outBuffer?: GPUBuffer },
 ) => BackendTensor;
 const cmp =
-  (name: string, op: string): ComparisonFn =>
+  (op: string): ComparisonFn =>
   (a, b, options) =>
-    comparisonOp(name, op, a, b, options);
+    comparisonOp(op, a, b, options);
 
-export const gt = cmp("gt", ">");
-export const lt = cmp("lt", "<");
-export const ge = cmp("ge", ">=");
-export const le = cmp("le", "<=");
-export const eq = cmp("eq", "==");
-export const ne = cmp("ne", "!=");
+export const gt = cmp(">");
+export const lt = cmp("<");
+export const ge = cmp(">=");
+export const le = cmp("<=");
+export const eq = cmp("==");
+export const ne = cmp("!=");
 
 // ============================================================================
 // ArgMax/ArgMin - return indices of max/min values
@@ -179,11 +177,11 @@ function argReduceOp(
     inputToOutDim,
   );
 
-  const pipeline = getPipeline(
-    ctx,
-    `${opName}:${inputShape.join(",")}:${dim}:${keepdim}`,
-    code,
-  );
+  // Key IS the WGSL: the structural key omitted inputStrides/outShape/
+  // inputToOutDim that argReduceWGSL bakes in, so a non-contiguous input with
+  // the same shape/dim/keepdim would collide on a stale pipeline
+  // (single-source-at-seams).
+  const pipeline = getPipeline(ctx, code, code);
 
   const paramsBuffer = createParamsBuffer(
     ctx.device,

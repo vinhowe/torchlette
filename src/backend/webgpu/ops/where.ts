@@ -121,15 +121,14 @@ function whereDirect(
     xTensor.offset,
     yTensor.offset,
   );
-  const key = `where:${indexShape.join("x")}:${condStrides.join(",")}:${xStrides.join(",")}:${yStrides.join(",")}:${condTensor.offset}:${xTensor.offset}:${yTensor.offset}`;
-
   const providedOut =
     options?.outBuffer && options.outBuffer.size >= outSize * 4
       ? options.outBuffer
       : undefined;
 
   const outBuffer = dispatchElementwise({
-    key,
+    // Key IS the WGSL (single-source-at-seams; tile-dispatch canonical).
+    key: code,
     shader: code,
     inputs: [condTensor.buffer, xTensor.buffer, yTensor.buffer],
     outputSizeBytes: outSize * 4,

@@ -65,7 +65,6 @@ function stridedScatterDirect(
   const maxSize = Math.max(baseSize, viewSize);
   const totalWorkgroups = Math.ceil(maxSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
 
   // ensureContiguous also materializes offset>0 views with contiguous
   // strides — the kernel reads `base` flat from element 0 and treats the
@@ -84,9 +83,8 @@ function stridedScatterDirect(
     srcStrides,
     srcOffset,
   );
-  const opName = op === "copy" ? "Copy" : "Add";
-  const key = `stridedScatter${opName}:${baseSize}:${viewShape.join("x")}:${viewStrides.join(",")}:${offset}:${srcStrides.join(",")}:${srcOffset}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
-  const pipeline = getPipeline(ctx, key, code);
+  // Key IS the WGSL (single-source-at-seams; tile-dispatch canonical).
+  const pipeline = getPipeline(ctx, code, code);
 
   const outBuffer = resolveOutputBuffer(ctx.device, baseSize * 4, [
     contiguousBase.buffer,
