@@ -101,6 +101,19 @@ export interface GemvKernelOptions {
    *  "epilogue" seam. Must satisfy gemvSupportsEpilogue(); incompatible
    *  with kSplit (partials must stay raw — the caller gates this). */
   epilogue?: EpilogueConfig;
+  /** Weight-only int8-grouped quant on the B operand (docs/quantization-
+   *  design.md). When present the B binding is a packed u32 array (4 int8 /
+   *  word) plus a companion `b_scales` f16 (u32-packed) binding, and the
+   *  K-loop load dequants in place — no materialized weight. NT mode only,
+   *  no kSplit, no vec4 (unpack is scalar). */
+  quantB?: QuantB;
+}
+
+/** int8-grouped quant descriptor for the B operand. */
+export interface QuantB {
+  scheme: "int8-grouped";
+  /** Group size along K (weights sharing one scale). Power of two. */
+  groupSize: number;
 }
 
 // ============================================================================
@@ -267,6 +280,7 @@ export function getGemvShaderCacheKey(o: GemvKernelOptions): string {
     o.mode === "nt" ? `r${o.rowsPerWg ?? GEMV_NT_DEFAULT_ROWS_PER_WG}` : "",
     o.mode === "nt" && o.vec4 ? "v4" : "",
     o.kSplit ? "ks" : "",
+    o.quantB ? `q8g${o.quantB.groupSize}` : "",
     epilogueKeyFragment(o.epilogue),
   ]
     .filter(Boolean)
@@ -285,14 +299,24 @@ export function createGemvKernel(o: GemvKernelOptions): TileKernelSpec {
   const outDtype: DType = o.mode === "nn" && o.kSplit ? "f32" : o.outputDtype;
   const needsF16 =
     o.dtypeA === "f16" || o.dtypeB === "f16" || outDtype === "f16";
+  const quantB = o.quantB;
+  if (quantB) {
+    if (o.mode !== "nt") throw new Error("gemv quantB: NT mode only");
+    if (o.kSplit) throw new Error("gemv quantB: incompatible with kSplit");
+  }
   const bindings: Record<
     string,
     { storage: "read" | "read_write"; type: DataType }
   > = {
     a: { storage: "read", type: o.dtypeA as DataType },
-    b: { storage: "read", type: o.dtypeB as DataType },
+    // Quantized B: packed int8 in a u32 array (4/word), + f16 scales packed as
+    // u32 (2/word). Both u32 bindings by construction (#59 load lesson).
+    b: { storage: "read", type: quantB ? "u32" : (o.dtypeB as DataType) },
     out: { storage: "read_write", type: outDtype as DataType },
   };
+  if (quantB) {
+    bindings.b_scales = { storage: "read", type: "u32" };
+  }
   // Epilogue seam: extra inputs bind AFTER the uniform slot (binding 4+),
   // matching the tiled plan's [a, b, out, params, ...epilogueInputs] order.
   const epilogue =
@@ -321,9 +345,9 @@ export function createGemvKernel(o: GemvKernelOptions): TileKernelSpec {
     const groupSize = wgSize / rowsPerWg;
     const useVec4 = o.vec4 ?? false;
     return {
-      name: "gemvNT",
+      name: quantB ? "gemvNTQuantI8" : "gemvNT",
       workgroupSize: wgSize,
-      enableF16: needsF16,
+      enableF16: needsF16 || !!quantB,
       uniformBindingIndex: 3,
       bindings,
       uniforms,
@@ -351,7 +375,37 @@ export function createGemvKernel(o: GemvKernelOptions): TileKernelSpec {
         const rowC = ctx.emitLet("row_c", row.min(n.sub(ctx.u32(1))));
         const rowBase = ctx.emitLet("row_base", rowC.mul(k));
         const acc = ctx.emitVar("acc", "f32", ctx.f32(0));
-        if (useVec4) {
+        if (quantB) {
+          // Weight-only int8-grouped dequant, fused into the row dot.
+          // Packed B is [N, K/4] u32 (4 int8/word); scales are [N, K/G] f16
+          // packed 2/word into u32. For element k index i in row rowC:
+          //   word  = bq[rowC*(K/4) + (i>>2)]; byte = i & 3
+          //   q/127 = unpack4x8snorm(word)[byte]
+          //   scaleIdx = rowC*(K/G) + (i/G); scale = f16 at (scaleIdx>>1)[idx&1]
+          //   w ≈ (q/127) * scale   (scale is the group abs-max; see quantize.ts)
+          const G = quantB.groupSize;
+          const gShift = Math.log2(G);
+          if (!Number.isInteger(gShift)) {
+            throw new Error(
+              `gemv quantB: groupSize ${G} must be a power of two`,
+            );
+          }
+          const wordsPerRow = ctx.emitLet("words_pr", k.shr(ctx.u32(2)));
+          const groupsPerRow = ctx.emitLet("groups_pr", k.shr(ctx.u32(gShift)));
+          const bRowBase = ctx.emitLet("b_row_base", rowC.mul(wordsPerRow));
+          const sRowBase = ctx.emitLet("s_row_base", rowC.mul(groupsPerRow));
+          ctx.forStride(lane, k, groupSize, (i) => {
+            const word = ctx.load("b", bRowBase.add(i.shr(ctx.u32(2))));
+            const qn = word.unpackInt8Snorm(i.and(ctx.u32(3)));
+            const sIdx = ctx.emitLet(
+              "s_idx",
+              sRowBase.add(i.shr(ctx.u32(gShift))),
+            );
+            const sWord = ctx.load("b_scales", sIdx.shr(ctx.u32(1)));
+            const scale = sWord.unpackHalf(sIdx.and(ctx.u32(1)));
+            acc.addAssign(ctx.load("a", i).toF32().mul(qn.mul(scale)));
+          });
+        } else if (useVec4) {
           // vec4 storage loads: k % 4 === 0 (route-gated), so both the
           // a-vector and each B row are 4-element aligned.
           const kVec = ctx.emitLet("k_vec", k.shr(ctx.u32(2)));

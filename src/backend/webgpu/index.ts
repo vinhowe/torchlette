@@ -59,6 +59,8 @@ export {
 export type { WebGPUTensor } from "./gpu-types";
 // Re-export autotune control functions
 export {
+  dispatchQuantizedGemvNT,
+  getQuantGemvDispatchCount,
   isAutotuneEnabled,
   setAutotuneEnabled,
 } from "./matmul/dispatch";

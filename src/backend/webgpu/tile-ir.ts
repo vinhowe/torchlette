@@ -296,6 +296,22 @@ interface UnpackHalfNode extends IRNodeBase {
   component: IRNode;
 }
 
+/**
+ * Extract one signed int8 from a packed u32 word as an f32 value in [-1, 1]:
+ * `unpack4x8snorm(word)[component]` — i.e. `clamp(q / 127, -1, 1)` where q is
+ * the signed byte. `component` is 0..3 (little-endian byte selection). Core
+ * WGSL, no extension. The weight-only-quant load path (docs/quantization-
+ * design.md): a packed int8 weight lives in a u32 binding (4 weights/word);
+ * the true dequant is `unpackInt8Snorm(word, comp) * (scale * 127)` — the ·127
+ * folds into the group scale at quantize time (scale127 = scale·127), so the
+ * hot loop is one builtin + one f16 scale load + one multiply.
+ */
+interface UnpackInt8SnormNode extends IRNodeBase {
+  kind: "unpackInt8Snorm";
+  word: IRNode;
+  component: IRNode;
+}
+
 /** vec4 binary: add, sub, mul between two vec4s, or vec4 * scalar */
 interface Vec4BinaryNode extends IRNodeBase {
   kind: "vec4Binary";
@@ -369,6 +385,7 @@ export type IRNode =
   | Vec4ArrayReadNode
   | Vec4SharedReadNode
   | UnpackHalfNode
+  | UnpackInt8SnormNode
   | LoadVec4Node;
 
 // ============================================================================
@@ -1009,6 +1026,8 @@ function cseKey(node: IRNode | Omit<IRNode, "id">): string | null {
       return `V4X:${getId(n.value)}:${n.comp}`;
     case "unpackHalf":
       return `UPH:${getId(n.word)}:${getId(n.component)}`;
+    case "unpackInt8Snorm":
+      return `UPI8:${getId(n.word)}:${getId(n.component)}`;
     case "vec4Binary":
       return `V4B:${n.op}:${getId(n.a)}:${getId(n.b)}`;
     default:
@@ -1302,6 +1321,26 @@ export class BlockExpr {
     return new BlockExpr(
       makeNode<UnpackHalfNode>({
         kind: "unpackHalf",
+        word: this.node,
+        component: c,
+        valueType: "scalar",
+        dataType: "f32",
+      }),
+    );
+  }
+
+  /**
+   * Interpret `this` as a u32 word holding four packed signed int8 values and
+   * extract byte `comp` (0..3, little-endian) as an f32 in [-1, 1]:
+   * `unpack4x8snorm(word)[comp]` = `q / 127`. Multiply by the group's
+   * `scale·127` to recover the dequantized weight. Core WGSL — no extension.
+   * See docs/quantization-design.md.
+   */
+  unpackInt8Snorm(comp: BlockExpr | number): BlockExpr {
+    const c = resolveArgU32(comp);
+    return new BlockExpr(
+      makeNode<UnpackInt8SnormNode>({
+        kind: "unpackInt8Snorm",
         word: this.node,
         component: c,
         valueType: "scalar",
