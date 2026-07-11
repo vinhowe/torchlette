@@ -13,6 +13,11 @@ import {
   releaseParamsBuffer,
 } from "./bind-group-cache";
 import { allocateOutputBuffer, resolveOutputBuffer } from "./buffer-arena";
+import {
+  describeWgslMismatch,
+  makeCacheKeyGuard,
+  wgslContentEqual,
+} from "./cache-key-guard";
 import { dispatchComputePass } from "./dispatch";
 import { generateFusedKernelTileIR } from "./fusion-tile-ir";
 import {
@@ -42,6 +47,18 @@ export class FusionKernelCache {
   private cache = new Map<string, CachedPipeline>();
   private maxSize: number;
 
+  // Cache-key ⇔ content coherence guard (#92). `meta.cacheKey` is computed by
+  // computeKernelMeta WITHOUT running the codegen; generateFusedKernelTileIR
+  // produces the WGSL. If the key omits a field the codegen bakes in, two
+  // different kernels collide on one entry → a stale fused pipeline served
+  // silently (historically one of the frozen-scalar disease's three caches).
+  // On a hit we (strict/sampled) regenerate the WGSL and assert it matches.
+  private guard = makeCacheKeyGuard<string>(
+    "FusionKernelCache",
+    wgslContentEqual,
+    describeWgslMismatch,
+  );
+
   constructor(maxSize = 1024) {
     this.maxSize = maxSize;
   }
@@ -60,6 +77,14 @@ export class FusionKernelCache {
     const cached = this.cache.get(meta.cacheKey);
 
     if (cached) {
+      // Seam guard: on a hit, (strict/sampled) regenerate the WGSL and assert
+      // it matches what this key cached. A mismatch = the key under-spans the
+      // codegen (#92); throw rather than serve a stale kernel.
+      this.guard.check(
+        meta.cacheKey,
+        cached.kernel.source,
+        () => generateFusedKernelTileIR(recipe, options).source,
+      );
       return { pipeline: cached.pipeline, kernel: cached.kernel };
     }
 
