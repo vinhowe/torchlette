@@ -326,8 +326,8 @@ export class Adam {
       this._foreachGroupStep(runtime, gi, idxs);
     }
     // Persist t/lr (materialize mid-step).
-    runtime.persist(this._tTensor());
-    for (const s of this._lrLive) if (s) runtime.persist(s.tensor._unwrap());
+    runtime.registerState(this._tTensor());
+    for (const s of this._lrLive) if (s) runtime.registerState(s.tensor._unwrap());
     return updated;
   }
 
@@ -401,8 +401,8 @@ export class Adam {
       // steps — without adoption into the step snapshot it would be demoted
       // as a temporary at markStep (buffer pooled while live → silent UAF).
       st = {
-        m: runtime.persist(runtime.cat(mFlat)),
-        v: runtime.persist(runtime.cat(vFlat)),
+        m: runtime.registerState(runtime.cat(mFlat)),
+        v: runtime.registerState(runtime.cat(vFlat)),
         sig,
       };
       this._foreachState.set(gi, st);
@@ -564,16 +564,16 @@ export class Adam {
       // beginStep re-snapshots them; under api.scope() the snapshot is fixed
       // at scope entry, so the adoption is what makes scope() a real
       // beginStep/endStep replacement. Idempotent (WeakSet add); mirrors the
-      // foreach path's runtime.persist() of its packed state.
-      runtime.persist(this.expAvg[i]);
-      runtime.persist(this.expAvgSq[i]);
+      // foreach path's runtime.registerState() of its packed state.
+      runtime.registerState(this.expAvg[i]);
+      runtime.registerState(this.expAvgSq[i]);
 
       updated.push(param);
     }
 
     // Persist t/lr (lazily materialize mid-step; same rationale as m/v).
-    runtime.persist(tRt);
-    for (const s of this._lrLive) if (s) runtime.persist(s.tensor._unwrap());
+    runtime.registerState(tRt);
+    for (const s of this._lrLive) if (s) runtime.registerState(s.tensor._unwrap());
 
     return updated;
   }
@@ -751,8 +751,8 @@ export class Adam {
       this._updateParamElementwise(runtime, i, param, grad);
       updated.push(param);
     }
-    runtime.persist(this._tTensor());
-    for (const s of this._lrLive) if (s) runtime.persist(s.tensor._unwrap());
+    runtime.registerState(this._tTensor());
+    for (const s of this._lrLive) if (s) runtime.registerState(s.tensor._unwrap());
     return updated;
   }
 
@@ -779,8 +779,8 @@ export class Adam {
       await runtime.force(param._unwrap());
       updated.push(param);
     }
-    runtime.persist(this._tTensor());
-    for (const s of this._lrLive) if (s) runtime.persist(s.tensor._unwrap());
+    runtime.registerState(this._tTensor());
+    for (const s of this._lrLive) if (s) runtime.registerState(s.tensor._unwrap());
     this.api.queueStepBoundary();
     return updated;
   }

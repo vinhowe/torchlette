@@ -37,19 +37,23 @@ class StorageTracker {
    *  ensures persistence survives storage replacement (e.g., Adam m/v updates). */
   private _stepStartTensors: WeakSet<object> | null = null;
 
-  /** Tensors DURABLY persisted via runtime.persist() (task #74). The step
-   *  snapshot above is TRANSIENT — rebuilt at each boundary and NULL between
-   *  steps — so `persist()` called between steps (the GradScaler ctor's
-   *  LiveScalar scale scalar) used to be a silent no-op: the tensor was
-   *  persistent only if it happened to own its storage's WeakRef slot at the
-   *  next snapshotForStep. This set records the persist() intent for the
-   *  WRAPPER's lifetime: releaseStepTemps never demotes a member, and
-   *  trackTensor treats members as persistent incumbents (sharer steal
-   *  refusal) even when no snapshot is active. WeakSet: membership dies with
-   *  the wrapper, so claims still release normally on GC/dispose. Fed ONLY by
-   *  persistDurable (runtime.persist) — scope-escape / keep() adoption stays
-   *  transient by design (those tensors are step/scope-scoped). */
-  private _durablePersistent = new WeakSet<object>();
+  /** REG — REGISTERED persistent state (task #70 D3; was `_durablePersistent`,
+   *  task #74). Modules and optimizers DECLARE their long-lived state by
+   *  registering the WRAPPER here (registerState); it is the ONE persistence
+   *  source (doc §3: persistent := ∃ w ∈ W(s) : w ∈ SNAP ∪ REG), GEN-INDEPENDENT
+   *  (§D1-log #3): a registered tensor is persistent whatever the boundary's
+   *  closing generation, so a concurrent test perturbing the shared gen counter
+   *  cannot filter it out of persistence. The step snapshot (SNAP) above is
+   *  TRANSIENT — rebuilt each boundary, NULL between steps — so registration
+   *  works BETWEEN steps too (the GradScaler ctor's LiveScalar, module params
+   *  registered at construction). releaseStepTemps never demotes a member.
+   *  WeakSet: membership dies with the wrapper (GC/dispose), so claims still
+   *  release normally — copy_-in-place state updates KEEP the wrapper (only the
+   *  storage changes), so an in-place-updated param/m/v stays registered with no
+   *  churn (why wrappers won the §8 ruling). Cleared (rebuilt-empty) at
+   *  disposeAllForNewEngine so a new engine does not inherit the dead engine's
+   *  registered state (the #74 cross-engine contract). */
+  private _registeredState = new WeakSet<object>();
 
   /** Implied-step-boundary generation stamps (see
    *  Torchlette.queueStepBoundary). Keyed by the engine EPOCH id
@@ -207,7 +211,7 @@ class StorageTracker {
       // from REG membership (doc §3: persistent := ∃ w ∈ W(s) : w ∈ SNAP ∪ REG,
       // no gen term on REG) makes that misclassification unconstructible. So the
       // REG check runs BEFORE the gen-filter continue.
-      if (this._durablePersistent.has(w)) {
+      if (this._registeredState.has(w)) {
         persistent = true; // REG (D1) — gen-independent
         hasLiveOwner = true;
       }
@@ -491,7 +495,7 @@ class StorageTracker {
         if (
           maxGen !== undefined &&
           (this._wrapperGen.get(target) ?? 0) > maxGen &&
-          !this._durablePersistent.has(target)
+          !this._registeredState.has(target)
         ) {
           continue;
         }
@@ -516,18 +520,19 @@ class StorageTracker {
   }
 
   /**
-   * DURABLE persist (task #74): mark a tensor persistent for the WRAPPER's
-   * lifetime, not just the active snapshot. `adoptIntoSnapshot` alone is a
-   * silent no-op between steps (no active snapshot) — a persist()ed tensor
-   * created there (the GradScaler ctor's LiveScalar scale scalar) stayed
-   * persistent only while it happened to own its storage's WeakRef slot; a
-   * storage-sharing clone could steal the slot and get the shared storage
-   * demoted/reaped under it. Members are never demoted by releaseStepTemps
-   * and count as persistent incumbents in trackTensor's sharer guard. See
-   * `_durablePersistent`.
+   * REGISTER persistent state (task #70 D3; was `persistDurable`, task #74). The
+   * ONE registration primitive: modules (params/buffers) and optimizers (m/v,
+   * velocity, t, lr) DECLARE their long-lived state by registering the WRAPPER
+   * here. Marks the tensor persistent for the WRAPPER's lifetime (REG =
+   * `_registeredState`, gen-independent), not just the active snapshot —
+   * registration works BETWEEN steps (no active snapshot) and survives every
+   * snapshot rebuild. Members are never demoted by releaseStepTemps. Also adopts
+   * into the active step snapshot so a mid-step registration is persistent for
+   * the CURRENT step immediately (before the next snapshotForStep). `persist()`
+   * is a deprecated warn-once alias that delegates here.
    */
-  persistDurable(tensor: object): void {
-    this._durablePersistent.add(tensor);
+  registerState(tensor: object): void {
+    this._registeredState.add(tensor);
     this._stepStartTensors?.add(tensor);
   }
 
@@ -581,6 +586,40 @@ class StorageTracker {
     return !this.allStorages.has(storageId);
   }
 
+  /**
+   * Is a reclaimed VIEW handle's base still live AND sharing its buffer? (task
+   * #70 D4). A reclaimed view whose flattened base root is live and whose GPU
+   * buffer IS that live base's buffer is NOT a use-after-free — the read returns
+   * correct bytes (the compiled-plan HARVEST-view class: `planOwnedBaseRetain`
+   * re-creates a view over a persistent base each replay, the per-replay handle
+   * is reaped at markStep but its buffer aliases the live base the plan keeps
+   * alive; #90 static-KV decode). This is the FIRST-CLASS form of the derived
+   * model's `nonWrapperRetain` / `_liveViewBases` "a live view's base is a kept
+   * holder" query (doc §3: "viewAliasesLiveBase becomes a first-class query"),
+   * now OWNED by the tracker that owns `_liveViewBases` — the D4 re-derivation
+   * that deletes op-dispatch's bespoke `viewAliasesLiveBase` clause.
+   *
+   * Single-source-of-truth seam: the base's live buffer is the ONE source; we
+   * ASSERT the view's buffer equals it (viewBuf === baseBuf) before exonerating.
+   * A genuinely-dangling view — base destroyed, or buffer already recycled to a
+   * different buffer — fails this and the guard still fires.
+   */
+  viewBaseIsLive(storage: StorageHandle): boolean {
+    if (storage.baseStorageId === undefined) return false;
+    // Flatten the base chain to its live root (harvest chains are depth-1 but be
+    // robust to nesting: a destroyed intermediate must not exonerate the read).
+    let base = this.allStorages.get(storage.baseStorageId);
+    while (base?.baseStorageId !== undefined) {
+      const parent = this.allStorages.get(base.baseStorageId);
+      if (!parent) break;
+      base = parent;
+    }
+    if (!base) return false; // base itself reclaimed → truly dangling
+    const viewBuf = (storage.backendTensor as { buffer?: unknown }).buffer;
+    const baseBuf = (base.backendTensor as { buffer?: unknown }).buffer;
+    return viewBuf !== undefined && viewBuf === baseBuf;
+  }
+
   /** [step-tape 2b] The RuntimeTensor that owns a storage (if alive). A
    *  multi-plan tape skeleton uses this to re-resolve a frozen materialized
    *  ref to the owner's CURRENT storage each replay - persistent tensors
@@ -596,7 +635,7 @@ class StorageTracker {
     for (const w of owners) {
       if (
         this._stepStartTensors?.has(w) === true ||
-        this._durablePersistent.has(w)
+        this._registeredState.has(w)
       ) {
         return w;
       }
@@ -704,6 +743,10 @@ class StorageTracker {
   reset(): void {
     this.allStorages.clear();
     this._ownerSet.clear();
+    // Drop registered state (REG) — a fresh tracker owns no persistent state.
+    this._registeredState = new WeakSet<object>();
+    // Reset the step snapshot (task #70 D4).
+    this._stepStartTensors = null;
   }
 
   /**
@@ -773,6 +816,39 @@ class StorageTracker {
     // never given the analogous reset.
     this.allStorages.clear();
     this._ownerSet.clear();
+    // Clear REG (registered state, task #70 D3): a new engine must not inherit
+    // the dead engine's registered module/optimizer state — the same
+    // cross-instance-interference class disposeAllForNewEngine exists for (#84,
+    // #74). A WeakSet cannot be iterated to clear; rebuild it empty. The dead
+    // engine's wrappers are going out of scope (its model/opt is finished), so
+    // their membership is dropped wholesale here; a lingering-but-live dead-engine
+    // wrapper cannot re-register (the engine is done). This is the doc §D3
+    // "cross-engine behavior" contract.
+    this._registeredState = new WeakSet<object>();
+    // Clear the step snapshot (task #70 D4 — the row-8 root cause). A fresh
+    // process starts with `_stepStartTensors === null`, and releaseStepTemps is a
+    // NO-OP while null (it reaps nothing until the first snapshotForStep). The
+    // SECOND engine in a process must start from that same null state — otherwise
+    // it inherits the DEAD engine's stale snapshot WeakSet (which contains none of
+    // the new engine's tensors), so the new engine's very first implied-boundary
+    // releaseStepTemps runs against that stale snapshot and reaps the new engine's
+    // live step-0 forward activation (owners=1, snap=false) → a [lifetime]
+    // reclaimed-read throw when the optimizer force reads it.
+    //
+    // This is the gpt2-memorization overfit FP (indictment row 8): it is the
+    // SECOND-ENGINE-IN-PROCESS class (#84), NOT a gen-perturbation. The D1 and D2
+    // attributions ("concurrent test perturbs the SHARED generation counter" /
+    // "runahead gen-scoping") were BOTH wrong — the reaped storage is at
+    // maxGen=0/stamp=0, a clean FIRST boundary, and it reproduces DETERMINISTICALLY
+    // in a single process with no parallelism: engine #0 OK, engine #1+ throw
+    // (tools/t-second-engine-overfit-probe.ts). The first engine never hit it
+    // because its snapshot was still null on its first boundary; the second engine
+    // inherited engine #0's stale non-null snapshot. The honesty invariant of this
+    // campaign: the differential surfaced that both prior attributions were wrong,
+    // and D4 records the correction rather than shipping the mis-located fix (a
+    // per-engine `_stepGen` counter was prototyped, measured NULL against this
+    // repro, and reverted — the stale snapshot was the whole bug).
+    this._stepStartTensors = null;
     if (this.allStorages.size !== 0) {
       throw new Error(
         `[storage-tracker] disposeAllForNewEngine left ${this.allStorages.size} residual storages — a storage escaped instance-boundary teardown and would leak into the next engine run (the second-in-process bimodality class, task #84).`,

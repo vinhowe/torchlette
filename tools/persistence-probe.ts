@@ -104,7 +104,7 @@ async function main() {
       //                  long-lived state inside a step. No warning.
       states[i].dispose();
       states[i] =
-        process.env.PERSIST === "1" ? runtime.persist(mNew) : mNew;
+        process.env.PERSIST === "1" ? runtime.registerState(mNew) : mNew;
       if (useParamUpdate) {
         runtime.copy_(
           params[i]._unwrap(),

@@ -135,7 +135,7 @@ export class SGD {
           // live: the silent-UAF class that corrupted per-param Adam, and
           // corrupted multi-param SGD here via the old replace-and-hold
           // `this.velocity[i] = update`).
-          v = runtime.persist(runtime.zeros(param.shape, this.device));
+          v = runtime.registerState(runtime.zeros(param.shape, this.device));
           this.velocity[i] = v;
         }
         // v = momentum*v + gradAdj, IN PLACE. `update` reads the POST-copy_

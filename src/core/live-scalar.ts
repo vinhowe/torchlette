@@ -68,12 +68,12 @@ export class LiveScalar {
     initial: number,
     device: "cpu" | "webgpu",
   ) {
-    // full(): a fixed-buffer persistent f32[1]. persist() adopts it into the
-    // step snapshot so it survives boundaries (model-level state). Its physical
-    // buffer is created once and written IN PLACE for the scalar's life (clause
-    // 2 — FIXED BUFFER); the value is delivered via setScalarInPlace, so the
-    // fillValue never varies (no template-fingerprint thrash from full()).
-    this.tensor = api.persist(api.full([1], initial, { device }));
+    // full(): a fixed-buffer persistent f32[1]. registerState() declares it REG
+    // state so it survives boundaries (model-level state). Its physical buffer is
+    // created once and written IN PLACE for the scalar's life (clause 2 — FIXED
+    // BUFFER); the value is delivered via setScalarInPlace, so the fillValue never
+    // varies (no template-fingerprint thrash from full()).
+    this.tensor = api.registerState(api.full([1], initial, { device }));
     this._value = initial;
     noteScalarSlotValue(this.tensor._unwrap(), initial);
   }
@@ -96,9 +96,9 @@ export class LiveScalar {
     const prev = inner.lazyRef;
     if (prev.kind === "materialized") {
       // SIDECAR pin (task #74): shares the persistent scale storage to keep it
-      // alive across the runahead window, but must NOT steal its WeakRef owner
-      // slot from the principal `inner` tensor — else this pin's GC/demotion
-      // reaps the live scale storage (implied-boundary reclaimed-read).
+      // alive across the runahead window via its own rc + the `_sidecarShare`
+      // keep flag the derived classifier reads (task #70 D2 — no owner slot to
+      // steal anymore; the pin is a plain owner-SET member with a keep signal).
       this._pin(
         rt.createSidecarFromStorageHandle(
           prev.storage,

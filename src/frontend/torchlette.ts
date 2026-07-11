@@ -247,13 +247,31 @@ export class Torchlette {
    * inside a step — optimizer state, EMA shadows, KV caches built from
    * graph ops and carried across markStep.
    */
+  /**
+   * @deprecated (task #70 D3) — use `registerState()`. `persist()` is a
+   * warn-once alias that delegates to `registerState()`; it sunsets with the
+   * next major cleanup pass.
+   */
   persist(a: Tensor): Tensor {
+    this.runtime.persist(a._unwrap()); // warn-once + delegate to registerState
+    return this.registerState(a);
+  }
+
+  /**
+   * REGISTER a tensor as persistent STATE (task #70 D3) — THE declaration for
+   * long-lived state. Modules register params/buffers (auto, via nn.Module);
+   * optimizers register their state (m/v/velocity/t/lr) at creation/first step.
+   * Registered state is gen-independent (persistent whatever the step boundary's
+   * generation) and survives every snapshot rebuild; step-boundary cleanup never
+   * reclaims it. Also escapes to every open ancestor scope so the tensor survives
+   * each LIFO scope restore.
+   */
+  registerState(a: Tensor): Tensor {
     this._assertUsable(a);
     const rt = a._unwrap();
-    this.runtime.persist(rt); // adopt into the active (step or innermost-scope) snapshot
+    this.runtime.registerState(rt);
     // Scope-escape to ROOT: also adopt into every ancestor scope's snapshot so
-    // the tensor survives each LIFO restore (no-op when no scope is open — the
-    // pre-existing step-persist behavior).
+    // the tensor survives each LIFO restore (no-op when no scope is open).
     for (const record of this._scopeStack) {
       storageTracker.adoptIntoSnapshotToken(record.parentSnapshot, rt);
     }

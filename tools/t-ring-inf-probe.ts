@@ -40,10 +40,10 @@ async function run(K: number): Promise<{
     enableFusion: true,
     enableMemoryPlanning: true,
   });
-  const w = api.persist(
+  const w = api.registerState(
     api.tensorFromArray([0.5, -0.5, 0.25, 0.75], [2, 2], { requiresGrad: true }),
   );
-  const target = api.persist(api.tensorFromArray([1, 0], [1, 2]));
+  const target = api.registerState(api.tensorFromArray([1, 0], [1, 2]));
   const opt = new Adam([w], { lr: 1e-2 }, api);
   const scaler = new GradScaler(api, {
     initScale: INIT_SCALE,

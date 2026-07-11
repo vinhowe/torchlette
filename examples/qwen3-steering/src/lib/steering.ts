@@ -102,7 +102,7 @@ export async function computeSteeringVector(
     // like the literature's small multiplier. Persist so it survives the
     // worker's step-scoped cleanup and every future generation's markStep.
     const diff = api.sub(meanPos, meanNeg); // [hidden]
-    api.persist(diff);
+    api.registerState(diff);
     return diff;
   });
 
@@ -132,7 +132,7 @@ export function makeResidualHook(
   // [hidden] → [1,1,hidden] so it broadcasts over x [batch, seq, hidden].
   // Persist it: generation runs under setStepScopedCleanup(true), which would
   // otherwise demote this once-per-generation tensor at the first markStep.
-  const dir3d = api.persist(api.reshape(direction, [1, 1, hiddenSize]));
+  const dir3d = api.registerState(api.reshape(direction, [1, 1, hiddenSize]));
   return (x, l) => {
     if (l !== layer) return x;
     // NB: no norm-preservation — Qwen3's residual norm is dominated by a few

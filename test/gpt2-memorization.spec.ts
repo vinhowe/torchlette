@@ -241,36 +241,24 @@ describe(
     test("overfits on a single sequence", async () => {
       if (!webgpuAvailable) return;
 
-      // FINDING (task #73 flip; re-confirmed under #70 D2). This loop uses the
-      // older `optimizer.stepAsync()` + `loss.dispose()` + implied-boundary
-      // (queueStepBoundary) path. Under the FULL parallel cpu-project run it
-      // FLAKES: a concurrently-interleaved test's bumps to the SHARED module-
-      // global epoch counter (src/core/epoch.ts) shift the committed boundary
-      // gen by ±1, so a fresh forward activation destined for THIS step's
-      // optimizer (stamp = maxGen−1, a LIVE owner, not yet in the snapshot) is
-      // mis-classified step-scoped and reaped by releaseStepTemps → a [lifetime]
-      // reclaimed-read throw when the optimizer force reads it. Proven a FALSE
-      // POSITIVE (converges to loss 0.0000 under warn-mode).
+      // HISTORY (task #73 flip → #70 D2 → #70 D4 FIX). This loop uses the older
+      // `optimizer.stepAsync()` + `loss.dispose()` + implied-boundary path. It
+      // used to throw a [lifetime] reclaimed-read under the strict default when it
+      // ran as the SECOND engine-in-process (after the "trains" test above). Root
+      // cause (D4, the corrected diagnosis): `disposeAllForNewEngine` failed to
+      // clear the storage tracker's `_stepStartTensors` snapshot, so the second
+      // engine inherited the dead first engine's stale non-null snapshot; its very
+      // first implied-boundary releaseStepTemps then reaped this engine's live
+      // step-0 forward activation (which was in no snapshot) → the throw when the
+      // optimizer force read it. It is the SECOND-ENGINE-IN-PROCESS class (#84),
+      // NOT the gen-perturbation the D1/D2 logs guessed — it reproduces
+      // DETERMINISTICALLY with zero parallelism (engine #0 OK, engine #1+ throw).
       //
-      // #70 D2 NOTE — this is NOT an ownership-classification FP, so the derived
-      // owner model does NOT make it unconstructible (§D1-log #3's premise was
-      // wrong about the reaped tensor: it is a gen-boundary-straddling TRANSIENT
-      // activation with a live owner, not a REG'd param — owners=1, durable=false
-      // at demotion time). Both the stored and the derived model classify it
-      // identically (a live owner, not persistent → step-scoped). The real fix is
-      // in the runahead gen-scoping / the module-global epoch counter's
-      // cross-test perturbability, not the owner model — tracked as follow-on
-      // (see docs/ownership-derivation-design.md §D2 log). The opt-out stays for
-      // the soak window until that fix lands.
-      const prevStrict = process.env.TORCHLETTE_STRICT_LIFETIME;
-      process.env.TORCHLETTE_STRICT_LIFETIME = "0";
-      try {
-        await runOverfitTest();
-      } finally {
-        if (prevStrict === undefined)
-          delete process.env.TORCHLETTE_STRICT_LIFETIME;
-        else process.env.TORCHLETTE_STRICT_LIFETIME = prevStrict;
-      }
+      // #70 D4 FIX: disposeAllForNewEngine now clears `_stepStartTensors = null`, so
+      // a fresh engine starts from the same null state a fresh PROCESS has. The
+      // STRICT_LIFETIME=0 opt-out is therefore DELETED: this runs under the strict
+      // default (the reclaimed-read guard THROWS on a real UAF), proven green.
+      await runOverfitTest();
     });
 
     async function runOverfitTest() {

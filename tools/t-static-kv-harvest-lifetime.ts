@@ -49,7 +49,7 @@ async function main() {
   };
 
   const run = async (captured: boolean): Promise<number[][]> => {
-    const kv = api.persist(api.zeros([1, H, S, D]));
+    const kv = api.registerState(api.zeros([1, H, S, D]));
     // captured=false: call body directly (golden, no replay). captured=true:
     // wrap in capture() so the harvest/replay path (the bug surface) runs.
     const decode = captured ? api.capture((x: Tensor) => body(kv, x)) : null;
