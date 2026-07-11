@@ -1064,7 +1064,12 @@ export class RuntimeEngine {
    * created BETWEEN steps need nothing — the next snapshot captures them.
    */
   persist(t: Tensor): Tensor {
-    storageTracker.adoptIntoSnapshot(t);
+    // DURABLE (task #74): survives snapshot rebuilds and works BETWEEN steps.
+    // The previous adoptIntoSnapshot-only persist was a silent no-op with no
+    // active snapshot (the GradScaler-ctor LiveScalar scale-scalar gap: a
+    // storage-sharing clone could steal its owner slot and get the shared
+    // storage reaped). Membership dies with the wrapper (WeakSet).
+    storageTracker.persistDurable(t);
     return t;
   }
 
@@ -1922,6 +1927,34 @@ export class RuntimeEngine {
   ): Tensor {
     const ref: LazyRef = createMaterializedRef(storage);
     return this.trackRef(ref, shape, device, dtype);
+  }
+
+  /** Like createFromStorageHandle, but the wrapper is a STORAGE-SHARING SIDECAR
+   *  (task #74): it aliases `storage` to keep it alive via its own rc across a
+   *  runahead window and must NEVER become that storage's tracked owner (the
+   *  GradScaler LiveScalar pin ring). trackTensor refuses the owner-slot steal
+   *  for sidecars, so a live principal (the persistent scale scalar) keeps the
+   *  slot and its GC/demotion never reaps the shared storage under it. */
+  createSidecarFromStorageHandle(
+    storage: import("../graph/types").StorageHandle,
+    shape: number[],
+    device: DeviceKind,
+    dtype: DType = "f32",
+  ): Tensor {
+    const ref: LazyRef = createMaterializedRef(storage);
+    const tensor = new Tensor(
+      createBaseId(),
+      ref,
+      shape,
+      device,
+      dtype,
+      /* graphRetained */ false,
+      /* sidecarShare */ true,
+    );
+    for (let i = 0; i < this.dispatchModes.length; i++) {
+      this.dispatchModes[i].onTensorCreated(tensor);
+    }
+    return tensor;
   }
 
   /** Create a fused kernel op node and track it as a new Tensor. */

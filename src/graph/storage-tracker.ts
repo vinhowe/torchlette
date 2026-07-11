@@ -40,6 +40,20 @@ class StorageTracker {
    *  ensures persistence survives storage replacement (e.g., Adam m/v updates). */
   private _stepStartTensors: WeakSet<object> | null = null;
 
+  /** Tensors DURABLY persisted via runtime.persist() (task #74). The step
+   *  snapshot above is TRANSIENT — rebuilt at each boundary and NULL between
+   *  steps — so `persist()` called between steps (the GradScaler ctor's
+   *  LiveScalar scale scalar) used to be a silent no-op: the tensor was
+   *  persistent only if it happened to own its storage's WeakRef slot at the
+   *  next snapshotForStep. This set records the persist() intent for the
+   *  WRAPPER's lifetime: releaseStepTemps never demotes a member, and
+   *  trackTensor treats members as persistent incumbents (sharer steal
+   *  refusal) even when no snapshot is active. WeakSet: membership dies with
+   *  the wrapper, so claims still release normally on GC/dispose. Fed ONLY by
+   *  persistDurable (runtime.persist) — scope-escape / keep() adoption stays
+   *  transient by design (those tensors are step/scope-scoped). */
+  private _durablePersistent = new WeakSet<object>();
+
   /** Implied-step-boundary generation stamps (see
    *  Torchlette.queueStepBoundary). Keyed by the engine EPOCH id
    *  (src/core/epoch.ts): each owning TENSOR OBJECT is stamped with the
@@ -85,30 +99,52 @@ class StorageTracker {
    * Used by destroyUnreachable() to detect GC'd tensors.
    */
   trackTensor(storageId: number, tensorRef: object): void {
-    // Ownership attribution (task #86): a graph-owned RETENTION CLONE
-    // (_graphRetained, from _cloneForRetention) shares a saved tensor's storage
-    // and takes its own rc, but must NOT steal that storage's WeakRef owner
-    // slot from a PERSISTENT incumbent. The owner slot is what releaseStepTemps
-    // classifies (persistent vs step-temp): if a mid-step clone (never in the
-    // snapshot) stole the slot from a persistent saved tensor (the GradScaler
-    // scale scalar — shape [1], held across the explicit boundary), then
-    // releaseStepTemps — seeing a non-snapshot owner — would release the shared
-    // storage's claim and reap it while the persistent tensor is still live: a
-    // reclaimed-read false positive on the explicit-boundary path, and a
-    // genuine UAF once the pooled buffer is reused. Refusing the steal keeps
-    // the persistent incumbent as owner so its snapshot membership protects the
-    // storage; the clone still keeps it alive via its own rc + Finalization
-    // Registry. This can NOT mask a real step-temp UAF: it only fires when the
-    // incumbent is a persistent (snapshot) tensor — a snapshot tensor's storage
-    // is not reclaimable anyway, so the classification is strictly restored,
-    // not weakened. When the incumbent is a TEMP (an activation), the clone may
-    // take the slot as before (no behavior change for that path).
-    const isRetentionClone =
-      (tensorRef as { _graphRetained?: boolean })._graphRetained === true;
-    if (isRetentionClone && this._stepStartTensors) {
+    // Ownership attribution. The owner slot (this storage's single WeakRef in
+    // tensorWeakRefs) is what BOTH the persistence classifier (snapshotForStep /
+    // releaseStepTemps) AND the GC scan (destroyUnreachable) read to decide the
+    // storage's fate. A wrapper minted to SHARE an existing storage and keep it
+    // alive purely via its OWN rc — never to be the storage's principal owner —
+    // must not take that slot from the incumbent that owns it, or its later
+    // demotion/GC reaps the SHARED storage under the still-live principal
+    // (reclaimed-read FP + latent UAF). Two such sharers exist:
+    //
+    //  (a) The autograd RETENTION CLONE (_graphRetained, from _cloneForRetention,
+    //      task #86): shares a saved tensor's storage. #86's hazard: a mid-step
+    //      clone stealing the slot from a PERSISTENT saved tensor (the GradScaler
+    //      scale scalar held across an EXPLICIT boundary) makes releaseStepTemps
+    //      see a non-snapshot owner and reap the live storage. The steal is
+    //      refused only for a SNAPSHOT (persistent) incumbent — when the
+    //      incumbent is a TEMP activation the clone may take the slot as before
+    //      (that path's behavior is unchanged).
+    //
+    //  (b) The GradScaler LiveScalar PIN-RING clone (_sidecarShare, task #74):
+    //      createSidecarFromStorageHandle on the persistent scale scalar, minted
+    //      each rescale to keep the scale storage alive across the runahead
+    //      window. Its principal — the scale scalar — was NOT a snapshot member
+    //      (persist() in the GradScaler ctor ran between steps, when no snapshot
+    //      is active), so #86's snapshot-only guard did not cover it; the pin
+    //      stole the slot and its GC reaped the live scale storage on the
+    //      IMPLIED-boundary path. Closed by the DURABLE persist set below.
+    //
+    // The refusal is scoped to PERSISTENT incumbents (active snapshot OR
+    // durable persist). Do NOT broaden it to ANY live incumbent: the
+    // temp-incumbent handoff is load-bearing — a retention clone taking a
+    // step-temp activation's slot is what keeps the user's
+    // read-a-temp-after-step() working (broadening regresses
+    // test/implied-step-boundary.spec.ts 3/6 under STRICT_LIFETIME).
+    const isSharer =
+      (tensorRef as { _graphRetained?: boolean })._graphRetained === true ||
+      (tensorRef as { _sidecarShare?: boolean })._sidecarShare === true;
+    if (isSharer) {
       const incumbent = this.tensorWeakRefs.get(storageId)?.deref();
-      if (incumbent && this._stepStartTensors.has(incumbent)) {
-        // Persistent incumbent — leave it as owner, only stamp the clone's gen.
+      if (
+        incumbent &&
+        incumbent !== tensorRef &&
+        (this._stepStartTensors?.has(incumbent) === true ||
+          this._durablePersistent.has(incumbent))
+      ) {
+        // Persistent incumbent — leave it as principal owner; the sharer keeps
+        // the storage alive via its own rc. Only stamp the sharer's gen.
         if (!this._wrapperGen.has(tensorRef)) {
           this._wrapperGen.set(tensorRef, currentEpoch());
         }
@@ -281,6 +317,22 @@ class StorageTracker {
     this._stepStartTensors?.add(tensor);
   }
 
+  /**
+   * DURABLE persist (task #74): mark a tensor persistent for the WRAPPER's
+   * lifetime, not just the active snapshot. `adoptIntoSnapshot` alone is a
+   * silent no-op between steps (no active snapshot) — a persist()ed tensor
+   * created there (the GradScaler ctor's LiveScalar scale scalar) stayed
+   * persistent only while it happened to own its storage's WeakRef slot; a
+   * storage-sharing clone could steal the slot and get the shared storage
+   * demoted/reaped under it. Members are never demoted by releaseStepTemps
+   * and count as persistent incumbents in trackTensor's sharer guard. See
+   * `_durablePersistent`.
+   */
+  persistDurable(tensor: object): void {
+    this._durablePersistent.add(tensor);
+    this._stepStartTensors?.add(tensor);
+  }
+
   // ── Scope-surface support (api.scope / api.openScope) ─────────────────────
   // The async scope() surface (docs/scoped-memory-design.md §2-4) reuses the
   // SAME persistent-snapshot reclamation the step path uses: scope entry
@@ -365,8 +417,9 @@ class StorageTracker {
       }
       // GC'd tensor: skip (will be handled by FR or gc scan in destroyUnreachable)
       if (target === undefined) continue;
-      // Persistent tensor: skip
+      // Persistent tensor (snapshot member or durably persist()ed): skip
       if (this._stepStartTensors.has(target)) continue;
+      if (this._durablePersistent.has(target)) continue;
       // Step-scoped tensor with live ref: release its claim
       if (rcGet(id) > 0) {
         rcRelease(id, "stepScoped");
