@@ -2227,3 +2227,68 @@ in `src/` (docs-only). When 4.4-coverage lands, the deletion harvest (B2/B3: the
 ~80 `record*` refs + params-sequence cache + `buildCompiledPlan` + BUILD_FROM_IR=0
 opt-out) becomes safe and is the ~−800–1200 SLOC win the original estimate named.
 
+## Task #71 — view offsets → volatile uniforms (INVESTIGATION + SHORTCUT FALSIFIED, 2026-07-11)
+
+**Goal (P0 runway, schedule-state §7):** a view's element offset (narrow
+`start`·stride) must NOT be part of template identity — a per-position decode
+narrow (static-KV / RoPE-slice) forks a new template per offset. Measured
+failing-first (`tools/t-view-offset-templates.ts`): **6 distinct narrow offsets →
+6 templates** (warmed structure), tripping the PAYLOAD-THRASH detector naming
+`narrow`. The engine's own remedy text is the spec: "declare it volatile in
+`PAYLOAD_HASH_EXEMPT` WITH a per-execution delivery mechanism."
+
+**Where offset lives (map):** (1) fingerprint — `narrow.start` is hashed
+(`fusion-detect.ts` `computePlanFingerprint`, `PAYLOAD_HASH_EXEMPT` doesn't list
+narrow); (2) the narrow VIEW action itself carries NO offset in the generated
+stream — it ALIASES to its input's slot (`stream-generate.ts` view case), so the
+offset only ever reaches a kernel through a CONSUMER (contiguous/cast/strided
+elementwise); (3) the consumer bakes the offset — `contiguousTileIR` /
+`binaryBroadcastSpec` / `castSpec` / `unaryStridedSpec` pass a numeric offset to
+`ctx.stridedLoad(...)` → `linearizeIndex` `this.u32(offset)` (a WGSL LITERAL), and
+the generator captures+bakes it (`cachedStridedInputs.offset`, the `storage`
+branch's `meta.offset`, `planContigCopy`'s `info.offset`). The rope kernel is the
+counter-example (offset ALREADY a `cos_offset`/`sin_offset` uniform, task #58).
+
+**LANDED (safe foundation, this pass):** `linearizeIndex`/`stridedIndex`/
+`stridedLoad` now accept the base offset as `number | BlockExpr` — a numeric
+literal (default, byte-identical WGSL) OR `ctx.uniform("base_offset")`. This is
+the codegen primitive the volatile-offset fix builds on. Plus `debugTemplateCount()`
+and the reproduction probe. Zero behavior change on the default path (gates 4/4,
+offset-views 48/48, fullstack compiled-vs-lowered 7.6e-6/30 steps).
+
+**SHORTCUT FALSIFIED — "exempt `narrow.start` + bail narrow plans to lowered."**
+The tempting cheap fix (exempt the offset from the fingerprint so templates
+collapse to 1, and force any narrow-containing plan to stay LOWERED so it reads
+the offset live) is UNSOUND and was reverted. Two findings:
+- **Value-based bail is unsound (offset-0-builds-first).** A compiled plan is
+  built ONCE from whichever instance builds the template first — usually
+  `start=0`. A start-0 build produces a valid-LOOKING start-0 kernel that is
+  WRONG for a start-16 sibling replay. No per-consumer `offset>0` bail catches
+  it (the builder's offset IS 0). The `#71` probe caught this exactly:
+  templates collapsed to 1 but **correctness FAILED** (start-20 read start-0's
+  region). The hazard is the SHARED template, not the built offset value.
+- **Blanket "bail ALL narrow plans" REGRESSES the compiled trainer.** Forcing
+  every narrow-containing plan lowered (even the fullstack GPT-2's CONSTANT
+  `start=0` position/logits slices — safely compiled today) perturbs the
+  compiled-plan liveness/harvest: fullstack **compiled diverged from its own
+  lowered arm by 2.4 nats** with a `[lifetime] reading RECLAIMED storage`
+  warning (the fix's LOWERED arm stayed byte-exact — so the lowered path is
+  correct, the mixed compiled/lowered boundary the bail creates is not). Reverted.
+
+**The complete fix REQUIRES the volatile-offset kernel change (not a bail).**
+Offset must be delivered as per-replay DATA to the consuming kernel — a
+`base_offset` uniform (the primitive is landed) repacked each replay from the
+current instance's offset (TAG_UNIFORM, the `setAdamConfigUniforms` pattern), so
+BOTH constant- and varying-offset narrows COMPILE (no plan bails, no liveness
+perturbation, no regression). Threads through: (a) the strided specs (offset →
+`ctx.uniform("base_offset")`), (b) both dispatch paths — the config-uniform
+`createTileKernelDispatcher` (has the staleness guard) AND the `ElementwiseDirectPlan`
+frozen-`paramsData` generator path (`planContiguousDirect`/`planBinaryDirect` +
+`generateSequential`/`planContigCopy`), which must emit the offset as a VOLATILE
+slot re-derived per replay from the node's narrow-offset (single-sourced with
+`view-meta.ts narrowMeta` / `deriveResultMeta`), (c) `PAYLOAD_HASH_EXEMPT`
+`narrow.start` (safe ONLY once (a)+(b) deliver offset as data), (d) the
+`getConfigBuffer` staleness guard extended to recognize the base_offset repack.
+This is a cross-seam change (tile-IR codegen + both dispatchers + generator +
+fingerprint) with silent-corruption stakes; it is scoped but not landed here.
+
