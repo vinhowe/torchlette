@@ -1,6 +1,6 @@
 # Ownership Derivation: liveness classification as a derived fact
 
-**Status:** RATIFIED (Vin, 2026-07-11) — D0 complete; §8 ruled WRAPPERS. D1 complete. D2 complete (flip landed; stored slot + defenses + shadow plumbing DELETED; row-8 opt-out RETAINED — §D1-log #3 corrected, its FP is runahead gen-scoping, not ownership). · Task #70
+**Status:** RATIFIED (Vin, 2026-07-11) — D0 complete; §8 ruled WRAPPERS. D1 complete. D2 complete (flip landed; stored slot + defenses + shadow plumbing DELETED; row-8 opt-out RETAINED — §D1-log #3 corrected, its FP is runahead gen-scoping, not ownership). D3 complete (registration surface; persist() → registerState() alias; `_durablePersistent` → `_registeredState`). D4 complete (viewAliasesLiveBase re-derived + deleted; row-8 RE-DIAGNOSED — it was the stale-snapshot second-engine-in-process bug #84, NOT gen-perturbation; disposeAllForNewEngine now clears `_stepStartTensors`, gpt2-memorization opt-out DELETED + proven). CAMPAIGN COMPLETE. · Task #70
 **Prereq:** #73 strict-lifetime default (in flight) — the tripwire net this campaign works under.
 
 ## 0. Declaration (one sentence)
@@ -483,7 +483,7 @@ beside registration — is deleted (one source: REG). `_durablePersistent` is no
 RENAMED to `_registeredState` (it always was REG; the rename removes the "durable persist vs
 register" fiction). No net-new persistence mechanism enters src/ (admission-pressure clean).
 
-## §D4 spec — guard re-derivation + the per-engine epoch fix (task #70, D4)
+## §D4 spec — guard re-derivation + the row-8 second-engine fix (task #70, D4)
 
 **1. `viewAliasesLiveBase` re-derived + deleted.** The `[lifetime]` reclaimed-read guard's
 `viewAliasesLiveBase` clause (op-dispatch `getInputStorage`) exonerates a reclaimed VIEW
@@ -498,31 +498,34 @@ The `declaredReplay` (`isStepTapeReplayActive`) clause STAYS — it is a TAPE-de
 fact (the whole step's dataflow is declared during a multi-plan replay), not an ownership
 fact. #90's gate (`static-kv-harvest-lifetime`, STEP_TAPE=1) is the regression net.
 
-**2. The per-engine epoch fix (row-8 / §D1-log #3 real fix).** The gen-stamp / gen-filter
-counter (`src/core/epoch.ts`) is a module-global singleton shared by EVERY engine in the
-process AND by the buffer pool / memory planner / backend quiesce. The row-8 FP: a
-concurrent engine's step boundary (or any of the frequent pool/planner bumps) advances the
-shared counter between engine A stamping a runahead activation (next step's forward, built
-lazily) and engine A committing its boundary — shifting that activation from "next step"
-(stamp > boundaryGen, protected) to "this step" (stamp ≤ boundaryGen, SWEPT), reaping a live
-storage → the `[lifetime]` throw. The gen-scoping's whole job — protect next-step runahead
-work from this step's sweep — is defeated by cross-engine perturbation of the shared clock.
+**2. The row-8 fix — the corrected diagnosis (BOTH D1 and D2 were wrong).** The row-8
+`gpt2-memorization` overfit FP was attributed by D1 to "a concurrent test perturbs the SHARED
+generation counter" and by D2 to "runahead gen-scoping / shared-epoch cross-test
+perturbation." D4 built the per-engine `_stepGen` counter those diagnoses implied, measured it
+against a deterministic repro, and it did NOTHING. Instrumenting the demotion site
+(`tools/t-second-engine-overfit-probe.ts`) revealed the truth: the reaped `[64,128]` storage
+is at **maxGen=0, stamp=0, owners=1, snap=false** — a CLEAN FIRST boundary, no gen anomaly at
+all. And it reproduces **DETERMINISTICALLY with ZERO parallelism**: build N GPT-2 engines
+back-to-back in one process; engine #0 converges, engine #1+ throw.
 
-*Fix (per evidence): a dedicated per-engine step-generation counter for the stamp/filter
-axis, decoupled from the process-global epoch.* The buffer-pool/planner/quiesce roles of the
-epoch are genuinely process-global (one GPU timeline, one planner registry) and STAY on
-`core/epoch`. Only the storage-tracker's gen-stamp axis needs per-engine isolation. The
-tracker gains its OWN monotonic `_stepGen` counter that is bumped ONLY by `bumpStepGen`
-(step boundaries) and read ONLY by `stampWrapperGen` — so between a stamp and a boundary the
-ONLY thing that can advance it is a step boundary, and the ACTIVE engine's boundary is the
-only stepper (the exec is serialized; a concurrent engine's boundary bumps its OWN axis).
-Per-engine is realized by keying `_stepGen` to the engine currently owning the tracker: the
-tracker's `_stepGen` is reset at `disposeAllForNewEngine` (one-live-engine-at-a-time — the
-same contract already in force), so a fresh engine starts its stamp axis clean and no dead
-engine's residual gen perturbs it. Decoupling from the high-frequency pool/planner bumps
-alone removes the perturbation source that made the FP reproduce; resetting per engine closes
-the cross-engine-boundary residual. THEN the `gpt2-memorization` `STRICT_LIFETIME=0` opt-out
-+ row-8 comment are DELETED and proven green under strict in the full parallel cpu run ×5.
+It is the **SECOND-ENGINE-IN-PROCESS class (#84).** `disposeAllForNewEngine` cleared
+`allStorages`, the owner set, and (D3) REG — but NOT the storage tracker's `_stepStartTensors`
+snapshot. A fresh PROCESS starts with `_stepStartTensors === null`, and `releaseStepTemps` is
+a NO-OP while null (it reaps nothing before the first `snapshotForStep`) — so engine #0's very
+first implied boundary reaps nothing and its live step-0 activation survives. The SECOND engine
+inherited the dead first engine's stale NON-NULL snapshot WeakSet (containing none of the new
+engine's tensors), so its first `releaseStepTemps` ran against that stale snapshot and reaped
+the new engine's live step-0 forward activation (`snap=false`) → the `[lifetime]` reclaimed-read
+throw when the optimizer force read it.
+
+*Fix:* `disposeAllForNewEngine` (and `reset()`) now clear `_stepStartTensors = null`, so a
+fresh engine starts from the same null state a fresh process has. Single-variable proof: with
+the clear disabled, engine #1 throws `[64,128]`; with it enabled, all engines converge. The
+per-engine `_stepGen` counter was prototyped, measured NULL against this repro, and REVERTED —
+the stale snapshot was the whole bug (campaign honesty invariant: D4 records that both prior
+attributions were wrong rather than shipping the mis-located fix). THEN the `gpt2-memorization`
+`STRICT_LIFETIME=0` opt-out + row-8 comment are DELETED and proven green under the strict
+default (deterministic probe + the parallel cpu run).
 
 **3. Other exoneration clauses swept.** The `releasedOverlay` clause (stage-3 B observation
 overlay) and the `declaredReplay` gate stay (tape/observation declarations, not ownership).
@@ -530,6 +533,8 @@ Any defensive check provably subsumed by the derived model is deleted with its g
 the rest are listed in the §D4 log.
 
 **Gates (D4, superset of D3):** full suite + strict default; `test:gates` 6/6; all lifetime
-specs; `static-kv-harvest` (STEP_TAPE=1); the #74 three cross-engine specs; the row-8 ×5
-parallel proof; profile-training perf/memory vs D2 (~48ms/5397MB); ledger probe 0/0;
-parity-fullstack ≤1e-5. Weight-norm net-negative.
+specs; `static-kv-harvest` (STEP_TAPE=1); the #74 cross-engine specs (second-run-determinism,
+client-engine-remote); the row-8 deterministic second-engine probe
+(`t-second-engine-overfit-probe.ts`) + gpt2-memorization green under strict; ledger probe 0/0;
+parity-fullstack ≤1e-5. Weight-norm net-negative (viewAliasesLiveBase moved to a tracker query;
+the row-8 fix is a one-line snapshot clear; no per-engine `_stepGen` mechanism landed).

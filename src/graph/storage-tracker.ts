@@ -586,6 +586,40 @@ class StorageTracker {
     return !this.allStorages.has(storageId);
   }
 
+  /**
+   * Is a reclaimed VIEW handle's base still live AND sharing its buffer? (task
+   * #70 D4). A reclaimed view whose flattened base root is live and whose GPU
+   * buffer IS that live base's buffer is NOT a use-after-free — the read returns
+   * correct bytes (the compiled-plan HARVEST-view class: `planOwnedBaseRetain`
+   * re-creates a view over a persistent base each replay, the per-replay handle
+   * is reaped at markStep but its buffer aliases the live base the plan keeps
+   * alive; #90 static-KV decode). This is the FIRST-CLASS form of the derived
+   * model's `nonWrapperRetain` / `_liveViewBases` "a live view's base is a kept
+   * holder" query (doc §3: "viewAliasesLiveBase becomes a first-class query"),
+   * now OWNED by the tracker that owns `_liveViewBases` — the D4 re-derivation
+   * that deletes op-dispatch's bespoke `viewAliasesLiveBase` clause.
+   *
+   * Single-source-of-truth seam: the base's live buffer is the ONE source; we
+   * ASSERT the view's buffer equals it (viewBuf === baseBuf) before exonerating.
+   * A genuinely-dangling view — base destroyed, or buffer already recycled to a
+   * different buffer — fails this and the guard still fires.
+   */
+  viewBaseIsLive(storage: StorageHandle): boolean {
+    if (storage.baseStorageId === undefined) return false;
+    // Flatten the base chain to its live root (harvest chains are depth-1 but be
+    // robust to nesting: a destroyed intermediate must not exonerate the read).
+    let base = this.allStorages.get(storage.baseStorageId);
+    while (base?.baseStorageId !== undefined) {
+      const parent = this.allStorages.get(base.baseStorageId);
+      if (!parent) break;
+      base = parent;
+    }
+    if (!base) return false; // base itself reclaimed → truly dangling
+    const viewBuf = (storage.backendTensor as { buffer?: unknown }).buffer;
+    const baseBuf = (base.backendTensor as { buffer?: unknown }).buffer;
+    return viewBuf !== undefined && viewBuf === baseBuf;
+  }
+
   /** [step-tape 2b] The RuntimeTensor that owns a storage (if alive). A
    *  multi-plan tape skeleton uses this to re-resolve a frozen materialized
    *  ref to the owner's CURRENT storage each replay - persistent tensors
@@ -711,6 +745,8 @@ class StorageTracker {
     this._ownerSet.clear();
     // Drop registered state (REG) — a fresh tracker owns no persistent state.
     this._registeredState = new WeakSet<object>();
+    // Reset the step snapshot (task #70 D4).
+    this._stepStartTensors = null;
   }
 
   /**
@@ -789,6 +825,30 @@ class StorageTracker {
     // wrapper cannot re-register (the engine is done). This is the doc §D3
     // "cross-engine behavior" contract.
     this._registeredState = new WeakSet<object>();
+    // Clear the step snapshot (task #70 D4 — the row-8 root cause). A fresh
+    // process starts with `_stepStartTensors === null`, and releaseStepTemps is a
+    // NO-OP while null (it reaps nothing until the first snapshotForStep). The
+    // SECOND engine in a process must start from that same null state — otherwise
+    // it inherits the DEAD engine's stale snapshot WeakSet (which contains none of
+    // the new engine's tensors), so the new engine's very first implied-boundary
+    // releaseStepTemps runs against that stale snapshot and reaps the new engine's
+    // live step-0 forward activation (owners=1, snap=false) → a [lifetime]
+    // reclaimed-read throw when the optimizer force reads it.
+    //
+    // This is the gpt2-memorization overfit FP (indictment row 8): it is the
+    // SECOND-ENGINE-IN-PROCESS class (#84), NOT a gen-perturbation. The D1 and D2
+    // attributions ("concurrent test perturbs the SHARED generation counter" /
+    // "runahead gen-scoping") were BOTH wrong — the reaped storage is at
+    // maxGen=0/stamp=0, a clean FIRST boundary, and it reproduces DETERMINISTICALLY
+    // in a single process with no parallelism: engine #0 OK, engine #1+ throw
+    // (tools/t-second-engine-overfit-probe.ts). The first engine never hit it
+    // because its snapshot was still null on its first boundary; the second engine
+    // inherited engine #0's stale non-null snapshot. The honesty invariant of this
+    // campaign: the differential surfaced that both prior attributions were wrong,
+    // and D4 records the correction rather than shipping the mis-located fix (a
+    // per-engine `_stepGen` counter was prototyped, measured NULL against this
+    // repro, and reverted — the stale snapshot was the whole bug).
+    this._stepStartTensors = null;
     if (this.allStorages.size !== 0) {
       throw new Error(
         `[storage-tracker] disposeAllForNewEngine left ${this.allStorages.size} residual storages — a storage escaped instance-boundary teardown and would leak into the next engine run (the second-in-process bimodality class, task #84).`,

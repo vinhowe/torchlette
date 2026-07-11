@@ -1956,10 +1956,12 @@ export class RuntimeEngine {
 
   /** Like createFromStorageHandle, but the wrapper is a STORAGE-SHARING SIDECAR
    *  (task #74): it aliases `storage` to keep it alive via its own rc across a
-   *  runahead window and must NEVER become that storage's tracked owner (the
-   *  GradScaler LiveScalar pin ring). trackTensor refuses the owner-slot steal
-   *  for sidecars, so a live principal (the persistent scale scalar) keeps the
-   *  slot and its GC/demotion never reaps the shared storage under it. */
+   *  runahead window (the GradScaler LiveScalar pin ring). It carries the
+   *  `_sidecarShare` flag, which the derived classifier reads off the owner-SET
+   *  member as a gen-independent KEEP signal (task #70 D2) — a storage held by a
+   *  live sidecar pin is never demoted by releaseStepTemps. (Historically this
+   *  drove an owner-SLOT steal refusal; the D2 flip deleted the slot, so the
+   *  sidecar is now a plain SET member with a keep flag.) */
   createSidecarFromStorageHandle(
     storage: import("../graph/types").StorageHandle,
     shape: number[],
