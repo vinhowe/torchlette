@@ -81,3 +81,31 @@ the intra-island/kernel magnification); the measured tier (contract unchanged fr
 workbench); engine round-trip (term model unchanged; the engine channel is the sibling
 work). The spike's inspector view may remain as a debug panel; it is no longer the
 primary surface.
+
+## 5. The game loop (added 2026-07-11 after play review — this section is why the surface exists)
+
+Review verdict on the loopless surface: "not at all play inducing... feels arbitrary...
+online softmax feels like random magic... notation feels dense... no idea what [derive
+FA] does." Diagnosis: sandbox without the game. The game was already designed — the
+intrinsic ladder (corpus: wgsl-cuda-containment.md, rung table + 12-exercise sequence).
+Normative here:
+
+1. **Every level is a want**: a baseline diagram + its cost + a TARGET (H/M budget).
+   The column-aligned cost table doubles as the score; the gap to target is always
+   visible. No level, no diagram — the cold start is a level select, not a canvas.
+2. **Vocabulary is rung-gated** (progressive disclosure): a level exposes ONLY the
+   notation devices and gestures its rung needs. Exercise 1 = wires + colors + recolor.
+   Density is a failure of gating, not a property of the notation.
+3. **Lemmas are EARNED at walls, never offered as buttons**: the player attempts the
+   natural move, the jam explains the obstruction in-place, and only then does the
+   lemma become available — with its carried state (Welford's running (μ, M2); online
+   softmax's (m, ℓ) + correction factor) INSPECTABLE in the diagram after application.
+   Exercise 3 (Welford) teaches lemma-as-concept small before exercise 8 (the wall).
+4. **The FA capstone is reached, not clicked**: the toolbar button dies; FA is the
+   final level of the slice, and by the time the player arrives every move in it is
+   one they have already made once.
+
+v1 slice = exercises 1, 3, 8, 9 (fuse-the-chain; LayerNorm→Welford; softmax lemma
+wall; FA capstone). Costs are napkin-static (score = H/M vs target); the measured tier
+joins when the engine bench lands. Completion state per level: target met → the level
+select shows the earned cost + the move count (the climbing-trace ledger).
