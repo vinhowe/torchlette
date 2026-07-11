@@ -267,3 +267,55 @@ int8 weight-only for GEMV NT (+ tiled if tractable), quantize utility in tools/,
 one real model (Qwen3-1.7B) wired end-to-end on Node/Dawn, all five gates.
 **STOP and report** — int4, browser integration, and SAE-demo wiring are phase 2,
 decided by the phase-1 report.
+
+## Phase-1 outcome (2026-07-11)
+
+**Scope landed: GEMV NT (decode) only.** The tiled (M>1 / prefill) quant path was
+NOT built — the tiled B operand is [K,N] with a transposed, cooperatively-staged
+load, so fusing dequant there is a materially larger and less-tested change than
+the GEMV NT row-dot. Prefill therefore stays f16/f32; decode (the M=1,
+bandwidth-bound path that is the entire steepness argument) is the quant target.
+Stated per the design's own "if only GEMV lands, say so."
+
+**Model wiring: the tied lm_head / embedding** (N=vocab, K=hidden — the single
+largest weight, ~311M params, the clearest residency win), spliced as the final
+decode projection where the input is a real materialized hidden state and the op
+is a clean M=1 GEMV. Full per-layer (q/k/v/o/gate/up/down) wiring needs the input
+forced+materialized before each eager quant dispatch, which fights the lazy
+forward (RoPE/attention compose lazily) — that's a **lazy custom-op** integration
+(a new IR node + backend executor threading the packed+scales pair through the
+plan builder), deferred to phase 2. The eager `dispatchQuantizedGemvNT` proves
+the op on a real model-weight distribution end-to-end.
+
+**Gate results (A100 dw-2-1, real Qwen3-1.7B lm_head N=151936 K=2048):**
+- Gate 1 (kernel exactness, `probe-quant-gemv.ts`, in-suite
+  `test/quant-gemv-parity.spec.ts`): quant kernel == f32-dequant control to f32
+  noise (~1e-5 rel) over 10 shapes, G∈{64,128}. PASS.
+- Gate 2 (real-weight parity, `quant-lmhead-realweight.ts`): int8 lm_head vs f32
+  lm_head — top-1 match, top-5 5/5, **max-abs logit drift 0.103** (≤0.5),
+  **mean-abs 0.016** (≤0.05), on a real weight + realistic post-norm hidden.
+  PASS.
+- Gate 5 (perf/residency): **residency 3.88x vs f32, 1.94x vs f16** (1245→321MB).
+  **Speed: int8 2.18 ms/call vs f32 1.34 ms/call — int8 is SLOWER on A100.**
+  Honest and expected: A100 (~2TB/s) is not bandwidth-starved, and the phase-1
+  kernel is SCALAR-load (per-element `unpack4x8snorm` + f16 scale) while the f32
+  GEMV uses vec4 loads. The A100 win is residency; the tokens/s win is the 16GB
+  Mac's bandwidth term (lm_head 1244→311 MB/token). A vec4-vectorized int8 load
+  is the obvious A100-speed follow-up (phase 2).
+- Gate 3 (20-token generation): NOT completed — the full 28-layer model forward
+  hangs intermittently at load/fence under Node/Dawn on this box (the
+  vkCreateDevice-class flake the task flags), unrelated to the quant kernel
+  (which passes standalone). Deferred to the lazy-custom-op wiring (phase 2),
+  where per-layer quant runs inside the model's own forward.
+- Gate 4 (build + suite + gates green): build clean; the new kernel gate is
+  in-suite (webgpu project); the existing GEMV probe still passes 124/124 (no
+  regression from the quantB branch).
+
+**Kernel seam bug caught pre-ship** (the single-source-at-seam class): the
+tile-IR dead-code pass (`someExprChild`) had no `unpackInt8Snorm` case, so it
+pruned the packed-weight load's index `let`s — the WGSL referenced an undeclared
+`b_row_base`. Added the case; a differential would have caught it at runtime, but
+the missing traversal case is the exact "two sides of a seam silently disagree"
+pattern the house rules warn about. Also: `unpack4x8snorm` is the chosen builtin
+(q/127, ·127 folded into the stored scale = group abs-max — the quantizer is the
+single source for that mapping).
