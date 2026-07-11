@@ -35,6 +35,14 @@ async function main() {
     LEN,
   ]);
 
+  // Warm base + addend materialization and settle the plan structure so the
+  // ONLY thing that varies across the measured loop is the narrow offset (not
+  // whether the addend's tensorFromArray lands in the same plan). Without this
+  // the first iteration is a structurally-distinct plan (a probe artifact).
+  {
+    const w = api.add(base.narrow(0, 0, LEN).contiguous(), addend);
+    await w.cpu();
+  }
   const before = debugTemplateCount();
 
   // Run each offset twice so a template would be a cache HIT the 2nd time —
