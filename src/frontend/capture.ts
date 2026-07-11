@@ -399,7 +399,7 @@ export class CapturedFn {
           // and the driver's K-steps-later readback reads garbage.
           const settle = await this.api._deferBoundaryCommit();
           for (const t of out) {
-            this.api.persist(t);
+            this.api.registerState(t);
             // Blocker #1: stage each scalar output into a POOL-EXCLUDED
             // readback buffer NOW (queue order — before any newer step can
             // rebind the live planner slot). The K-behind read then returns
@@ -446,7 +446,7 @@ export class CapturedFn {
       : undefined;
     if (this.runahead && result !== null) {
       for (const t of Array.isArray(result) ? result : [result]) {
-        this.api.persist(t);
+        this.api.registerState(t);
         // Blocker #1 (see hit path): stage the scalar output pool-excluded.
         t._stagedScalarRead = await this.api._startRingScalarReadback(t);
       }

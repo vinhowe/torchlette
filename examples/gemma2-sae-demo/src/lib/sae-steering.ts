@@ -152,7 +152,7 @@ export function makeSAEResidualHook(
     for (let i = 0; i < dModel; i++) combined[i] += alpha * row[i];
   }
 
-  const vec = api.persist(api.tensorFromArray(combined, [1, 1, dModel]));
+  const vec = api.registerState(api.tensorFromArray(combined, [1, 1, dModel]));
   return (x, l) => {
     if (l !== layer) return x;
     return api.add(x, vec);

@@ -214,7 +214,7 @@ export function getInputStorage(
         `mid-step and held across markStep was demoted as a step temporary; ` +
         `its buffer may have been reused. Create persistent state outside ` +
         `the step, update it in place via copy_, or mark it with ` +
-        `runtime.persist().`;
+        `runtime.registerState().`;
       if (strictLifetime(ref.storage)) {
         throw new Error(msg);
       }

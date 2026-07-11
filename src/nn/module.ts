@@ -41,6 +41,13 @@ export abstract class Module {
   registerParameter(name: string, tensor: Tensor | null): void {
     if (tensor !== null) {
       this._params.set(name, tensor);
+      // DECLARE persistent state (task #70 D3): a module param IS long-lived
+      // registered state. Registering it here — the single enumeration seam every
+      // param passes through — makes it gen-independent persistent (REG), strictly
+      // more robust than relying on the transient step snapshot alone (a param
+      // cannot fall out of persistence because a concurrent test perturbed the
+      // boundary gen). No duplicate walk: this rides the existing enumeration.
+      this.api.registerState(tensor);
     }
     Object.defineProperty(this, name, {
       value: tensor,
@@ -55,6 +62,9 @@ export abstract class Module {
    */
   registerBuffer(name: string, tensor: Tensor): void {
     this._buffers.set(name, tensor);
+    // DECLARE persistent state (task #70 D3): a buffer is a non-parameter
+    // persistent tensor — register it as REG state, same as a param.
+    this.api.registerState(tensor);
     Object.defineProperty(this, name, {
       value: tensor,
       writable: true,
@@ -155,13 +165,16 @@ export abstract class Module {
    * Returns this module for chaining.
    */
   to(device: DeviceKind): this {
+    // to() REPLACES the wrapper (a fresh moved tensor), so re-register the new
+    // wrapper as REG state (task #70 D3); the old wrapper's registration dies with
+    // it (WeakSet). This is the one wholesale-replacement case §D3 calls out.
     for (const [name, param] of this._params) {
-      const moved = this.api.to(param, device);
+      const moved = this.api.registerState(this.api.to(param, device));
       this._params.set(name, moved);
       (this as Record<string, unknown>)[name] = moved;
     }
     for (const [name, buffer] of this._buffers) {
-      const moved = this.api.to(buffer, device);
+      const moved = this.api.registerState(this.api.to(buffer, device));
       this._buffers.set(name, moved);
       (this as Record<string, unknown>)[name] = moved;
     }

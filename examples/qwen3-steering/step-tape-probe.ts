@@ -175,7 +175,7 @@ async function main() {
     const dir = new Float32Array(h);
     for (let i = 0; i < h; i++) dir[i] = Math.sin(i * 0.37) * 5;
     const vec: SteeringVector = {
-      direction: api.persist(api.tensorFromArray(dir, [h])),
+      direction: api.registerState(api.tensorFromArray(dir, [h])),
       layer: STEER_LAYER,
       hiddenSize: h,
       posPrompt: "synthetic+",
@@ -207,7 +207,7 @@ async function main() {
     const dir = new Float32Array(h);
     for (let i = 0; i < h; i++) dir[i] = Math.sin(i * 0.37) * 5;
     const vec: SteeringVector = {
-      direction: api.persist(api.tensorFromArray(dir, [h])),
+      direction: api.registerState(api.tensorFromArray(dir, [h])),
       layer: STEER_LAYER,
       hiddenSize: h,
       posPrompt: "synthetic+",

@@ -63,7 +63,7 @@ async function main() {
       const row = sae.featureDirectionCpu(feature);
       const combined = new Float32Array(dModel);
       for (let i = 0; i < dModel; i++) combined[i] = alpha * row[i];
-      const vec = api.persist(api.tensorFromArray(combined, [1, 1, dModel]));
+      const vec = api.registerState(api.tensorFromArray(combined, [1, 1, dModel]));
       hook = (x, l) => (l === layer ? api.add(x, vec) : x);
     }
     let out = "";

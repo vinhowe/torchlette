@@ -37,19 +37,23 @@ class StorageTracker {
    *  ensures persistence survives storage replacement (e.g., Adam m/v updates). */
   private _stepStartTensors: WeakSet<object> | null = null;
 
-  /** Tensors DURABLY persisted via runtime.persist() (task #74). The step
-   *  snapshot above is TRANSIENT — rebuilt at each boundary and NULL between
-   *  steps — so `persist()` called between steps (the GradScaler ctor's
-   *  LiveScalar scale scalar) used to be a silent no-op: the tensor was
-   *  persistent only if it happened to own its storage's WeakRef slot at the
-   *  next snapshotForStep. This set records the persist() intent for the
-   *  WRAPPER's lifetime: releaseStepTemps never demotes a member, and
-   *  trackTensor treats members as persistent incumbents (sharer steal
-   *  refusal) even when no snapshot is active. WeakSet: membership dies with
-   *  the wrapper, so claims still release normally on GC/dispose. Fed ONLY by
-   *  persistDurable (runtime.persist) — scope-escape / keep() adoption stays
-   *  transient by design (those tensors are step/scope-scoped). */
-  private _durablePersistent = new WeakSet<object>();
+  /** REG — REGISTERED persistent state (task #70 D3; was `_durablePersistent`,
+   *  task #74). Modules and optimizers DECLARE their long-lived state by
+   *  registering the WRAPPER here (registerState); it is the ONE persistence
+   *  source (doc §3: persistent := ∃ w ∈ W(s) : w ∈ SNAP ∪ REG), GEN-INDEPENDENT
+   *  (§D1-log #3): a registered tensor is persistent whatever the boundary's
+   *  closing generation, so a concurrent test perturbing the shared gen counter
+   *  cannot filter it out of persistence. The step snapshot (SNAP) above is
+   *  TRANSIENT — rebuilt each boundary, NULL between steps — so registration
+   *  works BETWEEN steps too (the GradScaler ctor's LiveScalar, module params
+   *  registered at construction). releaseStepTemps never demotes a member.
+   *  WeakSet: membership dies with the wrapper (GC/dispose), so claims still
+   *  release normally — copy_-in-place state updates KEEP the wrapper (only the
+   *  storage changes), so an in-place-updated param/m/v stays registered with no
+   *  churn (why wrappers won the §8 ruling). Cleared (rebuilt-empty) at
+   *  disposeAllForNewEngine so a new engine does not inherit the dead engine's
+   *  registered state (the #74 cross-engine contract). */
+  private _registeredState = new WeakSet<object>();
 
   /** Implied-step-boundary generation stamps (see
    *  Torchlette.queueStepBoundary). Keyed by the engine EPOCH id
@@ -207,7 +211,7 @@ class StorageTracker {
       // from REG membership (doc §3: persistent := ∃ w ∈ W(s) : w ∈ SNAP ∪ REG,
       // no gen term on REG) makes that misclassification unconstructible. So the
       // REG check runs BEFORE the gen-filter continue.
-      if (this._durablePersistent.has(w)) {
+      if (this._registeredState.has(w)) {
         persistent = true; // REG (D1) — gen-independent
         hasLiveOwner = true;
       }
@@ -491,7 +495,7 @@ class StorageTracker {
         if (
           maxGen !== undefined &&
           (this._wrapperGen.get(target) ?? 0) > maxGen &&
-          !this._durablePersistent.has(target)
+          !this._registeredState.has(target)
         ) {
           continue;
         }
@@ -516,18 +520,19 @@ class StorageTracker {
   }
 
   /**
-   * DURABLE persist (task #74): mark a tensor persistent for the WRAPPER's
-   * lifetime, not just the active snapshot. `adoptIntoSnapshot` alone is a
-   * silent no-op between steps (no active snapshot) — a persist()ed tensor
-   * created there (the GradScaler ctor's LiveScalar scale scalar) stayed
-   * persistent only while it happened to own its storage's WeakRef slot; a
-   * storage-sharing clone could steal the slot and get the shared storage
-   * demoted/reaped under it. Members are never demoted by releaseStepTemps
-   * and count as persistent incumbents in trackTensor's sharer guard. See
-   * `_durablePersistent`.
+   * REGISTER persistent state (task #70 D3; was `persistDurable`, task #74). The
+   * ONE registration primitive: modules (params/buffers) and optimizers (m/v,
+   * velocity, t, lr) DECLARE their long-lived state by registering the WRAPPER
+   * here. Marks the tensor persistent for the WRAPPER's lifetime (REG =
+   * `_registeredState`, gen-independent), not just the active snapshot —
+   * registration works BETWEEN steps (no active snapshot) and survives every
+   * snapshot rebuild. Members are never demoted by releaseStepTemps. Also adopts
+   * into the active step snapshot so a mid-step registration is persistent for
+   * the CURRENT step immediately (before the next snapshotForStep). `persist()`
+   * is a deprecated warn-once alias that delegates here.
    */
-  persistDurable(tensor: object): void {
-    this._durablePersistent.add(tensor);
+  registerState(tensor: object): void {
+    this._registeredState.add(tensor);
     this._stepStartTensors?.add(tensor);
   }
 
@@ -596,7 +601,7 @@ class StorageTracker {
     for (const w of owners) {
       if (
         this._stepStartTensors?.has(w) === true ||
-        this._durablePersistent.has(w)
+        this._registeredState.has(w)
       ) {
         return w;
       }
@@ -704,6 +709,8 @@ class StorageTracker {
   reset(): void {
     this.allStorages.clear();
     this._ownerSet.clear();
+    // Drop registered state (REG) — a fresh tracker owns no persistent state.
+    this._registeredState = new WeakSet<object>();
   }
 
   /**
@@ -773,6 +780,15 @@ class StorageTracker {
     // never given the analogous reset.
     this.allStorages.clear();
     this._ownerSet.clear();
+    // Clear REG (registered state, task #70 D3): a new engine must not inherit
+    // the dead engine's registered module/optimizer state — the same
+    // cross-instance-interference class disposeAllForNewEngine exists for (#84,
+    // #74). A WeakSet cannot be iterated to clear; rebuild it empty. The dead
+    // engine's wrappers are going out of scope (its model/opt is finished), so
+    // their membership is dropped wholesale here; a lingering-but-live dead-engine
+    // wrapper cannot re-register (the engine is done). This is the doc §D3
+    // "cross-engine behavior" contract.
+    this._registeredState = new WeakSet<object>();
     if (this.allStorages.size !== 0) {
       throw new Error(
         `[storage-tracker] disposeAllForNewEngine left ${this.allStorages.size} residual storages — a storage escaped instance-boundary teardown and would leak into the next engine run (the second-in-process bimodality class, task #84).`,

@@ -182,7 +182,7 @@ async function runSteerGen(
     // The steering direction, hoisted ONCE: a stable-identity persistent
     // closure tensor (per the contract, closure TENSORS are fine — it is
     // closure VALUES that freeze; the buffer is read live by every replay).
-    const dir3d = api.persist(api.reshape(vec.direction, [1, 1, h]));
+    const dir3d = api.registerState(api.reshape(vec.direction, [1, 1, h]));
     const state = { alpha: o.alphaAt(0) };
 
     // The three α-delivery bodies (identical math; only the α path differs).
@@ -325,7 +325,7 @@ function makeVec(api: Torchlette, h: number): SteeringVector {
   const dir = new Float32Array(h);
   for (let i = 0; i < h; i++) dir[i] = Math.sin(i * 0.37) * 5;
   return {
-    direction: api.persist(api.tensorFromArray(dir, [h])),
+    direction: api.registerState(api.tensorFromArray(dir, [h])),
     layer: STEER_LAYER,
     hiddenSize: h,
     posPrompt: "synthetic+",

@@ -116,6 +116,19 @@ import {
  * Plain objects and arrays are recursed into as before (for returning
  * `{ loss, logits }` from tidy).
  */
+/** Warn once that persist() is deprecated in favour of registerState()
+ *  (task #70 D3; sunset: next major cleanup). */
+let _warnedPersistDeprecated = false;
+function warnPersistDeprecated(): void {
+  if (_warnedPersistDeprecated) return;
+  _warnedPersistDeprecated = true;
+  console.warn(
+    "[deprecated] persist() → registerState(): persist() is a warn-once alias " +
+      "for registerState() and will be removed in the next major cleanup pass " +
+      "(task #70 D3).",
+  );
+}
+
 function collectTensorHandles(value: unknown): EngineTensor[] {
   const out: EngineTensor[] = [];
   const seen = new Set<unknown>();
@@ -1064,12 +1077,24 @@ export class RuntimeEngine {
    * created BETWEEN steps need nothing — the next snapshot captures them.
    */
   persist(t: Tensor): Tensor {
-    // DURABLE (task #74): survives snapshot rebuilds and works BETWEEN steps.
-    // The previous adoptIntoSnapshot-only persist was a silent no-op with no
-    // active snapshot (the GradScaler-ctor LiveScalar scale-scalar gap: a
-    // storage-sharing clone could steal its owner slot and get the shared
-    // storage reaped). Membership dies with the wrapper (WeakSet).
-    storageTracker.persistDurable(t);
+    // DEPRECATED (task #70 D3): persist() is now a warn-once alias for
+    // registerState() — the one registration primitive. Sunset: dies with the
+    // next major cleanup pass.
+    warnPersistDeprecated();
+    return this.registerState(t);
+  }
+
+  /**
+   * REGISTER a tensor as persistent STATE (task #70 D3). The one persistence
+   * primitive: modules register params/buffers (via nn.Module), optimizers
+   * register m/v/velocity/t/lr. Registered state (REG) is gen-independent —
+   * persistent whatever the step boundary's generation — and survives every
+   * snapshot rebuild. WeakSet-keyed by the wrapper: membership dies with the
+   * wrapper (GC/dispose), and copy_-in-place updates keep the wrapper so state
+   * stays registered across steps with no churn.
+   */
+  registerState(t: Tensor): Tensor {
+    storageTracker.registerState(t);
     return t;
   }
 

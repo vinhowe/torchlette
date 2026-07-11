@@ -390,3 +390,146 @@ in-suite regression that the derived model drives releaseStepTemps correctly.
   the owner model.
 
 **Gates:** see the D2 report / commit message for the full matrix vs the D1 baselines.
+
+## §D3 spec — the registration surface (task #70, D3)
+
+**Declaration (one sentence):** Modules and optimizers DECLARE their persistent
+state by registering it — module params/buffers ride the enumeration they already
+have, optimizers register their state tensors (Adam m/v/t/lr, SGD velocity) at
+creation / first step — and `persist()` becomes a deprecated warn-once alias for
+that one registration primitive, so persistence has ONE source (REG), not two.
+
+**What REG already is.** D1/D2 built REG as `_durablePersistent` — a WeakSet of
+wrappers, gen-independent, fed by `runtime.persist()` (task #74). `_derived` and
+`snapshotForStep` already read it as the gen-independent persistence axis (§D1-log
+#3, §D2 log #3). D3 does NOT add a new persistence mechanism; it renames the
+plumbing to the DECLARATION it always was and routes module/optimizer state through
+it explicitly, then retires `persist()` as the public spelling.
+
+**The registration primitive.** `storageTracker.registerState(wrapper)` (was
+`persistDurable`) is the one hook: it adds the wrapper to REG (`_registeredState`,
+was `_durablePersistent`) and, if a step snapshot is active, into SNAP too (so a
+mid-step registration is persistent for the current step without waiting for the
+next `snapshotForStep`). Surfaced as `runtime.registerState(t)` /
+`api.registerState(t)`.
+
+**Where the hooks live — decided + justified:**
+
+- **Modules ride the enumeration (not a duplicate walk).** `registerParameter` and
+  `registerBuffer` are the SINGLE point every module param/buffer passes through
+  (nn.Module §nn/module.ts). Registering there means module state is declared
+  exactly once, at the enumeration seam that already exists — no `parameters()`
+  re-walk, no per-optimizer "please persist my model" call. `to(device)` re-registers
+  the moved tensor (the old wrapper's REG membership dies with it — WeakSet). This
+  is doc §3's "nn.Module parameters/buffers already enumerate" made load-bearing:
+  params were previously persistent only VIA the SNAP snapshot (alive at beginStep);
+  registering them into REG makes them gen-independent too, which is strictly more
+  robust (a param cannot fall out of persistence because a concurrent test perturbed
+  the boundary gen — the same superiority §D1-log #3 gave stepAsync params).
+
+- **Optimizers register at creation / first materialization.** The `runtime.persist()`
+  calls the optimizer already makes (Adam m/v/t/lr in `_stepPerParam` / `_stepForeach`;
+  SGD velocity in `_getVelocity`) become `runtime.registerState()` calls at the same
+  sites. State that lazily materializes mid-step (m/v zeros, packed cat state) is
+  registered at first materialization — the site that already existed; the rename is
+  the whole change. No new "optimizer base registers everything" indirection: the
+  state tensors are created in different shapes per path (per-param vs foreach-packed),
+  so the registration lives where the tensor is minted, which is the honest declaration
+  point.
+
+  *Rejected: an optimizer-base auto-registration of `params`.* The D2 log records a
+  param-axis REG registration in the optimizer ctor that was prototyped and REVERTED
+  (it addressed the wrong tensor and broadened behavior for no proof). D3 does NOT
+  resurrect it: params are registered by the MODULE (their declaring owner), not by
+  every optimizer that happens to step them. The optimizer registers only the state
+  it OWNS (m/v/velocity/t/lr).
+
+**Unregistration semantics — decided + justified.** There is essentially NO explicit
+unregister, and that is the point of the wrappers ruling (§8): REG membership is keyed
+by the WRAPPER (WeakSet), and `copy_`-in-place state updates KEEP the wrapper (only its
+storage changes, via `_updateLazyRef`), so an in-place-updated param/m/v stays registered
+across every step with no churn. Membership dies exactly when the wrapper does (GC /
+dispose) — the WeakSet needs no manual removal. The one case that WOULD leak a stale
+registration is WHOLESALE wrapper replacement (a new tensor object replacing the old in a
+module slot): `to(device)` and `loadStateDict` (copy_-in-place, so no new wrapper — safe)
+are the only replacers; `to()` re-registers the new wrapper and drops the old naturally.
+`resetState` on the optimizer mints fresh state wrappers and re-registers them; the old
+wrappers' REG membership dies with them. So the deletion of `persist()`-as-concept costs
+no new unregister machinery — the wrapper-keyed WeakSet already has the right lifetime,
+which is WHY wrappers won the §8 ruling.
+
+**Cross-engine behavior (#74 reset).** REG is a module-global WeakSet shared across engines
+(like the whole storage tracker). `disposeAllForNewEngine` must clear REG's contributions
+from the dead engine so a new engine does not inherit stale registered state — the same
+one-live-engine-at-a-time contract `disposeAllForNewEngine` already enforces for
+`allStorages` / the owner set. A WeakSet cannot be iterated/cleared wholesale, so REG
+becomes a WeakSet that is REBUILT-empty at `disposeAllForNewEngine` (assign a fresh
+WeakSet — the dead engine's wrappers, which are going out of scope anyway, drop their
+membership; a lingering-but-live dead-engine wrapper simply re-registers on its next use,
+which cannot happen because the engine is finished). The three #74 acceptance specs
+(`second-run-determinism`, `client-engine-remote`, and the disposeAllForNewEngine assert)
+cover this; D3 extends their coverage to assert REG is cleared at the boundary (added: a
+between-engine registered-state-cleared assertion where the #74 specs already probe the
+boundary).
+
+**`persist()` sunset.** `runtime.persist` / `api.persist` warn-once (`[deprecated] persist()
+→ registerState()`) and delegate to `registerState`. Recorded sunset: **the alias dies with
+the next major cleanup pass** (tracked here; no new env flag — it is a source-level alias,
+not a runtime mode). All `persist()` call sites in `src/` are swept to `registerState`;
+`tools/` and `examples/` call sites are swept opportunistically (they are not shipped API).
+
+**Deletion named:** the DUAL persistence concept — `persist()` as a distinct public verb
+beside registration — is deleted (one source: REG). `_durablePersistent` is not deleted but
+RENAMED to `_registeredState` (it always was REG; the rename removes the "durable persist vs
+register" fiction). No net-new persistence mechanism enters src/ (admission-pressure clean).
+
+## §D4 spec — guard re-derivation + the per-engine epoch fix (task #70, D4)
+
+**1. `viewAliasesLiveBase` re-derived + deleted.** The `[lifetime]` reclaimed-read guard's
+`viewAliasesLiveBase` clause (op-dispatch `getInputStorage`) exonerates a reclaimed VIEW
+handle whose live base shares its buffer — the compiled-plan harvest-view class (#90). The
+derived model already expresses this: `_liveViewBases` names every storage that is the base
+of a live view, and `_derived` treats such a base as a `nonWrapperRetain` kept holder. D4
+re-derives the guard's exoneration from a first-class storage-tracker query
+(`viewBaseIsLive(storage)`: the view's flattened base root is live AND shares its buffer —
+the same single-source-of-truth buffer-equality seam, now OWNED by the tracker that owns
+`_liveViewBases`) and DELETES the bespoke `viewAliasesLiveBase` function from op-dispatch.
+The `declaredReplay` (`isStepTapeReplayActive`) clause STAYS — it is a TAPE-declaration
+fact (the whole step's dataflow is declared during a multi-plan replay), not an ownership
+fact. #90's gate (`static-kv-harvest-lifetime`, STEP_TAPE=1) is the regression net.
+
+**2. The per-engine epoch fix (row-8 / §D1-log #3 real fix).** The gen-stamp / gen-filter
+counter (`src/core/epoch.ts`) is a module-global singleton shared by EVERY engine in the
+process AND by the buffer pool / memory planner / backend quiesce. The row-8 FP: a
+concurrent engine's step boundary (or any of the frequent pool/planner bumps) advances the
+shared counter between engine A stamping a runahead activation (next step's forward, built
+lazily) and engine A committing its boundary — shifting that activation from "next step"
+(stamp > boundaryGen, protected) to "this step" (stamp ≤ boundaryGen, SWEPT), reaping a live
+storage → the `[lifetime]` throw. The gen-scoping's whole job — protect next-step runahead
+work from this step's sweep — is defeated by cross-engine perturbation of the shared clock.
+
+*Fix (per evidence): a dedicated per-engine step-generation counter for the stamp/filter
+axis, decoupled from the process-global epoch.* The buffer-pool/planner/quiesce roles of the
+epoch are genuinely process-global (one GPU timeline, one planner registry) and STAY on
+`core/epoch`. Only the storage-tracker's gen-stamp axis needs per-engine isolation. The
+tracker gains its OWN monotonic `_stepGen` counter that is bumped ONLY by `bumpStepGen`
+(step boundaries) and read ONLY by `stampWrapperGen` — so between a stamp and a boundary the
+ONLY thing that can advance it is a step boundary, and the ACTIVE engine's boundary is the
+only stepper (the exec is serialized; a concurrent engine's boundary bumps its OWN axis).
+Per-engine is realized by keying `_stepGen` to the engine currently owning the tracker: the
+tracker's `_stepGen` is reset at `disposeAllForNewEngine` (one-live-engine-at-a-time — the
+same contract already in force), so a fresh engine starts its stamp axis clean and no dead
+engine's residual gen perturbs it. Decoupling from the high-frequency pool/planner bumps
+alone removes the perturbation source that made the FP reproduce; resetting per engine closes
+the cross-engine-boundary residual. THEN the `gpt2-memorization` `STRICT_LIFETIME=0` opt-out
++ row-8 comment are DELETED and proven green under strict in the full parallel cpu run ×5.
+
+**3. Other exoneration clauses swept.** The `releasedOverlay` clause (stage-3 B observation
+overlay) and the `declaredReplay` gate stay (tape/observation declarations, not ownership).
+Any defensive check provably subsumed by the derived model is deleted with its gate named;
+the rest are listed in the §D4 log.
+
+**Gates (D4, superset of D3):** full suite + strict default; `test:gates` 6/6; all lifetime
+specs; `static-kv-harvest` (STEP_TAPE=1); the #74 three cross-engine specs; the row-8 ×5
+parallel proof; profile-training perf/memory vs D2 (~48ms/5397MB); ledger probe 0/0;
+parity-fullstack ≤1e-5. Weight-norm net-negative.
