@@ -2,6 +2,7 @@ import { getActiveBackend, getBackend } from "../backend/registry";
 import {
   type ArgReduceOptions,
   type Backend,
+  type BackendTensor,
   type CatOptions,
   type DeviceKind,
   type DivOptions,
@@ -18,6 +19,7 @@ import {
   type MinOptions,
   normalizeDim,
   type ScatterAddOptions,
+  type StorageFormat,
   type StridedScatterOptions,
   type SubOptions,
   type SumOptions,
@@ -1982,6 +1984,131 @@ export class RuntimeEngine {
       this.dispatchModes[i].onTensorCreated(tensor);
     }
     return tensor;
+  }
+
+  /**
+   * Create a packed-int weight operand from host-side packed + scales data
+   * (docs/quantization-design.md phase 2). Returns a Tensor with the LOGICAL
+   * weight shape `[N, K]` and logical dtype `format.elementType`, but backed by
+   * the PACKED buffer (u32 `[N, K/4]`) with the scales companion attached to its
+   * backendTensor via `format`/`scales`.
+   *
+   * The logical/backend shape divergence is contained: this is a materialized,
+   * persistent inference weight (never plan-allocated, never grad-tracked). The
+   * ONLY reader of its bytes is the backend matmul, which reads the packed
+   * buffer via `format` semantics (fused dequant) — everything above the matmul
+   * seam sees an ordinary `[N,K]` tensor. `api.linear` transposes it to `[K,N]`
+   * exactly as for an unquantized weight; the transpose view propagates the
+   * format (backend/webgpu/ops/views.ts permute).
+   */
+  async createQuantizedWeight(
+    packed: Uint32Array,
+    scalesBits: Uint16Array,
+    n: number,
+    k: number,
+    format: StorageFormat,
+    device?: DeviceKind,
+  ): Promise<Tensor> {
+    const resolvedDevice = this.getDevice(device);
+    const packing = format.packing;
+    if (!packing) {
+      throw new Error("createQuantizedWeight: format.packing is required");
+    }
+    if (k % 4 !== 0) {
+      throw new Error(`createQuantizedWeight: K=${k} must be divisible by 4`);
+    }
+    const wordsPerRow = k / 4;
+    if (packed.length !== n * wordsPerRow) {
+      throw new Error(
+        `createQuantizedWeight: packed length ${packed.length} != ${n * wordsPerRow}`,
+      );
+    }
+    const groupsPerRow = k / packing.groupSize;
+    if (scalesBits.length !== n * groupsPerRow) {
+      throw new Error(
+        `createQuantizedWeight: scales length ${scalesBits.length} != ${n * groupsPerRow}`,
+      );
+    }
+    // Upload packed weight (u32 [N, K/4]) and scales (u16 bits → u32-packed,
+    // 2 f16/word) as ordinary materialized tensors, then rewire.
+    const packedT = this.tensorFromArray(
+      packed,
+      [n, wordsPerRow],
+      resolvedDevice,
+      "u32",
+    );
+    // Scales are u16 bits; upload as u32 words (2 per word) — the kernel reads
+    // b_scales as u32 and unpacks with unpackHalf.
+    const scaleWords = Math.ceil(scalesBits.length / 2);
+    const scalesU32 = new Uint32Array(scaleWords);
+    new Uint16Array(scalesU32.buffer).set(scalesBits);
+    const scalesT = this.tensorFromArray(
+      scalesU32,
+      [scaleWords],
+      resolvedDevice,
+      "u32",
+    );
+    // Force both so their StorageHandles/backendTensors exist, then attach the
+    // format + scales companion to the packed operand.
+    await this.force(packedT);
+    await this.force(scalesT);
+    return this._finishQuantizedWeight(packedT, scalesT, n, k, format);
+  }
+
+  /** Synchronous variant: the caller has already forced packed+scales. */
+  _finishQuantizedWeight(
+    packedT: Tensor,
+    scalesT: Tensor,
+    n: number,
+    k: number,
+    format: StorageFormat,
+  ): Tensor {
+    const packedStorage = (
+      packedT.lazyRef as {
+        storage: import("../graph/types").StorageHandle;
+      }
+    ).storage;
+    // Rewrite the packed backendTensor to present the LOGICAL [N,K] shape/dtype
+    // (it was uploaded as u32 [N,K/4]). The buffer is unchanged; only the
+    // metadata that ops above the matmul seam read is the logical view. The
+    // packed layout lives in `format.packing`. This makes api.linear's transpose
+    // ([N,K] → [K,N]) produce correct logical shapes; the matmul seam reads
+    // `format`/`scales` and interprets the buffer as packed.
+    const packedBT = packedStorage.backendTensor as BackendTensor & {
+      shape: number[];
+      size: number;
+      strides?: number[];
+      dtype?: DType;
+      format?: StorageFormat;
+      scales?: BackendTensor;
+    };
+    packedBT.shape = [n, k];
+    packedBT.size = n * k;
+    packedBT.strides = [k, 1];
+    packedBT.dtype = format.elementType;
+    packedBT.format = format;
+    packedBT.scales = scalesT.backendTensor;
+    packedStorage.format = format;
+    // Both the packed buffer and the scales companion are PERSISTENT inference
+    // state — never a step temporary. Register them so markStep's step-scoped
+    // demotion never pools their buffers out from under a live forward (the
+    // "used in submit while destroyed" class). The scales tensor must also stay
+    // referenced (its only graph link is packedBT.scales, a bare backendTensor
+    // pointer) — stash it on the logical weight so GC can't collect it.
+    this.registerState(packedT);
+    this.registerState(scalesT);
+    // Logical [N,K] tensor over the packed storage; logical dtype = elementType.
+    const logical = this.createFromStorageHandle(
+      packedStorage,
+      [n, k],
+      packedStorage.device,
+      format.elementType,
+    );
+    this.registerState(logical);
+    (logical as unknown as { _quantScales?: Tensor; _quantPacked?: Tensor })._quantScales =
+      scalesT;
+    (logical as unknown as { _quantPacked?: Tensor })._quantPacked = packedT;
+    return logical;
   }
 
   /** Create a fused kernel op node and track it as a new Tensor. */

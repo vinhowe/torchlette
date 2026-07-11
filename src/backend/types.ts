@@ -8,10 +8,63 @@ export type BackendTensor = {
   dtype?: DType;
   /** True if this tensor owns the underlying buffer; false for views/shared tensors. */
   ownsBuffer?: boolean;
+  /**
+   * Optional STORAGE FORMAT (docs/quantization-design.md phase 2). Present only
+   * on packed-int weight operands (a matmul B operand). When `packing` is set,
+   * the buffer is a packed-int weight and `dtype`/`shape` describe the PACKED
+   * layout (u32, [N, K/4]); the companion scales live in `scales`. Consumers
+   * that don't understand the packing MUST dequant explicitly — never read the
+   * packed bytes as if they were the logical weight. Absent = degenerate
+   * (plain dtype) case; the axis is a pure superset. Read ONLY at the backend
+   * matmul seam — invisible to planner/tape/profiler.
+   */
+  format?: StorageFormat;
+  /** Companion scales tensor for a packed weight (set iff format.packing). */
+  scales?: BackendTensor;
   toArray(): number[];
   /** Optional cleanup method to release GPU resources */
   destroy?(): void;
 };
+
+/**
+ * A tensor's storage format — the generalization of the dtype arc
+ * (docs/quantization-design.md "Phase 2 altitude decision"). Plain dtype is the
+ * degenerate `{ elementType }` (no `packing`) case. A packed-int weight carries
+ * a `packing` descriptor; the packed buffer + scales companion together
+ * reconstruct the logical `[N, K]` weight, but that reconstruction happens ONLY
+ * inside the backend matmul kernel (fused dequant) or an explicit dequant op —
+ * never as a graph-visible tensor above the backend.
+ */
+export type StorageFormat = {
+  /** The logical element type of the UNPACKED weight (f16/f32). */
+  elementType: DType;
+  /** Present iff the operand is packed. Absent = plain dtype. */
+  packing?: QuantPacking;
+};
+
+/** Weight-only quantization packing descriptor (int8 this phase; int4 planned). */
+export type QuantPacking = {
+  scheme: "int8-grouped";
+  /** Group size G along K (weights sharing one scale). Power of two. */
+  groupSize: number;
+  /** Element type of the per-group scales companion buffer (f16). */
+  scalesDtype: DType;
+};
+
+/** Named format shorthands the loader/user surface accepts (weightFormat). */
+export type WeightFormatName = "int8-64" | "int8-128";
+
+/** Resolve a named weight format to a StorageFormat over an elementType. */
+export function resolveWeightFormat(
+  name: WeightFormatName,
+  elementType: DType = "f16",
+): StorageFormat {
+  const groupSize = name === "int8-64" ? 64 : 128;
+  return {
+    elementType,
+    packing: { scheme: "int8-grouped", groupSize, scalesDtype: "f16" },
+  };
+}
 
 // ============================================================================
 // Strided ViewMeta (§4.2-4.4)

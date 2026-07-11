@@ -344,3 +344,101 @@ CALLER-side wiring is not. The target form:
   downstream mentions quantization.
 
 Tracked as task #93.
+
+## Phase 2 implementation (2026-07-11, task #93)
+
+**The format axis, in one paragraph.** A `StorageFormat = { elementType: DType;
+packing?: { scheme: "int8-grouped"; groupSize: number; scalesDtype: DType } }`
+rides on the operand — on the `StorageHandle` (`src/graph/types.ts`) and its
+`backendTensor`/`WebGPUTensor` (`format` + a companion `scales` WebGPUTensor).
+Plain dtype is the degenerate `{ elementType }` case (`packing` absent), so a
+normal tensor carries no format at all and the axis is a pure superset. The lazy
+graph, planner, tape, and profiler never read `packing` — they read `shape` and
+`elementType` (via the existing `dtype`), which for a packed weight is the
+PACKED buffer's `u32` element type and `[N, K/4]` shape. The packed+scales
+pair-ness is visible ONLY at the backend matmul seam: `matmul(a, b)` reads
+`b.format?.packing`, and — as a **consumer capability predicate** — routes an
+`int8-grouped` B to `dispatchQuantizedGemvNT` when it can (M=1 decode, NT), or
+inserts an **EXPLICIT dequant** (a `dequantizeInt8Grouped` backend op that
+materializes the f32 weight, then a normal matmul) when it cannot (M>1 prefill,
+or any other consumer). There is no `quantized-linear` op and no caller-side
+special case: `api.linear` is format-blind; it builds `matmul(input,
+weight.T)` exactly as before, and the transpose view PROPAGATES the base's
+`format`/`scales` (a packed weight's "transpose" is a no-op marker — the NT
+kernel reads the packed `[N, K/4]` buffer directly). Selection is data: the
+capability lives in the matmul dispatch, keyed on the operand format.
+
+**Prefill / M>1 choice: explicit dequant-then-matmul.** The phase-1 kernel is
+GEMV/NT decode-shaped; a tiled quant kernel was out of scope (phase-1 outcome).
+Rather than silently dequant-materialize inside the tiled path, the M>1 consumer
+inserts an EXPLICIT `dequantizeInt8Grouped(packed, scales) → f32 [N,K]` op and
+runs the stock matmul on the result — declared, not hidden, and the residency
+win is preserved for decode (the only M=1, bandwidth-bound path). Prefill pays
+one transient f32 weight per matmul; decode never materializes.
+
+**Invisibility test.** `packing` is read in exactly two files — the backend
+matmul op (`ops/matmul-ops.ts`) and the dequant kernel it calls — plus the
+loader/format declaration. `LazyIRNode.dtype`, `Tensor.dtype`, plan-builder
+sizing, compiled-plan `NodeResult.dtype`, and both profilers read only
+`elementType` (the packed `u32`), so a quantized weight is an ordinary `u32`
+`[N,K/4]` tensor everywhere above the matmul seam.
+
+**Splice deletion.** The phase-1 eager `dispatchQuantizedGemvNT` is no longer a
+public caller entry — the backend matmul seam is the sole caller. The
+out-of-band gate scripts (`quant-lmhead-realweight.ts`) that reached around the
+model to call it are replaced by the operand-path gates.
+
+**int4 cost.** int4 is a new VALUE on the axis: a `"int4-grouped"` scheme entry
+(quantizer packing + `unpackInt4` in the kernel) and a capability line in the
+dispatch predicate. Zero new mechanism — the `StorageFormat` descriptor, the
+propagation, the capability seam, and the explicit-dequant fallback are all
+scheme-agnostic. Confirmed holds for this implementation.
+
+**Browser IDB.** The PACKED form is cached keyed by
+`${url}#${tensorName}#${scheme}g${groupSize}` (conversion is expensive; the key
+versions by format+scheme so a dtype/scheme change re-quantizes). Default OFF
+this wave via a `weightFormat` config/URL flag in the SAE demo (not a
+`TORCHLETTE_*` env).
+
+**Node gate results (A100 dw-2-1).**
+- Operand parity (`test/quant-operand-parity.spec.ts`, in-suite): `api.linear`
+  on a quantized weight == f32 control to f32 noise (drift ~1e-7 normalized by
+  output RMS) over 12 cases (N/K∈{128²,512×1024,2048×6144}, G∈{64,128}), with the
+  route asserted EXACT: M=1 → GEMV quant (qHits=1,dHits=0), M=4 → explicit dequant
+  (dHits=1). This is the invisibility+capability proof.
+- Phase-1 kernel gate (`quant-gemv-parity.spec.ts`) still 10/10, no regression
+  from the `quantB` branch.
+- Real-model: quantized Qwen3-1.7B (int8-64 projections via the loader
+  `weightFormat` path) LOADS (310 tensors) and runs a full 28-layer forward with
+  ZERO GPU uncaptured errors, producing a coherent next-token. The 2×-load
+  20-token gen gate hangs on the documented Node/Dawn full-model load/fence flake
+  (unrelated to the kernel; single load+forward is clean) — the 20-token coherent
+  generation runs on the Mac demo.
+- No regression: `test:gates` 6/6, matmul tiled/epilogue/batched 24/24,
+  matmul-view/offset-views 68/68, distilgpt2-finetune 1/1.
+
+**THE Mac measurement (2026-07-11, user's 16GB Mac, Chrome driven via CDP,
+gemma2-sae-demo served FROM THIS BRANCH on :5179; same prompt, same 🌉 Golden Gate
+preset steer, 12+80 tokens, steered=yes both runs, step-tape 76h/80 both):**
+
+| | f16 | int8-64 | Δ |
+|---|---|---|---|
+| decode ms/token | **2844** (fence 2812.8) | **260** (fence 240.4) | **10.9×** |
+| prefill (12 tok) | 23.5 s | 20.9 s | explicit-dequant path, ≈parity |
+| load (IDB-warm) | 59 s | 70 s | inline quantize +11 s once; packed form then cached |
+| 80-token output | coherent | coherent | sampled T=0.7, both fluent English |
+
+Residency (by construction — exact buffer sizes): projections 4.05 GB f16 →
+2.09 GB packed+scales (**1.94×, −1.96 GB resident**); the tied f16
+embedding/lm_head (1.18 GB) stays unquantized per scope. Per-token weight
+traffic 5.23 → 3.27 GB.
+
+**Honest attribution:** the pure bandwidth math predicted only 1.60× (the
+unquantized tied lm_head read caps it below 2×) — the measured 10.9× means the
+f16 decode was NOT at the bandwidth roof (5.23 GB / 2.84 s ≈ 1.8 GB/s effective
+on ~100 GB/s-class unified memory; the "bandwidth-bound" premise held only
+relatively). The browser f16 M=1 projections were running an inefficient kernel
+path, while the packed-operand route forces the dedicated GEMV NT kernel for
+every decode projection AND halves its bytes (int8 ≈ 13.6 GB/s effective — the
+remaining 240 ms plausibly dominated by the still-f16 lm_head sweep). The win is
+real and reproducible; its mechanism is kernel-route + bytes, not bytes alone.

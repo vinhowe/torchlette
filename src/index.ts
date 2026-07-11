@@ -43,6 +43,19 @@ export {
   webgpuDeviceRequirements,
 } from "./backend/webgpu";
 export { attnModifierKey } from "./backend/webgpu/attention-kernel";
+// Weight-only quantization (docs/quantization-design.md): the operand-format
+// axis + host quantizer. api.createQuantizedWeight is on the Torchlette class.
+export {
+  dequantizeToF32,
+  type QuantizedWeight,
+  quantizeLinearWeight,
+} from "./backend/quantize";
+export {
+  type QuantPacking,
+  resolveWeightFormat,
+  type StorageFormat,
+  type WeightFormatName,
+} from "./backend/types";
 export { STEP_TAPE_RECORD, STEP_TAPE_REPLAY, stStats } from "./core/step-tape";
 // Step-tape observability (§6): guard-miss/hit counters for apps.
 export { stReplayStats } from "./executor/step-tape-replay";

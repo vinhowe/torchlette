@@ -10,7 +10,12 @@ import {
   profiledCreateBindGroup,
   releaseParamsBuffer,
 } from "../bind-group-cache";
+import { resolveOutputBuffer } from "../buffer-arena";
 import { dispatchComputePass, dispatchMatmul, getPipeline } from "../dispatch";
+import {
+  dispatchDequantizeInt8Grouped,
+  dispatchQuantizedGemvNT,
+} from "../matmul/dispatch";
 import { requireContext } from "../gpu-context";
 import type { GPUBuffer, GPUBufferBinding, WebGPUTensor } from "../gpu-types";
 import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
@@ -41,6 +46,16 @@ export function matmul(
   const ctx = requireContext();
   const a = asGPUTensor(_a);
   const b = asGPUTensor(_b);
+
+  // --- Storage-format (quantization) seam (docs/quantization-design.md phase 2).
+  // A packed-int weight operand carries `b.format.packing` + a `b.scales`
+  // companion. This is the SOLE reader of the packing above nothing — the
+  // capability predicate lives here, keyed on the operand format (selection as
+  // data). `api.linear` transposed the [N,K] weight to [K,N] (b.shape), whose
+  // view propagated the format; recover N=b.shape[-1], K=b.shape[-2].
+  if (b.format?.packing) {
+    return matmulQuantizedB(a, b, options?.outBuffer);
+  }
 
   const limits = ctx.device.limits;
   const maxBindingSize =
@@ -80,6 +95,89 @@ export function matmul(
 
   // Fast path: existing implementation
   return dispatchMatmul(a, b, false, false, options?.outBuffer);
+}
+
+/**
+ * Matmul with a packed-int (quantized) B operand.
+ *
+ * B is the transposed [K, N] view of a packed weight (logical [N, K], buffer
+ * u32 [N, K/4]); `b.format.packing` describes the packing and `b.scales` is the
+ * f16-per-group scales companion (u32-packed). A is [..., M, K].
+ *
+ * - M === 1 (decode): fused-dequant GEMV NT — no f32 weight ever materialized
+ *   (the residency + bandwidth win, the whole point).
+ * - M > 1 (prefill): EXPLICIT dequant to f32 [N, K], then the stock matmul.
+ *   Declared, never a silent dequantize-materialize (phase-2 ruling).
+ */
+function matmulQuantizedB(
+  a: WebGPUTensor,
+  b: WebGPUTensor,
+  outBuffer?: GPUBuffer,
+): WebGPUTensor {
+  const ctx = requireContext();
+  const packing = b.format?.packing;
+  const scales = b.scales as WebGPUTensor | undefined;
+  if (!packing || !scales) {
+    throw new Error("matmulQuantizedB: missing packing/scales on B operand");
+  }
+  if (packing.scheme !== "int8-grouped") {
+    throw new Error(`matmulQuantizedB: unsupported scheme ${packing.scheme}`);
+  }
+  // B is [K, N] (transposed view of the [N, K] logical weight).
+  const bShape = b.shape;
+  const K = bShape[bShape.length - 2];
+  const N = bShape[bShape.length - 1];
+  const aShape = a.shape;
+  const M = aShape[aShape.length - 2];
+  const batch = sizeOf(aShape.slice(0, -2)) || 1;
+
+  if (M === 1 && batch === 1) {
+    // Decode: fused-dequant GEMV NT. A is [1, K] (contiguous).
+    const aContig = ensureContiguous(a);
+    const outShape = [...aShape.slice(0, -2), 1, N];
+    const outSize = sizeOf(outShape);
+    // Route through resolveOutputBuffer (arena/pool/recorder-aware) — a raw
+    // createTrackedBuffer is rejected during compiled-plan recording.
+    const out = resolveOutputBuffer(
+      ctx.device,
+      outSize * F32_BYTES,
+      [aContig.buffer, b.buffer, scales.buffer],
+      outBuffer,
+    );
+    dispatchQuantizedGemvNT(
+      ctx.device,
+      aContig.buffer,
+      b.buffer,
+      scales.buffer,
+      out,
+      N,
+      K,
+      packing.groupSize,
+      "f32",
+    );
+    if (aContig !== a) aContig.destroy?.();
+    return createTensor(outShape, out, undefined, 0, "f32", out !== outBuffer);
+  }
+
+  // Prefill (M > 1): explicit dequant to f32 [N, K], then stock matmul.
+  const deqBuffer = resolveOutputBuffer(ctx.device, N * K * F32_BYTES, [
+    b.buffer,
+    scales.buffer,
+  ]);
+  dispatchDequantizeInt8Grouped(
+    ctx.device,
+    b.buffer,
+    scales.buffer,
+    deqBuffer,
+    N,
+    K,
+    packing.groupSize,
+  );
+  // The dequantized weight is logical [N, K]; the matmul wants B = [K, N], so
+  // pass it transposed (transB=true, same NT semantics the packed path uses).
+  // Non-owning wrapper — the deq buffer is arena/pool-managed (resolveOutputBuffer).
+  const deqWeight = createTensor([N, K], deqBuffer, undefined, 0, "f32", false);
+  return dispatchMatmul(a, deqWeight, false, true, outBuffer);
 }
 
 /**

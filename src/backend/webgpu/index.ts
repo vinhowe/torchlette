@@ -59,7 +59,9 @@ export {
 export type { WebGPUTensor } from "./gpu-types";
 // Re-export autotune control functions
 export {
+  dispatchDequantizeInt8Grouped,
   dispatchQuantizedGemvNT,
+  getDequantI8DispatchCount,
   getQuantGemvDispatchCount,
   isAutotuneEnabled,
   setAutotuneEnabled,

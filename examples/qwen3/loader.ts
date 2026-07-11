@@ -9,9 +9,15 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Torchlette } from "../../src/frontend/torchlette";
+import { quantizeLinearWeight } from "../../src/backend/quantize";
+import {
+  resolveWeightFormat,
+  type WeightFormatName,
+} from "../../src/backend/types";
+import type { Tensor, Torchlette } from "../../src/frontend/torchlette";
+import type { Linear } from "../../src/nn/linear";
 import { resolveDest } from "../../packages/qwen3-browser/src/weights-map";
-import { configFromHF, Qwen3, type Qwen3Config } from "./model";
+import { configFromHF, Qwen3, type Qwen3Block, type Qwen3Config } from "./model";
 
 type SafetensorsMetadata = {
   [key: string]: {
@@ -124,6 +130,36 @@ function resolveDest(model: Qwen3, hfName: string): Tensor | null {
   }
 }
 
+/**
+ * The Linear projection module owning a given HF weight name, or null if the
+ * weight is not a quantizable projection (norms/embedding stay unquantized —
+ * see docs/quantization-design.md scope). Used by the weightFormat load path to
+ * REPLACE a projection's f16 weight with a packed-int operand.
+ */
+function resolveProjModule(model: Qwen3, hfName: string): Linear | null {
+  const m = hfName.match(/^model\.layers\.(\d+)\.(.+)$/);
+  if (!m) return null;
+  const block = model.layers.get(Number(m[1])) as Qwen3Block;
+  switch (m[2]) {
+    case "self_attn.q_proj.weight":
+      return block.attn.qProj;
+    case "self_attn.k_proj.weight":
+      return block.attn.kProj;
+    case "self_attn.v_proj.weight":
+      return block.attn.vProj;
+    case "self_attn.o_proj.weight":
+      return block.attn.oProj;
+    case "mlp.gate_proj.weight":
+      return block.mlp.gateProj;
+    case "mlp.up_proj.weight":
+      return block.mlp.upProj;
+    case "mlp.down_proj.weight":
+      return block.mlp.downProj;
+    default:
+      return null;
+  }
+}
+
 // ============================================================================
 // Model loading
 // ============================================================================
@@ -131,11 +167,20 @@ function resolveDest(model: Qwen3, hfName: string): Tensor | null {
 /**
  * Load a pretrained Qwen3 model from a HF snapshot directory
  * (config.json + model*.safetensors [+ index for sharded repos]).
+ *
+ * `weightFormat` (e.g. "int8-64") quantizes the per-layer PROJECTION weights
+ * (q/k/v/o/gate/up/down) to a packed-int operand at load — nothing downstream
+ * mentions quant (docs/quantization-design.md phase 2). Norms + embedding +
+ * tied lm_head stay f16 (the gather needs the table; scope excludes them).
  */
 export async function loadPretrainedQwen3(
   api: Torchlette,
   modelDir: string,
-  options?: { maxSeqLen?: number; weightDtype?: "f32" | "f16" },
+  options?: {
+    maxSeqLen?: number;
+    weightDtype?: "f32" | "f16";
+    weightFormat?: WeightFormatName;
+  },
 ): Promise<Qwen3> {
   const hfConfig = JSON.parse(
     await fs.promises.readFile(path.join(modelDir, "config.json"), "utf-8"),
@@ -179,6 +224,33 @@ export async function loadPretrainedQwen3(
           throw new Error(
             `Shape mismatch for ${name}: model ${JSON.stringify(dest.shape)} vs file ${JSON.stringify(info.shape)}`,
           );
+        }
+        // weightFormat: quantize projection weights at load and REPLACE the
+        // module's f16 parameter with a packed-int operand. The forward's
+        // api.linear is unchanged (format-blind) — the backend matmul routes.
+        const projModule = options?.weightFormat
+          ? resolveProjModule(model, name)
+          : null;
+        if (projModule && options?.weightFormat) {
+          const [N, K] = info.shape;
+          if (K % 4 === 0) {
+            const format = resolveWeightFormat(options.weightFormat, "f16");
+            const groupSize = format.packing!.groupSize;
+            if (K % groupSize === 0) {
+              const q = quantizeLinearWeight(data, N, K, groupSize);
+              const qWeight = await api.createQuantizedWeight(
+                q.packed,
+                q.scales,
+                N,
+                K,
+                format,
+              );
+              projModule.registerParameter("weight", qWeight as unknown as Tensor);
+              loaded++;
+              await api.markStep();
+              continue;
+            }
+          }
         }
         // Match the destination's dtype (linears/embeddings may be f16 while
         // norm weights stay f32).
