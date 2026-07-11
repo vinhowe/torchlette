@@ -24,6 +24,7 @@ mutable, distributed state:
 | #86 mech 1 | `_wrapperGen` stamped at the WRONG MOMENT (materialize, not birth) |
 | #86 mech 2 / #74 mech 1 | the single WeakRef owner SLOT stolen by clones/sidecars |
 | #74 `persist()` no-op | persistence recorded into a set that wasn't listening between steps |
+| #73 flip finding (2026-07-11) | parallel-run flake: a concurrent test perturbs the SHARED generation counter → a stepAsync param mis-filtered from the persistent snapshot → FP throw (gpt2-memorization; opted out for soak). Stored classification is fragile even to TEST INTERLEAVING. |
 
 Each fix added an invariant DEFENDING the stored state: birth-time stamping, two
 steal-refusal carve-outs (`_graphRetained`, `_sidecarShare`), a second persistence
