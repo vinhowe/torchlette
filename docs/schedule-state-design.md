@@ -81,10 +81,15 @@ i.e. the islands merge seen from inside). Properties:
   affected region, staging well-formedness) is backend-neutral and lives with the object.
   Whether a *realizer* can honor the resulting state is a capability-profile question (§4).
   v1 code must never check WGSL facts inside core legality.
-- **Lemmas are not moves.** Algebraic rewrites that change the computation while preserving
-  the function (online-softmax rescaling — the flashattention-critical step) live in a
-  separate **admitted-lemma library**. v1 ADMITS lemmas (hand-verified, library entries with
-  their own differential gates); it does not derive them. The library starts with one entry.
+- **Lemmas are not moves.** Moves rearrange WHEN/WHERE the same arithmetic happens; their
+  legality is structural. Some targets are unreachable by rearrangement: flashattention
+  requires the online-softmax identity (accumulate softmax·V block-by-block, RESCALING the
+  partial output by exp(m_old−m_new) whenever the running max rises) — an algebraic fact
+  about exp that computes different intermediates for the same function. Such rewrites live
+  in a separate **admitted-lemma library**: hand-proven entries with their own differential
+  gates, applicable by the editor where their pattern matches. v1 ADMITS lemmas; it does
+  not derive them (deriving = a theorem prover, out of scope). The library starts with the
+  one entry the P2 acceptance needs.
 
 ## 4. Realizer registry
 
@@ -126,10 +131,14 @@ schedule state**, not referenced by it. Existing structural generators die as th
 are absorbed. Deletion targets (named per house policy): the matmul structural-variant
 axis (K-split/chunk shape enumeration — selection stays, structure derives), reduction/
 row-program skeleton construction, elementwise loop scaffolding.
-**Authored escape hatch:** kernels that resist algorithm/schedule factoring (attention
-backward's register×shared vec4 dot, fused Adam, scatter's CAS loop) remain **authored**
-(the islands `authored` kind extended down): opaque ScheduleStates with decorations but no
-macro moves. Using it for those three is expected, not a failure.
+**Authored escape hatch:** a few hand-crafted kernels resist the algorithm/schedule
+factoring — forcing them in would mean growing the grammar toward a general scheduling
+language (fenced against) or accepting a slower reconstruction. These remain **authored**
+(the islands `authored` kind extended down): opaque ScheduleStates whose DECORATIONS are
+tunable but whose internals take no macro moves. Expected members: attention backward
+(register×shared vec4 dot), fused Adam, scatter's CAS loop. Using the hatch for those
+three is planned, not a failure; without it the migration is all-or-nothing and stalls on
+its three hardest kernels.
 
 ## 7. Phases (each independently shippable, stage-4 style)
 

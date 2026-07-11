@@ -34,8 +34,11 @@ not either pole's UI.
 - **Canonical hierarchical dataflow graph.** One graph; modules are hierarchy, not a
   separate representation. The three shipped model implementations (GPT-2, Qwen3,
   Gemma-2) become **generator definitions**; checkpoints BIND to generators
-  (safetensors ingest ≈ free — the staged-adapter decision). Arbitrary-source ingest is
-  REFUSED in v1, in writing, here.
+  (safetensors ingest ≈ free — the staged-adapter decision). Arbitrary-source ingest —
+  reconstructing an UNKNOWN architecture by inference from weight names/shapes — is
+  REFUSED in v1, in writing, here: that inference is heuristic and fails SILENTLY (wrong
+  weights bound to wrong nodes, the worst failure class). A new model family is supported
+  by writing its generator (~a day), never by inference.
 - **Generator vs instance with declared overrides.** Editing attention in the generator
   updates every instance; a per-index override (layer 13 differs) is a declared exception —
   the Figma component/override model. Speedrun bin 1 needs BOTH (activation swap =
@@ -43,7 +46,10 @@ not either pole's UI.
 - **ONE predicate language** for override selection, shared verbatim with optimizer
   param-groups and (later) structural schedules: "even layers", "2D params", "layers 3..7".
   Three consumers, one grammar — a second predicate syntax anywhere is a review-blocking
-  defect.
+  defect. (Why stated as a rule: nobody DECIDES to diverge — it happens by drift, one
+  convenient shortcut at a time, until "even layers" exists in three dialects and an edit
+  script can't be reused as a param-group spec. Drift is only stopped by a rule someone
+  can point at.)
 - **Stable UIDs + provenance ledger.** Path-keys break under structural edits → silent
   wrong-weights (the worst failure class). Every node carries a UID; every edit appends a
   ledger entry. The ledger triple-pays: undo/redo, lineage ("derived from X via edits" —
@@ -76,10 +82,15 @@ The feedback loop IS the product thesis: touch the model → watch behavior and 
 shift → unintuitive insight.
 
 **Edit-apply mechanism:** edits apply at generation boundaries via the tape's
-invalidate→re-record path — a graph edit changes the plan fingerprint, the next
-generation re-records. No execChain surgery required for v1 (the never-landed prototype
-stays dead); weight carry-over across the edit follows §3's table. Structural-edit
-latency budget = one re-record (~seconds), stated in the UI, not hidden.
+invalidate→re-record path — a graph edit changes the plan fingerprint, EVERY cache misses
+naturally, and the next generation records fresh (exactly like a first run). The rejected
+alternative ("execChain surgery", prototyped once, never landed): mutate the live
+executor's structures in place for instant mid-generation effect — which requires hand-
+patching every cache coherently (tape, compiled plans, buffer plans, fingerprints), i.e.
+re-opening the frozen-stale-state disease surface. The tradeoff is edit latency vs cache-
+coherence machinery; v1 buys ~seconds of re-record per structural edit (stated in the UI,
+not hidden) and gets staleness-impossible-by-construction. Weight carry-over across the
+edit follows §3's table.
 
 ## 5. v1 fence
 
