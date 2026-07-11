@@ -109,9 +109,18 @@ export const fuseMatmulSumRule: Rule = {
 
     // Remove the orphaned upstream chain. Pending tensors on the old
     // matmul/transpose were autograd saved-for-backward artifacts; by
-    // the time backward is computing, they're no longer needed.
-    ctx.markDead(refNode(bindings.get("mm")!)!);
-    ctx.markDead(refNode(bindings.get("tx")!)!);
+    // the time backward is computing, they're no longer needed. Guard against
+    // a SHARED / externally-held mm or tx (a user-shaped graph could reuse
+    // either) — killing a node with other live readers or an external
+    // RuntimeTensor produces "Input not ready" (the #67 class).
+    const mmNode = refNode(bindings.get("mm")!)!;
+    const txNode = refNode(bindings.get("tx")!)!;
+    if (ctx.consumerCount(mmNode) <= 1 && !ctx.isExternal(mmNode)) {
+      ctx.markDead(mmNode);
+    }
+    if (ctx.consumerCount(txNode) <= 1 && !ctx.isExternal(txNode)) {
+      ctx.markDead(txNode);
+    }
 
     // Mutate the matched sum node into a matmul in place. Preserves the
     // node id so RuntimeTensors pending on it (gradient outputs) keep
@@ -146,15 +155,12 @@ function isLeadingBatchSum(node: LazyIRNode): boolean {
 }
 
 function isLastTwoDimTranspose(node: LazyIRNode): boolean {
-  const payload = node.payload as
-    | { dim0?: number; dim1?: number }
-    | undefined;
+  const payload = node.payload as { dim0?: number; dim1?: number } | undefined;
   if (!payload || payload.dim0 == null || payload.dim1 == null) return false;
   const rank = node.shape.length;
   const d0 = payload.dim0 < 0 ? rank + payload.dim0 : payload.dim0;
   const d1 = payload.dim1 < 0 ? rank + payload.dim1 : payload.dim1;
   return (
-    (d0 === rank - 2 && d1 === rank - 1) ||
-    (d0 === rank - 1 && d1 === rank - 2)
+    (d0 === rank - 2 && d1 === rank - 1) || (d0 === rank - 1 && d1 === rank - 2)
   );
 }

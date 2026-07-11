@@ -204,3 +204,68 @@ describe("double-transpose / chaining", () => {
     expect(final.inputs[0]).toBe(X);
   });
 });
+
+// ============================================================================
+// Shared / external inner (task #67): the outer transpose is still removed,
+// but the INNER transpose MUST survive when it has other live consumers or an
+// external RuntimeTensor. Killing it made those readers hit "Input not ready:
+// transpose". This is the rule-level regression gate for the fix.
+// ============================================================================
+
+describe("double-transpose / keeps a shared or external inner alive", () => {
+  it("removes outer but NOT an inner with a second live consumer", () => {
+    // inner is consumed by BOTH the outer transpose AND another op (relu).
+    const X = matRef(1, [4, 8]);
+    const inner = transposeNode(X, [4, 8], 0, 1); // [8, 4]
+    const outer = transposeNode(pendingRef(inner), [8, 4], 0, 1); // [4, 8]
+    const otherConsumer = createLazyIRNode(
+      "relu",
+      [pendingRef(inner)], // second consumer of the SAME inner
+      [8, 4],
+      "f32",
+      "cpu",
+    );
+    const finalOuter = createLazyIRNode(
+      "relu",
+      [pendingRef(outer)],
+      [4, 8],
+      "f32",
+      "cpu",
+    );
+    const plan = [inner, outer, otherConsumer, finalOuter];
+    const maps = buildMaps(plan);
+
+    const killed = new Set<LazyIRNode>();
+    const stats = applyRules(plan, [doubleTransposeRule], maps, { killed });
+    expect(stats.applied).toBe(1); // outer collapsed
+    expect(finalOuter.inputs[0]).toBe(X); // consumer rewired to X
+    expect(killed.has(inner)).toBe(false); // inner NOT killed — still shared
+  });
+
+  it("removes outer but NOT an inner that is externally referenced", () => {
+    // inner has a single in-plan consumer (outer), but a live RuntimeTensor
+    // holds it (externalNodeIds) — e.g. a forward view saved for backward.
+    const X = matRef(1, [4, 8]);
+    const inner = transposeNode(X, [4, 8], 0, 1); // [8, 4]
+    const outer = transposeNode(pendingRef(inner), [8, 4], 0, 1); // [4, 8]
+    const finalOuter = createLazyIRNode(
+      "relu",
+      [pendingRef(outer)],
+      [4, 8],
+      "f32",
+      "cpu",
+    );
+    const plan = [inner, outer, finalOuter];
+    const maps = buildMaps(plan);
+
+    const killed = new Set<LazyIRNode>();
+    const externalNodeIds = new Set<number>([inner.id]);
+    const stats = applyRules(plan, [doubleTransposeRule], maps, {
+      killed,
+      externalNodeIds,
+    });
+    expect(stats.applied).toBe(1);
+    expect(finalOuter.inputs[0]).toBe(X);
+    expect(killed.has(inner)).toBe(false); // inner NOT killed — external
+  });
+});
