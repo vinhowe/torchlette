@@ -416,3 +416,29 @@ this wave via a `weightFormat` config/URL flag in the SAE demo (not a
   generation runs on the Mac demo.
 - No regression: `test:gates` 6/6, matmul tiled/epilogue/batched 24/24,
   matmul-view/offset-views 68/68, distilgpt2-finetune 1/1.
+
+**THE Mac measurement (2026-07-11, user's 16GB Mac, Chrome driven via CDP,
+gemma2-sae-demo served FROM THIS BRANCH on :5179; same prompt, same 🌉 Golden Gate
+preset steer, 12+80 tokens, steered=yes both runs, step-tape 76h/80 both):**
+
+| | f16 | int8-64 | Δ |
+|---|---|---|---|
+| decode ms/token | **2844** (fence 2812.8) | **260** (fence 240.4) | **10.9×** |
+| prefill (12 tok) | 23.5 s | 20.9 s | explicit-dequant path, ≈parity |
+| load (IDB-warm) | 59 s | 70 s | inline quantize +11 s once; packed form then cached |
+| 80-token output | coherent | coherent | sampled T=0.7, both fluent English |
+
+Residency (by construction — exact buffer sizes): projections 4.05 GB f16 →
+2.09 GB packed+scales (**1.94×, −1.96 GB resident**); the tied f16
+embedding/lm_head (1.18 GB) stays unquantized per scope. Per-token weight
+traffic 5.23 → 3.27 GB.
+
+**Honest attribution:** the pure bandwidth math predicted only 1.60× (the
+unquantized tied lm_head read caps it below 2×) — the measured 10.9× means the
+f16 decode was NOT at the bandwidth roof (5.23 GB / 2.84 s ≈ 1.8 GB/s effective
+on ~100 GB/s-class unified memory; the "bandwidth-bound" premise held only
+relatively). The browser f16 M=1 projections were running an inefficient kernel
+path, while the packed-operand route forces the dedicated GEMV NT kernel for
+every decode projection AND halves its bytes (int8 ≈ 13.6 GB/s effective — the
+remaining 240 ms plausibly dominated by the still-f16 lm_head sweep). The win is
+real and reproducible; its mechanism is kernel-route + bytes, not bytes alone.
