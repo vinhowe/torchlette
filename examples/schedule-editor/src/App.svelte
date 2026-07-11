@@ -4,6 +4,11 @@
   import AppBar from "./lib/components/primitives/AppBar.svelte";
   import ThemeProvider from "./lib/components/theme/ThemeProvider.svelte";
   import ThemeToggle from "./lib/components/theme/ThemeToggle.svelte";
+  import Workbench from "./lib/components/workbench/Workbench.svelte";
+  import {
+    calculateStaticCost,
+    scheduleStateHash,
+  } from "./lib/cost-model";
   import {
     applyMove,
     boundaryKeys,
@@ -13,6 +18,14 @@
     makeSplit,
     mergeLegality,
   } from "./lib/partition";
+  import {
+    cloneScheduleState,
+    FALLBACK_DEVICE,
+    readDeviceModel,
+    type DeviceModel,
+    type ScheduleHistoryPoint,
+    type ScheduleState,
+  } from "./lib/schedule-state";
   import type { HistoryEntry, Partition, PartitionMove, PlanNode, ScheduleDump } from "./lib/types";
 
   let dump = $state<ScheduleDump | null>(null);
@@ -27,6 +40,13 @@
   let zoom = $state(10);
   let notice = $state("Ready.");
   let loadError = $state("");
+  let matmulTemplate = $state<ScheduleState | null>(null);
+  let attentionTemplate = $state<ScheduleState | null>(null);
+  let scheduleHistory = $state<ScheduleHistoryPoint[]>([]);
+  let scheduleHistoryCursor = $state(-1);
+  let scheduleHistoryId = 0;
+  let deviceModel = $state<DeviceModel>({ ...FALLBACK_DEVICE });
+  let scheduleBindingNote = $state("");
 
   const nodesByPos = $derived(new Map((dump?.nodes ?? []).map((node) => [node.pos, node])));
   const selectedNode = $derived(selectedNodePos === null ? null : nodesByPos.get(selectedNodePos) ?? null);
@@ -51,12 +71,39 @@
       : null,
   );
   const exportText = $derived(exportObject ? JSON.stringify(exportObject, null, 2) : "");
+  const currentSchedule = $derived(
+    scheduleHistoryCursor >= 0
+      ? scheduleHistory[scheduleHistoryCursor]?.state ?? null
+      : null,
+  );
+  const currentScheduleCost = $derived(
+    currentSchedule ? calculateStaticCost(currentSchedule, deviceModel) : null,
+  );
+  const structuralCosts = $derived(
+    undoStack.flatMap((entry, index) =>
+      entry.staticCost
+        ? [{ label: `${index + 1}. partition ${entry.forward.op}`, cost: entry.staticCost.predictedMs }]
+        : [],
+    ),
+  );
 
   onMount(async () => {
     try {
-      const response = await fetch("/data/gpt2-tiny-forward.json");
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-      dump = (await response.json()) as ScheduleDump;
+      const [dumpResponse, matmulResponse, attentionResponse, detectedDevice] =
+        await Promise.all([
+          fetch("/data/gpt2-tiny-forward.json"),
+          fetch("/data/schedule-states/tiled-matmul.json"),
+          fetch("/data/schedule-states/authored-attention-forward.json"),
+          readDeviceModel(),
+        ]);
+      for (const response of [dumpResponse, matmulResponse, attentionResponse]) {
+        if (!response.ok)
+          throw new Error(`${response.url}: ${response.status} ${response.statusText}`);
+      }
+      dump = (await dumpResponse.json()) as ScheduleDump;
+      matmulTemplate = (await matmulResponse.json()) as ScheduleState;
+      attentionTemplate = (await attentionResponse.json()) as ScheduleState;
+      deviceModel = detectedDevice;
       basePartition = clonePartition(dump.partition);
       current = clonePartition(dump.partition);
       selectedNodePos = dump.nodes[0]?.pos ?? null;
@@ -98,6 +145,34 @@
     }
     const member = current?.islands[index]?.members[0];
     if (member !== undefined) selectedNodePos = member;
+    openSchedule(index);
+  }
+
+  function openSchedule(index: number): void {
+    const island = current?.islands[index];
+    if (!island || !matmulTemplate || !attentionTemplate) return;
+    const attentionRegion = island.members.some(
+      (member) =>
+        (member >= 82 && member <= 107) ||
+        (member >= 166 && member <= 189),
+    );
+    const template = attentionRegion ? attentionTemplate : matmulTemplate;
+    const state = cloneScheduleState(template);
+    const cost = calculateStaticCost(state, deviceModel);
+    scheduleHistoryId += 1;
+    scheduleHistory = [
+      {
+        id: scheduleHistoryId,
+        label: "opened island state",
+        state,
+        stateHash: scheduleStateHash(state),
+        cost,
+      },
+    ];
+    scheduleHistoryCursor = 0;
+    scheduleBindingNote = attentionRegion
+      ? `Island ${index} lies in the decomposed attention region; showing the authored fused-forward target state.`
+      : `Island ${index} opens the tiled-matmul consumer fixture for the intra-island proposal.`;
   }
 
   function chooseCut(island: number, cut: number): void {
@@ -110,8 +185,19 @@
 
   function commit(entry: HistoryEntry): void {
     if (!current) return;
-    current = applyMove(current, entry.forward);
-    undoStack = [...undoStack, entry];
+    const annotated: HistoryEntry = currentScheduleCost && currentSchedule
+      ? {
+          ...entry,
+          staticCost: {
+            stateHash: scheduleStateHash(currentSchedule),
+            predictedMs: currentScheduleCost.predictedMs,
+            arithmeticIntensity: currentScheduleCost.arithmeticIntensity,
+            rooflineBound: currentScheduleCost.rooflineBound,
+          },
+        }
+      : entry;
+    current = applyMove(current, annotated.forward);
+    undoStack = [...undoStack, annotated];
     redoStack = [];
     moves = [...moves, entry.forward];
     selectedIslands = [];
@@ -169,6 +255,49 @@
     selectedIslands = [];
     selectedCut = null;
     notice = "Restored the detector-derived partition.";
+  }
+
+  function editSchedule(
+    label: string,
+    edit: (state: ScheduleState) => void,
+  ): void {
+    if (!currentSchedule) return;
+    const next = cloneScheduleState(currentSchedule);
+    edit(next);
+    const cost = calculateStaticCost(next, deviceModel);
+    scheduleHistoryId += 1;
+    scheduleHistory = [
+      ...scheduleHistory.slice(0, scheduleHistoryCursor + 1),
+      {
+        id: scheduleHistoryId,
+        label,
+        state: next,
+        stateHash: scheduleStateHash(next),
+        cost,
+      },
+    ];
+    scheduleHistoryCursor = scheduleHistory.length - 1;
+    notice = `Decoration edit recorded: ${label}.`;
+  }
+
+  function undoSchedule(): void {
+    if (scheduleHistoryCursor <= 0) return;
+    scheduleHistoryCursor -= 1;
+    notice = "Schedule decoration undo restored a prior state object.";
+  }
+
+  function redoSchedule(): void {
+    if (scheduleHistoryCursor >= scheduleHistory.length - 1) return;
+    scheduleHistoryCursor += 1;
+    notice = "Schedule decoration redo restored the next state object.";
+  }
+
+  function updateDevice(next: DeviceModel): void {
+    deviceModel = next;
+    scheduleHistory = scheduleHistory.map((point) => ({
+      ...point,
+      cost: calculateStaticCost(point.state, next),
+    }));
   }
 
   async function copyExport(): Promise<void> {
@@ -294,9 +423,30 @@
               </div>
             </div>
             <p class="type-fine text-muted-foreground">
-              Width is proportional to member count. Scroll horizontally or change zoom; block detail collapses below 12 px/member.
+              Width is proportional to member count. Scroll horizontally or change zoom; click an island to open its intra-island ScheduleState.
             </p>
           </section>
+
+          {#if currentSchedule && currentScheduleCost}
+            <Workbench
+              state={currentSchedule}
+              cost={currentScheduleCost}
+              device={deviceModel}
+              history={scheduleHistory}
+              historyCursor={scheduleHistoryCursor}
+              {structuralCosts}
+              bindingNote={scheduleBindingNote}
+              onEdit={editSchedule}
+              onUndo={undoSchedule}
+              onRedo={redoSchedule}
+              onDeviceChange={updateDevice}
+            />
+          {:else}
+            <section class="stack-field border-b border-border pad-box">
+              <h2 class="type-title">Intra-island workbench</h2>
+              <p class="prose text-muted-foreground">Select an island in the lane to zoom into its skeleton, decorations, and performance model.</p>
+            </section>
+          {/if}
 
           <section class="stack-field pad-box">
             <div class="flex items-center justify-between gap-2">
