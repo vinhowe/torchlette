@@ -241,19 +241,27 @@ describe(
     test("overfits on a single sequence", async () => {
       if (!webgpuAvailable) return;
 
-      // FINDING (task #73 flip): this loop uses the older `optimizer.stepAsync()`
-      // + `loss.dispose()` + implied-boundary path. In ISOLATION it is clean under
-      // the strict default (the #86 birth-time wrapper-gen stamp classifies the
-      // [64,128] embed param as persistent, so it is never reaped). But under the
-      // FULL parallel cpu-project run it FLAKES: a concurrently-interleaved test
-      // perturbs the shared generation counter, occasionally mis-filtering the
-      // param out of the persistent snapshot → releaseStepTemps reaps its live
-      // storage → a [lifetime] reclaimed-read throw. The read is a proven FALSE
-      // POSITIVE (converges to loss 0.0000 under warn-mode). The FP-elimination
-      // arc (#74/#86/#90) validated the `optimizer.step()`+markStep loop, not this
-      // stepAsync path. Opt this one path out of the throw for the soak window.
-      // Remove once the shared-generation-counter interleaving is made robust
-      // (the real fix lives in storage-tracker snapshot filtering, not here).
+      // FINDING (task #73 flip; re-confirmed under #70 D2). This loop uses the
+      // older `optimizer.stepAsync()` + `loss.dispose()` + implied-boundary
+      // (queueStepBoundary) path. Under the FULL parallel cpu-project run it
+      // FLAKES: a concurrently-interleaved test's bumps to the SHARED module-
+      // global epoch counter (src/core/epoch.ts) shift the committed boundary
+      // gen by ±1, so a fresh forward activation destined for THIS step's
+      // optimizer (stamp = maxGen−1, a LIVE owner, not yet in the snapshot) is
+      // mis-classified step-scoped and reaped by releaseStepTemps → a [lifetime]
+      // reclaimed-read throw when the optimizer force reads it. Proven a FALSE
+      // POSITIVE (converges to loss 0.0000 under warn-mode).
+      //
+      // #70 D2 NOTE — this is NOT an ownership-classification FP, so the derived
+      // owner model does NOT make it unconstructible (§D1-log #3's premise was
+      // wrong about the reaped tensor: it is a gen-boundary-straddling TRANSIENT
+      // activation with a live owner, not a REG'd param — owners=1, durable=false
+      // at demotion time). Both the stored and the derived model classify it
+      // identically (a live owner, not persistent → step-scoped). The real fix is
+      // in the runahead gen-scoping / the module-global epoch counter's
+      // cross-test perturbability, not the owner model — tracked as follow-on
+      // (see docs/ownership-derivation-design.md §D2 log). The opt-out stays for
+      // the soak window until that fix lands.
       const prevStrict = process.env.TORCHLETTE_STRICT_LIFETIME;
       process.env.TORCHLETTE_STRICT_LIFETIME = "0";
       try {

@@ -203,18 +203,6 @@ export function getInputStorage(
         console.warn(msg);
       }
     }
-    // D1 SHADOW: compare the stored reclaimed verdict with the derived model's
-    // W(s)-emptiness at this read seam (behavior-neutral; the stored side still
-    // drives the throw below). Skip during a declared tape replay — the whole
-    // step dataflow is declared reachable there, so a destroyed recording-era id
-    // is expected and not a divergence.
-    if (!declaredReplay) {
-      storageTracker.shadowCompareGuard(
-        ref.storage.id,
-        storageTracker.isDestroyed(ref.storage.id) &&
-          !viewAliasesLiveBase(ref.storage),
-      );
-    }
     if (
       storageTracker.isDestroyed(ref.storage.id) &&
       !declaredReplay &&

@@ -1,6 +1,6 @@
 # Ownership Derivation: liveness classification as a derived fact
 
-**Status:** RATIFIED (Vin, 2026-07-11) — D0 complete; §8 ruled WRAPPERS. D1 in flight. · Task #70
+**Status:** RATIFIED (Vin, 2026-07-11) — D0 complete; §8 ruled WRAPPERS. D1 complete. D2 complete (flip landed; stored slot + defenses + shadow plumbing DELETED; row-8 opt-out RETAINED — §D1-log #3 corrected, its FP is runahead gen-scoping, not ownership). · Task #70
 **Prereq:** #73 strict-lifetime default (in flight) — the tripwire net this campaign works under.
 
 ## 0. Declaration (one sentence)
@@ -299,3 +299,94 @@ redundant with `_derived` / the owner SET):
 The shadow counters (`shadowDivergenceCount` / `shadowAdjudicatedCount`) and the D1
 comparison plumbing (`_shadowCompareSurvival`, `shadowCompareGuard`) are themselves D2
 deletions once derived is authoritative — the differential has served its purpose.
+
+## §D2 log — the FLIP: derived authoritative, stored model + defenses DELETED (task #70)
+
+D2 made the derived owner-SET classifier the AUTHORITATIVE liveness verdict and deleted
+the stored single owner SLOT (`tensorWeakRefs`) with all its defenses and the D1 shadow
+plumbing. Net-negative src SLOC (the campaign's payoff phase). No public API change; no
+new env flags. Implementation all in `src/graph/storage-tracker.ts`, plus the guard call
+site (`src/executor/op-dispatch.ts`), the sharer-flag docs (`src/runtime/tensor.ts`), and
+the gpt2-memorization opt-out (`test/gpt2-memorization.spec.ts`).
+
+**Deletions (handoff order):**
+
+1. **The single owner SLOT as classifier input** — the `tensorWeakRefs` Map field, and
+   with it the two steal-refusal carve-outs in `trackTensor` (the `_graphRetained` /
+   `_sidecarShare` incumbent-persistence checks) and the slot back-fill stamp path.
+   `trackTensor` is now just `_ownerSetAdd` (the owner SET registers every wrapper
+   unconditionally — a member cannot steal, so misclassification-by-steal is
+   unconstructible). Every stored-slot consumer was re-expressed over the owner SET:
+   `snapshotForStep` (iterate set members), `destroyUnreachable`'s GC safety-net scan
+   (release one rc per storage whose W(s) empties — the per-wrapper FR otherwise handles
+   release), `unregister` / `destroyStorageIds` / `reset` / `disposeAllForNewEngine` (no
+   slot to clear). `ownerOf` (tape-replay helper — the one non-classifier reader) is
+   re-pointed at the SET, preferring a persistent/REG member as the principal.
+
+2. **`releaseStepTemps`' slot-based demotion** → re-expressed over the DERIVED `stepScoped`
+   verdict. The sweep now iterates the owner-SET keys, computes `_derived` per storage, and
+   releases exactly the storages the derived model classifies step-scoped (live owner, no
+   kept holder). Adjudication #1's stale-disposed-slot class DISSOLVES: there is no slot to
+   go stale — the set drops a wrapper at its dispose/`_updateLazyRef` seam via
+   `untrackTensor`, so the classifier reads the actual live holders.
+
+3. **Gen-filter asymmetry unified.** REG (`_durablePersistent`) is gen-independent
+   everywhere: `_derived` already checked REG before the gen-filter continue; `snapshotForStep`
+   now also exempts REG members from the gen-filter. `_stepStartTensors` (SNAP) stays
+   gen-scoped; the two membership sets remain (their merge into a `persist()` registration
+   API is D3).
+
+   **CORRECTION to §D1-log #3 (the row-8 opt-out could NOT be deleted).** D1 predicted the
+   derived model would make the `gpt2-memorization` overfit FP unconstructible, so D2 would
+   delete its `TORCHLETTE_STRICT_LIFETIME=0` opt-out. Under the flip this was tested at the
+   demotion site (`TL_DBG_DEMOTE`, full parallel cpu run): the reaped `[64,128]` storage is
+   **NOT a REG'd param** — it is a fresh forward activation destined for THIS step's optimizer
+   (`owners=1, durable=false, snap=false, stamp = maxGen−1`) that a concurrent test's bump to
+   the SHARED module-global epoch counter (`src/core/epoch.ts`) shifted just under the
+   committed boundary gen. The STORED and DERIVED models classify it IDENTICALLY (a live
+   owner, not persistent → step-scoped); REG's gen-independence does not reach it because it
+   is a transient, not registrable state. So the FP is a **runahead gen-scoping / shared-epoch
+   cross-test-perturbation** issue, orthogonal to the ownership flip — no owner-model change
+   makes it unconstructible. The opt-out is therefore RETAINED (with a corrected comment); its
+   real fix (per-engine epoch, or a ±1-robust boundary gen) is follow-on, D4-adjacent. This is
+   the campaign's honesty invariant: the differential surfaced that a D1 prediction was wrong,
+   and D2 records the correction rather than shipping a mis-attributed "fix". (A param-axis REG
+   registration in the optimizer ctor was prototyped and REVERTED — it addressed the wrong
+   tensor and broadened behavior for no proof.)
+
+4. **The D1 shadow-comparison plumbing** — `_shadowCompareSurvival`, `shadowCompareGuard`
+   (+ its op-dispatch call site), `shadowDivergenceCount`, `shadowAdjudicatedCount`, and the
+   `_shadowDivergences` / `_shadowAdjudicated` / `_shadowWarned` counters + the
+   `isTestContext` helper (and the now-unused `ENV` import). Kept: the owner SET, `_derived`,
+   `_liveViewBases`, and `ownerSetStats` (renamed from `shadowOwnerSetStats`; the GC
+   hard-boundary gate still needs it to prove WeakRef-only).
+
+**BUG the flip surfaced (D1 masked it) — `_derived` gen-ordering of the graph/sidecar keep
+signals.** In D1, `_derived` checked `_graphRetained` / `_sidecarShare` AFTER the gen-filter
+`continue`, so a retention clone / sidecar pin BORN DURING backward (stamp > maxGen — "next
+step" to the gen-filter) had its keep-signal silently dropped. D1 never noticed: the shadow's
+`derivedSurvives = keptHolder ∨ storedSurvives` OR'd in the stored slot, which covered the
+clone. Once derived became AUTHORITATIVE the ordering bug bit — `implied-step-boundary.spec.ts`
+regressed 3/6 (read-a-step-temp-after-step() threw RECLAIMED: a live retention clone's shared
+storage reaped under it). FIX: graph/sidecar are GEN-INDEPENDENT keep signals exactly like REG
+(a LIVE clone holds the saved value THIS step's backward needs whatever its birth gen) — moved
+BEFORE the gen continue. This is a genuine correctness improvement the differential's superset
+trick had been hiding; the authoritative flip is what forced it out.
+
+`test/ownership-shadow-gc.spec.ts` adapted to the post-flip world: the GC-collapse test
+uses `ownerSetStats`; the second test (formerly "no unadjudicated shadow divergences")
+becomes "a clean CPU step runs without a lifetime throw under the strict default" — the
+in-suite regression that the derived model drives releaseStepTemps correctly.
+
+**Candidate D4 deletions / follow-ons discovered.**
+- The `[lifetime]` guard's `viewAliasesLiveBase` exoneration (op-dispatch getInputStorage)
+  is now subsumed by the derived `nonWrapperRetain` / `_liveViewBases` query — the derived
+  model already treats a live view's base as a kept holder (doc §3: "viewAliasesLiveBase
+  becomes a first-class query"). D4 should re-derive the guard's reclaimed-read exoneration
+  from `_liveOwners` + `_liveViewBases` and delete that clause.
+- **The row-8 runahead FP (above):** the `gpt2-memorization` overfit opt-out cannot retire
+  until the shared module-global epoch counter is made per-engine (or the implied-boundary
+  gen is made ±1-robust to cross-test bumps). This is the real fix §D1-log #3 mis-located in
+  the owner model.
+
+**Gates:** see the D2 report / commit message for the full matrix vs the D1 baselines.
