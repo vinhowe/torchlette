@@ -288,6 +288,175 @@ async function handleSynthetic() {
   console.log("SYNTHETIC", JSON.stringify(results));
 }
 
+/** Decisive #59 isolation: dispatch LITERAL gather WGSL on a FRESH device,
+ *  ZERO torchlette. Uploads a known f16 table [8,4] (row r col c = r + c/8,
+ *  f16-exact) + f32 indices [1,4] at offset 0 and runs two literal shaders:
+ *  (A) the old `array<f16>` gather, (B) the new `array<u32>` unpack2x16float
+ *  gather. If A reads row 2r on Metal but B is correct → Tint→MSL miscompile.
+ *  If A is correct on Metal too → the tab bug is NOT the shader; it's our
+ *  dispatch params. Driven: self.onmessage({data:{type:"rawgather"}}). */
+async function handleRawGather() {
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error("no adapter");
+  const hasF16 = adapter.features.has("shader-f16");
+  const device = await adapter.requestDevice({
+    requiredFeatures: hasF16 ? (["shader-f16"] as GPUFeatureName[]) : [],
+  });
+
+  const N = 8;
+  const D = 4;
+  // Build the f16 table as raw bytes (row r col c = r + c/8, f16-exact).
+  const f16bits = (x: number): number => {
+    // minimal f32→f16 for small exact values
+    const f = new Float32Array([x]);
+    const u = new Uint32Array(f.buffer)[0];
+    const sign = (u >>> 16) & 0x8000;
+    let exp = ((u >>> 23) & 0xff) - 127 + 15;
+    const mant = u & 0x7fffff;
+    if (exp <= 0) return sign; // subnormal/zero (values here >=0 and small)
+    return sign | (exp << 10) | (mant >>> 13);
+  };
+  const tableU16 = new Uint16Array(N * D);
+  for (let r = 0; r < N; r++)
+    for (let c = 0; c < D; c++) tableU16[r * D + c] = f16bits(r + c / 8);
+  const indicesF32 = new Float32Array([1, 3, 5, 7]); // gather rows 1,3,5,7
+
+  const mkBuf = (
+    data: ArrayBufferView,
+    usage: number,
+  ): GPUBuffer => {
+    const b = device.createBuffer({
+      size: Math.max(16, (data.byteLength + 3) & ~3),
+      usage,
+      mappedAtCreation: true,
+    });
+    new Uint8Array(b.getMappedRange()).set(
+      new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+    );
+    b.unmap();
+    return b;
+  };
+
+  const tableBuf = mkBuf(
+    tableU16,
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const idxBuf = mkBuf(indicesF32, GPUBufferUsage.STORAGE);
+
+  // out per shader: 4 f16 (one gathered row of D=4)
+  const runShader = async (
+    label: string,
+    wgsl: string,
+    outIsU16: boolean,
+  ): Promise<number[] | string> => {
+    try {
+      const outBytes = outIsU16 ? D * 2 : D * 4;
+      const outBuf = device.createBuffer({
+        size: Math.max(16, (outBytes + 3) & ~3),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+      const cfg = new Uint32Array([D]); // size = D output elements
+      const cfgBuf = mkBuf(cfg, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+      const mod = device.createShaderModule({ code: wgsl });
+      const pipe = device.createComputePipeline({
+        layout: "auto",
+        compute: { module: mod, entryPoint: "main" },
+      });
+      const bg = device.createBindGroup({
+        layout: pipe.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: tableBuf } },
+          { binding: 1, resource: { buffer: idxBuf } },
+          { binding: 2, resource: { buffer: outBuf } },
+          { binding: 3, resource: { buffer: cfgBuf } },
+        ],
+      });
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(pipe);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+      const readBuf = device.createBuffer({
+        size: outBuf.size,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, outBuf.size);
+      device.queue.submit([enc.finish()]);
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const raw = readBuf.getMappedRange().slice(0);
+      readBuf.unmap();
+      // decode f16 out → numbers
+      const u16 = new Uint16Array(raw);
+      const decode = (h: number): number => {
+        const s = (h & 0x8000) >> 15;
+        const e = (h & 0x7c00) >> 10;
+        const m = h & 0x03ff;
+        let val: number;
+        if (e === 0) val = m / 1024 / 16384;
+        else if (e === 31) val = m ? NaN : Infinity;
+        else val = (1 + m / 1024) * Math.pow(2, e - 15);
+        return s ? -val : val;
+      };
+      return Array.from({ length: D }, (_, i) => decode(u16[i]));
+    } catch (err) {
+      return `ERR: ${String(err)}`;
+    }
+  };
+
+  // (A) OLD literal shader: array<f16> input, direct index. dim0 gather of [8,4].
+  const shaderF16 = `enable f16;
+struct Cfg { size: u32 };
+@group(0) @binding(0) var<storage, read> input: array<f16>;
+@group(0) @binding(1) var<storage, read> indices: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f16>;
+@group(0) @binding(3) var<uniform> config: Cfg;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= config.size) { return; }
+  let row = u32(indices[i]);
+  let e = (row * ${D}u) + (i % ${D}u);
+  out[i] = input[e];
+}`;
+
+  // (B) NEW literal shader: array<u32> input, unpack2x16float extraction.
+  const shaderU32 = `enable f16;
+struct Cfg { size: u32 };
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> indices: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f16>;
+@group(0) @binding(3) var<uniform> config: Cfg;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= config.size) { return; }
+  let row = u32(indices[i]);
+  let e = (row * ${D}u) + (i % ${D}u);
+  out[i] = f16(unpack2x16float(input[(e >> 1u)])[(e & 1u)]);
+}`;
+
+  const out: Record<string, unknown> = {
+    hasF16,
+    indices: Array.from(indicesF32),
+    // expected: gather row 1 → [1, 1.125, 1.25, 1.375] (col/8), but the
+    // dispatch gathers rows 1,3,5,7 at output cols 0..3 respectively:
+    // out[i] = table[indices[i], i] = [1+0/8, 3+1/8, 5+2/8, 7+3/8]
+    expected: [1 + 0 / 8, 3 + 1 / 8, 5 + 2 / 8, 7 + 3 / 8],
+    A_f16_direct: await runShader("A", shaderF16, true),
+    B_u32_unpack: await runShader("B", shaderU32, true),
+    adapterInfo: {
+      vendor: (adapter as unknown as { info?: { vendor?: string } }).info
+        ?.vendor,
+      architecture: (
+        adapter as unknown as { info?: { architecture?: string } }
+      ).info?.architecture,
+    },
+  };
+  (self as unknown as { __rawgather: unknown }).__rawgather = out;
+  console.log("RAWGATHER", JSON.stringify(out));
+}
+
 self.onmessage = async (e: MessageEvent) => {
   const msg = e.data;
   try {
@@ -297,6 +466,8 @@ self.onmessage = async (e: MessageEvent) => {
       await handleReadback(msg.row ?? 0, msg.n ?? 16);
     } else if (msg.type === "synthetic") {
       await handleSynthetic();
+    } else if (msg.type === "rawgather") {
+      await handleRawGather();
     } else if (msg.type === "inspect") {
       await handleInspect(msg.id, msg.prompt, msg.topK);
     } else if (msg.type === "generate") {

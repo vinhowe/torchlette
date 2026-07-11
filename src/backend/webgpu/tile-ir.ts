@@ -282,6 +282,20 @@ interface Vec4DynComponentNode extends IRNodeBase {
   idx: IRNode;
 }
 
+/**
+ * Extract one f16 element from a packed u32 word as an f32 value:
+ * `unpack2x16float(word)[component]`. `component` is 0 (low 16 bits) or 1
+ * (high 16 bits) — little-endian half selection. Core WGSL, no shader-f16
+ * extension required for the load. Used to read f16 storage through a u32
+ * binding (routes around a dispatch-context-sensitive wrong-row f16 storage
+ * read in gather shaders on Apple Metal, Chrome/Tint→MSL; see #59).
+ */
+interface UnpackHalfNode extends IRNodeBase {
+  kind: "unpackHalf";
+  word: IRNode;
+  component: IRNode;
+}
+
 /** vec4 binary: add, sub, mul between two vec4s, or vec4 * scalar */
 interface Vec4BinaryNode extends IRNodeBase {
   kind: "vec4Binary";
@@ -354,6 +368,7 @@ export type IRNode =
   | Vec4BinaryNode
   | Vec4ArrayReadNode
   | Vec4SharedReadNode
+  | UnpackHalfNode
   | LoadVec4Node;
 
 // ============================================================================
@@ -992,6 +1007,8 @@ function cseKey(node: IRNode | Omit<IRNode, "id">): string | null {
       return `V4D:${getId(n.a)}:${getId(n.b)}`;
     case "vec4Component":
       return `V4X:${getId(n.value)}:${n.comp}`;
+    case "unpackHalf":
+      return `UPH:${getId(n.word)}:${getId(n.component)}`;
     case "vec4Binary":
       return `V4B:${n.op}:${getId(n.a)}:${getId(n.b)}`;
     default:
@@ -1271,6 +1288,24 @@ export class BlockExpr {
         targetType: dtype,
         valueType: this.node.valueType,
         dataType: dtype,
+      }),
+    );
+  }
+
+  /**
+   * Interpret `this` as a u32 word holding two packed f16 values and extract
+   * component `comp` (0 = low 16 bits, 1 = high 16 bits) as an f32 scalar.
+   * Emits `unpack2x16float(word)[comp]`. Core WGSL — no shader-f16 extension.
+   */
+  unpackHalf(comp: BlockExpr | number): BlockExpr {
+    const c = resolveArgU32(comp);
+    return new BlockExpr(
+      makeNode<UnpackHalfNode>({
+        kind: "unpackHalf",
+        word: this.node,
+        component: c,
+        valueType: "scalar",
+        dataType: "f32",
       }),
     );
   }
