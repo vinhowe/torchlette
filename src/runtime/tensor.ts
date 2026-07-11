@@ -239,29 +239,23 @@ export class Tensor {
   _debugCreationSite?: string;
   /** Autograd graph-owned retention clone (task #86). Set by the ctor when
    *  _cloneForRetention passes graphRetained=true. Such a clone shares a saved
-   *  tensor's storage and takes its OWN rc, but must not STEAL the storage's
-   *  WeakRef owner slot from a PERSISTENT saved tensor: the owner slot is what
-   *  releaseStepTemps classifies (persistent vs step-temp). If a mid-step clone
-   *  (never in the snapshot) stole the slot from a persistent tensor (e.g. the
-   *  GradScaler scale scalar), releaseStepTemps would release the shared
-   *  storage's claim and reap it under the live persistent tensor — a
-   *  reclaimed-read false positive / UAF. trackTensor consults this flag and
-   *  refuses the steal only when the incumbent owner is persistent; the clone's
-   *  lifetime is otherwise owned by the autograd graph (disposed at
-   *  cleanupAutogradGraph). */
+   *  tensor's storage and takes its OWN rc — it is the derived model's G(s)>0
+   *  signal (task #70): `_derived` reads it directly off the owner-SET member as
+   *  a KEEP signal, so a storage held by a live retention clone is never demoted
+   *  by releaseStepTemps. (Historically this flag drove an owner-SLOT steal
+   *  refusal; the D2 flip deleted the slot — a graph clone is now a plain owner-
+   *  SET member and cannot steal anything. The clone's lifetime is owned by the
+   *  autograd graph, disposed at cleanupAutogradGraph.) */
   _graphRetained = false;
 
-  /** Storage-sharing SIDECAR that must never own its storage's WeakRef slot
-   *  (task #74). Like `_graphRetained` but for NON-autograd sharers: the
-   *  GradScaler LiveScalar pin-ring clones (`createFromStorageHandle` on the
-   *  persistent scale scalar) alias an existing storage purely to keep it alive
-   *  across the runahead window via their own rc. They must not become the
-   *  storage's tracked owner — else their demotion/GC reaps the shared storage
-   *  under the live principal (the scale scalar), which is not a snapshot member
-   *  (its eager `persist()` between steps is a no-op), so #86's snapshot-only
-   *  guard did not cover it. trackTensor refuses the owner-slot steal whenever a
-   *  sidecar meets a live incumbent. Set at construction
-   *  (RuntimeEngine.createSidecarFromStorageHandle). */
+  /** Storage-sharing SIDECAR pin (task #74). Like `_graphRetained` but for
+   *  NON-autograd sharers: the GradScaler LiveScalar pin-ring clones
+   *  (`createFromStorageHandle` on the persistent scale scalar) alias an existing
+   *  storage purely to keep it alive across the runahead window via their own rc.
+   *  It is a KEEP signal read by `_derived` off the owner-SET member (task #70) —
+   *  a storage held by a live sidecar pin is never demoted. (Historically this
+   *  drove an owner-SLOT steal refusal; the D2 flip deleted the slot.) Set at
+   *  construction (RuntimeEngine.createSidecarFromStorageHandle). */
   _sidecarShare = false;
 
   constructor(
