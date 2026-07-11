@@ -1,6 +1,11 @@
 <script lang="ts">
 import { onMount } from "svelte";
-import { axisById, partitionLegality, recolorLegality } from "../../ncd/model";
+import {
+  axisById,
+  napkinCost,
+  partitionLegality,
+  recolorLegality,
+} from "../../ncd/model";
 import type {
   SurfaceEquivalence,
   SurfaceGesture,
@@ -25,6 +30,7 @@ type Props = {
   jam?: SurfaceJam | null;
   equivalence?: SurfaceEquivalence | null;
   activeGesture?: SurfaceGesture | null;
+  targetCost?: { h: number; m?: number } | null;
   onPartitionDrop: (axisId: string, kind: PartitionKind) => void;
   onPartitionPreview: (axisId: string, kind: PartitionKind) => void;
   onResidencyDrop: (wireId: string, column: number, level: NcdLevel) => void;
@@ -40,6 +46,7 @@ let {
   jam = null,
   equivalence = null,
   activeGesture = null,
+  targetCost = null,
   onPartitionDrop,
   onPartitionPreview,
   onResidencyDrop,
@@ -75,11 +82,13 @@ let pendingWheel = {
   clientX: 0,
   clientY: 0,
 };
+let inspectedBoxId = $state<string | null>(null);
 
 const lanes = $derived(surfaceLanes(term));
 const world = $derived(surfaceWorldSize(term));
 const costs = $derived(surfaceColumnCosts(previewTerm ?? term));
 const committedCosts = $derived(surfaceColumnCosts(term));
+const totalCost = $derived(napkinCost(term));
 const priorCosts = $derived(
   equivalence ? surfaceColumnCosts(equivalence.before) : committedCosts,
 );
@@ -133,6 +142,11 @@ function formatCost(value: number): string {
   if (value >= 1e6) return `${(value / 1e6).toFixed(2)}m`;
   if (value >= 1e3) return `${(value / 1e3).toFixed(1)}k`;
   return value.toLocaleString();
+}
+
+function scoreGap(current: number, target: number): string {
+  const gap = current - target;
+  return gap <= 0 ? "met" : `${formatCost(gap)} over`;
 }
 
 function parsePayload(
@@ -207,7 +221,7 @@ function residencyTargetValid(wireId: string, column: number): boolean {
 }
 
 function boxTargetValid(boxId: string): boolean {
-  return activeGesture?.type === "lemma" && boxId === "softmax";
+  return activeGesture?.type === "lemma" && boxId === activeGesture.targetBoxId;
 }
 
 function dropAxis(event: DragEvent, axisId: string): void {
@@ -454,7 +468,12 @@ onMount(() => {
             Boolean(equivalence) &&
             columnCost.memory.l1 !== priorCosts[index]?.memory.l1}
           class="ncd-cost-cell"
-        >{formatCost(columnCost.memory.l1)}</div>
+        >
+          {formatCost(columnCost.memory.l1)}
+          {#if targetCost?.m !== undefined && index === costs.length - 1}
+            <span class="ncd-target-score">max {formatCost(totalCost.memoryByLevel.l1)} / ≤{formatCost(targetCost.m)} · {scoreGap(totalCost.memoryByLevel.l1, targetCost.m)}</span>
+          {/if}
+        </div>
       {/each}
       <div class="ncd-cost-label"><i>H</i><sub>ℓ1</sub></div>
       {#each costs as columnCost, index}
@@ -468,7 +487,7 @@ onMount(() => {
         >
           {formatCost(columnCost.transfer.l1)}
           {#if index === costs.length - 1}
-            <span class="ncd-cumulative">Σ {formatCost(columnCost.cumulative.l1)}</span>
+            <span class="ncd-cumulative">Σ {formatCost(columnCost.cumulative.l1)}{#if targetCost} / ≤{formatCost(targetCost.h)} · {scoreGap(totalCost.transferByLevel.l1, targetCost.h)}{/if}</span>
           {/if}
         </div>
       {/each}
@@ -635,11 +654,33 @@ onMount(() => {
           : "Head/body decomposition available"}
         ondragover={(event) => event.preventDefault()}
         ondrop={(event) => dropBox(event, box.id)}
+        onclick={() =>
+          (inspectedBoxId = inspectedBoxId === box.id ? null : box.id)}
+        onkeydown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            inspectedBoxId = inspectedBoxId === box.id ? null : box.id;
+          }
+        }}
       >
         <span class="ncd-function-glyph">
           {box.kind === "matmul" ? "◁" : box.kind === "online-softmax" ? "↻" : "σ"}
         </span>
         <span class="ncd-function-label">{box.label}</span>
+        {#if box.inspection}
+          <span class="ncd-carried-badge">{box.inspection.states.map((state) => state.symbol).join(" · ")}</span>
+          {#if inspectedBoxId === box.id}
+            <div class="ncd-inspection" data-testid={`inspection-${box.id}`}>
+              <strong>{box.inspection.title}</strong>
+              {#each box.inspection.states as state}
+                <button title={state.explanation} onclick={(event) => event.stopPropagation()}><i>{state.symbol}</i> · {state.label}<span>{state.explanation}</span></button>
+              {/each}
+              {#if box.inspection.correction}
+                <button title={box.inspection.correction.explanation} onclick={(event) => event.stopPropagation()}><i>{box.inspection.correction.expression}</i><span>{box.inspection.correction.explanation}</span></button>
+              {/if}
+            </div>
+          {/if}
+        {/if}
         {#if jamMatches("box", box.id)}
           <span class="ncd-jam-note">{jam?.reason}</span>
         {/if}
@@ -773,6 +814,16 @@ onMount(() => {
     color: var(--ncd-annotation);
     font-size: 11px;
     font-style: italic;
+    white-space: nowrap;
+  }
+  .ncd-target-score {
+    position: absolute;
+    right: 5px;
+    bottom: 1px;
+    color: var(--ncd-annotation);
+    font-size: 8px;
+    font-style: italic;
+    white-space: nowrap;
   }
   .ncd-flow-layer { position: absolute; inset: 0; overflow: visible; }
   .ncd-wire-path,
@@ -925,6 +976,50 @@ onMount(() => {
     text-align: center;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .ncd-carried-badge {
+    position: absolute;
+    top: calc(100% + 3px);
+    padding: 1px 4px;
+    border: 1px solid var(--ncd-level-one-ink);
+    background: var(--ncd-level-one);
+    color: var(--ncd-level-one-ink);
+    font-size: 10px;
+    white-space: nowrap;
+  }
+  .ncd-inspection {
+    position: absolute;
+    z-index: 30;
+    top: calc(100% + 22px);
+    left: 50%;
+    display: flex;
+    width: 250px;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px;
+    border: 1px solid var(--ncd-ink);
+    background: var(--ncd-paper);
+    transform: translateX(-50%);
+  }
+  .ncd-inspection strong { font-size: 12px; font-weight: 600; }
+  .ncd-inspection button {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 4px;
+    border: 1px solid var(--ncd-rule-faint);
+    background: transparent;
+    color: var(--ncd-ink);
+    cursor: help;
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 11px;
+    text-align: left;
+  }
+  .ncd-inspection button:hover { background: var(--ncd-subalgorithm); }
+  .ncd-inspection button span {
+    color: var(--ncd-annotation);
+    font-size: 10px;
+    line-height: 1.25;
   }
   .ncd-jam-note {
     position: absolute;

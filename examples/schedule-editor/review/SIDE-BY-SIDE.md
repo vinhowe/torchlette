@@ -55,3 +55,5 @@ column order, wire order, box composition, tuple membership, and decorations.
   [`?` keyboard reference](./checkpoint-d-help.png). See
   [CHECKPOINT-D.md](./CHECKPOINT-D.md) for controller conventions and the
   aggressive-user protocol.
+- Checkpoint E: the [four-level intrinsic-ladder game loop](./CHECKPOINT-E.md),
+  including goal, wall, lemma-inspection, and completion captures.

@@ -116,3 +116,12 @@ and a semantic-column-aligned M/H table. Sequence UI remains the surrounding
 palette, history, and projection chrome. The canvas pans and zooms; no x/y is
 stored in the term. Review captures and the honest reference comparison live in
 [review/SIDE-BY-SIDE.md](./review/SIDE-BY-SIDE.md).
+
+The NCD mode now opens on four intrinsic-ladder challenges rather than the
+freeform canvas. Each challenge states a baseline and H/M target, gates its
+gesture vocabulary, offers two player-invoked hints, and records earned cost
+plus move count. Welford and online softmax remain absent until the level's
+stream attempt produces the corresponding dependency wall. The original
+surface is retained behind “Open freeform sandbox.” See
+[review/CHECKPOINT-E.md](./review/CHECKPOINT-E.md) for the target derivations and
+game-loop captures.

@@ -31,7 +31,7 @@ export interface SurfaceEquivalence {
 export type SurfaceGesture =
   | { type: "partition"; kind: "group" | "stream"; size: number }
   | { type: "level"; level: NcdLevel }
-  | { type: "lemma"; lemmaId: string };
+  | { type: "lemma"; lemmaId: string; targetBoxId: string };
 
 export const SURFACE_COLUMN_WIDTH = 176;
 export const SURFACE_LEFT_GUTTER = 112;
