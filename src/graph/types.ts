@@ -95,6 +95,14 @@ export interface StorageHandle {
    *  default; TORCHLETTE_STRICT_LIFETIME=0 downgrades to warn), never silent. Set by the
    *  claimant's post-replay clear seam each step. */
   releasedOverlay?: boolean;
+  /**
+   * Optional STORAGE FORMAT (docs/quantization-design.md phase 2). Set on a
+   * packed-int weight operand's handle so the format survives the lazy graph →
+   * materialization → dispatch path. The backend matmul reads it (via the
+   * resolved backendTensor.format) to select the fused-dequant kernel or an
+   * explicit dequant. Absent for ordinary tensors — the axis is a pure superset.
+   */
+  format?: import("../backend/types").StorageFormat;
 }
 
 /**

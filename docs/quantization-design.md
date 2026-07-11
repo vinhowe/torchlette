@@ -344,3 +344,58 @@ CALLER-side wiring is not. The target form:
   downstream mentions quantization.
 
 Tracked as task #93.
+
+## Phase 2 implementation (2026-07-11, task #93)
+
+**The format axis, in one paragraph.** A `StorageFormat = { elementType: DType;
+packing?: { scheme: "int8-grouped"; groupSize: number; scalesDtype: DType } }`
+rides on the operand — on the `StorageHandle` (`src/graph/types.ts`) and its
+`backendTensor`/`WebGPUTensor` (`format` + a companion `scales` WebGPUTensor).
+Plain dtype is the degenerate `{ elementType }` case (`packing` absent), so a
+normal tensor carries no format at all and the axis is a pure superset. The lazy
+graph, planner, tape, and profiler never read `packing` — they read `shape` and
+`elementType` (via the existing `dtype`), which for a packed weight is the
+PACKED buffer's `u32` element type and `[N, K/4]` shape. The packed+scales
+pair-ness is visible ONLY at the backend matmul seam: `matmul(a, b)` reads
+`b.format?.packing`, and — as a **consumer capability predicate** — routes an
+`int8-grouped` B to `dispatchQuantizedGemvNT` when it can (M=1 decode, NT), or
+inserts an **EXPLICIT dequant** (a `dequantizeInt8Grouped` backend op that
+materializes the f32 weight, then a normal matmul) when it cannot (M>1 prefill,
+or any other consumer). There is no `quantized-linear` op and no caller-side
+special case: `api.linear` is format-blind; it builds `matmul(input,
+weight.T)` exactly as before, and the transpose view PROPAGATES the base's
+`format`/`scales` (a packed weight's "transpose" is a no-op marker — the NT
+kernel reads the packed `[N, K/4]` buffer directly). Selection is data: the
+capability lives in the matmul dispatch, keyed on the operand format.
+
+**Prefill / M>1 choice: explicit dequant-then-matmul.** The phase-1 kernel is
+GEMV/NT decode-shaped; a tiled quant kernel was out of scope (phase-1 outcome).
+Rather than silently dequant-materialize inside the tiled path, the M>1 consumer
+inserts an EXPLICIT `dequantizeInt8Grouped(packed, scales) → f32 [N,K]` op and
+runs the stock matmul on the result — declared, not hidden, and the residency
+win is preserved for decode (the only M=1, bandwidth-bound path). Prefill pays
+one transient f32 weight per matmul; decode never materializes.
+
+**Invisibility test.** `packing` is read in exactly two files — the backend
+matmul op (`ops/matmul-ops.ts`) and the dequant kernel it calls — plus the
+loader/format declaration. `LazyIRNode.dtype`, `Tensor.dtype`, plan-builder
+sizing, compiled-plan `NodeResult.dtype`, and both profilers read only
+`elementType` (the packed `u32`), so a quantized weight is an ordinary `u32`
+`[N,K/4]` tensor everywhere above the matmul seam.
+
+**Splice deletion.** The phase-1 eager `dispatchQuantizedGemvNT` is no longer a
+public caller entry — the backend matmul seam is the sole caller. The
+out-of-band gate scripts (`quant-lmhead-realweight.ts`) that reached around the
+model to call it are replaced by the operand-path gates.
+
+**int4 cost.** int4 is a new VALUE on the axis: a `"int4-grouped"` scheme entry
+(quantizer packing + `unpackInt4` in the kernel) and a capability line in the
+dispatch predicate. Zero new mechanism — the `StorageFormat` descriptor, the
+propagation, the capability seam, and the explicit-dequant fallback are all
+scheme-agnostic. Confirmed holds for this implementation.
+
+**Browser IDB.** The PACKED form is cached keyed by
+`${url}#${tensorName}#${scheme}g${groupSize}` (conversion is expensive; the key
+versions by format+scheme so a dtype/scheme change re-quantizes). Default OFF
+this wave via a `weightFormat` config/URL flag in the SAE demo (not a
+`TORCHLETTE_*` env).

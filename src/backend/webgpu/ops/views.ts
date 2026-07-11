@@ -920,7 +920,7 @@ export function permute(a: BackendTensor, dims: number[]): BackendTensor {
 
   // Return a view sharing the same buffer
   // View - does not own the buffer
-  return createTensor(
+  const view = createTensor(
     m.shape,
     tensor.buffer,
     m.strides,
@@ -928,4 +928,14 @@ export function permute(a: BackendTensor, dims: number[]): BackendTensor {
     tensor.dtype,
     false,
   );
+  // Propagate a packed-weight StorageFormat through the transpose view
+  // (docs/quantization-design.md phase 2). api.linear transposes the [N,K]
+  // weight to [K,N] before matmul; the packed buffer is unchanged (a packed
+  // weight's "transpose" is a no-op marker), so the format/scales ride onto
+  // the view and the matmul seam reads them to select the fused-dequant kernel.
+  if (tensor.format?.packing) {
+    (view as WebGPUTensor).format = tensor.format;
+    (view as WebGPUTensor).scales = tensor.scales;
+  }
+  return view;
 }

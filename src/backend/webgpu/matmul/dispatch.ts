@@ -19,6 +19,8 @@ import { GPUBufferUsage } from "../gpu-types";
 import { getWarmupPipeline, recordPipeline } from "../pipeline-warmup";
 import { F32_BYTES } from "../shape-utils";
 import { getCurrentOpLabel } from "../shared-encoder";
+import { compileTileKernel } from "../tile-compiler";
+import { splitWorkgroups2d, type TileKernelSpec } from "../tile-ir";
 import { onTeardown } from "../webgpu-state";
 import { cacheTuningResult } from "./autotune";
 import {
@@ -913,6 +915,112 @@ export function dispatchQuantizedGemvNT(
     (getCurrentOpLabel() ?? "matmul") + "_gemv_q8",
   );
   releaseParamsBuffer(paramsBuffer);
+}
+
+/**
+ * Explicit dequant of an int8-grouped packed weight to f32 [N, K] — the M>1 /
+ * prefill fallback (docs/quantization-design.md phase 2). The tiled quant path
+ * was not built (phase-1 outcome), so a consumer that can't take the packed
+ * operand (M>1) gets this EXPLICIT dequant, then runs the stock matmul on the
+ * result — declared, never a silent dequantize-materialize. One thread per
+ * output element; mirrors the GEMV kernel's unpack (unpackInt8Snorm · f16
+ * group scale). Single source for the dequant mapping: quantize.ts.
+ * Binds [bq, out, params, b_scales].
+ */
+let dequantI8DispatchCount = 0;
+/** Count of explicit int8 dequant dispatches (probe/gate hook). */
+export function getDequantI8DispatchCount(): number {
+  return dequantI8DispatchCount;
+}
+
+export function dispatchDequantizeInt8Grouped(
+  device: GPUDevice,
+  packedWeight: GPUBuffer,
+  scales: GPUBuffer,
+  outBuffer: GPUBuffer,
+  n: number,
+  k: number,
+  groupSize: number,
+): void {
+  dequantI8DispatchCount++;
+  const gShift = Math.log2(groupSize);
+  if (!Number.isInteger(gShift)) {
+    throw new Error(`dequant: groupSize ${groupSize} must be a power of two`);
+  }
+  const spec = createDequantInt8Kernel(groupSize);
+  const cacheKey = `dequant_i8g${groupSize}`;
+  const pipeline = cachedPipeline(device, pipelineCache, cacheKey, () =>
+    compileTileKernel(spec),
+  );
+  const paramsBuffer = sharedCreateParamsBuffer(
+    device,
+    new Uint32Array([n, k, 0, 0]),
+  );
+  const bindGroup = cachedCreateBindGroup(device, pipeline, [
+    packedWeight,
+    outBuffer,
+    paramsBuffer,
+    scales,
+  ]);
+  const total = n * k;
+  const totalWg = Math.ceil(total / 256);
+  const gx = Math.min(totalWg, 65535);
+  const gy = Math.ceil(totalWg / 65535);
+  dispatchComputePass(
+    pipeline,
+    bindGroup,
+    gx,
+    gy,
+    1,
+    (getCurrentOpLabel() ?? "matmul") + "_dequant_i8",
+  );
+  releaseParamsBuffer(paramsBuffer);
+}
+
+/** Per-element dequant tile kernel: out[e] = unpackInt8Snorm(bq)·scale. */
+function createDequantInt8Kernel(groupSize: number): TileKernelSpec {
+  const gShift = Math.log2(groupSize);
+  return {
+    name: "dequantI8Grouped",
+    workgroupSize: 256,
+    enableF16: true,
+    uniformBindingIndex: 2,
+    bindings: {
+      b: { storage: "read", type: "u32" },
+      out: { storage: "read_write", type: "f32" },
+      b_scales: { storage: "read", type: "u32" },
+    },
+    uniforms: { n: "u32", k: "u32", pad0: "u32", pad1: "u32" },
+    grid: (u) => splitWorkgroups2d(Math.ceil((u.n * u.k) / 256)),
+    kernel(ctx) {
+      const n = ctx.emitLet("n", ctx.uniform("n"));
+      const k = ctx.emitLet("k", ctx.uniform("k"));
+      const total = ctx.emitLet("total", n.mul(k));
+      // 2D-flattened global element index.
+      const e = ctx.emitLet(
+        "e",
+        ctx.rowIndex2d().mul(ctx.u32(256)).add(ctx.localIndex()),
+      );
+      ctx.ifThen(e.lt(total), () => {
+        const row = ctx.emitLet("row", e.div(k));
+        const col = ctx.emitLet("col", e.mod(k));
+        const wordsPerRow = ctx.emitLet("words_pr", k.shr(ctx.u32(2)));
+        const groupsPerRow = ctx.emitLet("groups_pr", k.shr(ctx.u32(gShift)));
+        const word = ctx.load(
+          "b",
+          row.mul(wordsPerRow).add(col.shr(ctx.u32(2))),
+        );
+        const qn = word.unpackInt8Snorm(col.and(ctx.u32(3)));
+        const sIdx = ctx.emitLet(
+          "s_idx",
+          row.mul(groupsPerRow).add(col.shr(ctx.u32(gShift))),
+        );
+        const sWord = ctx.load("b_scales", sIdx.shr(ctx.u32(1)));
+        const scale = sWord.unpackHalf(sIdx.and(ctx.u32(1)));
+        ctx.emitStore("out", e, qn.mul(scale));
+      });
+    },
+  };
 }
 
 /**

@@ -536,6 +536,34 @@ export class Torchlette {
   }
 
   /**
+   * Create a packed-int (quantized) weight operand from host-side packed +
+   * scales data (docs/quantization-design.md phase 2). Returns a Tensor with
+   * the LOGICAL weight shape `[N, K]` and dtype `format.elementType`, backed by
+   * the packed u32 buffer + scales companion. Feed it to `api.linear` exactly
+   * like an ordinary weight — the frontend and lazy graph are format-blind; the
+   * backend matmul reads the format and fuses the dequant (M=1) or dequants
+   * explicitly (M>1). See `resolveWeightFormat`.
+   */
+  async createQuantizedWeight(
+    packed: Uint32Array,
+    scales: Uint16Array,
+    n: number,
+    k: number,
+    format: import("../backend/types").StorageFormat,
+    device?: import("../backend/types").DeviceKind,
+  ): Promise<Tensor> {
+    const rt = await this.runtime.createQuantizedWeight(
+      packed,
+      scales,
+      n,
+      k,
+      format,
+      device,
+    );
+    return this._wrap(rt, false);
+  }
+
+  /**
    * Set the global random seed for all subsequent random ops (rand, randn, bernoulli).
    * All Torchlette instances sharing the same runtime use the same RNG state,
    * so this affects all random generation globally.
