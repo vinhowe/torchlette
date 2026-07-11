@@ -797,6 +797,186 @@ the warmup/median discipline is a P3 precondition. (f) the provenance map's seam
 boundaries (R11) → the map is an M0/P0 named artifact with specified invalidation/rebase, not an
 asserted spine.
 
+## 11. Ownership deletion/relocation table (P0 deliverable (d) — the R6 artifact)
+
+**Ruling S2 / red-team R6 (blocker):** the live tile-IR is an imperative scheduling
+language; every named ScheduleState fact is already owned once or twice below it. Observing
+that structure and replaying it through the same generator passes the byte differential while
+leaving ownership intact. R6's demanded artifact is THIS table: EVERY structural/schedule-bearing
+fact currently owned by the imperative tile-IR structure, the tile-compiler auto-passes, tile-ops
+placement logic, and matmul geometry derivation — mapped to its S1 tier (§2), or marked
+`dies` / `stays-as-semantic-builder`. Grep-verified (file:line), not from memory. The executable
+enforcement is §12 (the no-second-owner assertion; the elementwise prototype is
+`src/schedule/elementwise-skeleton.ts assertNoSecondOwnerElementwise`).
+
+**Verdict vocabulary.** `semantic`/`requests`/`receipts` = the S1 tier that OWNS the fact after
+P0-full. `dies` = pure imperative scaffolding the derived loop-nest VIEW + `applySchedule`
+regenerates, leaving NO surviving owner. `stays-as-semantic-builder` = a generator reduced to
+emitting semantic-IR nodes (R22's required outcome). A few rows carry a SPLIT verdict where a
+field's identity-bearing part and its lowering part separate; those are noted inline and counted
+once by their primary verdict.
+
+### 11.1 tile-ir.ts imperative structure
+
+| Fact | Current owner (file:line) | Tier / disposition |
+|---|---|---|
+| `forRange` (var, start, bound, body) | `tile-ir.ts:678` `ForRangeStmt`; builder `:2111` | **semantic** (loop/dispatch structure; kind=sequential) |
+| `forStride` (var, start, bound, stride, body) | `tile-ir.ts:689` `ForStrideStmt` | **semantic** (loop structure; stride is a nest traversal fact) |
+| `unroll?` flag on for-loops | `tile-ir.ts:684`, `:697` | **dies** (realization choice — an unroll of a semantic loop is a receipt-adjacent codegen decision) |
+| `barrier()` statement | `tile-ir.ts:713` `BarrierStmt`; builder `:2213` | **semantic** (barriers are schedule facts, NOT projections — S2/NCD F13, R3 `Barrier` relation) |
+| `sharedArray` / `varArray` allocation | `tile-ir.ts:644` `VarArrayStmt`; `sharedWrite` `:717` | **semantic** (named value lifetime + staging intent: `global→shared` edge, F6) |
+| shared read (`sharedRead`) | `tile-ir.ts:181` `SharedReadNode` | **semantic** (staging edge consumer; residency-intent path) |
+| `threadIdx` (dim 0/1/2) | `tile-ir.ts:172` `ThreadIdxNode`; builder `:1899` | **dies** (raw thread index regenerated; the ROLE it participates in is semantic via `role-partition`) |
+| `localIndex` | `tile-ir.ts:177` `LocalIndexNode` | **dies** (lane index regenerated; lane ASSIGNMENT is a schedule fact, the raw builtin read dies) |
+| `globalId` (dim) | `tile-ir.ts:198` `GlobalIdNode`; builder `:1899` | **dies** (dispatch-geometry read regenerated from ProgramGridMap + workgroup receipt) |
+| `programId` (dim) | `tile-ir.ts:109` `ProgramIdNode`; builder `:1774` | **split**: the map=**semantic** (ProgramGridMap domain), the raw builtin read=**dies** |
+| `numWorkgroups` (dim) | `tile-ir.ts:204` `NumWorkgroupsNode` | **dies** (derived from grid; regenerated) |
+| workgroup size field | `tile-ir.ts:3343` `TileKernelSpec.workgroupSize`; `_setWgSize` `:3687` | **receipts** (WGSL x/y/z — R1/A-R7; the BUDGET is a **request**, the emitted geometry is a receipt) |
+| pointer-kind placement `thread\|tile` | `tile-ir.ts:475` `BlockLoadStmt.ptrKind`; `tile-ops.ts:179/186` | **semantic** (residency intent: thread=register, tile=shared — F6/F1) + **requests** (preference) |
+| register block / register tile alloc | `tile-ir.ts:459` `BlockAllocStmt`; `tile-ops.ts:216` | **semantic** (named value lifetime + register residency intent, F1) |
+| `blockLoad` thread/tile base+stride | `tile-ir.ts:468` `BlockLoadStmt` | **dies** (index arithmetic regenerated from staging edge + nest) |
+| `blockStore` base+stride+guard | `tile-ir.ts:490` `BlockStoreStmt` | **semantic** (output flow edge register→global, F6) + index arith **dies** |
+| operand-placement-dependent dot (`aPlacement`/`bPlacement`) | `tile-ir.ts:507-508` `BlockDotStmt` | **semantic** (operand-residency intent, F1); vec-form of the dot = **receipts** |
+| `bTransposed`, `aSmemStride`/`bSmemStride`, smem elem-types | `tile-ir.ts:509,516-519` | smem stride/elem-type = **receipts**; transposed = **semantic** (no-materialization view) |
+| `smemVec4`, `smemElemType`, `smemStride` (tileLoad) | `tile-ir.ts:429-431` `TileLoadStmt` | **receipts** (exact vec-load form + shared layout — R1/A-R6) |
+| `loadVec4` (`array<vec4<T>>` binding) | `tile-ir.ts:348` `LoadVec4Node` | **receipts** (exact vec-load form; "vec width is one decoration" retracted) |
+| vec4 nodes (dot/native/construct/splat/component/binary/arrayRead/sharedRead) | `tile-ir.ts:241,265,250,259,272,316,324,331` | **receipts** (vectorized lowering forms; A-R6 vec width `refused`) |
+| subgroup ops (shuffleXor/Add/Max/Min/BroadcastFirst/InclusiveAdd) | `tile-ir.ts:209-238` | **semantic atoms** (each enumerated INDIVIDUALLY per R5/A-R13; placement via role/reduction skeleton) |
+| `atomicOp` (max/min/add/or/and/xor/exchange) | `tile-ir.ts:741` `AtomicOpStmt` | **semantic atom** (`atomicAdd<f32>` named with order/scope contract, R5) |
+| `atomicCAS` / f32-add-via-CAS-loop | `tile-ir.ts:749` `AtomicCASStmt`, `:761+` | **receipts** (CASLoop-vs-NativeAtomic — R5/R25/A-R12) |
+| `unpackHalf`, `unpackInt8Snorm` | `tile-ir.ts:293,309` | **receipts** (f16/int8 storage-read lowering form) |
+| `if`/`ifElse` guarded statements | `tile-ir.ts:700,706` | **dies** (tail masking / bounds guards regenerated from `checkedAffine` bounds + block shape) |
+| `guardedStore` / `directStore` | `tile-ir.ts:724,732` | **dies** (store lowering regenerated; the store EDGE is semantic, the guard arith dies) |
+| `var`/`assign`/`addAssign`/`indexAssign`/`indexAddAssign` | `tile-ir.ts:637,652,658,664,671` | **dies** (imperative SSA scaffolding regenerated from the expression DAG + carried-value edges) |
+
+### 11.2 tile-compiler.ts auto-passes (pipeline `compileTileKernel:378-491`)
+
+| Fact | Current owner (file:line) | Tier / disposition |
+|---|---|---|
+| auto vec-width (`autoVectorize`→`computeSafeVecWidth`) | `tile-compiler.ts:381-405`; flag `tile-ir.ts:3357` | **receipts** (chosen vec width — A-R6; intent may be a request) |
+| explicit `vectorize` width | `tile-ir.ts:3356`; emit `:601` | **requests** (vectorization preference) → realized form in **receipts** |
+| subgroup auto-detect + auto-enable | `tile-compiler.ts:407-421`; flag `tile-ir.ts:3351` | **requests** (capability request) → **receipts** (emitted); NOT semantic |
+| TPR (threads-per-row) auto-detect | `tile-compiler.ts:426` `autoDetectTPR`; flag `noTPR` `tile-ir.ts:3369` | **semantic** (`role-partition` — cooperative striding is a role fact, F5/S2) + realized count **receipts** |
+| block layout computation | `tile-compiler.ts:428` `computeBlockLayouts` | **receipts** (physical thread-tile layout) |
+| auto thread_row/thread_col injection | `tile-compiler.ts:433-454` | **dies** (regenerated from role partition + nest) |
+| automatic barrier insertion | `tile-compiler.ts:458-461` `insertBarriers` | **split**: the `Barrier` relation is **semantic** (derived from staging edges + WAR/WAW inside `applySchedule`); the imperative auto-pass **dies** |
+| auto-CSE (let-binding injection) | `tile-compiler.ts:463-464` | **dies** (pure codegen optimization; realizer-internal) |
+| LICM (always-on) | `tile-compiler.ts:466-467` `hoistLoopInvariants` | **dies** (codegen optimization; realizer-internal) |
+| dead code elimination | `tile-compiler.ts:469-470` | **dies** (codegen optimization; realizer-internal) |
+| unroll decisioning (≤4/≤8/≤16) | `tile-compiler.ts:801-871` | **dies** (realization choice; `unroll?` flag dies with it) |
+| physical WG = logical × TPR | `tile-compiler.ts:552-557` | **receipts** (emitted workgroup geometry) |
+| vec4 storage binding rewrite | `tile-compiler.ts:472-484` | **receipts** (exact vec-load form) |
+
+### 11.3 tile-ops.ts placement logic
+
+| Fact | Current owner (file:line) | Tier / disposition |
+|---|---|---|
+| register vs shared placement by pointer kind | `tile-ops.ts:178-197`; doc `:215-224` | **semantic** (residency/staging intent) + **requests** (preference) |
+| `smemElemType` override on cooperative load | `tile-ops.ts:203-207` | **receipts** (shared-mem element-type layout) |
+| `_transposed` / smemStride view fields on Block | `tile-ops.ts:227-233` | transposed=**semantic** (no-materialization view); smemStride=**receipts** |
+| arithmetic/unary/reduce result → register (implicit) | `tile-ops.ts:218-223` doc; methods `:540-685` | **semantic** (default register residency intent for intermediates) |
+
+### 11.4 matmul/types.ts geometry derivation
+
+| Fact | Current owner (file:line) | Tier / disposition |
+|---|---|---|
+| `tileM`/`tileN` (output block shape) | `types.ts:48-51` `MatmulKernelConfig` | **semantic** (logical block shapes — A-R1 determination) |
+| `tileK` (K-dim shared tile) | `types.ts:52-53` | **semantic** (block shape of the reduction axis) |
+| `threadTileM`/`threadTileN` | `types.ts:54-57` | **receipts** (per-thread tile — A-R1 excludes it from semantic) |
+| `useSubgroups` | `types.ts:58-59` | **requests** (capability request — F9: distinct from atom family + hierarchy level) |
+| `vectorWidth` (1\|2\|4) | `types.ts:60-61` | **receipts** (vec-load form — A-R6) |
+| `kSplit` | `types.ts:38` `CodegenOptions.kSplit` | **semantic** (K-split changes reduction loop STRUCTURE — a `tile` of K + program-map/pack; SELECTION is a request) |
+| `swapGrid` | `types.ts:39-40` | **semantic** (`ProgramGridMap` `kind:"swap"` — R4 mandatory reification test) |
+| epilogue chain (`EpilogueConfig.ops`) | `types.ts:13-24` | **semantic** (no-materialization/fusion edges — recolor'd boundaries) |
+| `transposeMode` NN/NT/TN/TT | `types.ts:71`, `getTransposeMode:133` | **semantic** (no-materialization transpose view) |
+| `DEFAULT_CONFIG` / `TUNING_SPACE` | `types.ts:107,120` | **requests** (search space / default → `ScheduleTemplate` + autotuner candidates, P1/R9) |
+| `getWorkgroupSize` | `types.ts:246-254` | **receipts** (derived emitted geometry) |
+| `validateConfig` (divisibility, smem≤16KB, wg≤256) | `types.ts:205-241` | **stays-as-semantic-builder** (→ authored-kernel typed parameter schema's dependent constraints — R10/F7) |
+| `classifyShape` / `ShapeClass` | `types.ts:77,146` | **requests** (`ApplicabilityPredicate` input — P1/R9) |
+| `getShaderCacheKey` | `types.ts:295-328` | **stays-as-semantic-builder** → replaced by canonical serialization + strong digest (R27); the ad-hoc string key dies |
+
+### 11.5 ops-tile-ir.ts — the ELEMENTWISE family (P0 walking-skeleton scope)
+
+| Fact | Current owner (file:line) | Tier / disposition |
+|---|---|---|
+| elementwise loop scaffolding (`elementwiseKernel`: wg256 + `size` uniform + grid + bounds-checked idx) | `tile-ir.ts:3519-3543`; used at `ops-tile-ir.ts:63,80,101,156,207,273,372,471,532` | **dies** (the 1-thread-per-element nest is the canonical DERIVED loop-nest VIEW; the factory becomes a **semantic builder** emitting the elementwise region) |
+| `elementwiseGrid` dispatch geometry | `tile-ir.ts:3395-3409` | **receipts** (emitted x/y/z; the grid RULE derives from ProgramGridMap identity) |
+| per-element expression (unary/binary/where/cast body) | `whereSpec:264`, `binaryBroadcastSpec:360`, `unaryStridedSpec:458`, `castSpec:523`, `contiguousSpec:592` | **stays-as-semantic-builder** (→ elementwise semantic-IR expression DAG builders — reified as `deriveScheduleState`/`applySchedule`) |
+| `stridedLoad` (indexShape + strides + offset) | `whereSpec:290-310`, `binaryBroadcastSpec:384-397` | **semantic** (strides specialize the no-materialization view / access pattern = value-lifetime + index fact); offset volatile (below) |
+| view offset as volatile `*_offset` uniform (#71) | `ops-tile-ir.ts:433-455`, `{A,B,COND,X,Y}_OFFSET_UNIFORM` | **requests**/data (volatile uniform — per-replay data, NOT baked; strides=template identity=semantic, offset scalar=volatile) |
+| `emitStore` (out[idx]=expr) | `whereSpec:311`, `binaryBroadcastSpec:398` | **semantic** (output flow edge register→global, F6) |
+| `enableF16` per-dtype | `binaryBroadcastSpec:374`, `castSpec` region | **receipts** (WGSL `enable f16;` emission) |
+| `WGSL_OP_TO_FUSION` op mapping | `ops-tile-ir.ts:346-354` | **stays-as-semantic-builder** (op-name → semantic op catalog entry) |
+| `applyFusedOp` op dispatch | `binaryBroadcastSpec:398`, `castSpec:552` | **stays-as-semantic-builder** (single-sourced op catalog — the skeleton routes through it verbatim) |
+
+### 11.6 Headline counts and the R6 conclusion
+
+**60 facts mapped.** By primary verdict:
+- **semantic: 22** — loop/dispatch structure (forRange/forStride/barrier/program-map/swapGrid/kSplit), named value lifetimes + staging intent (shared alloc/read, register blocks, pointer-kind placement, blockStore edge), operand-residency intent (dot placement, transposed views), block shapes (tileM/N/K), fusion edges (epilogue chain), semantic atoms (atomicOp, subgroup ops), TPR-as-role-partition, elementwise strided-view access.
+- **requests: 8** — vectorize preference, subgroup enable / `useSubgroups`, TUNING_SPACE/DEFAULT_CONFIG search space, classifyShape applicability, view-offset volatile data, pointer-kind preference half.
+- **receipts: 16** — workgroup x/y/z, all vec4 lowering + loadVec4 + vectorWidth + auto-vec-width, threadTile M/N, smem stride/elem-type/vec4 layout, CAS-vs-native, unpackHalf/unpackInt8Snorm, physical WG=logical×TPR, block layout, getWorkgroupSize, enableF16 emission.
+- **dies: 12** — thread/local/global-id raw reads, numWorkgroups read, if/ifElse guards, guardedStore/directStore lowering, var/assign SSA scaffolding, blockLoad index arith, auto thread_row/col injection, unroll flag + decisioning, auto-CSE, LICM, DCE, elementwise loop scaffolding.
+- **stays-as-semantic-builder: 7** — validateConfig (→ typed param-schema constraints), getShaderCacheKey (→ canonical serialization), the five elementwise spec builders' expression bodies (→ semantic-IR builders — DONE for the family in the skeleton), WGSL_OP_TO_FUSION + applyFusedOp (→ op catalog).
+
+**The R6 conclusion:** the 12 facts that `die` (SSA vars, raw builtin index reads, guard/store lowering, the elementwise nest, and the three pure codegen passes CSE/LICM/DCE) are EXACTLY the set that leaves NO second owner once the loop-nest VIEW derives from `(semantic region × schedule state)`. The 7 `stays-as-semantic-builder` facts are R22's required outcome — generators reduced to semantic builders. The 16-fact `receipts` tier is where every WGSL-ism the red team named (workgroup x/y/z, vec4 forms, CAS lowering, thread tiles) lands, confirming Appendix A's authority-horizon split. **No structural fact maps to two SURVIVING owners:** each has exactly one tier (split rows separate an identity part from a lowering part, each landing in one distinct tier). That single-owner property is the §2.6 invariant the §12 assertion enforces executably.
+
+## 12. The no-second-owner assertion (P0 deliverable — design)
+
+**Ruling S2 (d) / red-team R22:** byte-identity proves an adapter, not reification. The
+principal acceptance gate is only sound if the schema-only-serialization property AND the
+single-owner property are ASSERTED EXECUTABLY, not reviewed. The ownership-derivation campaign's
+assert-agreement discipline (single source of truth at a seam; assert the other side matches) is
+the cited template. This section specifies how P0-FULL will assert it corpus-wide; the ELEMENTWISE
+PROTOTYPE ships now (`src/schedule/elementwise-skeleton.ts assertNoSecondOwnerElementwise`, run on
+every derived state by `test/schedule/elementwise-differential.spec.ts`).
+
+**What "second owner" means precisely.** A fact `f` in tier T of a `ScheduleState` has a second
+owner iff some SOURCE GENERATOR or LOWER IR (the imperative tile-IR node stream, the compiler
+pass state, or the emitted WGSL) carries an INDEPENDENT value for `f` that a consumer could read
+instead of T's. The disease is silent divergence: the two values agree today (byte-identical) and
+drift tomorrow. The assertion makes the seam loud.
+
+The design has three executable checks, in ascending cost:
+
+1. **Schema-only serialization (structural, zero-runtime — the R22 core).** The `ScheduleState`
+   schema (`src/schedule/types.ts`) has NO field able to hold an opaque generator, a callback, a
+   WGSL string, or a lossless AST dump. The ONLY opacity is the discriminated `Skeleton`
+   `visibility:"opaque"` variant, which forbids loop/staging/role data and REQUIRES a kernelRef +
+   refusal reason (F3). P0-full asserts, over the full corpus, that every state serializes through
+   the canonical encoder (§5) touching ONLY declared schema/move/atom/lemma fields — a reflective
+   walk that REFUSES any `unknown`/`Function`/string-shaped-like-WGSL leaf. The prototype's
+   token-scan (`assertNoSecondOwnerElementwise` step 1) is the seed; P0-full replaces the
+   substring scan with a typed-encoder walk that cannot serialize an out-of-schema value at all.
+
+2. **Derive/apply round-trip agreement (the assert-agreement seam).** For every corpus kernel
+   reachable from both plan paths, `compileTileKernel(applySchedule(region, deriveScheduleState(k)))`
+   must equal the live builder's WGSL BYTE-FOR-BYTE (§8 gate 1). This is the SINGLE-SOURCE seam:
+   the schedule state is the one source; the live generator is the "other side" asserted to match.
+   Crucially — per R22 — this is necessary but NOT sufficient alone; it is gated by (1) and (3) so
+   an adapter that replays the old generator cannot satisfy it (it has nowhere to store the
+   generator, per (1)).
+
+3. **No-independent-value assertion (the actual no-second-owner claim).** For each fact the table
+   (§11) assigns to a tier, P0-full asserts that after `applySchedule`, the imperative tile-IR and
+   compiler state do NOT hold a SEPARATELY-AUTHORED copy — they hold only the value DERIVED from
+   the schedule. Mechanically: `applySchedule` is the sole writer of each structural field of the
+   lowered tile-IR; a `dies`-classified fact must have NO producer other than `applySchedule`'s
+   derivation (checked by construction — the generator that used to write it is deleted or reduced
+   to a builder). For `semantic`/`requests`/`receipts` facts, the check is that the lowered IR's
+   copy is a pure function of the schedule tier (re-derive-and-compare under STRICT, reusing the
+   #92 seam-guard the caches already carry). A `stays-as-semantic-builder` fact is asserted to emit
+   ONLY semantic-IR nodes, never a schedule decoration (so it cannot become a shadow owner). The
+   prototype asserts the family-local shape of this (steps 2–4 of
+   `assertNoSecondOwnerElementwise`: exactly one store edge; offset is a named uniform not a baked
+   literal; no roles/sync/atoms/lemmas hide in an elementwise state — their ABSENCE is load-bearing
+   because they do NOT derive, S2).
+
+**Enforcement point.** P0-full runs check (1) as a compile-time + serialization test over the
+corpus, (2) as the §8 gate-1 byte differential on both plan paths, and (3) as a STRICT-mode
+runtime assertion at `applySchedule` (behind the strict-lifetime-style guard, sunset once the
+soak completes). A violation of any is review-BLOCKING and, for (1)/(3), THROWS — the adapter and
+AST-dump cheats are not merely discouraged, they are unconstructible (schema) or fatal (assertion).
+
 ## Appendix A — paper Triton capability profile
 
 Checked in as `docs/design-corpus/appendix-a-triton-profile.md` (R28). It profiles each S1
