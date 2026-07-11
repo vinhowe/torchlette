@@ -283,7 +283,7 @@
 </script>
 
 {#if screen === "intro"}
-  <NcdGame {onExit} onComplete={() => (screen = "map")} onSandbox={() => (screen = "sandbox")} />
+  <NcdGame {onExit} onComplete={() => (screen = "map")} />
 {:else if screen === "sandbox"}
   <div class="sandbox-shell">
     <button class="sandbox-back" onclick={() => (screen = "map")}>← Back to lessons</button>
@@ -313,7 +313,7 @@
               <span class="map-index">{index + 1}</span>
               <span class="map-copy">
                 <small>{index === 0 ? "KEEP VALUES CLOSE" : index === 1 ? "CARRY A SUMMARY" : index === 2 ? "REPAIR THE SCALE" : "COMPOSE EVERYTHING"}</small>
-                <strong>{item.id === "fuse-chain" ? "Stop shipping the glue" : item.id === "layernorm" ? "A useful backpack" : item.id === "softmax" ? "When the ruler moves" : "Build the fast attention path"}</strong>
+                <strong>{item.id === "fuse-chain" ? "Stop the round trips" : item.id === "layernorm" ? "A useful backpack" : item.id === "softmax" ? "When the ruler moves" : "Build the fast attention path"}</strong>
                 <em>{item.id === "fuse-chain" ? "bias → GELU → residual" : item.id === "layernorm" ? "LayerNorm, one flowing row" : item.id === "softmax" ? "softmax, without rereading" : "the capstone"}</em>
               </span>
               {#if progress[item.id]}
@@ -341,12 +341,16 @@
         <header class="mission">
           <div>
             <p class="eyebrow">{level.id === "attention" ? "CAPSTONE" : "ONE NEW IDEA"}</p>
-            <h1>{level.id === "fuse-chain" ? "Stop shipping the glue" : level.id === "layernorm" ? "A useful backpack" : level.id === "softmax" ? "When the ruler moves" : "Build the fast attention path"}</h1>
+            <h1>{level.id === "fuse-chain" ? "Stop the round trips" : level.id === "layernorm" ? "A useful backpack" : level.id === "softmax" ? "When the ruler moves" : "Build the fast attention path"}</h1>
             <p>{level.id === "fuse-chain" ? "Three tiny operations are waiting on two long deliveries." : level.id === "layernorm" ? "Can LayerNorm cross a row once instead of three times?" : level.id === "softmax" ? "Can softmax keep a correct total when a later value changes the scale?" : "Remove the two giant square intermediates without overflowing the nearby workbench."}</p>
           </div>
           <div class="physical-score" class:won={phase === "complete"}>
             <div><span>Traffic this step</span><strong>{formatBytes(trafficBytes(term, level.id))}</strong></div>
-            <div><span>Goal</span><strong>{formatBytes(targetTrafficBytes)}</strong></div>
+            <div><span>Traffic goal</span><strong>{formatBytes(targetTrafficBytes)}</strong></div>
+            {#if level.target.m !== undefined}
+              <div class="space-row"><span>Nearby workbench</span><strong>{formatBytes(cost.memoryBytesByLevel.l1)}</strong></div>
+              <div class="space-row"><span>Space limit</span><strong>{formatBytes(targetNearbyBytes)}</strong></div>
+            {/if}
             <small>{phase === "complete" ? "Goal reached" : `${formatBytes(Math.max(0, trafficBytes(term, level.id) - targetTrafficBytes))} still removable`}</small>
           </div>
         </header>
@@ -391,6 +395,7 @@
                 <div><span>mean</span><strong>{labStep === 0 ? "—" : labStep === 1 ? "3" : "6"}</strong></div>
                 <div><span>spread M2</span><strong>{labStep === 0 ? "—" : labStep === 1 ? "2" : "40"}</strong></div>
               </div>
+              {#if labStep === 2}<div class="moment-proof"><span>distances from mean 6</span><strong>(−4)² + (−2)² + 2² + 4² = 40</strong><small>M2 is the running sum of squared distances.</small></div>{/if}
               <p>{labStep < 2 ? "The backpack has three slots. Feed the next block." : "Four input values are gone, but these three numbers preserve exactly what variance needs."}</p>
               {#if labStep < 2}<button class="big-action" onclick={feedMomentBlock}>Feed {labStep === 0 ? "[2, 4]" : "[8, 10]"} →</button>{:else}<button class="big-action" onclick={installWelford}>Carry this backpack through LayerNorm</button>{/if}
             </section>
@@ -501,11 +506,11 @@
           {/if}
         {/if}
 
-        <footer class="notation-ledger">
+        {#if level.id !== "fuse-chain" || phase === "complete"}<footer class="notation-ledger">
           <span>PLAIN WORDS</span><strong>memory traffic</strong><i>becomes</i><code>Hₗ₁</code>
           <span>PLAIN WORDS</span><strong>nearby space needed</strong><i>becomes</i><code>Mₗ₁</code>
           <small>These symbols are labels for quantities you have already changed.</small>
-        </footer>
+        </footer>{/if}
       </section>
     {/if}
   </main>
@@ -560,6 +565,8 @@
   .physical-score small { display: block; margin-top: 9px; padding-top: 9px; color: var(--warm); border-top: 1px solid rgba(255,255,255,.1); }
   .physical-score.won { background: rgba(97,222,182,.12); }
   .physical-score.won strong, .physical-score.won small { color: var(--mint); }
+  .physical-score .space-row { margin-top: 5px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,.08); }
+  .physical-score .space-row strong { color: #b9e9db; font-size: 15px; }
   .feedback { min-height: 64px; display: flex; align-items: center; gap: 14px; margin-bottom: 18px; padding: 14px 18px; color: #cad6e5; background: rgba(114,183,255,.08); border: 1px solid rgba(114,183,255,.16); border-radius: 16px; }
   .feedback span { color: var(--blue); font-size: 23px; }
   .feedback p { margin: 0; line-height: 1.45; }
@@ -599,6 +606,10 @@
   .backpack span { font-size: 11px; }
   .backpack strong { font-size: 25px; }
   .backpack-lab > p, .softmax-lab > h2 { text-align: center; color: #c4d0df; }
+  .moment-proof { width: min(600px,100%); margin: -10px auto 16px; padding: 12px 16px; color: #c8d6e5; text-align: center; background: rgba(255,255,255,.06); border-radius: 12px; }
+  .moment-proof span, .moment-proof strong, .moment-proof small { display: block; }
+  .moment-proof strong { margin: 3px 0; color: var(--warm); font-size: 18px; }
+  .moment-proof small { color: #8e9db1; }
   .score-bars { height: 150px; display: flex; justify-content: center; align-items: end; gap: 13px; }
   .score-bars i { width: 65px; display: grid; place-items: start center; padding-top: 10px; color: var(--ink); background: var(--warm); border-radius: 10px 10px 0 0; font-style: normal; font-weight: 900; }
   .score-bars .future { background: var(--pink); }

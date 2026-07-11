@@ -77,7 +77,7 @@ Failure is diagnostic and local. It changes the machine enough to expose the dep
 - **Getting-it moment:** the route collapses, traffic falls by 16 MB, and the warm NCD segment appears over the shortcut.
 - **Vocabulary earned:** near memory, round trip, one lower-level color.
 
-### Level 1 — Stop shipping the glue
+### Level 1 — Stop the round trips
 
 - **One concept:** fuse a chain of elementwise operations by keeping both intermediates nearby.
 - **Felt before named:** the arithmetic stations finish almost instantly, but courier trips dominate the clock and traffic.
@@ -172,4 +172,3 @@ Mechanical assertions remain necessary: actions mutate the semantic term, costs 
 - Does Welford feel like a necessary carried summary rather than a magic card?
 - Can they explain the online-softmax correction by pointing to the moving maximum?
 - In the capstone, do they choose tools based on visible problems rather than remembered UI choreography?
-

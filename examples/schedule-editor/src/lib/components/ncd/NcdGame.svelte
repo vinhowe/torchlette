@@ -3,7 +3,7 @@
   import { GAME_LEVELS } from "../../ncd/game-levels";
   import type { NcdTerm } from "../../ncd/types";
 
-  let { onExit, onComplete, onSandbox }: { onExit: () => void; onComplete: () => void; onSandbox: () => void } = $props();
+  let { onExit, onComplete }: { onExit: () => void; onComplete: () => void } = $props();
 
   const ROWS_PER_STEP = 2048;
   const base = GAME_LEVELS[0].baseline;
@@ -87,7 +87,7 @@
     <div class="step-markers" aria-label="Lesson progress">
       <span class="active"></span><span></span><span></span><span></span><span></span>
     </div>
-    <div class="header-actions"><button class="quiet-button" onclick={onSandbox}>Open freeform sandbox</button><button class="quiet-button" onclick={onExit}>Schedule editor</button></div>
+    <button class="quiet-button" onclick={onExit}>Schedule editor</button>
   </header>
 
   <section class="lesson-stage" class:solved aria-live="polite">
@@ -225,7 +225,6 @@
   button { font: inherit; }
   .quiet-button { justify-self: end; border: 0; color: #aebbd0; background: transparent; cursor: pointer; padding: 10px 12px; border-radius: 12px; }
   .quiet-button:hover { color: white; background: rgba(255,255,255,.07); }
-  .header-actions { justify-self: end; display: flex; gap: 2px; }
   .lesson-stage { width: min(1120px, calc(100% - 40px)); margin: 0 auto; padding: 58px 0 80px; position: relative; }
   .lesson-heading { max-width: 670px; }
   .kicker { margin: 0 0 10px; color: var(--warm); text-transform: uppercase; letter-spacing: .14em; font-size: 12px; font-weight: 800; }

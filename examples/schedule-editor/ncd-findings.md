@@ -266,3 +266,31 @@ level's jam” means the player demonstrates the obstruction again before the
 card appears. Long-term progression may remember that the lemma is known while
 still requiring a local proof-obligation encounter. Those should be separate
 fields (`knownLemma`, `wallWitnessed`) rather than one unlock boolean.
+
+## Game rebuild round — findings from teaching before notation
+
+### F32 — one semantic cost needs an explicit workload context
+
+The napkin model correctly returns transfer for one term evaluation, but “32,768
+bytes” is not automatically a meaningful training-step quantity. The game makes
+its multiplier explicit (2,048 rows for the small lessons) and labels every
+scaled number “one training step.” A durable term/benchmark contract needs a
+separate workload multiplicity object; silently baking batch count into an axis
+would corrupt the kernel-local diagram.
+
+### F33 — a lemma needs an executable counterexample, not only inspection text
+
+`NcdBox.inspection` can name `(count, mean, M2)` or `(m, ℓ)`, but it cannot derive
+the four-number Welford trace or the moving-maximum softmax trace used to teach
+why those states are sufficient. These examples properly live in lesson data,
+not the schedule term. A future lemma library should pair its proof identity with
+small executable witnesses that a consumer can render without hard-coding the
+algebra into each UI.
+
+### F34 — traffic and capacity are distinct win conditions in the teaching layer
+
+The first rebuild displayed only traffic even when the semantic target also
+bounded nearby memory. That made query tiling in the attention capstone feel
+unmotivated. Showing both physical quantities fixed the lesson, but exposed that
+a scalar `target: {h,m}` lacks explanatory binding: the challenge should name
+which gesture is expected to relieve which resource and on what hardware limit.
