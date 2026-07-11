@@ -95,3 +95,16 @@ documented fallback architecture/roofline constants. The measured tier declares
 its RPC in [workbench-contract.md](./workbench-contract.md) and remains visibly
 awaiting the engine. Consumer-side schema findings are recorded in
 [workbench-findings.md](./workbench-findings.md).
+
+## Editable NCD spike
+
+The `NCD diagram` mode reframes the property workbench as a bidirectional
+Neural Circuit Diagram term. Its semantic boxes, wires, axes, and columns stay
+fixed while residency colors, group/stream partitions, and divisibility
+superscripts are editable labels. Static assets live in `public/data/ncd/`.
+
+The attention walkthrough replays the admitted online-softmax lemma, two legal
+fusion recolorings, `g_q=64`, and `s_x=32`. H/M are read directly from the wire
+residency and partition labels, and the loop/pseudocode pane is mechanically
+projected from the same term. See [ncd-findings.md](./ncd-findings.md) for the
+consumer-side failures and ambiguities exposed by making the notation editable.

@@ -1,0 +1,67 @@
+{
+  "schemaVersion": "ncd-term-1-proposal",
+  "id": "ncd-matmul-1024-f32-tile32",
+  "name": "Tiled matmul 1024³",
+  "semantic": {
+    "axes": [
+      { "id": "m", "label": "m", "size": 1024 },
+      { "id": "n", "label": "n", "size": 1024 },
+      { "id": "k", "label": "k", "size": 1024 }
+    ],
+    "wires": [
+      { "id": "A", "label": "A", "axisIds": ["m", "k"], "elementBytes": 4, "tupleGroup": "inputs" },
+      { "id": "B", "label": "B", "axisIds": ["k", "n"], "elementBytes": 4, "tupleGroup": "inputs" },
+      { "id": "C", "label": "C", "axisIds": ["m", "n"], "elementBytes": 4 }
+    ],
+    "boxes": [
+      {
+        "id": "matmul",
+        "label": "A · B",
+        "kind": "matmul",
+        "column": 1,
+        "inputWireIds": ["A", "B"],
+        "outputWireIds": ["C"],
+        "streamability": {
+          "kind": "decomposed",
+          "axes": [
+            {
+              "axisId": "k",
+              "head": "initialize C tile to zero",
+              "body": "C_tile += A[:,k:k+s] · B[k:k+s,:]",
+              "accumulatorWireIds": ["C"]
+            }
+          ]
+        }
+      }
+    ],
+    "columns": [
+      { "id": "inputs", "index": 0, "label": "global inputs" },
+      { "id": "matmul-body", "index": 1, "label": "matmul body" },
+      { "id": "output", "index": 2, "label": "global output" }
+    ],
+    "tupleGroups": [
+      { "id": "inputs", "label": "(A, B)", "wireIds": ["A", "B"] }
+    ]
+  },
+  "decorations": {
+    "residency": [
+      { "wireId": "A", "column": 0, "level": "l0" },
+      { "wireId": "A", "column": 1, "level": "l1" },
+      { "wireId": "B", "column": 0, "level": "l0" },
+      { "wireId": "B", "column": 1, "level": "l1" },
+      { "wireId": "C", "column": 1, "level": "l1" },
+      { "wireId": "C", "column": 2, "level": "l0" }
+    ],
+    "partitions": [
+      { "axisId": "m", "kind": "group", "size": 32, "label": "g_m" },
+      { "axisId": "n", "kind": "group", "size": 32, "label": "g_n" },
+      { "axisId": "k", "kind": "stream", "size": 16, "label": "s_k" }
+    ],
+    "divisibility": [
+      { "axisId": "m", "multiple": 4, "reason": "thread tile M" },
+      { "axisId": "n", "multiple": 4, "reason": "thread tile N" },
+      { "axisId": "k", "multiple": 4, "reason": "vec4 load" }
+    ],
+    "admittedLemmas": []
+  }
+}

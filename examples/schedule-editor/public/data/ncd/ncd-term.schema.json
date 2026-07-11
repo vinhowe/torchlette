@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://torchlette.dev/schema/ncd-term.proposal.json",
+  "title": "torchlette editable NCD term proposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "name", "semantic", "decorations"],
+  "properties": {
+    "schemaVersion": { "const": "ncd-term-1-proposal" },
+    "id": { "type": "string", "minLength": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "semantic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["axes", "wires", "boxes", "columns", "tupleGroups"],
+      "properties": {
+        "axes": { "type": "array", "items": { "$ref": "#/$defs/axis" } },
+        "wires": { "type": "array", "items": { "$ref": "#/$defs/wire" } },
+        "boxes": { "type": "array", "items": { "$ref": "#/$defs/box" } },
+        "columns": { "type": "array", "items": { "$ref": "#/$defs/column" } },
+        "tupleGroups": { "type": "array", "items": { "$ref": "#/$defs/tupleGroup" } }
+      }
+    },
+    "decorations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["residency", "partitions", "divisibility", "admittedLemmas"],
+      "properties": {
+        "residency": { "type": "array", "items": { "$ref": "#/$defs/residency" } },
+        "partitions": { "type": "array", "items": { "$ref": "#/$defs/partition" } },
+        "divisibility": { "type": "array", "items": { "$ref": "#/$defs/divisibility" } },
+        "admittedLemmas": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+      }
+    }
+  },
+  "$defs": {
+    "positiveInteger": { "type": "integer", "minimum": 1 },
+    "axis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "size"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "size": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "wire": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "axisIds", "elementBytes"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "axisIds": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "elementBytes": { "enum": [1, 2, 4, 8] },
+        "tupleGroup": { "type": "string", "minLength": 1 }
+      }
+    },
+    "decomposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["axisId", "head", "body", "accumulatorWireIds"],
+      "properties": {
+        "axisId": { "type": "string", "minLength": 1 },
+        "head": { "type": "string", "minLength": 1 },
+        "body": { "type": "string", "minLength": 1 },
+        "accumulatorWireIds": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "streamability": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "axes"],
+          "properties": {
+            "kind": { "const": "decomposed" },
+            "axes": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/decomposition" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reason"],
+          "properties": {
+            "kind": { "const": "none" },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "box": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "kind", "column", "inputWireIds", "outputWireIds", "streamability"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "column": { "type": "integer", "minimum": 0 },
+        "inputWireIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "outputWireIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "streamability": { "$ref": "#/$defs/streamability" }
+      }
+    },
+    "column": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "index", "label"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "index": { "type": "integer", "minimum": 0 },
+        "label": { "type": "string", "minLength": 1 }
+      }
+    },
+    "tupleGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "wireIds"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "wireIds": { "type": "array", "minItems": 2, "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "residency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["wireId", "column", "level"],
+      "properties": {
+        "wireId": { "type": "string", "minLength": 1 },
+        "column": { "type": "integer", "minimum": 0 },
+        "level": { "enum": ["l0", "l1"] }
+      }
+    },
+    "partition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["axisId", "kind", "size", "label"],
+      "properties": {
+        "axisId": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["group", "stream"] },
+        "size": { "$ref": "#/$defs/positiveInteger" },
+        "label": { "type": "string", "pattern": "^[gs]_" }
+      }
+    },
+    "divisibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["axisId", "multiple", "reason"],
+      "properties": {
+        "axisId": { "type": "string", "minLength": 1 },
+        "multiple": { "$ref": "#/$defs/positiveInteger" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
