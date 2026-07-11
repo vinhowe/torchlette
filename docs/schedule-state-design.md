@@ -81,6 +81,14 @@ i.e. the islands merge seen from inside). Properties:
   affected region, staging well-formedness) is backend-neutral and lives with the object.
   Whether a *realizer* can honor the resulting state is a capability-profile question (§4).
   v1 code must never check WGSL facts inside core legality.
+- **Atoms are not moves either.** Some primitives should be COMPOSED AROUND, never derived:
+  data-dependent constructs (the f32 atomic-add CAS retry loop WebGPU forces) and, at
+  CUDA altitude later, hardware intrinsics (wgmma, cp.async — exactly how CuTe treats
+  them). An **atom** is a wrapped primitive with declared semantics (footprint, sync
+  behavior, cost) that moves schedule around. Atoms are first-class grammar members, not
+  escape hatches: scatter-add is an elementwise schedule composed around an
+  `atomicAddF32` atom, not an opaque kernel. v1's atom set: {atomicAddF32-CAS,
+  subgroup ops (feature-gated)}.
 - **Lemmas are not moves.** Moves rearrange WHEN/WHERE the same arithmetic happens; their
   legality is structural. Some targets are unreachable by rearrangement: flashattention
   requires the online-softmax identity (accumulate softmax·V block-by-block, RESCALING the
@@ -131,14 +139,24 @@ schedule state**, not referenced by it. Existing structural generators die as th
 are absorbed. Deletion targets (named per house policy): the matmul structural-variant
 axis (K-split/chunk shape enumeration — selection stays, structure derives), reduction/
 row-program skeleton construction, elementwise loop scaffolding.
-**Authored escape hatch:** a few hand-crafted kernels resist the algorithm/schedule
-factoring — forcing them in would mean growing the grammar toward a general scheduling
-language (fenced against) or accepting a slower reconstruction. These remain **authored**
-(the islands `authored` kind extended down): opaque ScheduleStates whose DECORATIONS are
-tunable but whose internals take no macro moves. Expected members: attention backward
-(register×shared vec4 dot), fused Adam, scatter's CAS loop. Using the hatch for those
-three is planned, not a failure; without it the migration is all-or-nothing and stalls on
-its three hardest kernels.
+**Authored = not-yet-re-derived (migration staging, NOT an expressivity ceiling).**
+A kernel marked **authored** (the islands `authored` kind extended down) is an opaque
+ScheduleState whose DECORATIONS are tunable but whose internals take no macro moves —
+because it hasn't been re-derived yet, not because it can't be. Three rules give the
+hatch its teeth:
+1. The authored set SHRINKS monotonically: each member is either re-derived
+   (moves + lemmas + atoms) or decomposed into a schedule composed around atoms.
+2. Anything claimed to be PERMANENTLY underivable is tracked as a named grammar failure
+   (a defect in §3, not a shrug) — the corpus claim is that the closure of the grammar
+   contains the state of the art, and that claim is falsified by permanent members.
+3. Expressivity requirement fed back into §2: re-deriving attention backward at perf
+   parity requires operand-RESIDENCY decorations (which operand lives in registers vs
+   shared — the register×shared vec4 dot is a decoration, not magic). The object carries
+   that axis from P0.
+v1's expected authored members and their exits: attention backward (re-derive at the
+self-hosting milestone — needs the recomputation-identity and D-precompute lemmas),
+fused Adam (re-derive — needs a horizontal-pack move at multi-tensor altitude),
+scatter-add (NOT authored: composed around the atomicAddF32 atom from P0).
 
 ## 7. Phases (each independently shippable, stage-4 style)
 
@@ -158,6 +176,14 @@ its three hardest kernels.
   island → skeleton + decorations rendered; P1 edits live from the UI; macro moves behind
   the same legality-refusal UX. (Engine channel for partition requests is the sibling
   islands work — contract.md already specs it.)
+
+- **P4 — self-hosting (the grammar-completeness gate).** Re-derive the framework's own
+  fastest hand-crafted kernels in-grammar at perf parity: attention BACKWARD
+  (recomputation-identity + D-precompute lemmas admitted, operand-residency decorations
+  exercised) and fused Adam (horizontal-pack move). Exit: the authored set is empty or
+  atoms-only. This is the executable form of the corpus claim "the closure contains the
+  state of the art" — applied to ourselves first. May land after v2 starts; it gates the
+  COMPLETENESS claim, not the editor.
 
 v2 (Triton realizer) and v3 (CuTe) are separate campaign charters, written against P0–P2
 evidence.
