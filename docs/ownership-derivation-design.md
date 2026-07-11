@@ -1,6 +1,6 @@
 # Ownership Derivation: liveness classification as a derived fact
 
-**Status:** DRAFT FOR REVIEW (Vin) · 2026-07-11 · Task #70 (promoted per the platonic-form review)
+**Status:** RATIFIED (Vin, 2026-07-11) — D0 complete; §8 ruled WRAPPERS. D1 in flight. · Task #70
 **Prereq:** #73 strict-lifetime default (in flight) — the tripwire net this campaign works under.
 
 ## 0. Declaration (one sentence)
@@ -111,8 +111,7 @@ SNAP generalizes to scope membership later.
 
 ## 8. The open design question (for review)
 
-Whether REG (registered state) is a set of WRAPPERS or a set of STORAGES. Wrappers
-matches the snapshot's semantics and survives storage replacement (copy_-in-place keeps
-the wrapper); storages would survive wrapper churn but reintroduces exactly the
-replacement-and-hold ambiguity that caused #68. RECOMMENDED: wrappers, consistent with
-the wrapper-level-stamps rule the implied-boundary work already established.
+RULED (Vin, 2026-07-11): **WRAPPERS.** Matches the snapshot's semantics and survives
+storage replacement (copy_-in-place keeps the wrapper); storages would reintroduce the
+replacement-and-hold ambiguity that caused #68. Consistent with the wrapper-level-stamps
+rule from the implied-boundary work.
