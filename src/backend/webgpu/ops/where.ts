@@ -132,7 +132,14 @@ function whereDirect(
     shader: code,
     inputs: [condTensor.buffer, xTensor.buffer, yTensor.buffer],
     outputSizeBytes: outSize * 4,
-    params: params(outSize),
+    // Task #71: offsets ride params after size, in uniform-declaration order
+    // (size, cond_offset, x_offset, y_offset).
+    params: params(
+      outSize,
+      condTensor.offset,
+      xTensor.offset,
+      yTensor.offset,
+    ),
     outBuffer: providedOut,
     dispatchX: Math.ceil(outSize / WORKGROUP_SIZE),
   });
@@ -184,7 +191,8 @@ function whereChunked(
       y: yTensor.buffer,
       out: outBuffer,
     },
-    { size: outSize },
+    // Task #71: chunked binds each input from element 0, so all offsets are 0.
+    { size: outSize, cond_offset: 0, x_offset: 0, y_offset: 0 },
     {
       modes: {
         cond: condIsScalar ? "scalar" : "chunked",

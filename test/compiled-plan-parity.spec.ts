@@ -30,6 +30,8 @@ const TOOLS = path.join(__dirname, "..", "tools");
 const PARITY_PROBE = path.join(TOOLS, "t-compiled-parity-probe.ts");
 const DETERMINISM = path.join(TOOLS, "t-stream-determinism.ts");
 const CHUNKED_SUM = path.join(TOOLS, "t-chunked-sum-probe.ts");
+const VIEW_OFFSET_TEMPLATES = path.join(TOOLS, "t-view-offset-templates.ts");
+const VIEW_OFFSET_CROSS = path.join(TOOLS, "t-view-offset-cross-replay.ts");
 const TIMEOUT = 300_000;
 
 /** Spawn a tsx tool with retry/backoff (Dawn child spawn is flaky under
@@ -156,6 +158,39 @@ describe("compiled-plan correctness gates", () => {
         sg.filter((l) => l.includes("FULLY GENERATED")).length,
         `expected the chunked-sum plan to FULLY GENERATE:\n${sg.join("\n")}`,
       ).toBeGreaterThan(0);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "view offsets are data, not template identity (N offsets → 1 template)",
+    async () => {
+      if (!webgpu) return;
+      // Task #71: distinct narrow offsets must collapse to ONE compiled-plan
+      // template (offset delivered as a volatile base_offset uniform), AND
+      // every offset's values must be correct — the falsified shortcut passed
+      // the template count but read the wrong region.
+      // The PASS/FIXED strings are the correctness signal. (Exit code is NOT
+      // asserted: Dawn's teardown intermittently segfaults AFTER main() prints
+      // and process.exit(0) — a known flaky-under-suite-load artifact, not a
+      // probe failure; the printed result is authoritative.)
+      const { stdout } = await runTool(VIEW_OFFSET_TEMPLATES, {});
+      expect(stdout, stdout.slice(-500)).toContain("correctness: PASS");
+      expect(stdout, stdout.slice(-500)).toContain("RESULT: FIXED");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "cross-offset compiled replay reads the CURRENT offset (offset-0-builds-first trap)",
+    async () => {
+      if (!webgpu) return;
+      // A compiled plan built at offset A must serve a start-B sibling replay
+      // B's region, not A's frozen one. Permanent regression gate for the
+      // falsified value-based bail. (Exit code not asserted — see the templates
+      // gate above re: Dawn teardown segfault; the PASS string is the signal.)
+      const { stdout } = await runTool(VIEW_OFFSET_CROSS, {});
+      expect(stdout, stdout.slice(-500)).toContain("CROSS-OFFSET-REPLAY: PASS");
     },
     TIMEOUT,
   );

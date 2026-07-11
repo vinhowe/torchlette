@@ -91,7 +91,11 @@ import type {
   StorageHandle,
 } from "../graph/types";
 import { diffSegmentsAligned, diffStreams } from "./stream-diff";
-import { type GeneratedStream, generateStream } from "./stream-generate";
+import {
+  buildDirectOffsetRepack,
+  type GeneratedStream,
+  generateStream,
+} from "./stream-generate";
 
 /** Mark a storage's GPU buffer as liveness-safe for immediate pool reuse. */
 function markLivenessSafe(storage: StorageHandle): void {
@@ -119,6 +123,7 @@ import {
   recordBarrier,
   recordWrite,
   resetPlannerRegistry,
+  setPendingParamsVolatilePack,
   setRecordingNodeIndex,
   startCompilationRecording,
   stopCompilationRecording,
@@ -2228,6 +2233,12 @@ export async function executeLoweredPlan(
       actionIndex++
     ) {
       const action = loweredPlan.actions[actionIndex];
+      // Task #71: the per-node offset-repack flag is scoped to ONE direct-
+      // elementwise node's dispatch. Clear it at every action boundary so a
+      // throw that skipped a node's post-exec clear can't leak its closure into
+      // a later action's createParamsBuffer (defensive; a throw normally aborts
+      // the plan). No-op when not recording.
+      if (compilationRecording) setPendingParamsVolatilePack(null);
       switch (action.kind) {
         case "fused": {
           // Attribute recorded commands to the group's output node — without
@@ -2675,7 +2686,17 @@ export async function executeLoweredPlan(
           if (node.result) break;
 
           // Tag the node for recording hooks (volatile uniform attribution).
-          if (compilationRecording) setRecordingNodeIndex(nodeIdx);
+          if (compilationRecording) {
+            setRecordingNodeIndex(nodeIdx);
+            // Task #71: if this strided-elementwise node's input offset can
+            // vary (view chain contains a narrow), flag its direct-dispatch
+            // params buffer for a TAG_UNIFORM offset repack so the recorded
+            // stream matches the generator's. Set fresh each node (overwriting
+            // any prior value — so a throw in a previous node's dispatch, which
+            // skips its post-exec clear below, cannot leak that node's closure
+            // into this one's createParamsBuffer). Cleared after execution too.
+            setPendingParamsVolatilePack(buildDirectOffsetRepack(node));
+          }
 
           setProfileModule(node.module ?? "unknown");
           let inputs;
@@ -2711,6 +2732,10 @@ export async function executeLoweredPlan(
               ? await resultOrPromise
               : resultOrPromise;
           assignNodeResult(node, handlerResult, backendInputs, inputs);
+          // Task #71: clear the pending offset-repack flag (consumed by
+          // createParamsBuffer during the dispatch above; clear even if the op
+          // took a non-direct path and never consumed it).
+          if (compilationRecording) setPendingParamsVolatilePack(null);
           stats.sequentialNodes++;
 
           // Record data-source for compiled plan (re-executed each step)

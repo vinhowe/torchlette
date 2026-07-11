@@ -935,6 +935,28 @@ export function setRecordingNodeIndex(nodeIndex: number): void {
 }
 
 /**
+ * Task #71: the executor sets this before executing a strided-elementwise node
+ * whose input offset can VARY across replays (its view chain contains a
+ * narrow). When set, createParamsBuffer records a TAG_UNIFORM volatile repack
+ * on the direct-dispatch params buffer, so the recording carries the same
+ * offset-repack command the stream generator emits (the segment diff needs
+ * both sides identical). Cleared right after the node executes.
+ */
+let pendingParamsVolatilePack:
+  | ((node: LazyIRNode) => ArrayBufferView)
+  | null = null;
+export function setPendingParamsVolatilePack(
+  pack: ((node: LazyIRNode) => ArrayBufferView) | null,
+): void {
+  pendingParamsVolatilePack = pack;
+}
+export function consumePendingParamsVolatilePack():
+  | ((node: LazyIRNode) => ArrayBufferView)
+  | null {
+  return pendingParamsVolatilePack;
+}
+
+/**
  * Poison the active recording. buildCompiledPlan returns an invalid plan, so
  * the template keeps using the (always-correct) lowered path. Use when a
  * recording hook observes state a frozen replay would get wrong.

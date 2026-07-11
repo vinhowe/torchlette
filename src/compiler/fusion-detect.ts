@@ -1695,6 +1695,15 @@ const PAYLOAD_HASH_EXEMPT: Record<string, "ALL" | Set<string>> = {
   rand: new Set(["seed"]),
   randn: new Set(["seed"]),
   bernoulli: new Set(["seed"]),
+  // Task #71: a narrow view's `start` (→ element offset) is delivered to the
+  // consuming kernel as a VOLATILE `base_offset` uniform (strided specs read
+  // ctx.uniform, direct paths pack it into paramsData, compiled replay
+  // re-derives it per replay via TAG_UNIFORM). So distinct offsets share one
+  // template and are data, not identity. `dim`/`length` STAY hashed (they DO
+  // change strides/output shape → codegen). SAFE ONLY because the offset
+  // delivery mechanism exists — exempting without it serves a start-0 build's
+  // frozen offset to a start-N replay (the falsified shortcut).
+  narrow: new Set(["start"]),
 };
 
 const _f64Scratch = new Float64Array(1);

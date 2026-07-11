@@ -251,7 +251,10 @@ export function planBinaryDirectCore(
     key: shader,
     shader,
     outputSizeBytes: outSize * bytesPerElement,
-    paramsData: params(outSize),
+    // Task #71: a/b offsets ride paramsData after size, in uniform-declaration
+    // order (size, a_offset, b_offset). Compiled replay re-derives both from
+    // the current step's input view offsets (volatile repack).
+    paramsData: params(outSize, a.offset, b.offset),
     dispatchX: dispatch.x,
     dispatchY: dispatch.y,
   };
@@ -417,7 +420,8 @@ function binaryChunked(
   const dispatcher = createTileKernelDispatcher(spec);
   dispatcher.dispatchChunked(
     { a: a.buffer, b: b.buffer, out: outBuffer },
-    { size: outSize },
+    // Task #71: chunked binds each operand from element 0 → offsets are 0.
+    { size: outSize, a_offset: 0, b_offset: 0 },
     {
       modes: {
         a: aIsScalar ? "scalar" : "chunked",
@@ -479,7 +483,8 @@ export function planUnaryDirectCore(
     key: shader,
     shader,
     outputSizeBytes: a.size * outBytesPerElement,
-    paramsData: params(a.size),
+    // Task #71: offset via uniform (after size). See planBinaryDirectCore.
+    paramsData: params(a.size, a.offset),
     dispatchX: dispatch.x,
     dispatchY: dispatch.y,
   };
@@ -537,7 +542,8 @@ export function dispatchUnary(
     const dispatcher = createTileKernelDispatcher(spec);
     dispatcher.dispatchChunked(
       { a: a.buffer, out: outBuffer },
-      { size: outSize },
+      // Task #71: chunked binds from element 0 → base_offset is 0.
+      { size: outSize, base_offset: 0 },
       {
         modes: { a: "chunked", out: "chunked" },
         sizeUniform: "size",

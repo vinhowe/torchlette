@@ -13,7 +13,9 @@ import { ENV } from "../../core/env";
 import {
   invalidateActiveRecording,
   assignSlot,
+  consumePendingParamsVolatilePack,
   isCompilationRecordingActive,
+  recordVolatileUniform,
   setLastBindGroupBuffers,
 } from "../../executor/compiled-plan";
 import {
@@ -112,6 +114,17 @@ const cacheState: BindGroupCacheState = {
   paramsSequenceBuffers: [],
 };
 
+/**
+ * Task #71: if the executor flagged this node's params as carrying a volatile
+ * offset (view chain contains a narrow), record a TAG_UNIFORM repack on the
+ * params buffer so the recorded stream matches the generator's (both re-derive
+ * the offset per replay). No-op unless recording AND a pending pack is set.
+ */
+function maybeRecordParamsVolatile(buffer: GPUBuffer): void {
+  const pack = consumePendingParamsVolatilePack();
+  if (pack) recordVolatileUniform(buffer, pack);
+}
+
 export function createParamsBuffer(
   device: GPUDevice,
   data: Uint32Array,
@@ -136,12 +149,14 @@ export function createParamsBuffer(
           }
         }
         if (same) {
-          if (compiling)
+          if (compiling) {
             assignSlot(cached.buffer, {
               kind: "params",
               seqIndex: idx,
               data: data.slice(),
             });
+            maybeRecordParamsVolatile(cached.buffer);
+          }
           return cached.buffer; // Skip writeBuffer entirely
         }
       }
@@ -187,12 +202,14 @@ export function createParamsBuffer(
       } else {
         cached.data = data.slice();
       }
-      if (compiling)
+      if (compiling) {
         assignSlot(cached.buffer, {
           kind: "params",
           seqIndex: idx,
           data: data.slice(),
         });
+        maybeRecordParamsVolatile(cached.buffer);
+      }
       return cached.buffer;
     }
 
@@ -209,12 +226,14 @@ export function createParamsBuffer(
         data: data.slice(),
       };
       paramsSequenceSet.add(buffer);
-      if (compiling)
+      if (compiling) {
         assignSlot(buffer, {
           kind: "params",
           seqIndex: idx,
           data: data.slice(),
         });
+        maybeRecordParamsVolatile(buffer);
+      }
       return buffer;
     }
   }
@@ -236,8 +255,10 @@ export function createParamsBuffer(
     };
     paramsSequenceSet.add(buffer);
   }
-  if (compiling)
+  if (compiling) {
     assignSlot(buffer, { kind: "params", seqIndex: idx, data: data.slice() });
+    maybeRecordParamsVolatile(buffer);
+  }
   return buffer;
 }
 
