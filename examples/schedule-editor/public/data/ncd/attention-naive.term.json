@@ -1,0 +1,101 @@
+{
+  "schemaVersion": "ncd-term-1-proposal",
+  "id": "ncd-attention-naive-b1-h12-n512-d64",
+  "name": "Naive attention → FlashAttention",
+  "semantic": {
+    "axes": [
+      { "id": "b", "label": "b", "size": 1 },
+      { "id": "h", "label": "h", "size": 12 },
+      { "id": "q", "label": "q", "size": 512 },
+      { "id": "x", "label": "x", "size": 512 },
+      { "id": "d", "label": "d", "size": 64 }
+    ],
+    "wires": [
+      { "id": "Q", "label": "Q", "axisIds": ["b", "h", "q", "d"], "elementBytes": 4, "tupleGroup": "qkv" },
+      { "id": "K", "label": "K", "axisIds": ["b", "h", "x", "d"], "elementBytes": 4, "tupleGroup": "qkv" },
+      { "id": "V", "label": "V", "axisIds": ["b", "h", "x", "d"], "elementBytes": 4, "tupleGroup": "qkv" },
+      { "id": "scores", "label": "S", "axisIds": ["b", "h", "q", "x"], "elementBytes": 4 },
+      { "id": "probabilities", "label": "P", "axisIds": ["b", "h", "q", "x"], "elementBytes": 4 },
+      { "id": "O", "label": "O", "axisIds": ["b", "h", "q", "d"], "elementBytes": 4 }
+    ],
+    "boxes": [
+      {
+        "id": "qk",
+        "label": "Q · Kᵀ",
+        "kind": "matmul",
+        "column": 1,
+        "inputWireIds": ["Q", "K"],
+        "outputWireIds": ["scores"],
+        "streamability": {
+          "kind": "decomposed",
+          "axes": [
+            { "axisId": "x", "head": "emit empty score row", "body": "append one K block of scores", "accumulatorWireIds": ["scores"] }
+          ]
+        }
+      },
+      {
+        "id": "softmax",
+        "label": "softmax",
+        "kind": "softmax",
+        "column": 3,
+        "inputWireIds": ["scores"],
+        "outputWireIds": ["probabilities"],
+        "streamability": {
+          "kind": "none",
+          "reason": "ordinary softmax normalizes with a denominator unavailable until the whole x axis is materialized"
+        }
+      },
+      {
+        "id": "pv",
+        "label": "P · V",
+        "kind": "matmul",
+        "column": 5,
+        "inputWireIds": ["probabilities", "V"],
+        "outputWireIds": ["O"],
+        "streamability": {
+          "kind": "decomposed",
+          "axes": [
+            { "axisId": "x", "head": "initialize O tile to zero", "body": "O_tile += P_block · V_block", "accumulatorWireIds": ["O"] }
+          ]
+        }
+      }
+    ],
+    "columns": [
+      { "id": "inputs", "index": 0, "label": "Q,K,V at ℓ0" },
+      { "id": "qk", "index": 1, "label": "QK body" },
+      { "id": "scores-boundary", "index": 2, "label": "S boundary" },
+      { "id": "softmax", "index": 3, "label": "softmax body" },
+      { "id": "prob-boundary", "index": 4, "label": "P boundary" },
+      { "id": "pv", "index": 5, "label": "PV body" },
+      { "id": "output", "index": 6, "label": "O at ℓ0" }
+    ],
+    "tupleGroups": [
+      { "id": "qkv", "label": "(Q, K, V)", "wireIds": ["Q", "K", "V"] }
+    ]
+  },
+  "decorations": {
+    "residency": [
+      { "wireId": "Q", "column": 0, "level": "l0" },
+      { "wireId": "Q", "column": 1, "level": "l1" },
+      { "wireId": "K", "column": 0, "level": "l0" },
+      { "wireId": "K", "column": 1, "level": "l1" },
+      { "wireId": "V", "column": 0, "level": "l0" },
+      { "wireId": "V", "column": 5, "level": "l1" },
+      { "wireId": "scores", "column": 1, "level": "l1" },
+      { "wireId": "scores", "column": 2, "level": "l0" },
+      { "wireId": "scores", "column": 3, "level": "l1" },
+      { "wireId": "probabilities", "column": 3, "level": "l1" },
+      { "wireId": "probabilities", "column": 4, "level": "l0" },
+      { "wireId": "probabilities", "column": 5, "level": "l1" },
+      { "wireId": "O", "column": 5, "level": "l1" },
+      { "wireId": "O", "column": 6, "level": "l0" }
+    ],
+    "partitions": [],
+    "divisibility": [
+      { "axisId": "q", "multiple": 32, "reason": "BR workgroup tile" },
+      { "axisId": "x", "multiple": 32, "reason": "BC streamed tile" },
+      { "axisId": "d", "multiple": 4, "reason": "vec4 head-dimension load" }
+    ],
+    "admittedLemmas": []
+  }
+}

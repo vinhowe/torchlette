@@ -1,191 +1,230 @@
 <script lang="ts">
-  import { onMount } from "svelte";
-  import { Clipboard, Download, Minus, Plus, Redo2, RotateCcw, Undo2 } from "@lucide/svelte";
-  import AppBar from "./lib/components/primitives/AppBar.svelte";
-  import ThemeProvider from "./lib/components/theme/ThemeProvider.svelte";
-  import ThemeToggle from "./lib/components/theme/ThemeToggle.svelte";
-  import Workbench from "./lib/components/workbench/Workbench.svelte";
-  import {
-    calculateStaticCost,
-    scheduleStateHash,
-  } from "./lib/cost-model";
-  import {
-    applyMove,
-    boundaryKeys,
-    clonePartition,
-    hexHash,
-    makeMerge,
-    makeSplit,
-    mergeLegality,
-  } from "./lib/partition";
-  import {
-    cloneScheduleState,
-    FALLBACK_DEVICE,
-    readDeviceModel,
-    type DeviceModel,
-    type ScheduleHistoryPoint,
-    type ScheduleState,
-  } from "./lib/schedule-state";
-  import type { HistoryEntry, Partition, PartitionMove, PlanNode, ScheduleDump } from "./lib/types";
+import {
+  Clipboard,
+  Download,
+  Minus,
+  Plus,
+  Redo2,
+  RotateCcw,
+  Undo2,
+} from "@lucide/svelte";
+import { onMount } from "svelte";
+import NcdView from "./lib/components/ncd/NcdView.svelte";
+import AppBar from "./lib/components/primitives/AppBar.svelte";
+import ThemeProvider from "./lib/components/theme/ThemeProvider.svelte";
+import ThemeToggle from "./lib/components/theme/ThemeToggle.svelte";
+import Workbench from "./lib/components/workbench/Workbench.svelte";
+import { calculateStaticCost, scheduleStateHash } from "./lib/cost-model";
+import {
+  applyMove,
+  boundaryKeys,
+  clonePartition,
+  hexHash,
+  makeMerge,
+  makeSplit,
+  mergeLegality,
+} from "./lib/partition";
+import {
+  cloneScheduleState,
+  type DeviceModel,
+  FALLBACK_DEVICE,
+  readDeviceModel,
+  type ScheduleHistoryPoint,
+  type ScheduleState,
+} from "./lib/schedule-state";
+import type {
+  HistoryEntry,
+  Partition,
+  PartitionMove,
+  PlanNode,
+  ScheduleDump,
+} from "./lib/types";
 
-  let dump = $state<ScheduleDump | null>(null);
-  let basePartition = $state<Partition | null>(null);
-  let current = $state<Partition | null>(null);
-  let selectedIslands = $state<number[]>([]);
-  let selectedNodePos = $state<number | null>(null);
-  let selectedCut = $state<{ island: number; cut: number } | null>(null);
-  let undoStack = $state<HistoryEntry[]>([]);
-  let redoStack = $state<HistoryEntry[]>([]);
-  let moves = $state<PartitionMove[]>([]);
-  let zoom = $state(10);
-  let notice = $state("Ready.");
-  let loadError = $state("");
-  let matmulTemplate = $state<ScheduleState | null>(null);
-  let attentionTemplate = $state<ScheduleState | null>(null);
-  let scheduleHistory = $state<ScheduleHistoryPoint[]>([]);
-  let scheduleHistoryCursor = $state(-1);
-  let scheduleHistoryId = 0;
-  let deviceModel = $state<DeviceModel>({ ...FALLBACK_DEVICE });
-  let scheduleBindingNote = $state("");
+let dump = $state<ScheduleDump | null>(null);
+let basePartition = $state<Partition | null>(null);
+let current = $state<Partition | null>(null);
+let selectedIslands = $state<number[]>([]);
+let selectedNodePos = $state<number | null>(null);
+let selectedCut = $state<{ island: number; cut: number } | null>(null);
+let undoStack = $state<HistoryEntry[]>([]);
+let redoStack = $state<HistoryEntry[]>([]);
+let moves = $state<PartitionMove[]>([]);
+let zoom = $state(10);
+let notice = $state("Ready.");
+let loadError = $state("");
+let matmulTemplate = $state<ScheduleState | null>(null);
+let attentionTemplate = $state<ScheduleState | null>(null);
+let scheduleHistory = $state<ScheduleHistoryPoint[]>([]);
+let scheduleHistoryCursor = $state(-1);
+let scheduleHistoryId = 0;
+let deviceModel = $state<DeviceModel>({ ...FALLBACK_DEVICE });
+let scheduleBindingNote = $state("");
+let mode = $state<"schedule" | "ncd">("schedule");
 
-  const nodesByPos = $derived(new Map((dump?.nodes ?? []).map((node) => [node.pos, node])));
-  const selectedNode = $derived(selectedNodePos === null ? null : nodesByPos.get(selectedNodePos) ?? null);
-  const baseBoundaries = $derived(basePartition ? boundaryKeys(basePartition) : new Set<string>());
-  const requestedBoundaries = $derived(current ? boundaryKeys(current) : new Set<string>());
-  const matchesDerived = $derived(Boolean(basePartition && current && basePartition.boundaryHash === current.boundaryHash));
-  const mergeState = $derived(
-    current
-      ? mergeLegality(current, selectedIslands, nodesByPos)
-      : { legal: false, reason: "Partition is loading." },
-  );
-  const exportObject = $derived(
-    dump && basePartition && current
-      ? {
-          schemaVersion: 1,
-          type: "schedule.partition.request",
-          planFingerprint: dump.meta.planFingerprint,
-          baseBoundaryHash: basePartition.boundaryHash,
-          requestedPartition: current,
-          moves,
-        }
-      : null,
-  );
-  const exportText = $derived(exportObject ? JSON.stringify(exportObject, null, 2) : "");
-  const currentSchedule = $derived(
-    scheduleHistoryCursor >= 0
-      ? scheduleHistory[scheduleHistoryCursor]?.state ?? null
-      : null,
-  );
-  const currentScheduleCost = $derived(
-    currentSchedule ? calculateStaticCost(currentSchedule, deviceModel) : null,
-  );
-  const structuralCosts = $derived(
-    undoStack.flatMap((entry, index) =>
-      entry.staticCost
-        ? [{ label: `${index + 1}. partition ${entry.forward.op}`, cost: entry.staticCost.predictedMs }]
-        : [],
-    ),
-  );
-
-  onMount(async () => {
-    try {
-      const [dumpResponse, matmulResponse, attentionResponse, detectedDevice] =
-        await Promise.all([
-          fetch("/data/gpt2-tiny-forward.json"),
-          fetch("/data/schedule-states/tiled-matmul.json"),
-          fetch("/data/schedule-states/authored-attention-forward.json"),
-          readDeviceModel(),
-        ]);
-      for (const response of [dumpResponse, matmulResponse, attentionResponse]) {
-        if (!response.ok)
-          throw new Error(`${response.url}: ${response.status} ${response.statusText}`);
+const nodesByPos = $derived(
+  new Map((dump?.nodes ?? []).map((node) => [node.pos, node])),
+);
+const selectedNode = $derived(
+  selectedNodePos === null ? null : (nodesByPos.get(selectedNodePos) ?? null),
+);
+const baseBoundaries = $derived(
+  basePartition ? boundaryKeys(basePartition) : new Set<string>(),
+);
+const requestedBoundaries = $derived(
+  current ? boundaryKeys(current) : new Set<string>(),
+);
+const matchesDerived = $derived(
+  Boolean(
+    basePartition &&
+      current &&
+      basePartition.boundaryHash === current.boundaryHash,
+  ),
+);
+const mergeState = $derived(
+  current
+    ? mergeLegality(current, selectedIslands, nodesByPos)
+    : { legal: false, reason: "Partition is loading." },
+);
+const exportObject = $derived(
+  dump && basePartition && current
+    ? {
+        schemaVersion: 1,
+        type: "schedule.partition.request",
+        planFingerprint: dump.meta.planFingerprint,
+        baseBoundaryHash: basePartition.boundaryHash,
+        requestedPartition: current,
+        moves,
       }
-      dump = (await dumpResponse.json()) as ScheduleDump;
-      matmulTemplate = (await matmulResponse.json()) as ScheduleState;
-      attentionTemplate = (await attentionResponse.json()) as ScheduleState;
-      deviceModel = detectedDevice;
-      basePartition = clonePartition(dump.partition);
-      current = clonePartition(dump.partition);
-      selectedNodePos = dump.nodes[0]?.pos ?? null;
-      notice = `Loaded ${dump.nodes.length} nodes in ${dump.partition.islands.length} islands.`;
-    } catch (error) {
-      loadError = error instanceof Error ? error.message : String(error);
+    : null,
+);
+const exportText = $derived(
+  exportObject ? JSON.stringify(exportObject, null, 2) : "",
+);
+const currentSchedule = $derived(
+  scheduleHistoryCursor >= 0
+    ? (scheduleHistory[scheduleHistoryCursor]?.state ?? null)
+    : null,
+);
+const currentScheduleCost = $derived(
+  currentSchedule ? calculateStaticCost(currentSchedule, deviceModel) : null,
+);
+const structuralCosts = $derived(
+  undoStack.flatMap((entry, index) =>
+    entry.staticCost
+      ? [
+          {
+            label: `${index + 1}. partition ${entry.forward.op}`,
+            cost: entry.staticCost.predictedMs,
+          },
+        ]
+      : [],
+  ),
+);
+
+onMount(async () => {
+  try {
+    const [dumpResponse, matmulResponse, attentionResponse, detectedDevice] =
+      await Promise.all([
+        fetch("/data/gpt2-tiny-forward.json"),
+        fetch("/data/schedule-states/tiled-matmul.json"),
+        fetch("/data/schedule-states/authored-attention-forward.json"),
+        readDeviceModel(),
+      ]);
+    for (const response of [dumpResponse, matmulResponse, attentionResponse]) {
+      if (!response.ok)
+        throw new Error(
+          `${response.url}: ${response.status} ${response.statusText}`,
+        );
     }
-  });
-
-  function controlClass(tone: "default" | "primary" | "destructive" = "default"): string {
-    const tones = {
-      default: "border-border bg-card text-foreground hover:bg-muted active:bg-border/50",
-      primary:
-        "border-primary-accent/55 bg-primary-accent/5 text-primary-accent hover:bg-primary-accent/(--tint-hover) active:bg-primary-accent/(--tint-active)",
-      destructive:
-        "border-destructive-accent/55 bg-destructive-accent/5 text-destructive-accent hover:bg-destructive-accent/(--tint-hover) active:bg-destructive-accent/(--tint-active)",
-    };
-    return `inline-flex h-control items-center justify-center gap-1 border px-1.5 type-button focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50 ${tones[tone]}`;
+    dump = (await dumpResponse.json()) as ScheduleDump;
+    matmulTemplate = (await matmulResponse.json()) as ScheduleState;
+    attentionTemplate = (await attentionResponse.json()) as ScheduleState;
+    deviceModel = detectedDevice;
+    basePartition = clonePartition(dump.partition);
+    current = clonePartition(dump.partition);
+    selectedNodePos = dump.nodes[0]?.pos ?? null;
+    notice = `Loaded ${dump.nodes.length} nodes in ${dump.partition.islands.length} islands.`;
+  } catch (error) {
+    loadError = error instanceof Error ? error.message : String(error);
   }
+});
 
-  function islandClass(kind: string, selected: boolean): string {
-    const kindClass =
-      kind === "fused"
-        ? "border-primary bg-primary/12 text-primary-accent"
-        : kind === "reduction"
-          ? "border-warning bg-warning/15 text-warning-strong"
-          : "border-border-strong bg-card text-card-foreground";
-    return `${kindClass} ${selected ? "outline outline-1 outline-ring outline-offset-1" : "hover:bg-muted"}`;
+function controlClass(
+  tone: "default" | "primary" | "destructive" = "default",
+): string {
+  const tones = {
+    default:
+      "border-border bg-card text-foreground hover:bg-muted active:bg-border/50",
+    primary:
+      "border-primary-accent/55 bg-primary-accent/5 text-primary-accent hover:bg-primary-accent/(--tint-hover) active:bg-primary-accent/(--tint-active)",
+    destructive:
+      "border-destructive-accent/55 bg-destructive-accent/5 text-destructive-accent hover:bg-destructive-accent/(--tint-hover) active:bg-destructive-accent/(--tint-active)",
+  };
+  return `inline-flex h-control items-center justify-center gap-1 border px-1.5 type-button focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50 ${tones[tone]}`;
+}
+
+function islandClass(kind: string, selected: boolean): string {
+  const kindClass =
+    kind === "fused"
+      ? "border-primary bg-primary/12 text-primary-accent"
+      : kind === "reduction"
+        ? "border-warning bg-warning/15 text-warning-strong"
+        : "border-border-strong bg-card text-card-foreground";
+  return `${kindClass} ${selected ? "outline outline-1 outline-ring outline-offset-1" : "hover:bg-muted"}`;
+}
+
+function selectIsland(index: number): void {
+  selectedCut = null;
+  if (selectedIslands.includes(index)) {
+    selectedIslands = selectedIslands.filter((item) => item !== index);
+  } else if (selectedIslands.length < 2) {
+    selectedIslands = [...selectedIslands, index];
+  } else {
+    selectedIslands = [index];
   }
+  const member = current?.islands[index]?.members[0];
+  if (member !== undefined) selectedNodePos = member;
+  openSchedule(index);
+}
 
-  function selectIsland(index: number): void {
-    selectedCut = null;
-    if (selectedIslands.includes(index)) {
-      selectedIslands = selectedIslands.filter((item) => item !== index);
-    } else if (selectedIslands.length < 2) {
-      selectedIslands = [...selectedIslands, index];
-    } else {
-      selectedIslands = [index];
-    }
-    const member = current?.islands[index]?.members[0];
-    if (member !== undefined) selectedNodePos = member;
-    openSchedule(index);
-  }
+function openSchedule(index: number): void {
+  const island = current?.islands[index];
+  if (!island || !matmulTemplate || !attentionTemplate) return;
+  const attentionRegion = island.members.some(
+    (member) =>
+      (member >= 82 && member <= 107) || (member >= 166 && member <= 189),
+  );
+  const template = attentionRegion ? attentionTemplate : matmulTemplate;
+  const state = cloneScheduleState(template);
+  const cost = calculateStaticCost(state, deviceModel);
+  scheduleHistoryId += 1;
+  scheduleHistory = [
+    {
+      id: scheduleHistoryId,
+      label: "opened island state",
+      state,
+      stateHash: scheduleStateHash(state),
+      cost,
+    },
+  ];
+  scheduleHistoryCursor = 0;
+  scheduleBindingNote = attentionRegion
+    ? `Island ${index} lies in the decomposed attention region; showing the authored fused-forward target state.`
+    : `Island ${index} opens the tiled-matmul consumer fixture for the intra-island proposal.`;
+}
 
-  function openSchedule(index: number): void {
-    const island = current?.islands[index];
-    if (!island || !matmulTemplate || !attentionTemplate) return;
-    const attentionRegion = island.members.some(
-      (member) =>
-        (member >= 82 && member <= 107) ||
-        (member >= 166 && member <= 189),
-    );
-    const template = attentionRegion ? attentionTemplate : matmulTemplate;
-    const state = cloneScheduleState(template);
-    const cost = calculateStaticCost(state, deviceModel);
-    scheduleHistoryId += 1;
-    scheduleHistory = [
-      {
-        id: scheduleHistoryId,
-        label: "opened island state",
-        state,
-        stateHash: scheduleStateHash(state),
-        cost,
-      },
-    ];
-    scheduleHistoryCursor = 0;
-    scheduleBindingNote = attentionRegion
-      ? `Island ${index} lies in the decomposed attention region; showing the authored fused-forward target state.`
-      : `Island ${index} opens the tiled-matmul consumer fixture for the intra-island proposal.`;
-  }
+function chooseCut(island: number, cut: number): void {
+  selectedIslands = [island];
+  selectedCut = { island, cut };
+  const member = current?.islands[island]?.members[cut];
+  if (member !== undefined) selectedNodePos = member;
+  notice = "Member boundary selected. Split is available.";
+}
 
-  function chooseCut(island: number, cut: number): void {
-    selectedIslands = [island];
-    selectedCut = { island, cut };
-    const member = current?.islands[island]?.members[cut];
-    if (member !== undefined) selectedNodePos = member;
-    notice = "Member boundary selected. Split is available.";
-  }
-
-  function commit(entry: HistoryEntry): void {
-    if (!current) return;
-    const annotated: HistoryEntry = currentScheduleCost && currentSchedule
+function commit(entry: HistoryEntry): void {
+  if (!current) return;
+  const annotated: HistoryEntry =
+    currentScheduleCost && currentSchedule
       ? {
           ...entry,
           staticCost: {
@@ -196,139 +235,155 @@
           },
         }
       : entry;
-    current = applyMove(current, annotated.forward);
-    undoStack = [...undoStack, annotated];
-    redoStack = [];
-    moves = [...moves, entry.forward];
-    selectedIslands = [];
-    selectedCut = null;
-  }
+  current = applyMove(current, annotated.forward);
+  undoStack = [...undoStack, annotated];
+  redoStack = [];
+  moves = [...moves, entry.forward];
+  selectedIslands = [];
+  selectedCut = null;
+}
 
-  function mergeSelected(): void {
-    if (!current || !mergeState.legal || !mergeState.indices) {
-      notice = `Refused: ${mergeState.reason}`;
-      return;
-    }
-    commit(makeMerge(current, mergeState.indices[0], mergeState.indices[1]));
-    notice = "Merged adjacent islands; inverse split recorded for undo.";
+function mergeSelected(): void {
+  if (!current || !mergeState.legal || !mergeState.indices) {
+    notice = `Refused: ${mergeState.reason}`;
+    return;
   }
+  commit(makeMerge(current, mergeState.indices[0], mergeState.indices[1]));
+  notice = "Merged adjacent islands; inverse split recorded for undo.";
+}
 
-  function splitSelected(): void {
-    if (!current || !selectedCut) {
-      notice = "Refused: select an interior member boundary first.";
-      return;
-    }
-    commit(makeSplit(current, selectedCut.island, selectedCut.cut));
-    notice = "Split island; inverse merge recorded for undo.";
+function splitSelected(): void {
+  if (!current || !selectedCut) {
+    notice = "Refused: select an interior member boundary first.";
+    return;
   }
+  commit(makeSplit(current, selectedCut.island, selectedCut.cut));
+  notice = "Split island; inverse merge recorded for undo.";
+}
 
-  function undo(): void {
-    const entry = undoStack.at(-1);
-    if (!entry || !current) return;
-    current = applyMove(current, entry.inverse);
-    undoStack = undoStack.slice(0, -1);
-    redoStack = [...redoStack, entry];
-    moves = moves.slice(0, -1);
-    selectedIslands = [];
-    selectedCut = null;
-    notice = `Undo applied structurally as ${entry.inverse.op}.`;
-  }
+function undo(): void {
+  const entry = undoStack.at(-1);
+  if (!entry || !current) return;
+  current = applyMove(current, entry.inverse);
+  undoStack = undoStack.slice(0, -1);
+  redoStack = [...redoStack, entry];
+  moves = moves.slice(0, -1);
+  selectedIslands = [];
+  selectedCut = null;
+  notice = `Undo applied structurally as ${entry.inverse.op}.`;
+}
 
-  function redo(): void {
-    const entry = redoStack.at(-1);
-    if (!entry || !current) return;
-    current = applyMove(current, entry.forward);
-    redoStack = redoStack.slice(0, -1);
-    undoStack = [...undoStack, entry];
-    moves = [...moves, entry.forward];
-    selectedIslands = [];
-    selectedCut = null;
-    notice = `Redo applied structurally as ${entry.forward.op}.`;
-  }
+function redo(): void {
+  const entry = redoStack.at(-1);
+  if (!entry || !current) return;
+  current = applyMove(current, entry.forward);
+  redoStack = redoStack.slice(0, -1);
+  undoStack = [...undoStack, entry];
+  moves = [...moves, entry.forward];
+  selectedIslands = [];
+  selectedCut = null;
+  notice = `Redo applied structurally as ${entry.forward.op}.`;
+}
 
-  function reset(): void {
-    if (!basePartition) return;
-    current = clonePartition(basePartition);
-    undoStack = [];
-    redoStack = [];
-    moves = [];
-    selectedIslands = [];
-    selectedCut = null;
-    notice = "Restored the detector-derived partition.";
-  }
+function reset(): void {
+  if (!basePartition) return;
+  current = clonePartition(basePartition);
+  undoStack = [];
+  redoStack = [];
+  moves = [];
+  selectedIslands = [];
+  selectedCut = null;
+  notice = "Restored the detector-derived partition.";
+}
 
-  function editSchedule(
-    label: string,
-    edit: (state: ScheduleState) => void,
-  ): void {
-    if (!currentSchedule) return;
-    const next = cloneScheduleState(currentSchedule);
-    edit(next);
-    const cost = calculateStaticCost(next, deviceModel);
-    scheduleHistoryId += 1;
-    scheduleHistory = [
-      ...scheduleHistory.slice(0, scheduleHistoryCursor + 1),
-      {
-        id: scheduleHistoryId,
-        label,
-        state: next,
-        stateHash: scheduleStateHash(next),
-        cost,
-      },
-    ];
-    scheduleHistoryCursor = scheduleHistory.length - 1;
-    notice = `Decoration edit recorded: ${label}.`;
-  }
+function editSchedule(
+  label: string,
+  edit: (state: ScheduleState) => void,
+): void {
+  if (!currentSchedule) return;
+  const next = cloneScheduleState(currentSchedule);
+  edit(next);
+  const cost = calculateStaticCost(next, deviceModel);
+  scheduleHistoryId += 1;
+  scheduleHistory = [
+    ...scheduleHistory.slice(0, scheduleHistoryCursor + 1),
+    {
+      id: scheduleHistoryId,
+      label,
+      state: next,
+      stateHash: scheduleStateHash(next),
+      cost,
+    },
+  ];
+  scheduleHistoryCursor = scheduleHistory.length - 1;
+  notice = `Decoration edit recorded: ${label}.`;
+}
 
-  function undoSchedule(): void {
-    if (scheduleHistoryCursor <= 0) return;
-    scheduleHistoryCursor -= 1;
-    notice = "Schedule decoration undo restored a prior state object.";
-  }
+function undoSchedule(): void {
+  if (scheduleHistoryCursor <= 0) return;
+  scheduleHistoryCursor -= 1;
+  notice = "Schedule decoration undo restored a prior state object.";
+}
 
-  function redoSchedule(): void {
-    if (scheduleHistoryCursor >= scheduleHistory.length - 1) return;
-    scheduleHistoryCursor += 1;
-    notice = "Schedule decoration redo restored the next state object.";
-  }
+function redoSchedule(): void {
+  if (scheduleHistoryCursor >= scheduleHistory.length - 1) return;
+  scheduleHistoryCursor += 1;
+  notice = "Schedule decoration redo restored the next state object.";
+}
 
-  function updateDevice(next: DeviceModel): void {
-    deviceModel = next;
-    scheduleHistory = scheduleHistory.map((point) => ({
-      ...point,
-      cost: calculateStaticCost(point.state, next),
-    }));
-  }
+function updateDevice(next: DeviceModel): void {
+  deviceModel = next;
+  scheduleHistory = scheduleHistory.map((point) => ({
+    ...point,
+    cost: calculateStaticCost(point.state, next),
+  }));
+}
 
-  async function copyExport(): Promise<void> {
-    await navigator.clipboard.writeText(exportText);
-    notice = "Requested partition JSON copied.";
-  }
+async function copyExport(): Promise<void> {
+  await navigator.clipboard.writeText(exportText);
+  notice = "Requested partition JSON copied.";
+}
 
-  function downloadExport(): void {
-    const url = URL.createObjectURL(new Blob([exportText], { type: "application/json" }));
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = "requested-partition.json";
-    anchor.click();
-    URL.revokeObjectURL(url);
-    notice = "Requested partition JSON exported.";
-  }
+function downloadExport(): void {
+  const url = URL.createObjectURL(
+    new Blob([exportText], { type: "application/json" }),
+  );
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "requested-partition.json";
+  anchor.click();
+  URL.revokeObjectURL(url);
+  notice = "Requested partition JSON exported.";
+}
 
-  function boundaryTone(left: number, right: number): string {
-    const key = `${left}|${right}`;
-    if (requestedBoundaries.has(key) && !baseBoundaries.has(key)) return "bg-success";
-    return "bg-border-strong";
-  }
+function boundaryTone(left: number, right: number): string {
+  const key = `${left}|${right}`;
+  if (requestedBoundaries.has(key) && !baseBoundaries.has(key))
+    return "bg-success";
+  return "bg-border-strong";
+}
 </script>
 
 <ThemeProvider>
   <div class="fixed inset-0 flex flex-col overflow-hidden bg-background text-foreground">
-    <AppBar title="torchlette" context="Schedule editor">
+    <AppBar title="torchlette" context={mode === "ncd" ? "NCD calculus" : "Schedule editor"}>
       <ThemeToggle integrated />
     </AppBar>
 
-    {#if loadError}
+    <nav class="flex h-control shrink-0 items-stretch border-b border-border bg-panel" aria-label="Editor mode">
+      <button
+        class={mode === "schedule" ? "border-r border-border bg-primary/12 px-2 type-body text-primary-accent" : "border-r border-border px-2 type-body hover:bg-muted active:bg-border/50"}
+        onclick={() => (mode = "schedule")}
+      >Island schedule</button>
+      <button
+        class={mode === "ncd" ? "border-r border-border bg-primary/12 px-2 type-body text-primary-accent" : "border-r border-border px-2 type-body hover:bg-muted active:bg-border/50"}
+        onclick={() => (mode = "ncd")}
+      >NCD diagram</button>
+    </nav>
+
+    {#if mode === "ncd"}
+      <NcdView />
+    {:else if loadError}
       <main class="pad-box stack-field min-h-0 flex-1 overflow-y-auto">
         <h1 class="type-heading">Ground-truth plan failed to load</h1>
         <p class="prose text-destructive-strong">{loadError}</p>
