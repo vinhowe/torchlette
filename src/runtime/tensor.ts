@@ -384,6 +384,10 @@ export class Tensor {
     // permanently orphaning it in externallyReachable.
     if (isMaterialized(this._lazyRef)) {
       rcRelease(this._lazyRef.storage.id, "tensor.updateRef");
+      // D1 shadow: this wrapper is leaving the old storage — drop it from that
+      // storage's owner SET so the derived model doesn't see a stale member
+      // (kept symmetric with the rcRelease at the same seam).
+      storageTracker.untrackTensor(this._lazyRef.storage.id, this);
       this._held.storageId = -1;
     }
 
@@ -499,6 +503,9 @@ export class Tensor {
       // Per §1.4: "Any reclamation of underlying buffers must respect allocator
       // fencing and in-flight plan retention (§14)"
       rcRelease(storage.id, "tensor.dispose");
+      // D1 shadow: drop this wrapper from the storage's owner SET (symmetric
+      // with the rcRelease). A disposed wrapper is no longer a live holder.
+      storageTracker.untrackTensor(storage.id, this);
       // Note: Do NOT destroy immediately - lazy execution means GPU work may
       // not have been submitted yet. Destruction is deferred to markStep().
     }

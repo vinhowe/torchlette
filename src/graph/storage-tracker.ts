@@ -1,3 +1,4 @@
+import { ENV } from "../core/env";
 import {
   bumpEpoch,
   currentEpoch,
@@ -11,6 +12,17 @@ import {
 import { getNextStorageId } from "./node-factory";
 import { rcDelete, rcGet, rcRelease } from "./refcount";
 import type { StorageHandle } from "./types";
+
+/**
+ * Test-context detection (D1 shadow divergence handling). Vitest sets
+ * `VITEST=true` in every worker process; that is the "existing detection" the
+ * D1 spec rides — NO new env flag. Under a test context an ownership-shadow
+ * divergence THROWS (the #74 lesson: GC-timing bugs hide from sampled
+ * instrumentation, so the differential must be loud in the suite). Outside
+ * tests it counts + single-warns. Read once at module load — the value is set
+ * before torchlette's modules evaluate in a worker.
+ */
+const isTestContext = (): boolean => ENV.VITEST === "true";
 
 /**
  * Storage tracker — manages StorageHandle lifecycle via reference counting.
@@ -89,6 +101,30 @@ class StorageTracker {
   /** Debug counters */
   private _debugDestroyCount = 0;
 
+  // ── D1: derived-ownership SHADOW model (task #70) ────────────────────────
+  // The owner SET: per-storage set of live wrapper WeakRefs. Maintained
+  // ALONGSIDE (never replacing) the single `tensorWeakRefs` owner slot. Every
+  // trackTensor registers into this set UNCONDITIONALLY — no steal semantics,
+  // no sharer refusal (that is the whole point: a slot that cannot be stolen
+  // cannot disagree with reality). Pruned lazily on read (dead deref dropped)
+  // and eagerly on unregister/destroy/GC-scan, so it never extends a wrapper's
+  // lifetime (WeakRef only — the shadow must not perturb GC-sensitive behavior,
+  // doc §7(b)/hard boundary). In D1 this feeds the derived classifier that runs
+  // in SHADOW: every classification-consuming decision computes BOTH the stored
+  // outcome and the derived one and asserts agreement (throw under test, count+
+  // single-warn otherwise). D2 flips derived authoritative and deletes the slot.
+  private _ownerSet = new Map<number, Set<WeakRef<object>>>();
+
+  /** Divergence counters (the always-on shadow differential). Nonzero outside
+   *  test contexts means the stored and derived models disagreed somewhere; the
+   *  single-warn keeps logs quiet while the count is the regression signal. */
+  private _shadowDivergences = 0;
+  /** Adjudicated (§D1-log) divergences: known, verdict-recorded, derived-
+   *  superior classes that do NOT throw. Tracked SEPARATELY so the "zero
+   *  divergences" gate means zero UNADJUDICATED divergences. */
+  private _shadowAdjudicated = 0;
+  private _shadowWarned = false;
+
   /** Register a newly created storage. */
   register(storage: StorageHandle): void {
     this.allStorages.set(storage.id, storage);
@@ -99,6 +135,12 @@ class StorageTracker {
    * Used by destroyUnreachable() to detect GC'd tensors.
    */
   trackTensor(storageId: number, tensorRef: object): void {
+    // D1 shadow: register into the owner SET unconditionally. Unlike the single
+    // owner slot below, the set has NO steal semantics — a sharer (retention
+    // clone / sidecar) JOINS W(s) rather than fighting for a slot. This is the
+    // structural fact the derived classifier reads. Done first so it happens on
+    // EVERY trackTensor, including the sharer-guard early-return path.
+    this._ownerSetAdd(storageId, tensorRef);
     // Ownership attribution. The owner slot (this storage's single WeakRef in
     // tensorWeakRefs) is what BOTH the persistence classifier (snapshotForStep /
     // releaseStepTemps) AND the GC scan (destroyUnreachable) read to decide the
@@ -160,6 +202,302 @@ class StorageTracker {
     }
   }
 
+  // ── D1: owner-SET maintenance + derived classifier ──────────────────────
+
+  /** Add a wrapper to storage s's owner set (idempotent by object identity —
+   *  a wrapper re-tracked to the same storage does not double-insert because we
+   *  compare deref'd targets). Prunes dead refs opportunistically. */
+  private _ownerSetAdd(storageId: number, tensorRef: object): void {
+    let set = this._ownerSet.get(storageId);
+    if (!set) {
+      set = new Set();
+      this._ownerSet.set(storageId, set);
+    }
+    // Dedup by identity + drop any dead refs while we are here.
+    for (const ref of set) {
+      const t = ref.deref();
+      if (t === undefined) set.delete(ref);
+      else if (t === tensorRef) return; // already a member
+    }
+    set.add(new WeakRef(tensorRef));
+  }
+
+  /** Live wrappers referencing storage s (W(s)), pruning dead refs. */
+  private _liveOwners(storageId: number): object[] {
+    const set = this._ownerSet.get(storageId);
+    if (!set) return [];
+    const live: object[] = [];
+    for (const ref of set) {
+      const t = ref.deref();
+      if (t === undefined) set.delete(ref);
+      else live.push(t);
+    }
+    if (set.size === 0) this._ownerSet.delete(storageId);
+    return live;
+  }
+
+  /** The set of storage ids that are the BASE of at least one live view (each
+   *  such view holds an rc-retain on its base that releaseStepTemps neither sees
+   *  nor releases). Computed ONCE per releaseStepTemps sweep and passed to
+   *  `_derived`, so the shadow stays O(N) rather than O(N²). */
+  private _liveViewBases(): Set<number> {
+    const bases = new Set<number>();
+    for (const [, s] of this.allStorages) {
+      if (s.baseStorageId !== undefined && rcGet(s.id) > 0) {
+        bases.add(s.baseStorageId);
+      }
+    }
+    return bases;
+  }
+
+  /**
+   * Derived classification (doc §3), computed at inquiry from single-source
+   * facts — never stored. `persistent` := ∃ w ∈ W(s) : w ∈ SNAP ∪ REG (REG =
+   * `_durablePersistent`, gen-independent — §D1-log #3); `graphHeld` := ∃ live
+   * `_graphRetained` clone (the model's G(s)>0 — the retention clone IS a
+   * wrapper taking its own rc); `sidecar` := ∃ live `_sidecarShare` pin.
+   * `keptHolder` := rc>0 ∧ (persistent ∨ graphHeld ∨ sidecar ∨ nonWrapperRetain)
+   * — the derived model's contribution over stored per-slot rc arithmetic (the
+   * caller ORs it with storedSurvives). `maxGen` mirrors the gen-scoped
+   * snapshot/release for the SNAP axis (REG is exempt); a wrapper born after the
+   * boundary is the next step's and excluded from the SNAP-scoped W(s).
+   */
+  private _derived(
+    storageId: number,
+    maxGen: number | undefined,
+    liveViewBases: Set<number>,
+  ): {
+    persistent: boolean;
+    graphHeld: boolean;
+    sidecar: boolean;
+    stepScoped: boolean;
+    hasLiveOwner: boolean;
+    keptHolder: boolean;
+  } {
+    let persistent = false;
+    let graphHeld = false;
+    let sidecar = false;
+    let hasLiveOwner = false;
+    for (const w of this._liveOwners(storageId)) {
+      // REG (durable persist) is GEN-INDEPENDENT — a registered state tensor is
+      // persistent whatever the boundary's closing generation. This is where the
+      // derived model is STRICTLY SUPERIOR to the stored one (§D1-log #3, the
+      // row-8 / #73 FP): the stored snapshot gen-filters EVERYTHING, so when a
+      // concurrent test perturbs the SHARED generation counter a stepAsync param
+      // (durably persist()ed by its optimizer) gets filtered OUT of the transient
+      // snapshot and reaped — a false-positive UAF throw. Deriving persistence
+      // from REG membership (doc §3: persistent := ∃ w ∈ W(s) : w ∈ SNAP ∪ REG,
+      // no gen term on REG) makes that misclassification unconstructible. So the
+      // REG check runs BEFORE the gen-filter continue.
+      if (this._durablePersistent.has(w)) {
+        persistent = true; // REG (D1) — gen-independent
+        hasLiveOwner = true;
+      }
+      if (maxGen !== undefined && (this._wrapperGen.get(w) ?? 0) > maxGen) {
+        continue; // next-step wrapper: not part of THIS step's SNAP-scoped W(s)
+      }
+      hasLiveOwner = true;
+      if (this._stepStartTensors?.has(w) === true) persistent = true;
+      if ((w as { _graphRetained?: boolean })._graphRetained === true) {
+        graphHeld = true; // autograd saved-slot retention clone: G(s)>0
+      }
+      if ((w as { _sidecarShare?: boolean })._sidecarShare === true) {
+        sidecar = true; // GradScaler LiveScalar pin: a persistence pin (task #74)
+      }
+    }
+    // A storage is DEMOTABLE (stepScoped) at markStep only if EVERY thing that
+    // keeps it alive is a step-scoped wrapper claim releaseStepTemps will drop.
+    // It is KEPT if any of:
+    //   • a persistent (SNAP∪REG), graph-retention, or sidecar-pin wrapper — the
+    //     legitimate long-lived holders (doc §3);
+    //   • a NON-wrapper retain: this storage is the BASE of a live view (the view
+    //     rcRetain'd it). releaseStepTemps neither sees nor releases that retain,
+    //     so reaping would UAF the view's base (the rc=1/setN=0 class from the
+    //     ledger-attack probe — an old param storage still base-retained after
+    //     the wrapper moved to the adamStep result). Plan-input retains are
+    //     transient within a plan; releaseStepTemps runs at markStep after all
+    //     plans complete, so they are not live here. rc-counting is unsound (a
+    //     single wrapper holds ctor+materialize rc=2), so base retention is
+    //     detected STRUCTURALLY (liveViewBases), not by rc arithmetic.
+    // Ground truth: a storage already at rc≤0 is DEAD (destroyed at the next
+    // destroyUnreachable) whatever the wrapper set says — a stale view whose
+    // baseStorageId still names this id but which already released its base
+    // retain leaves `liveViewBases` naming a dead base (the id=161 rc=0/viewBase
+    // case). rc is the authority for "is anything still holding it"; the wrapper
+    // classification only decides WHETHER releaseStepTemps will drop the last
+    // holder. So survival = rc>0 (after the step-temp claim would be released)
+    // AND a kept holder exists.
+    const rc = rcGet(storageId);
+    // A NON-wrapper retain keeps the storage past releaseStepTemps (which only
+    // releases wrapper claims): a live view's base retain, or — when W(s)=∅ —
+    // any rc at all (it cannot be a wrapper claim). Detected structurally
+    // (liveViewBases, computed once) — rc-counting is unsound (one wrapper holds
+    // ctor+materialize rc=2).
+    const nonWrapperRetain =
+      liveViewBases.has(storageId) || (!hasLiveOwner && rc > 0);
+    // keptHolder := a holder that survives the sweep — a persistent (SNAP∪REG),
+    // graph-retention, or sidecar-pin wrapper, or a non-wrapper retain. The
+    // derived model's ONE contribution over the stored per-slot rc arithmetic is
+    // exactly this: if the slot missed a live kept holder (stale/disposed slot),
+    // the storage MUST survive even where the stored release would zero rc — the
+    // reap-live class. `survives` is therefore keptHolder OR whatever the stored
+    // rc-arithmetic yields (supplied by the caller as storedSurvives). Here we
+    // return the derived-only signal; the caller ORs it with storedSurvives.
+    const keptHolder =
+      rc > 0 && (persistent || graphHeld || sidecar || nonWrapperRetain);
+    const stepScoped = rc > 0 && hasLiveOwner && !keptHolder;
+    return {
+      persistent,
+      graphHeld,
+      sidecar,
+      stepScoped,
+      hasLiveOwner,
+      keptHolder,
+    };
+  }
+
+  /**
+   * SHADOW comparison at the `releaseStepTemps` demotion decision, on the
+   * behavioral invariant that actually matters: does the STORAGE SURVIVE the
+   * boundary (i.e. NOT get destroyed at the following destroyUnreachable)?
+   *
+   * The stored model and the derived model classify DIFFERENT axes — stored
+   * decides "release THIS slot-wrapper's rc-claim" (per-claim), derived decides
+   * "is the storage fully step-scoped" (per-storage). Comparing those two axes
+   * directly false-fires whenever a storage has MULTIPLE holders (a step-temp
+   * wrapper AND a view-base retain / graph clone): stored releases the one
+   * claim, the storage survives via the others, yet the raw claim-verdict
+   * differs from the storage-verdict. The SURVIVAL outcome is the common,
+   * behaviorally-meaningful axis: reaping a still-needed storage is THE bug.
+   *
+   * `storedSurvives` = the storage's rc stays > 0 after releaseStepTemps runs.
+   * `derivedSurvives` = ¬stepScoped. A real divergence (throw under test) is
+   * exactly a SURVIVAL disagreement — one model would reap what the other keeps.
+   */
+  private _shadowCompareSurvival(
+    storageId: number,
+    storedSurvives: boolean,
+    derivedSurvives: boolean,
+    slotTarget: object | undefined,
+    derived: { persistent: boolean; graphHeld: boolean; sidecar: boolean },
+  ): void {
+    if (storedSurvives === derivedSurvives) return; // agreement on outcome
+
+    // With derivedSurvives = keptHolder ∨ storedSurvives, the ONLY reachable
+    // disagreement is keptHolder ∧ ¬storedSurvives: the stored per-slot rc
+    // arithmetic would REAP a storage the derived model knows still has a live
+    // kept holder (persistent / graph-retention / sidecar / view-base) — the
+    // reap-live class this campaign exists to surface.
+
+    // ADJUDICATED (§D1-log #1): a stored/derived SURVIVAL disagreement whose
+    // root is a stale DISPOSED slot wrapper. The stored single owner SLOT is
+    // cleared only on OVERWRITE by a later trackTensor for the same id, never on
+    // dispose — so it can deref to a DISPOSED wrapper whose real liveness is
+    // zero, skewing the stored survival estimate (a disposed snapshot member
+    // makes stored "keep" a storage the derived owner SET — which dropped the
+    // wrapper at dispose via untrackTensor — correctly reaps, or vice versa).
+    // The derived model reads the ACTUAL live holders and is authoritative;
+    // stored's staleness is cured structurally in D2 when the slot dies. Do NOT
+    // throw; count separately so the unadjudicated gate stays clean.
+    const adjudicated =
+      slotTarget !== undefined &&
+      (slotTarget as { disposed?: boolean }).disposed === true;
+
+    const msg =
+      `[ownership-shadow] ${adjudicated ? "ADJUDICATED(§D1-log#1: stale-disposed-slot; derived superior; D2 fix)" : "DIVERGENCE"} @ releaseStepTemps storage=${storageId}: ` +
+      `stored survives=${storedSurvives} vs derived survives=${derivedSurvives} ` +
+      `(persistent=${derived.persistent} graphHeld=${derived.graphHeld} ` +
+      `sidecar=${derived.sidecar} slotDisposed=${adjudicated}). ` +
+      `D1 asserts survival agreement; adjudicate in docs/ownership-derivation-design.md §D1-log.`;
+    if (adjudicated) {
+      this._shadowAdjudicated++;
+      if (!this._shadowWarned) {
+        this._shadowWarned = true;
+        console.warn(msg);
+      }
+      return;
+    }
+    this._shadowDivergences++;
+    if (isTestContext()) throw new Error(msg);
+    if (!this._shadowWarned) {
+      this._shadowWarned = true;
+      console.warn(msg);
+    }
+  }
+
+  /** D1 shadow divergence count (regression signal; the profiler / probes read
+   *  this to assert 0). */
+  shadowDivergenceCount(): number {
+    return this._shadowDivergences;
+  }
+
+  /** Count of ADJUDICATED (known, §D1-log, derived-superior) divergences. */
+  shadowAdjudicatedCount(): number {
+    return this._shadowAdjudicated;
+  }
+
+  /** Test-only: owner-SET stats. `sets` = number of storages with a set entry;
+   *  `liveMembers` = total LIVE (deref'd) wrappers across all sets. Used by the
+   *  GC-pressure gate to prove the shadow holds only WeakRefs (after GC + a
+   *  prune sweep, a dropped wrapper's membership collapses — the set never
+   *  extends a wrapper's lifetime). Prunes dead refs as a side effect (same as
+   *  any read of the set). */
+  shadowOwnerSetStats(): { sets: number; liveMembers: number } {
+    let liveMembers = 0;
+    for (const [, set] of this._ownerSet) {
+      for (const ref of set) {
+        if (ref.deref() === undefined) set.delete(ref);
+        else liveMembers++;
+      }
+    }
+    return { sets: this._ownerSet.size, liveMembers };
+  }
+
+  /**
+   * D1 SHADOW at the [lifetime] guard's classification (op-dispatch
+   * getInputStorage). The stored guard fires on `isDestroyed(id)` (minus the
+   * declaredReplay / viewAliasesLiveBase exonerations). This runs ONLY when the
+   * stored side says the storage was RECLAIMED (`storedReclaimed`): the derived
+   * model must then agree it was safe to reap — i.e. NO live persistent or
+   * graph-held owner remains in W(s). If one DOES remain, the stored tracker
+   * destroyed a storage a live persistent/graph-held wrapper still holds — the
+   * reap-live-state UAF this campaign hunts, a genuine divergence.
+   *
+   * The reverse direction (stored NOT reclaimed) is deliberately NOT checked:
+   * countless plan-internal intermediates are read through result storages that
+   * were never wrapped in a Tensor (W(s)=∅ by construction, no trackTensor). An
+   * alive, un-wrapped intermediate is not "dangling" — emptiness of W(s) is only
+   * meaningful once the stored tracker has independently declared the storage
+   * gone. So the guard shadow keys off `storedReclaimed` as the gate.
+   */
+  shadowCompareGuard(storageId: number, storedReclaimed: boolean): void {
+    if (!storedReclaimed) return; // alive storage: never a dangling read
+    let liveHolder = false;
+    for (const w of this._liveOwners(storageId)) {
+      if (
+        (w as { _graphRetained?: boolean })._graphRetained === true ||
+        (w as { _sidecarShare?: boolean })._sidecarShare === true ||
+        this._stepStartTensors?.has(w) === true ||
+        this._durablePersistent.has(w)
+      ) {
+        liveHolder = true;
+        break;
+      }
+    }
+    if (!liveHolder) return; // agreement: reaped storage has no live holder
+    this._shadowDivergences++;
+    const msg =
+      `[ownership-shadow] DIVERGENCE @ lifetime-guard storage=${storageId}: ` +
+      `stored reclaimed=true but derived finds a LIVE persistent/graph-held ` +
+      `owner in W(s) — the stored tracker reaped a storage a live wrapper still ` +
+      `holds (reap-live-state UAF). Adjudicate docs/ownership-derivation-design.md §D1-log.`;
+    if (isTestContext()) throw new Error(msg);
+    if (!this._shadowWarned) {
+      this._shadowWarned = true;
+      console.warn(msg);
+    }
+  }
+
   /** Stamp a tensor OBJECT's generation at CONSTRUCTION (called from the
    *  Tensor ctor). Ties the persistent-vs-next-step classification to when
    *  the object was born rather than when its storage first materialized —
@@ -184,6 +522,22 @@ class StorageTracker {
   unregister(storageId: number): void {
     this.allStorages.delete(storageId);
     this.tensorWeakRefs.delete(storageId);
+    // D1: owner set kept (see destroyStorageIds) — self-prunes via WeakRef.
+  }
+
+  /** D1 shadow: a wrapper is leaving storage s (moved to a new storage via
+   *  _updateLazyRef, or disposed). Remove it from W(s) so the derived model
+   *  does not see a stale member. Mirror of _ownerSetAdd's per-wrapper removal.
+   *  Public so tensor.ts can call it at the release seam (kept symmetric with
+   *  the existing rcRelease there). No-op if the storage/set is gone. */
+  untrackTensor(storageId: number, tensorRef: object): void {
+    const set = this._ownerSet.get(storageId);
+    if (!set) return;
+    for (const ref of set) {
+      const t = ref.deref();
+      if (t === undefined || t === tensorRef) set.delete(ref);
+    }
+    if (set.size === 0) this._ownerSet.delete(storageId);
   }
 
   /**
@@ -199,6 +553,21 @@ class StorageTracker {
       if (ref.deref() === undefined) {
         this.tensorWeakRefs.delete(id);
         if (rcGet(id) > 0) rcRelease(id, "gc");
+      }
+    }
+
+    // D1: prune the owner SET. Entries for DESTROYED storages (no longer in
+    // allStorages) whose wrappers have all died are dropped — this bounds the
+    // shadow's memory (the sets are kept through destruction for the guard
+    // shadow, so they must be reaped once every wrapper is gone). Cheap: this
+    // sweep already runs at every reclamation boundary. Live-storage entries and
+    // entries still holding a live wrapper are retained.
+    for (const [id, set] of this._ownerSet) {
+      for (const ref of set) {
+        if (ref.deref() === undefined) set.delete(ref);
+      }
+      if (set.size === 0 && !this.allStorages.has(id)) {
+        this._ownerSet.delete(id);
       }
     }
 
@@ -255,6 +624,13 @@ class StorageTracker {
     for (const id of ids) {
       const storage = this.allStorages.get(id);
       if (!storage) continue;
+      // Note: destruction here is rc-driven (rc≤0), NOT classification-driven.
+      // A persistent wrapper's OLD storage is legitimately destroyed here after
+      // the wrapper moves to a NEW storage (Adam m/v replacement: the wrapper
+      // stays in SNAP, its old storage's rc hits 0 via _updateLazyRef). So this
+      // is not a classification-consuming decision point — the shadow does NOT
+      // compare here (it would false-fire on every state replacement). The
+      // demotion CHOICE lives in releaseStepTemps; that is where the shadow runs.
 
       // Release view base ref (view is being destroyed → base loses a reference).
       // EXCEPT for compiled-plan harvested views whose base retain is owned by
@@ -273,6 +649,13 @@ class StorageTracker {
       }
       this.allStorages.delete(id);
       this.tensorWeakRefs.delete(id);
+      // D1: do NOT drop the owner set here. Keeping it through destruction lets
+      // the [lifetime] guard shadow observe whether a LIVE persistent/graph-held
+      // wrapper still points at a stored-destroyed storage (the reap-live UAF).
+      // The set self-prunes lazily as those wrappers die (WeakRef deref), and
+      // storage ids are monotonic (no id reuse to alias a stale set). Dropped
+      // only at instance/engine reset. untrackTensor already removes a wrapper
+      // at its dispose/_updateLazyRef release seam.
       count++;
       this._debugDestroyCount++;
     }
@@ -404,6 +787,8 @@ class StorageTracker {
   releaseStepTemps(maxGen?: number): number {
     if (!this._stepStartTensors) return 0;
     let released = 0;
+    // D1 shadow: precompute live view-base ids ONCE (keeps the shadow O(N)).
+    const liveViewBases = this._liveViewBases();
     for (const [id, ref] of this.tensorWeakRefs) {
       const target = ref.deref();
       // Gen-scoped release (implied boundaries): tensors created after the
@@ -418,8 +803,38 @@ class StorageTracker {
       // GC'd tensor: skip (will be handled by FR or gc scan in destroyUnreachable)
       if (target === undefined) continue;
       // Persistent tensor (snapshot member or durably persist()ed): skip
-      if (this._stepStartTensors.has(target)) continue;
-      if (this._durablePersistent.has(target)) continue;
+      const storedPersistent =
+        this._stepStartTensors.has(target) ||
+        this._durablePersistent.has(target);
+      // D1 SHADOW: compare the two models on the SURVIVAL outcome (does the
+      // storage get destroyed at the following destroyUnreachable?). The stored
+      // side keys off the SINGLE owner slot; the derived side reads the whole
+      // owner SET. A SURVIVAL disagreement means one model would reap a storage
+      // the other keeps live — the reap-live / missed-reap class this campaign
+      // exists to surface. (Compared on survival, not raw claim-verdict, because
+      // a storage with a step-temp wrapper AND another holder legitimately
+      // survives a claim release — see _shadowCompareSurvival.)
+      const derived = this._derived(id, maxGen, liveViewBases);
+      // Stored: releaseStepTemps releases exactly THIS slot wrapper's one rc
+      // when it is not persistent. The storage survives iff its rc stays > 0.
+      const rcNow = rcGet(id);
+      const storedSurvives = storedPersistent ? rcNow > 0 : rcNow - 1 > 0;
+      // Derived: the storage survives if a KEPT holder keeps it (the derived
+      // model's contribution — catches the reap-live case where the stale/
+      // disposed slot missed a live persistent/graph/sidecar/view-base holder)
+      // OR the stored rc-arithmetic already keeps it alive. ORing with
+      // storedSurvives is what makes the derived model STRICTLY a superset of
+      // stored survival — it never predicts reaping MORE than stored (which the
+      // per-slot rc arithmetic is the ground truth for), only KEEPING more.
+      const derivedSurvives = derived.keptHolder || storedSurvives;
+      this._shadowCompareSurvival(
+        id,
+        storedSurvives,
+        derivedSurvives,
+        target,
+        derived,
+      );
+      if (storedPersistent) continue;
       // Step-scoped tensor with live ref: release its claim
       if (rcGet(id) > 0) {
         rcRelease(id, "stepScoped");
@@ -496,6 +911,10 @@ class StorageTracker {
   reset(): void {
     this.allStorages.clear();
     this.tensorWeakRefs.clear();
+    this._ownerSet.clear();
+    this._shadowDivergences = 0;
+    this._shadowAdjudicated = 0;
+    this._shadowWarned = false;
   }
 
   /**
@@ -565,6 +984,7 @@ class StorageTracker {
     // never given the analogous reset.
     this.allStorages.clear();
     this.tensorWeakRefs.clear();
+    this._ownerSet.clear();
     if (this.allStorages.size !== 0) {
       throw new Error(
         `[storage-tracker] disposeAllForNewEngine left ${this.allStorages.size} residual storages — a storage escaped instance-boundary teardown and would leak into the next engine run (the second-in-process bimodality class, task #84).`,
