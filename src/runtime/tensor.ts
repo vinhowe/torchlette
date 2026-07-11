@@ -251,6 +251,19 @@ export class Tensor {
    *  cleanupAutogradGraph). */
   _graphRetained = false;
 
+  /** Storage-sharing SIDECAR that must never own its storage's WeakRef slot
+   *  (task #74). Like `_graphRetained` but for NON-autograd sharers: the
+   *  GradScaler LiveScalar pin-ring clones (`createFromStorageHandle` on the
+   *  persistent scale scalar) alias an existing storage purely to keep it alive
+   *  across the runahead window via their own rc. They must not become the
+   *  storage's tracked owner — else their demotion/GC reaps the shared storage
+   *  under the live principal (the scale scalar), which is not a snapshot member
+   *  (its eager `persist()` between steps is a no-op), so #86's snapshot-only
+   *  guard did not cover it. trackTensor refuses the owner-slot steal whenever a
+   *  sidecar meets a live incumbent. Set at construction
+   *  (RuntimeEngine.createSidecarFromStorageHandle). */
+  _sidecarShare = false;
+
   constructor(
     baseId: BaseId,
     lazyRef: LazyRef,
@@ -258,6 +271,7 @@ export class Tensor {
     device: DeviceKind,
     dtype: DType = "f32",
     graphRetained = false,
+    sidecarShare = false,
   ) {
     this.baseId = baseId;
     this._lazyRef = lazyRef;
@@ -265,9 +279,10 @@ export class Tensor {
     this.shape = shape.slice();
     this.dtype = dtype;
     // Set BEFORE the rcRetain/trackTensor block below so trackTensor sees the
-    // flag while deciding whether this clone may take the storage's owner slot
-    // (task #86).
+    // flags while deciding whether this wrapper may take the storage's owner
+    // slot (task #86 retention clones; task #74 LiveScalar pin sidecars).
     this._graphRetained = graphRetained;
+    this._sidecarShare = sidecarShare;
     if (_debugTracking) {
       _debugLiveTensors.add(this);
       // Capture creation stack for leak tracing

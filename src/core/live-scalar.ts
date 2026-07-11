@@ -95,8 +95,12 @@ export class LiveScalar {
     // (see `_pinRing` — deferred consumers still read it under runahead).
     const prev = inner.lazyRef;
     if (prev.kind === "materialized") {
+      // SIDECAR pin (task #74): shares the persistent scale storage to keep it
+      // alive across the runahead window, but must NOT steal its WeakRef owner
+      // slot from the principal `inner` tensor — else this pin's GC/demotion
+      // reaps the live scale storage (implied-boundary reclaimed-read).
       this._pin(
-        rt.createFromStorageHandle(
+        rt.createSidecarFromStorageHandle(
           prev.storage,
           inner.shape,
           inner.device,

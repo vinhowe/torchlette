@@ -16,7 +16,12 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { initWebGPU, webgpuBackend } from "../../src/backend/webgpu";
 import { registerBackend } from "../../src/backend/registry";
 import { executePlanSequential } from "../../src/executor/sequential";
-import { createStorageHandle } from "../../src/graph/node-factory";
+import {
+  createStorageHandle,
+  getNextStorageId,
+} from "../../src/graph/node-factory";
+import { rcRelease, rcRetain } from "../../src/graph/refcount";
+import { storageTracker } from "../../src/graph/storage-tracker";
 import type { StorageHandle } from "../../src/graph/types";
 import { createRemoteEngine, type Transport } from "../../src/remote/client-engine";
 import { deserializePlan } from "../../src/remote/serialize";
@@ -38,10 +43,26 @@ class InProcessTransport implements Transport {
   private readonly registry = new Map<HandleRef, StorageHandle>();
   private nextHandle = 1;
 
+  // Each registry entry is ONE ownership of its StorageHandle, accounted via
+  // the engine's shared refcount system — exactly as the real server session
+  // does (examples/remote-training-demo/server.ts allocHandle/release). Without
+  // it, server-side plan-output storages sit at rc=0 in the module-global
+  // tracker that the CLIENT engine (same process) shares, and the client's next
+  // destroyUnreachable() reaps them under the transport's live registry → a
+  // cross-"engine" reclaimed-read under STRICT_LIFETIME (task #74).
   private alloc(storage: StorageHandle): HandleRef {
     const h = `h${this.nextHandle++}`;
     this.registry.set(h, storage);
+    rcRetain(storage.id, "session.handle");
     return h;
+  }
+
+  private free(h: HandleRef): boolean {
+    const storage = this.registry.get(h);
+    if (!storage) return false;
+    this.registry.delete(h);
+    rcRelease(storage.id, "session.handle");
+    return true;
   }
 
   async execute(params: {
@@ -50,7 +71,7 @@ class InProcessTransport implements Transport {
   }): Promise<{ outputs: Record<number, HandleRef> }> {
     // Process piggybacked releases first, mirroring the real server.
     if (params.releases && params.releases.length > 0) {
-      for (const h of params.releases) this.registry.delete(h);
+      for (const h of params.releases) this.free(h);
     }
     const plan = deserializePlan(params.plan, {
       resolveHandle: (h) => {
@@ -59,6 +80,10 @@ class InProcessTransport implements Transport {
         return s;
       },
     });
+    // Snapshot the storage-id watermark, execute, retain outputs, then drop
+    // this plan's step-scoped intermediates (rc still 0) — the real server's
+    // force → materialize → destroyUnreachableSince sequence.
+    const sinceId = getNextStorageId();
     await executePlanSequential(plan, webgpuBackend);
 
     const outputSet = params.plan.outputNodes
@@ -72,6 +97,7 @@ class InProcessTransport implements Transport {
         outputs[i] = this.alloc(node.result);
       }
     }
+    storageTracker.destroyUnreachableSince(sinceId);
     return { outputs };
   }
 
@@ -108,8 +134,9 @@ class InProcessTransport implements Transport {
   }): Promise<{ releasedCount: number }> {
     let n = 0;
     for (const h of params.handles) {
-      if (this.registry.delete(h)) n++;
+      if (this.free(h)) n++;
     }
+    if (n > 0) storageTracker.destroyUnreachable();
     return { releasedCount: n };
   }
 

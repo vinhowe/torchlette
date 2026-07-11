@@ -171,6 +171,25 @@ export async function executePlanSegmented(
   let lastResult: StorageHandle | null = null;
   const finalOutputId = gpuSync ? plan.nodes[plan.nodes.length - 1].id : 0;
 
+  // Nodes whose results are referenced from OUTSIDE this plan — saved-for-
+  // backward tensors and any user-held pending tensor. The gpuSync segment
+  // reclaimer below (`survivingNodeIds`) otherwise only sees later segments
+  // WITHIN this plan, so it would release a forward node (e.g. a scalar the
+  // separate backward plan reshapes) whose only consumer lives in another
+  // plan — a cross-plan reclaimed-read under STRICT_LIFETIME. The lightweight
+  // (non-gpuSync) path already gets this protection via executePlanSequential's
+  // early-release externalNodeIds; the gpuSync path was missing it (task #74).
+  let externalNodeIds: Set<number> | null = null;
+  if (gpuSync) {
+    try {
+      const { getPendingNodeIds } = await import("../runtime/tensor");
+      const pending = getPendingNodeIds();
+      if (pending.size > 0) externalNodeIds = pending;
+    } catch {
+      /* runtime/tensor not available */
+    }
+  }
+
   for (let segIdx = 0; segIdx < segments.length; segIdx++) {
     const segment = segments[segIdx];
     const isLastSegment = segIdx === segments.length - 1;
@@ -195,8 +214,12 @@ export async function executePlanSegmented(
 
     if (gpuSync) {
       // GPU sync path: batch ops, submit, wait, then release dead buffers
-      // Find node IDs that must survive this segment (used by later segments)
+      // Find node IDs that must survive this segment (used by later segments,
+      // the final output, OR a consumer in another plan — externalNodeIds).
       const survivingNodeIds = new Set<number>([finalOutputId]);
+      if (externalNodeIds) {
+        for (const id of externalNodeIds) survivingNodeIds.add(id);
+      }
       for (const laterSegment of segments.slice(segIdx + 1)) {
         for (const laterNode of laterSegment.nodes) {
           for (const input of laterNode.inputs) {
