@@ -172,10 +172,24 @@ scatter-add (NOT authored: composed around the atomicAddF32 atom from P0).
   apply the admitted rescaling lemma. Gate: the derived kernel is numerically differential-
   clean vs naive AND lands within a stated factor (set before measuring) of the authored
   fusedAttention kernel's time. Per-move numerical differential mandatory.
-- **P3 — editor zoom-in.** Sol's islands editor gains the intra-island view: click an
-  island → skeleton + decorations rendered; P1 edits live from the UI; macro moves behind
-  the same legality-refusal UX. (Engine channel for partition requests is the sibling
-  islands work — contract.md already specs it.)
+- **P3 — the workbench: zoom-in + the perf feedback loop.** Sol's islands editor gains
+  the intra-island view: click an island → skeleton + decorations rendered; P1 edits live
+  from the UI; macro moves behind the same legality-refusal UX. (Engine channel for
+  partition/schedule requests is the sibling islands work — contract.md is the template.)
+  **The feedback loop is two-tier:**
+  1. *Static tier (instant, no GPU):* computed from ScheduleState + device limits —
+     shared-memory usage vs budget, occupancy proxy, bytes-moved estimate, roofline
+     position. This IS the realizer's costModel (§4) — one artifact, two consumers
+     (autotuner + workbench); building a second estimator is a defect.
+  2. *Measured tier (~100ms on settle):* island-in-isolation bench at real shapes —
+     warm pool, median-of-N, read-late-steps discipline — via per-dispatch timestamp
+     queries (Dawn profiler attribution exists; the browser device already requests
+     `timestamp-query`).
+  Every state in the undo stack carries its measurements: the ledger is a climbing trace.
+  **Note the early-arrival property:** decorations are tunable on AUTHORED states too, so
+  the first fiddle-able workbench — the real fused flash-attention kernel with its real
+  knobs and live numbers — ships at P0+P1+channel+P3, BEFORE any macro-move work. P2
+  deepens the same workbench to structural gestures; it does not gate it.
 
 - **P4 — self-hosting (the grammar-completeness gate).** Re-derive the framework's own
   fastest hand-crafted kernels in-grammar at perf parity: attention BACKWARD
