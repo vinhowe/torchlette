@@ -90,6 +90,37 @@
         }
       ]
     },
+    "inspection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "states"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "states": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["symbol", "label", "explanation"],
+            "properties": {
+              "symbol": { "type": "string", "minLength": 1 },
+              "label": { "type": "string", "minLength": 1 },
+              "explanation": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "correction": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["expression", "explanation"],
+          "properties": {
+            "expression": { "type": "string", "minLength": 1 },
+            "explanation": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
     "box": {
       "type": "object",
       "additionalProperties": false,
@@ -101,7 +132,8 @@
         "column": { "type": "integer", "minimum": 0 },
         "inputWireIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "outputWireIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-        "streamability": { "$ref": "#/$defs/streamability" }
+        "streamability": { "$ref": "#/$defs/streamability" },
+        "inspection": { "$ref": "#/$defs/inspection" }
       }
     },
     "column": {

@@ -34,6 +34,11 @@ export interface NcdBox {
   inputWireIds: string[];
   outputWireIds: string[];
   streamability: Streamability;
+  inspection?: {
+    title: string;
+    states: Array<{ symbol: string; label: string; explanation: string }>;
+    correction?: { expression: string; explanation: string };
+  };
 }
 
 export interface NcdColumn {
@@ -133,8 +138,8 @@ export type LemmaRelabeling = {
   op: "lemma";
   boxId: string;
   lemmaId: string;
-  before: Pick<NcdBox, "label" | "kind" | "streamability">;
-  after: Pick<NcdBox, "label" | "kind" | "streamability">;
+  before: Pick<NcdBox, "label" | "kind" | "streamability" | "inspection">;
+  after: Pick<NcdBox, "label" | "kind" | "streamability" | "inspection">;
   add: boolean;
 };
 

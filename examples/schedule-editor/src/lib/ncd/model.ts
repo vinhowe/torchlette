@@ -330,6 +330,9 @@ export function applyMove(term: NcdTerm, move: NcdMove): NcdTerm {
     box.label = move.after.label;
     box.kind = move.after.kind;
     box.streamability = copy(move.after.streamability);
+    box.inspection = move.after.inspection
+      ? copy(move.after.inspection)
+      : undefined;
     next.decorations.admittedLemmas = next.decorations.admittedLemmas.filter(
       (item) => item !== move.lemmaId,
     );
@@ -364,6 +367,7 @@ export function onlineSoftmaxLemma(term: NcdTerm): LemmaRelabeling {
       label: box.label,
       kind: box.kind,
       streamability: copy(box.streamability),
+      inspection: box.inspection ? copy(box.inspection) : undefined,
     },
     after: {
       label: "online softmax",
@@ -378,6 +382,27 @@ export function onlineSoftmaxLemma(term: NcdTerm): LemmaRelabeling {
             accumulatorWireIds: ["scores", "probabilities"],
           },
         ],
+      },
+      inspection: {
+        title: "Online-softmax carried state",
+        states: [
+          {
+            symbol: "m",
+            label: "running maximum",
+            explanation: "Largest score seen in all streamed blocks so far.",
+          },
+          {
+            symbol: "ℓ",
+            label: "running normalizer",
+            explanation:
+              "Sum of exponentials expressed relative to the current running maximum.",
+          },
+        ],
+        correction: {
+          expression: "exp(m_old − m_new)",
+          explanation:
+            "When a later block raises the maximum, this rescales every earlier contribution into the new reference frame.",
+        },
       },
     },
     add: true,

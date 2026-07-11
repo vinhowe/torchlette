@@ -216,3 +216,53 @@ diagram-equivalence overlay are all ephemeral surface state. Keeping them out of
 the serialized term preserved round-trip identity and made acceptance #3 directly
 testable. Selection may eventually be shareable presence, but it should not become
 schedule semantics.
+
+## Game-loop round — findings forced by progression
+
+### F26 — a level is not a schedule term
+
+Goal framing, target budgets, gated vocabulary, hint stages, jam-unlock state,
+completion, and the move ledger all refer to a term without changing its
+semantics. Keeping this progression object beside the NCD term prevented lesson
+state from contaminating the engine contract. A future share format needs to
+distinguish `term`, `challenge`, and `attempt` explicitly.
+
+### F27 — lemma inspection makes carried state first-class
+
+Free-form `head` and `body` strings were insufficient once the player had to
+inspect why Welford or online softmax works. `NcdBox.inspection` now carries
+named state variables and a correction expression with explanations. This is
+still pedagogical evidence rather than a typed proof; the eventual lemma term
+should derive these views from its accumulator/state-machine representation.
+
+### F28 — unlocks need proof identity, not refusal-string matching
+
+The v1 game unlocks a lemma when the streamability predicate fails in a level
+whose authored challenge names that wall. Production challenges should bind an
+expected proof obligation ID to an admitted lemma ID. Parsing or comparing the
+human refusal text would make wording changes alter game legality.
+
+### F29 — targets depend on a canonical admitted end state
+
+Each target is `ceil(knownSolvedNapkinCost × 1.10)`. That is honest only because
+the challenge ships a known solved term and uses the same local-step H/M
+convention as the player surface. If multiple end states are valid, the target
+must name the accepted cost envelope rather than secretly privilege one move
+sequence.
+
+### F30 — the cost model needs scalar/intermediate shape fidelity
+
+The LayerNorm and softmax teaching terms keep intermediate wires row-shaped so
+the existing color-transition calculus can show the pass cost and fusion
+gesture. Real mean, variance, maximum, and normalizer values are scalars plus
+row programs. A richer algebra must distinguish the carried scalar state from
+the row-sized materialization it eliminates; otherwise teaching shape and
+kernel shape remain conflated.
+
+### F31 — earned knowledge and per-level lemma walls are different state
+
+The capstone reuses online softmax, but the strict rule “no lemma before this
+level's jam” means the player demonstrates the obstruction again before the
+card appears. Long-term progression may remember that the lemma is known while
+still requiring a local proof-obligation encounter. Those should be separate
+fields (`knownLemma`, `wallWitnessed`) rather than one unlock boolean.

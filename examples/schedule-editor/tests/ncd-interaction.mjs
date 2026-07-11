@@ -55,6 +55,7 @@ try {
   async function openSurface() {
     await page.goto(ORIGIN);
     await page.getByRole("button", { name: "NCD diagram" }).click();
+    await page.getByRole("button", { name: "Open freeform sandbox" }).click();
     const viewport = page.locator(".ncd-viewport");
     await viewport.waitFor();
     return viewport;
