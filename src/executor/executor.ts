@@ -421,6 +421,14 @@ export function getFusionAnalysisTemplate(
   return fusionAnalysisCache.get(fingerprint);
 }
 
+/** Test/debug: number of DISTINCT lowered-plan templates currently cached
+ *  (one per unique plan fingerprint). The task #71 measurement: N distinct
+ *  view offsets that fork the template identity show up here as N entries;
+ *  after routing the offset through a volatile uniform they collapse to 1. */
+export function debugTemplateCount(): number {
+  return fusionAnalysisCache.size;
+}
+
 /** Test/debug: for every cached template with a valid compiled plan, the SET of
  *  harvested result identities ("nodeIndex:outputIndex"), keyed by fingerprint
  *  hex. The observed-liveness set-parity gate compares this map across the
