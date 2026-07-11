@@ -3,7 +3,7 @@
   import { GAME_LEVELS } from "../../ncd/game-levels";
   import type { NcdTerm } from "../../ncd/types";
 
-  let { onExit }: { onExit: () => void } = $props();
+  let { onExit, onComplete, onSandbox }: { onExit: () => void; onComplete: () => void; onSandbox: () => void } = $props();
 
   const ROWS_PER_STEP = 2048;
   const base = GAME_LEVELS[0].baseline;
@@ -87,7 +87,7 @@
     <div class="step-markers" aria-label="Lesson progress">
       <span class="active"></span><span></span><span></span><span></span><span></span>
     </div>
-    <button class="quiet-button" onclick={onExit}>Schedule editor</button>
+    <div class="header-actions"><button class="quiet-button" onclick={onSandbox}>Open freeform sandbox</button><button class="quiet-button" onclick={onExit}>Schedule editor</button></div>
   </header>
 
   <section class="lesson-stage" class:solved aria-live="polite">
@@ -185,7 +185,7 @@
           <span class="notation-caption">nearby memory</span>
         </div>
         <div class="reveal-actions">
-          <button class="primary-button" disabled title="The full lesson arrives in Commit B">Continue to the chain <span>→</span></button>
+          <button class="primary-button" onclick={onComplete}>Continue to the chain <span>→</span></button>
           <button class="text-button" onclick={reset}>Run it again</button>
         </div>
       </div>
@@ -225,6 +225,7 @@
   button { font: inherit; }
   .quiet-button { justify-self: end; border: 0; color: #aebbd0; background: transparent; cursor: pointer; padding: 10px 12px; border-radius: 12px; }
   .quiet-button:hover { color: white; background: rgba(255,255,255,.07); }
+  .header-actions { justify-self: end; display: flex; gap: 2px; }
   .lesson-stage { width: min(1120px, calc(100% - 40px)); margin: 0 auto; padding: 58px 0 80px; position: relative; }
   .lesson-heading { max-width: 670px; }
   .kicker { margin: 0 0 10px; color: var(--warm); text-transform: uppercase; letter-spacing: .14em; font-size: 12px; font-weight: 800; }
@@ -284,7 +285,6 @@
   .function-box { z-index: 1; padding: 13px 10px; border: 1.5px solid #273149; background: #fffaf0; font-style: italic; }
   .notation-caption { position: absolute; bottom: 12px; color: #9a632b; font-family: Inter, sans-serif; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .12em; }
   .reveal-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 16px; border-top: 1px solid #e5ddce; padding-top: 20px; }
-  .primary-button:disabled { opacity: .45; cursor: default; }
   .text-button { border: 0; color: #5b6472; background: transparent; cursor: pointer; text-decoration: underline; text-underline-offset: 4px; }
   @keyframes route-flow { to { stroke-dashoffset: -21; } }
   @keyframes parcel-pulse { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); box-shadow: 0 17px 42px rgba(255,189,89,.5); } }

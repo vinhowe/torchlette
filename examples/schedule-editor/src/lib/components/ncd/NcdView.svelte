@@ -37,6 +37,8 @@ import type {
 } from "../../ncd/types";
 import NcdRenderer from "./NcdRenderer.svelte";
 
+let { startInSandbox = false }: { startInSandbox?: boolean } = $props();
+
 let attentionBase = $state<NcdTerm | null>(null);
 let matmulBase = $state<NcdTerm | null>(null);
 let current = $state<NcdTerm | null>(null);
@@ -56,7 +58,9 @@ let equivalenceNonce = 0;
 let equivalenceTimer: ReturnType<typeof setTimeout> | undefined;
 let activeGesture = $state<SurfaceGesture | null>(null);
 let helpOpen = $state(false);
-let gameScreen = $state<"select" | "goal" | "play" | "sandbox">("select");
+let gameScreen = $state<"select" | "goal" | "play" | "sandbox">(
+  startInSandbox ? "sandbox" : "select",
+);
 let selectedLevelId = $state<GameLevelId | null>(null);
 let jamFired = $state(false);
 let hintStage = $state(0);

@@ -9,7 +9,7 @@ import {
   Undo2,
 } from "@lucide/svelte";
 import { onMount } from "svelte";
-import NcdGame from "./lib/components/ncd/NcdGame.svelte";
+import NcdLearningGame from "./lib/components/ncd/NcdLearningGame.svelte";
 import AppBar from "./lib/components/primitives/AppBar.svelte";
 import ThemeProvider from "./lib/components/theme/ThemeProvider.svelte";
 import ThemeToggle from "./lib/components/theme/ThemeToggle.svelte";
@@ -365,7 +365,7 @@ function boundaryTone(left: number, right: number): string {
 </script>
 
 {#if mode === "ncd"}
-  <NcdGame onExit={() => (mode = "schedule")} />
+  <NcdLearningGame onExit={() => (mode = "schedule")} />
 {:else}
 <ThemeProvider>
   <div class="fixed inset-0 flex flex-col overflow-hidden bg-background text-foreground">

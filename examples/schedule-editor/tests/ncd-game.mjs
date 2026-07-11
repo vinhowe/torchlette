@@ -7,16 +7,7 @@ const PORT = 43180;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
 const server = spawn(
   "pnpm",
-  [
-    "exec",
-    "vite",
-    "preview",
-    "--host",
-    "127.0.0.1",
-    "--port",
-    String(PORT),
-    "--strictPort",
-  ],
+  ["exec", "vite", "preview", "--host", "127.0.0.1", "--port", String(PORT), "--strictPort"],
   { cwd: process.cwd(), detached: true, stdio: "ignore" },
 );
 
@@ -29,189 +20,113 @@ async function waitForServer() {
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  throw new Error("Timed out waiting for the NCD game preview");
+  throw new Error("Timed out waiting for the NCD learning-game preview");
+}
+
+async function dragCenter(page, source, target) {
+  const sourceBox = await source.boundingBox();
+  const targetBox = await target.boundingBox();
+  assert.ok(sourceBox && targetBox);
+  await page.mouse.move(sourceBox.x + sourceBox.width / 2, sourceBox.y + sourceBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + targetBox.height / 2, { steps: 8 });
+  await page.mouse.up();
 }
 
 let browser;
 try {
   await waitForServer();
   browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({
-    viewport: { width: 1600, height: 1100 },
-  });
+  const page = await browser.newPage({ viewport: { width: 1600, height: 1100 } });
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto(ORIGIN);
   await page.getByRole("button", { name: "NCD diagram" }).click();
-  await page.addStyleTag({
-    content:
-      "*{animation:none!important;transition:none!important}.ncd-equivalence{display:none!important}",
-  });
+  await page.addStyleTag({ content: "*{animation:none!important;transition:none!important}" });
 
-  const capture = async (name) => {
-    await page.waitForTimeout(250);
-    await page.screenshot({ path: `review/checkpoint-e-${name}.png` });
-  };
-
-  async function chooseLevel(name) {
-    await page.getByRole("button", { name }).click();
-    await page.getByRole("button", { name: "Start level" }).waitFor();
-  }
-
-  async function startLevel() {
-    await page.getByRole("button", { name: "Start level" }).click();
-    await page.locator(".ncd-viewport").waitFor();
-  }
-
-  async function paint(wireId, column) {
-    await page
-      .locator(`[data-wire="${wireId}"][data-column="${column}"]`)
-      .click({
-        force: true,
-      });
-  }
-
-  async function dropPartition(axisId, kind) {
-    await page
-      .locator(`[data-axis="${axisId}"]`)
-      .first()
-      .evaluate((element, partitionKind) => {
-        const dataTransfer = new DataTransfer();
-        dataTransfer.setData(
-          "application/x-torchlette-ncd",
-          JSON.stringify({ type: "partition", kind: partitionKind }),
-        );
-        element.dispatchEvent(
-          new DragEvent("drop", {
-            bubbles: true,
-            cancelable: true,
-            dataTransfer,
-          }),
-        );
-      }, kind);
-  }
-
-  async function expectComplete(title, moves) {
-    await page.getByText(/TARGET MET — LEVEL COMPLETE/).waitFor();
-    assert.match(
-      await page.locator("main").innerText(),
-      new RegExp(`${moves} moves`),
-    );
-    await page.getByRole("button", { name: "Levels" }).click();
-    const card = page.getByRole("button", { name: new RegExp(title) });
-    assert.match(await card.innerText(), /COMPLETE/);
-    assert.match(await card.innerText(), new RegExp(`Moves\\s+${moves}`));
-  }
-
-  // Exercise 1: the palette is exactly level colors + paint; two fusions win.
-  await chooseLevel(/Fuse the chain/);
-  await capture("level1-goal");
-  await startLevel();
-  assert.equal(
-    await page.getByRole("button", { name: "gₐ · Group" }).count(),
-    0,
+  // Level 0 begins with an action, not a menu or jargon.
+  assert.equal(await page.getByTestId("traffic-value").innerText(), "64 MB");
+  assert.equal(await page.getByText("Hₗ₁").count(), 0);
+  await dragCenter(
+    page,
+    page.getByRole("button", { name: /Temporary result parcel/ }),
+    page.locator('[data-nearby-drop="true"]'),
   );
-  assert.equal(
-    await page.getByRole("button", { name: "sₐ · Stream" }).count(),
-    0,
-  );
-  assert.equal(await page.getByRole("button", { name: /Lemma/ }).count(), 0);
-  assert.deepEqual(
-    await page.locator('button[draggable="true"]').allTextContents(),
-    ["ℓ0 · Global", "ℓ1 · Lower"],
-  );
-  await capture("level1-jam-na-vocabulary");
-  await paint("mid1", 2);
-  await capture("level1-lemma-na-first-fusion");
-  await paint("mid2", 4);
-  await capture("level1-completion");
-  await expectComplete("Fuse the chain", 2);
-  console.log("PASS level 1: gated paint vocabulary → two-move completion");
+  assert.equal(await page.getByTestId("traffic-value").innerText(), "48 MB");
+  assert.match(await page.getByTestId("interpretation").innerText(), /removed one round trip/i);
+  assert.match(await page.getByTestId("interpretation").innerText(), /16 MB/);
+  await page.getByRole("button", { name: "Show me the shorthand" }).click();
+  assert.match(await page.getByTestId("notation-reveal").innerText(), /keep this value nearby/i);
+  await page.getByRole("button", { name: /Continue to the chain/ }).click();
+  await page.getByTestId("lesson-map").waitFor();
+  console.log("PASS level 0: act → physical consequence → earned notation");
 
-  // Exercise 3: dependent variance jams, then Welford exposes μ and M2.
-  await chooseLevel(/Carry the moments/);
-  await capture("level3-goal");
-  await startLevel();
-  assert.equal(await page.getByRole("button", { name: /Lemma/ }).count(), 0);
-  await dropPartition("r", "stream");
-  assert.match(await page.getByTestId("lemma-wall").innerText(), /whole row/);
-  assert.equal(await page.getByRole("button", { name: /Lemma/ }).count(), 1);
-  await capture("level3-jam");
-  await page.getByRole("button", { name: /Lemma/ }).click();
-  await page.locator('[data-box="variance"]').click({ force: true });
-  const welfordInspection = await page
-    .getByTestId("inspection-variance")
-    .innerText();
-  assert.match(welfordInspection, /μ/);
-  assert.match(welfordInspection, /M2/);
-  assert.match(welfordInspection, /δ²/);
-  await capture("level3-lemma-inspection");
-  await paint("mid1", 2);
-  await paint("mid2", 4);
-  await dropPartition("r", "stream");
-  await capture("level3-completion");
-  await expectComplete("Carry the moments", 4);
-  console.log(
-    "PASS level 3: jam → Welford unlock → inspected carried state → completion",
-  );
+  // Level 1 repeats the direct manipulation twice and names fusion after mastery.
+  await page.getByRole("button", { name: /Open Fuse the chain/ }).click();
+  assert.match(await page.getByTestId("teaching-feedback").innerText(), /temporary parcels/i);
+  await page.getByTestId("boundary-a").click();
+  assert.match(await page.getByTestId("teaching-feedback").innerText(), /16 MB less traffic/i);
+  await page.getByTestId("boundary-b").click();
+  assert.match(await page.getByTestId("level-completion").innerText(), /That is fusion/i);
+  await page.getByRole("button", { name: /Back to lesson map/ }).last().click();
+  assert.match(await page.getByRole("button", { name: /Open Fuse the chain/ }).innerText(), /✓/);
+  console.log("PASS level 1: two concrete shortcuts → fusion named at completion");
 
-  // Exercise 8: the larger lemma wall exposes online-softmax reference-frame state.
-  await chooseLevel(/Cross the lemma wall/);
-  await capture("level8-goal");
-  await startLevel();
-  assert.equal(await page.getByRole("button", { name: /Lemma/ }).count(), 0);
-  await dropPartition("r", "stream");
-  assert.match(
-    await page.getByTestId("lemma-wall").innerText(),
-    /maximum unavailable/,
-  );
-  assert.equal(await page.getByRole("button", { name: /Lemma/ }).count(), 1);
-  await capture("level8-jam");
-  await page.getByRole("button", { name: /Lemma/ }).click();
-  await page.locator('[data-box="softmax-sum"]').click({ force: true });
-  const softmaxInspection = await page
-    .getByTestId("inspection-softmax-sum")
-    .innerText();
-  assert.match(softmaxInspection, /running maximum/);
-  assert.match(softmaxInspection, /running normalizer/);
-  assert.match(softmaxInspection, /exp\(m_old − m_new\)/);
-  await capture("level8-lemma-inspection");
-  await paint("mid1", 2);
-  await paint("mid2", 4);
-  await dropPartition("r", "stream");
-  await capture("level8-completion");
-  await expectComplete("Cross the lemma wall", 4);
-  console.log(
-    "PASS level 8: jam → online-softmax unlock → correction inspected → completion",
-  );
+  // LayerNorm: the failed prediction exposes the dependency; Welford is operated before named.
+  await page.getByRole("button", { name: /Open Carry the moments/ }).click();
+  await page.getByRole("button", { name: /Try one continuous pass/ }).click();
+  assert.match(await page.getByTestId("layernorm-failure").innerText(), /mean so far[\s\S]*becomes/i);
+  await page.getByRole("button", { name: /4-number experiment/ }).click({ force: true });
+  assert.equal(await page.getByTestId("welford-lab").getByText("Welford", { exact: false }).count(), 0);
+  await page.getByRole("button", { name: /Feed \[2, 4\]/ }).click({ force: true });
+  await page.getByRole("button", { name: /Feed \[8, 10\]/ }).click({ force: true });
+  assert.match(await page.getByTestId("welford-lab").innerText(), /count[\s\S]*4[\s\S]*mean[\s\S]*6[\s\S]*M2[\s\S]*40/i);
+  await page.getByRole("button", { name: /Carry this backpack/ }).click({ force: true });
+  assert.match(await page.locator(".earned-tool").innerText(), /Welford running moments/);
+  await page.getByRole("button", { name: /Keep each chunk nearby/ }).click({ force: true });
+  await page.getByRole("button", { name: /Flow 128 values/ }).click({ force: true });
+  assert.match(await page.getByTestId("level-completion").innerText(), /three-number backpack/i);
+  await page.getByRole("button", { name: /Back to lesson map/ }).last().click();
+  console.log("PASS level 3: productive failure → operated summary → Welford → flowing row");
 
-  // Exercise 9: no autoplay; compose the four learned mechanics by hand.
-  await chooseLevel(/Assemble FlashAttention/);
-  await capture("level9-goal");
-  await startLevel();
-  assert.equal(await page.getByRole("button", { name: /Lemma/ }).count(), 0);
-  await dropPartition("x", "stream");
-  assert.equal(await page.getByRole("button", { name: /Lemma/ }).count(), 1);
-  await capture("level9-jam");
-  await page.getByRole("button", { name: /Lemma/ }).click();
-  await page.locator('[data-box="softmax"]').click({ force: true });
-  assert.match(
-    await page.getByTestId("inspection-softmax").innerText(),
-    /exp\(m_old − m_new\)/,
-  );
-  await capture("level9-lemma-inspection");
-  await paint("scores", 2);
-  await paint("probabilities", 4);
-  await dropPartition("q", "group");
-  await dropPartition("x", "stream");
-  await capture("level9-completion");
-  await expectComplete("Assemble FlashAttention", 5);
-  console.log(
-    "PASS level 9: five learned moves → FlashAttention target; ledger recorded",
-  );
+  // Softmax: a wrong choice remains visible, then the player repairs the moving scale.
+  await page.getByRole("button", { name: /Open Cross the lemma wall/ }).click();
+  await page.getByRole("button", { name: /Try one continuous pass/ }).click();
+  assert.match(await page.getByTestId("softmax-failure").innerText(), /later maximum moves the ruler/i);
+  await page.getByRole("button", { name: /Try it with/ }).click({ force: true });
+  assert.equal(await page.getByTestId("softmax-lab").getByText("online softmax", { exact: false }).count(), 0);
+  await page.getByRole("button", { name: /Reveal first block/ }).click({ force: true });
+  await page.getByRole("button", { name: /Reveal next block/ }).click({ force: true });
+  await page.getByRole("button", { name: /Keep 1.368 and add/ }).click({ force: true });
+  assert.match(await page.getByTestId("teaching-feedback").innerText(), /would not normalize/i);
+  await page.getByRole("button", { name: /Rescale the old subtotal/ }).click({ force: true });
+  assert.match(await page.getByTestId("softmax-correction").innerText(), /exp\(2 − 4\)/);
+  await page.getByRole("button", { name: /Carry the ruler/ }).click({ force: true });
+  assert.match(await page.locator(".earned-tool").innerText(), /Online softmax/);
+  await page.getByRole("button", { name: /Keep score chunks nearby/ }).click();
+  await page.getByRole("button", { name: /Flow 128 scores/ }).click();
+  assert.match(await page.getByTestId("level-completion").innerText(), /repairs the old subtotal/i);
+  await page.getByRole("button", { name: /Back to lesson map/ }).last().click();
+  console.log("PASS level 8: moving-ruler counterexample → rescaling insight → online softmax");
+
+  // Capstone: no new mechanics. A premature stream points back to the learned dependency.
+  await page.getByRole("button", { name: /Open Assemble FlashAttention/ }).click();
+  await page.getByRole("button", { name: /Flow 32 key columns/ }).click();
+  assert.match(await page.getByTestId("teaching-feedback").innerText(), /Reuse the m,ℓ backpack first/i);
+  await page.getByRole("button", { name: /Carry m and ℓ/ }).click();
+  await page.getByRole("button", { name: /Keep score blocks nearby/ }).click();
+  await page.getByRole("button", { name: /Keep probability blocks nearby/ }).click();
+  await page.getByRole("button", { name: /Work on 64 query rows/ }).click();
+  await page.getByRole("button", { name: /Flow 32 key columns/ }).click();
+  assert.match(await page.getByTestId("level-completion").innerText(), /built the FlashAttention schedule/i);
+  assert.match(await page.getByTestId("level-completion").innerText(), /54 MB[\s\S]*576 KB/i);
+  await page.getByRole("button", { name: /Read the paper shorthand/ }).click();
+  await page.getByTestId("earned-notation").waitFor();
+  assert.match(await page.getByTestId("earned-notation").innerText(), /warm regions stayed nearby/i);
+  console.log("PASS level 9: four earned ideas compose into FlashAttention; notation arrives last");
 
   assert.deepEqual(errors, []);
-  console.log("NCD game-loop acceptance: 4/4 level paths passed");
+  console.log("NCD learning-game acceptance: level 0 + 4/4 lesson paths passed");
 } finally {
   await browser?.close();
   try {
