@@ -1289,6 +1289,11 @@ interface DerivedMeta {
   dtype: DType;
   /** Base storage buffer size in bytes (the >maxBindingSize guard input). */
   bufferSize: number;
+  /** Packed-int (quantization) StorageFormat, propagated through transparent
+   *  view ops so the build-without-execution matmul capture can recognize a
+   *  quantized operand and decline to plan it as a plain tiled matmul (the
+   *  seam-only fused-dequant route the stub can't reproduce). */
+  format?: import("../backend/types").StorageFormat;
 }
 
 /** Output shape of a node's output `oi` (mirrors the harvest's extra-output map). */
@@ -1343,6 +1348,9 @@ function makeMetaDeriver(): {
       offset: bt.offset ?? 0,
       dtype: bt.dtype,
       bufferSize: bt.buffer.size,
+      // Packed-weight format rides the storage/backendTensor (createQuantizedWeight
+      // + the view-op propagation); carry it so a quantized operand stays visible.
+      format: st.format ?? bt.format,
     };
   };
 
@@ -1382,6 +1390,8 @@ function makeMetaDeriver(): {
             bufferSize: r.materialized
               ? sizeOf(node.shape) * dtypeBytes(node.dtype)
               : inp.bufferSize,
+            // A materializing reshape breaks packing; a free view keeps it.
+            format: r.materialized ? undefined : inp.format,
           };
         } else {
           const vm = viewResultMeta(node.op, inpVM, node.shape, node.payload);
@@ -1392,6 +1402,9 @@ function makeMetaDeriver(): {
               offset: vm.offset,
               dtype: node.dtype,
               bufferSize: inp.bufferSize, // metadata-only view → same base buffer
+              // Metadata-only view (transpose/permute/…) is format-transparent:
+              // the packed buffer + scales are unchanged (mirrors views.ts).
+              format: inp.format,
             };
           }
         }
@@ -1432,6 +1445,7 @@ function stubTensor(m: DerivedMeta): {
   dtype: DType;
   isContiguous: boolean;
   buffer: { size: number };
+  format?: import("../backend/types").StorageFormat;
 } {
   return {
     shape: m.shape,
@@ -1440,6 +1454,7 @@ function stubTensor(m: DerivedMeta): {
     dtype: m.dtype,
     isContiguous: checkContiguous(m.shape, m.strides),
     buffer: { size: m.bufferSize },
+    format: m.format,
   };
 }
 
@@ -1507,6 +1522,13 @@ function populateCapturesFromIR(
         (!rawBindable(a) && detectSimpleTranspose(a as never) === null) ||
         (!rawBindable(b) && detectSimpleTranspose(b as never) === null);
       if (unsafe) action.cachedMatmulPlan = "ir-noncontig-matmul";
+      // A packed-int (quantized) B operand must route through the seam
+      // (matmulQuantizedB) — the generated tiled-matmul stream cannot reproduce
+      // the fused-dequant kernel. Bail so this matmul stays uncovered → the plan
+      // is not fully covered → the lowered seam path runs (the sole format
+      // reader). Mirrors the planBareMatmul guard for the live-capture path.
+      else if (b?.format?.packing)
+        action.cachedMatmulPlan = "quantized-operand";
     }
 
     captureActionLayouts(action, node, nodeIdx, stubs, backendName, false);

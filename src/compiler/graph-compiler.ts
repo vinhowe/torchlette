@@ -13,10 +13,10 @@
  * cached in the FusionAnalysisTemplate.
  */
 
-import { ENV } from "../core/env";
 import type { DType } from "../backend/types";
+import { ENV } from "../core/env";
 import { enforceWriteAfterReadOrder } from "../executor/plan-builder";
-import type { LazyIRNode } from "../graph/types";
+import type { LazyIRNode, LazyRef } from "../graph/types";
 import {
   type ExecutionSegment,
   isFusibleOp,
@@ -79,6 +79,54 @@ interface GraphAnalysisResult {
  *
  * This is extracted from the inline code in executor-lowered.ts.
  */
+/** Ops that carry a packed-weight StorageFormat through to their input's
+ *  storage (pure metadata views; the packed buffer is unchanged). Mirrors the
+ *  format propagation in backend/webgpu/ops/views.ts. */
+const FORMAT_TRANSPARENT_VIEW_OPS: ReadonlySet<string> = new Set([
+  "transpose",
+  "permute",
+  "reshape",
+  "contiguous",
+]);
+
+/**
+ * True if a matmul B operand resolves to a packed-int (quantized) weight.
+ *
+ * A quantized weight is dispatched by the matmul SEAM (backend.ops.matmul →
+ * matmulQuantizedB: fused-dequant GEMV NT for M=1, explicit dequant for M>1) —
+ * a capability NEITHER dispatchMatmulDirect NOR the epilogue dispatch path
+ * reproduce (they read the packed u32 buffer as a plain f16 [N,K] weight →
+ * NaN). So a quantized matmul must NEVER be claimed into a matmul directive
+ * (epilogue chain / prologue) — those actions bypass the seam. Declining the
+ * directive leaves it a `sequential` action, whose generic dispatch calls the
+ * format-reading seam. `api.linear` transposes the [N,K] weight before the
+ * matmul, so B is a transpose VIEW whose format rides its base storage
+ * (views.ts) — resolve through the transparent view ops to find it.
+ */
+function matmulBOperandIsQuantized(ref: LazyRef): boolean {
+  let cur: LazyRef | undefined = ref;
+  // Bounded walk (view chains are short: transpose → weight).
+  for (let hops = 0; cur && hops < 8; hops++) {
+    if (cur.kind === "materialized") {
+      return !!(
+        cur.storage.format?.packing ?? cur.storage.backendTensor.format?.packing
+      );
+    }
+    if (cur.kind !== "pending") return false;
+    const node = cur.node;
+    // A produced-and-materialized view still carries its format on the result.
+    if (
+      node.result?.format?.packing ||
+      node.result?.backendTensor.format?.packing
+    ) {
+      return true;
+    }
+    if (!FORMAT_TRANSPARENT_VIEW_OPS.has(node.op)) return false;
+    cur = node.inputs[0];
+  }
+  return false;
+}
+
 function detectMatmulEpilogueChains(
   planNodes: LazyIRNode[],
   consumers: Map<number, LazyIRNode[]>,
@@ -99,6 +147,9 @@ function detectMatmulEpilogueChains(
   for (let mi = 0; mi < planNodes.length; mi++) {
     const node = planNodes[mi];
     if (node.op !== "matmul") continue;
+    // Quantized-weight matmuls MUST stay on the seam (sequential action) — the
+    // directive dispatch paths bypass the format read. Skip directive detection.
+    if (node.inputs[1] && matmulBOperandIsQuantized(node.inputs[1])) continue;
 
     const matmulPos = mi;
     const chainIds: number[] = [];
@@ -303,10 +354,7 @@ export function analyzeGraph(
   }
 
   // Log pass stats when TORCHLETTE_LOG_REWRITES=1
-  if (
-    ENV.TORCHLETTE_LOG_REWRITES === "1" &&
-    rewriteBypassedIds.size > 0
-  ) {
+  if (ENV.TORCHLETTE_LOG_REWRITES === "1" && rewriteBypassedIds.size > 0) {
     const parts: string[] = [];
     for (const [name, count] of passStats) {
       if (count > 0) parts.push(`${name}=${count}`);
@@ -394,8 +442,8 @@ export function analyzeGraph(
           if (depPos !== undefined && depPos > i) {
             console.error(
               `[TOPOSORT VIOLATION] node ${node.id} op=${node.op} at pos ${i} ` +
-              `depends on ${inp.node.id} op=${inp.node.op} at pos ${depPos} ` +
-              `(epilogueClaimed=${epilogueClaimedIds.has(inp.node.id)})`,
+                `depends on ${inp.node.id} op=${inp.node.op} at pos ${depPos} ` +
+                `(epilogueClaimed=${epilogueClaimedIds.has(inp.node.id)})`,
             );
           }
         }
@@ -462,10 +510,7 @@ export function analyzeGraph(
 
   // --- Priority 40: Elementwise fusion (via segmentPlanForExecution) ---
   // Bypassed nodes are excluded from fusion (they become view-like pass-throughs)
-  if (
-    ENV.TORCHLETTE_DEBUG_FUSION === "1" &&
-    reorderedNodes.length > 200
-  ) {
+  if (ENV.TORCHLETTE_DEBUG_FUSION === "1" && reorderedNodes.length > 200) {
     // Show which gelu ops are claimed and by which system
     for (const n of reorderedNodes) {
       if (n.op === "gelu") {
@@ -503,10 +548,7 @@ export function analyzeGraph(
   });
 
   // Debug dump: show fusion break patterns for large backward plans
-  if (
-    ENV.TORCHLETTE_DEBUG_FUSION === "1" &&
-    reorderedNodes.length > 200
-  ) {
+  if (ENV.TORCHLETTE_DEBUG_FUSION === "1" && reorderedNodes.length > 200) {
     let totalFusible = 0;
     const runLengths: number[] = [];
     let runLen = 0;
