@@ -695,6 +695,14 @@ export function planBareMatmul(
   b: WebGPUTensor,
 ): BareMatmulPlan | string {
   const ctx = requireContext();
+  // A packed-int (quantized) B operand is routed by the matmul seam
+  // (matmulQuantizedB) to a fused-dequant GEMV NT / explicit-dequant kernel —
+  // a capability the plain tiled-matmul stream generator does NOT reproduce
+  // (it would read the packed u32 buffer as a plain f16 [N,K] weight). The
+  // graph compiler already keeps a quantized matmul out of the directive /
+  // sequential-capture path (see graph-compiler.ts matmulHasQuantizedB), so
+  // this guard is belt-and-suspenders for any other bare-matmul capture site.
+  if (b.format?.packing) return "quantized-operand";
   const prep = prepareMatmulInputs(a, b, false, false);
   if (prep.aWasCopied || prep.bWasCopied) {
     if (prep.aWasCopied) destroyCopy(prep.effectiveA);
