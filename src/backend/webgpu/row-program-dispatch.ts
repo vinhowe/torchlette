@@ -123,6 +123,47 @@ export function dispatchRowProgram(
 }
 
 // ============================================================================
+// Stream-generation plan (stage-4 phase 4.4-coverage)
+// ============================================================================
+
+/**
+ * The dispatch geometry the stream generator needs to emit a row-program as
+ * ALLOC(output) + DISPATCH, single-sourced with `dispatchRowProgram`. All of it
+ * is STRUCTURAL — the kernel is keyed by `program.cacheKey` (stable across
+ * steps), the uniforms {num_rows, feature_dim} come from the lowered action, and
+ * the output byte size comes from the consumer's element count. No live buffer
+ * is read; the config buffer is the kernel's cached one (present post-execution,
+ * shared with the dispatch path → identical pipeline identity for the differ).
+ * `bindingOrder` lists the kernel's bind slots: `in0..inN` (input order matching
+ * `inputBuffers`), `output`, and `null` for the uniform config position.
+ */
+export interface RowProgramDispatchPlan {
+  pipeline: GPUComputePipeline;
+  bindingOrder: (string | null)[];
+  grid: [number, number, number];
+  configBuffer: GPUBuffer | null;
+  outBytes: number;
+}
+
+export function planRowProgramDispatch(
+  program: RowProgram,
+  numRows: number,
+  dimSize: number,
+  expectedOutElements: number,
+): RowProgramDispatchPlan {
+  const outBytes = expectedOutElements * dtypeBytes(program.output.dtype);
+  const kernel = getOrCreateKernel(program);
+  const p = kernel.plan({ num_rows: numRows, feature_dim: dimSize });
+  return {
+    pipeline: p.pipeline,
+    bindingOrder: p.bindingOrder,
+    grid: p.grid,
+    configBuffer: p.configBuffer,
+    outBytes,
+  };
+}
+
+// ============================================================================
 // Teardown
 // ============================================================================
 
