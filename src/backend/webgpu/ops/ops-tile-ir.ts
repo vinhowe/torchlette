@@ -272,6 +272,11 @@ export function whereSpec(
 ): TileKernelSpec {
   return elementwiseKernel({
     name: "where",
+    uniforms: {
+      [COND_OFFSET_UNIFORM]: "u32",
+      [X_OFFSET_UNIFORM]: "u32",
+      [Y_OFFSET_UNIFORM]: "u32",
+    },
     bindings: {
       cond: { storage: "read", type: "f32" },
       x: { storage: "read", type: "f32" },
@@ -279,15 +284,30 @@ export function whereSpec(
       out: { storage: "read_write", type: "f32" },
     },
     kernel(ctx, idx) {
+      void condOffset; // Task #71: offsets via uniforms, not baked.
+      void xOffset;
+      void yOffset;
       const condVal = ctx.stridedLoad(
         "cond",
         idx,
         indexShape,
         condStrides,
-        condOffset,
+        ctx.uniform(COND_OFFSET_UNIFORM),
       );
-      const xVal = ctx.stridedLoad("x", idx, indexShape, xStrides, xOffset);
-      const yVal = ctx.stridedLoad("y", idx, indexShape, yStrides, yOffset);
+      const xVal = ctx.stridedLoad(
+        "x",
+        idx,
+        indexShape,
+        xStrides,
+        ctx.uniform(X_OFFSET_UNIFORM),
+      );
+      const yVal = ctx.stridedLoad(
+        "y",
+        idx,
+        indexShape,
+        yStrides,
+        ctx.uniform(Y_OFFSET_UNIFORM),
+      );
       ctx.emitStore("out", idx, condVal.ne(ctx.f32(0)).select(xVal, yVal));
     },
   });
@@ -352,14 +372,29 @@ export function binaryBroadcastSpec(
   return elementwiseKernel({
     name: `binary_${fusionOp}`,
     enableF16: dtype === "f16",
+    uniforms: { [A_OFFSET_UNIFORM]: "u32", [B_OFFSET_UNIFORM]: "u32" },
     bindings: {
       a: { storage: "read", type: dtype },
       b: { storage: "read", type: dtype },
       out: { storage: "read_write", type: dtype },
     },
     kernel(ctx, idx) {
-      const aVal = ctx.stridedLoad("a", idx, indexShape, aStrides, aOffset);
-      const bVal = ctx.stridedLoad("b", idx, indexShape, bStrides, bOffset);
+      void aOffset; // Task #71: both offsets via uniforms, not baked.
+      void bOffset;
+      const aVal = ctx.stridedLoad(
+        "a",
+        idx,
+        indexShape,
+        aStrides,
+        ctx.uniform(A_OFFSET_UNIFORM),
+      );
+      const bVal = ctx.stridedLoad(
+        "b",
+        idx,
+        indexShape,
+        bStrides,
+        ctx.uniform(B_OFFSET_UNIFORM),
+      );
       ctx.emitStore("out", idx, applyFusedOp(ctx, fusionOp, [aVal, bVal]));
     },
   });
@@ -396,6 +431,27 @@ export function binaryBroadcastTileIR(
 // ============================================================================
 
 /**
+ * Task #71: a view's element offset (narrow start·stride) rides into the
+ * strided-elementwise kernels as a VOLATILE `base_offset` uniform (one per
+ * strided input, e.g. `a_offset`/`b_offset`), never a baked WGSL literal — so
+ * distinct offsets share ONE compiled-plan template and are delivered as
+ * per-replay data (TAG_UNIFORM repack), mirroring rope's cos_offset/sin_offset.
+ * The strides still specialize codegen (template identity); only the offset
+ * scalar is volatile. The direct-dispatch paths append these offset value(s)
+ * to `paramsData` AFTER `size` (elementwiseKernel declares `size` first, then
+ * the extra uniforms in insertion order — packUniforms/params() must agree).
+ *
+ * These are the canonical uniform names; the direct paths and the volatile
+ * repack (stream-generate) key on them.
+ */
+export const OFFSET_UNIFORM = "base_offset";
+export const A_OFFSET_UNIFORM = "a_offset";
+export const B_OFFSET_UNIFORM = "b_offset";
+export const COND_OFFSET_UNIFORM = "cond_offset";
+export const X_OFFSET_UNIFORM = "x_offset";
+export const Y_OFFSET_UNIFORM = "y_offset";
+
+/**
  * Build a TileKernelSpec for a strided unary op.
  * Used by both direct dispatch (compiled to WGSL) and chunked dispatch.
  */
@@ -415,16 +471,22 @@ export function unaryStridedSpec(
   return elementwiseKernel({
     name: `unary_${opKey}`,
     enableF16: dtype === "f16" || outDtype === "f16",
+    uniforms: { [OFFSET_UNIFORM]: "u32" },
     bindings: {
       a: { storage: "read", type: dtype },
       out: { storage: "read_write", type: outDtype },
     },
     kernel(ctx, idx) {
+      // Task #71: offset delivered as a uniform (volatile), NOT baked. WGSL is
+      // offset-independent → distinct offsets collapse to one template. The
+      // `offset` argument is retained only for chunked/offset-0 call sites
+      // whose value is a compile-time constant 0 (their uniform packs to 0).
+      void offset;
       ctx.emitStore(
         "out",
         idx,
         applyFusedOp(ctx, opKey, [
-          ctx.stridedLoad("a", idx, shape, strides, offset),
+          ctx.stridedLoad("a", idx, shape, strides, ctx.uniform(OFFSET_UNIFORM)),
         ]),
       );
     },
@@ -470,12 +532,20 @@ export function castSpec(
   return elementwiseKernel({
     name: `cast_${srcDtype}_${dstDtype}`,
     enableF16: srcDtype === "f16" || dstDtype === "f16",
+    uniforms: { [OFFSET_UNIFORM]: "u32" },
     bindings: {
       a: { storage: "read", type: srcDtype },
       out: { storage: "read_write", type: dstDtype },
     },
     kernel(ctx, idx) {
-      const val = ctx.stridedLoad("a", idx, shape, strides, offset);
+      void offset; // Task #71: offset via uniform, not baked (see unaryStridedSpec).
+      const val = ctx.stridedLoad(
+        "a",
+        idx,
+        shape,
+        strides,
+        ctx.uniform(OFFSET_UNIFORM),
+      );
       ctx.emitStore(
         "out",
         idx,
@@ -515,23 +585,39 @@ export function contiguousTileIR(
   offset: number,
   dtype: DataType,
 ): string {
-  return compileTileKernel(
-    elementwiseKernel({
-      name: `contiguous_${dtype}`,
-      enableF16: dtype === "f16",
-      bindings: {
-        input: { storage: "read", type: dtype },
-        out: { storage: "read_write", type: dtype },
-      },
-      kernel(ctx, idx) {
-        ctx.emitStore(
-          "out",
+  return compileTileKernel(contiguousSpec(shape, strides, offset, dtype));
+}
+
+/** Spec form of the contiguous strided-copy kernel (offset via uniform, #71). */
+export function contiguousSpec(
+  shape: number[],
+  strides: number[],
+  offset: number,
+  dtype: DataType,
+): TileKernelSpec {
+  return elementwiseKernel({
+    name: `contiguous_${dtype}`,
+    enableF16: dtype === "f16",
+    uniforms: { [OFFSET_UNIFORM]: "u32" },
+    bindings: {
+      input: { storage: "read", type: dtype },
+      out: { storage: "read_write", type: dtype },
+    },
+    kernel(ctx, idx) {
+      void offset; // Task #71: offset via uniform, not baked.
+      ctx.emitStore(
+        "out",
+        idx,
+        ctx.stridedLoad(
+          "input",
           idx,
-          ctx.stridedLoad("input", idx, shape, strides, offset),
-        );
-      },
-    }),
-  );
+          shape,
+          strides,
+          ctx.uniform(OFFSET_UNIFORM),
+        ),
+      );
+    },
+  });
 }
 
 // ============================================================================

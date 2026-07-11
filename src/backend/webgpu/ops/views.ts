@@ -181,7 +181,8 @@ export function planCastDirectCore(
     key: shader,
     shader,
     outputSizeBytes: tensor.size * dtypeBytes(dtype),
-    paramsData: params(tensor.size),
+    // Task #71: offset via uniform (after size). See planContiguousDirectCore.
+    paramsData: params(tensor.size, tensor.offset),
     dispatchX: dispatch.x,
     dispatchY: dispatch.y,
   };
@@ -228,7 +229,8 @@ function castChunked(
   const dispatcher = createTileKernelDispatcher(spec);
   dispatcher.dispatchChunked(
     { a: tensor.buffer, out: outBuffer },
-    { size: totalElements },
+    // Task #71: chunked binds from element 0 → base_offset is 0.
+    { size: totalElements, base_offset: 0 },
     {
       modes: { a: "chunked", out: "chunked" },
       bytesPerElement: { a: srcBytesPerElement, out: dstBytesPerElement },
@@ -532,7 +534,10 @@ export function planContiguousDirectCore(
     key: shader,
     shader,
     outputSizeBytes: outSize * bytesPerElement,
-    paramsData: params(outSize),
+    // Task #71: offset rides paramsData AFTER size (elementwiseKernel declares
+    // `size` first, then `base_offset`). The compiled-replay volatile repack
+    // rewrites this offset word per replay from the current view's offset.
+    paramsData: params(outSize, tensor.offset),
     dispatchX: dispatch.x,
     dispatchY: dispatch.y,
   };

@@ -2292,3 +2292,37 @@ slot re-derived per replay from the node's narrow-offset (single-sourced with
 This is a cross-seam change (tile-IR codegen + both dispatchers + generator +
 fingerprint) with silent-corruption stakes; it is scoped but not landed here.
 
+**LANDED (the complete fix, 2026-07-11).** Offset is now delivered as a
+per-replay `base_offset` uniform (or `a_offset`/`b_offset`, `cond/x/y_offset`)
+and `narrow.start` is `PAYLOAD_HASH_EXEMPT`. What shipped:
+- **Codegen (`ops-tile-ir.ts`)**: `unaryStridedSpec`/`castSpec`/`binaryBroadcastSpec`/
+  `whereSpec`/`contiguousSpec` declare the offset uniform(s) and read them via
+  `ctx.uniform(...)` — NOT baked. WGSL is offset-independent (constant AND
+  varying offsets share one template; the spec's "uniform-for-all inside
+  compiled plans" choice — chosen for uniformity + no dual-mode classification
+  bug, at the cost of the number-literal byte-stability).
+- **Direct paths (`dispatch.ts`/`views.ts`/`where.ts`)**: `paramsData` gains the
+  offset word(s) AFTER `size` (declaration order: `params(size, ...offsets)`).
+  Chunked `createTileKernelDispatcher` sites pass the offset uniform as `0`
+  (chunked binds from element 0).
+- **Volatile delivery (single closure, two paths)**: `buildDirectOffsetRepack`
+  (`stream-generate.ts`) returns a `pack(node)` that re-derives each input's
+  offset from the CURRENT step's graph (`view-meta.ts deriveNodeOffset`, walking
+  the narrow chain / live result meta) and repacks `[size, ...offsets]`. The
+  GENERATED path emits it as a `TAG_UNIFORM` BEFORE the dispatch; the RECORDING
+  path fires the SAME closure via the executor's `setPendingParamsVolatilePack`
+  hook → `createParamsBuffer` → `recordVolatileUniform`, so both streams carry
+  an identical TAG_UNIFORM and the segment diff matches. Only fires for
+  direct-elementwise ops whose input chain contains a narrow (guarded tightly —
+  matmul/reductions/fused kernels with narrow inputs use their own configs).
+- **Fingerprint**: `narrow: Set(["start"])` in `PAYLOAD_HASH_EXEMPT` (`dim`/
+  `length` stay hashed — they change strides/shape → codegen).
+
+Verified: `t-view-offset-templates` 6 offsets → **1 template**, values correct
+at every offset (was 6 templates). New in-suite gates (`compiled-plan-parity.spec.ts`):
+the templates gate + a cross-offset replay gate (`t-view-offset-cross-replay` —
+build at offset A, replay at B, assert B's region; the offset-0-builds-first
+trap, now permanent). offset-views 48/48; fullstack compiled==lowered 8.6e-6/30
+steps. Real-decode (gpt2 substitute — qwen3-1.7B loader stalls on this box):
+16 decode steps forked **15→1** templates (steady 12→0), no PAYLOAD-THRASH.
+

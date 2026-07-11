@@ -85,6 +85,12 @@ import {
 import type { AttnInputContig, LoweredPlan } from "./lowered-plan";
 import { getInputStorage } from "./op-dispatch";
 import { lookupScalarStorage } from "./scalar-table";
+import {
+  deriveNodeOffset,
+  type MetaNodeLike,
+  VIEW_META_OPS,
+  type ViewMeta,
+} from "../backend/webgpu/ops/view-meta";
 
 export interface GeneratedStream {
   /** Per-covered-action command segments, in action order. Verified against
@@ -904,27 +910,161 @@ function generateSequential(
     seqIndex: -1,
     data: plan.paramsData.slice(),
   });
-  return {
-    commands: [
-      {
-        tag: TAG_ALLOC,
-        slot: outSlot,
-        bytes: plan.outputSizeBytes,
-        allocKind: 0,
-        // Only poolable operands are aliasing candidates; scalar-table buffers
-        // are persistent and excluded by resolveOutputBuffer.
-        inputSlots: aliasInSlots,
-      },
-      {
-        tag: TAG_DISPATCH,
-        pipeline,
-        bindings: [...inSlots, outSlot, paramsSlot],
-        gx: plan.dispatchX,
-        gy: plan.dispatchY,
-        gz: 1,
-      },
-    ],
-    outSlot,
+  const commands: GpuCommand[] = [
+    {
+      tag: TAG_ALLOC,
+      slot: outSlot,
+      bytes: plan.outputSizeBytes,
+      allocKind: 0,
+      // Only poolable operands are aliasing candidates; scalar-table buffers
+      // are persistent and excluded by resolveOutputBuffer.
+      inputSlots: aliasInSlots,
+    },
+  ];
+  // Task #71: if any input's offset can VARY across replays (its view chain
+  // contains a narrow), the frozen paramsData holds only the record-time
+  // offset — a start-N replay of a start-0-built template would read the wrong
+  // region (the falsified shortcut). Emit a TAG_UNIFORM that re-derives every
+  // input offset from the CURRENT step's node and rewrites the params buffer
+  // (params layout: [size, ...offsets] in uniform-declaration order). Emitted
+  // BEFORE the dispatch to match the recording order (createParamsBuffer runs
+  // the repack at params-buffer creation, before dispatchComputePass encodes).
+  // nodeIndex -1 is patched to this node's plan index by the caller.
+  const offsetRepack = buildDirectOffsetRepack(node);
+  if (offsetRepack) {
+    commands.push({
+      tag: TAG_UNIFORM,
+      slot: paramsSlot,
+      nodeIndex: -1,
+      pack: offsetRepack,
+    });
+  }
+  commands.push({
+    tag: TAG_DISPATCH,
+    pipeline,
+    bindings: [...inSlots, outSlot, paramsSlot],
+    gx: plan.dispatchX,
+    gy: plan.dispatchY,
+    gz: 1,
+  });
+  return { commands, outSlot };
+}
+
+/** The narrow-offset param word count per direct-elementwise op: one offset
+ *  per strided input (binary = 2, unary/cast/contiguous = 1), following `size`
+ *  in paramsData. `where` is not on the generated direct path (clip/scaler run
+ *  it on offset-0 tensors). */
+function directOpInputCount(node: LazyIRNode): number {
+  if (BINARY_OPS.has(node.op)) return 2;
+  return 1; // cast / contiguous / unary / gelu
+}
+
+/** Ops that dispatch through the direct-elementwise params path (the only ops
+ *  whose paramsData carries the #71 base_offset uniform). */
+function isDirectElementwiseOp(op: string): boolean {
+  return (
+    BINARY_OPS.has(op) ||
+    UNARY_OPS.has(op) ||
+    op === "cast" ||
+    op === "contiguous" ||
+    op === "gelu"
+  );
+}
+
+/** Does this node's input view chain contain a narrow (→ potentially-varying
+ *  element offset)? Only then must the compiled replay re-derive the offset.
+ *  Walks ONLY through VIEW_META_OPS — the exact set deriveNodeViewMeta handles
+ *  — so a detected narrow is GUARANTEED offset-derivable (a chain through an op
+ *  the deriver can't model would otherwise silently repack offset 0). The real
+ *  view-node ops (narrow/permute/transpose/reshape/view/expand) are all in this
+ *  set; squeeze/unsqueeze/broadcastTo lower to reshape/expand and never appear
+ *  as node ops. */
+function inputHasNarrow(ref: LazyIRNode["inputs"][number]): boolean {
+  if (ref.kind !== "pending") return false;
+  let n: LazyIRNode | undefined = ref.node;
+  const seen = new Set<number>();
+  while (n && VIEW_META_OPS.has(n.op) && !seen.has(n.id)) {
+    if (n.op === "narrow") return true;
+    seen.add(n.id);
+    const inp = n.inputs[0];
+    n = inp && inp.kind === "pending" ? inp.node : undefined;
+  }
+  return false;
+}
+
+/** resolveLive: the input ref's live output ViewMeta, when its result tensor
+ *  still exists (a materialized base, or a view not yet released). Full
+ *  shape/strides/offset so the deriver can bottom out on a materialized base. */
+function refLiveMeta(
+  ref: MetaNodeLike["inputs"][number],
+): ViewMeta | undefined {
+  const r = ref as unknown as LazyIRNode["inputs"][number];
+  let bt: { shape: number[]; strides: number[]; offset?: number } | undefined;
+  if (r.kind === "materialized") {
+    bt = r.storage.backendTensor as typeof bt;
+  } else if (r.kind === "pending") {
+    const oi = r.outputIndex ?? 0;
+    const st = oi === 0 ? r.node.result : r.node.results?.[oi];
+    if (st) bt = st.backendTensor as typeof bt;
+  }
+  if (!bt) return undefined;
+  return { shape: bt.shape, strides: bt.strides, offset: bt.offset ?? 0 };
+}
+
+/** The offset of a direct-op input, re-derived from the CURRENT step's graph:
+ *  prefer the input's own live layout, else walk its view chain. */
+function directInputOffset(ref: LazyIRNode["inputs"][number]): number {
+  const mref = ref as unknown as MetaNodeLike["inputs"][number];
+  const live = refLiveMeta(mref);
+  if (live) return live.offset;
+  if (ref.kind === "pending" && ref.node) {
+    return deriveNodeOffset(ref.node, refLiveMeta) ?? 0;
+  }
+  return 0;
+}
+
+/**
+ * Task #71: build a volatile-repack closure for a direct-elementwise params
+ * buffer whose input offset(s) can vary across replays. Returns null when no
+ * input traces through a narrow (offset is a compile-time constant → the frozen
+ * paramsData is already correct, no repack overhead). The closure re-derives
+ * each input offset from the CURRENT step's node via deriveNodeOffset
+ * (single-sourced with view-meta), recomputes `size` from the output shape
+ * (template-invariant), and packs EXACTLY [size, ...offsets] — the same
+ * un-padded word count the direct path's params(size, ...offsets) writes (the
+ * params buffer is sized from that byteLength; over-writing would overrun it).
+ * Shared by the GENERATED path (this file) AND the RECORDING path
+ * (bind-group-cache via the executor's pending-pack hook) so the two command
+ * streams carry the identical TAG_UNIFORM and the segment diff matches.
+ */
+export function buildDirectOffsetRepack(
+  node: LazyIRNode,
+): ((node: LazyIRNode) => ArrayBufferView) | null {
+  // ONLY the ops that dispatch through the direct-elementwise params path
+  // (plan{Binary,Unary,Cast,Contiguous}Direct) carry the base_offset uniform.
+  // Guard tightly: matmul / reductions / fused kernels / views also take
+  // narrow inputs but use their OWN configs — attaching this repack to their
+  // params buffer would rewrite the wrong bytes (silent corruption). Mirrors
+  // generateSequential's isUnary/wgslOp direct-path classification.
+  if (!isDirectElementwiseOp(node.op)) return null;
+  const nInputs = directOpInputCount(node);
+  let anyNarrow = false;
+  for (let i = 0; i < nInputs; i++) {
+    if (node.inputs[i] && inputHasNarrow(node.inputs[i])) anyNarrow = true;
+  }
+  if (!anyNarrow) return null;
+  return (curNode: LazyIRNode): ArrayBufferView => {
+    // EXACTLY the direct-path params width: [size, ...offsets]. The direct
+    // dispatch sizes its params buffer from params(size, ...offsets).byteLength
+    // (no 16-byte pad — unlike packUniforms), so the repack must write the same
+    // word count or the writeBuffer overruns the buffer.
+    const out = new Uint32Array(1 + nInputs);
+    out[0] = sizeOf(curNode.shape);
+    for (let i = 0; i < nInputs; i++) {
+      const ref = curNode.inputs[i];
+      out[1 + i] = ref ? directInputOffset(ref) : 0;
+    }
+    return out;
   };
 }
 
