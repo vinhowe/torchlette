@@ -38,6 +38,7 @@ import {
   type KernelContext,
   type TileKernelSpec,
 } from "../backend/webgpu/tile-ir";
+import { printScheduleState, reportNoSecondOwner } from "./canonical";
 import type {
   LoopUid,
   NamedValue,
@@ -304,22 +305,15 @@ function evalBody(
 export function assertNoSecondOwnerElementwise(state: ScheduleState): void {
   const s = state.semantic;
 
-  // (1) No opaque generator / WGSL / AST dump anywhere. The schema has no field
-  //     for these; a reflective scan confirms none leaked in via `any`.
-  const serialized = JSON.stringify(state);
-  for (const forbidden of [
-    "opaqueGenerator",
-    "generatorFn",
-    "\\n@compute",
-    "fn main",
-    "wgsl",
-  ]) {
-    if (serialized.toLowerCase().includes(forbidden.toLowerCase()))
-      throw new Error(
-        `no-second-owner: schedule serialization contains forbidden token "${forbidden}" ` +
-          `(an adapter/AST-dump cheat — R22).`,
-      );
-  }
+  // (1) Schema-only serialization (§12 check 1, R22 core). The canonical PRINTER
+  //     IS the check: it walks the typed schema and THROWS (`assertNever`) on any
+  //     out-of-schema value — an opaque generator / WGSL string / AST dump
+  //     smuggled through `any` has no print rule, so it cannot serialize. This
+  //     CASHES a §11 deletion: the prototype's `JSON.stringify` + forbidden-
+  //     substring token-scan was a SECOND owner of the no-opaque-leak fact; the
+  //     printer is now its sole structural owner (§12: "P0-full replaces the
+  //     substring scan with a typed-encoder walk").
+  printScheduleState(state);
 
   // (2) Every value lives at exactly ONE tier (its allocation). The offset — the
   //     one per-replay scalar — must be a uniform NAME (data), never a baked
@@ -327,7 +321,7 @@ export function assertNoSecondOwnerElementwise(state: ScheduleState): void {
   for (const v of s.values) {
     if (v.load) {
       if (!v.load.offsetUniform)
-        throw new Error(
+        reportNoSecondOwner(
           `no-second-owner: value ${v.uid} loads without a named offset uniform ` +
             `(a baked offset would be a second owner of the view's position — #71).`,
         );
@@ -337,7 +331,7 @@ export function assertNoSecondOwnerElementwise(state: ScheduleState): void {
   // (3) The store is an EDGE, not implicit; the output value is allocated global
   //     exactly once (no shadow store owner in the body).
   if (s.stores.length !== 1)
-    throw new Error(
+    reportNoSecondOwner(
       `no-second-owner: elementwise schedule must have exactly one store edge, got ${s.stores.length}.`,
     );
 
@@ -345,7 +339,7 @@ export function assertNoSecondOwnerElementwise(state: ScheduleState): void {
   //     do NOT derive — S2 — so their ABSENCE here is load-bearing: an
   //     elementwise kernel that needed them would be mis-derived).
   if (s.roles.length || s.sync.length || s.atoms.length || s.lemmas.length)
-    throw new Error(
+    reportNoSecondOwner(
       `no-second-owner: elementwise family carries no roles/sync/atoms/lemmas; ` +
         `found some — the derivation mis-classified structure.`,
     );
