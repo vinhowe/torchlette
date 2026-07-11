@@ -43,8 +43,9 @@ class StorageTracker {
   /** Implied-step-boundary generation stamps (see
    *  Torchlette.queueStepBoundary). Keyed by the engine EPOCH id
    *  (src/core/epoch.ts): each owning TENSOR OBJECT is stamped with the
-   *  epoch current when it is first seen; a queued step boundary records
-   *  the current epoch as its closing generation and bumps the counter.
+   *  epoch current when the OBJECT is CONSTRUCTED (stampWrapperGen, from the
+   *  Tensor ctor); a queued step boundary records the current epoch as its
+   *  closing generation and bumps the counter.
    *  Stamps are compared only relatively (`stamp > boundaryEpoch`), so the
    *  epoch also advancing at other quiesce points is harmless — monotonic
    *  time-order is all that's used. Gen-scoped cleanup uses the stamps to
@@ -54,7 +55,21 @@ class StorageTracker {
    *  can be replaced mid-step (fused Adam's m/v side outputs re-point the
    *  wrapper every step), so a storage-level stamp would mis-classify
    *  long-lived state as next-step work and demote it — live optimizer
-   *  state corrupted, the persistence-UAF class. */
+   *  state corrupted, the persistence-UAF class.
+   *
+   *  ATTRIBUTION INVARIANT (task #86): the stamp records when the TENSOR
+   *  OBJECT was born, NOT when its storage first materialized. A persistent
+   *  tensor created eagerly but MATERIALIZED lazily (every `tensorFromArray`
+   *  param: the object exists before the loop, but its upload node — and thus
+   *  its first `trackTensor` — fires generations later, inside a step). Were
+   *  the stamp set at first `trackTensor` (materialize time), such a param
+   *  would carry a gen LATER than the closing boundary and be filtered OUT of
+   *  the persistent snapshot in `snapshotForStep`, then reaped by
+   *  `releaseStepTemps` while the live `w` still points at that storage (the
+   *  minimal-loop SGD reclaimed-read false positive — and a genuine UAF the
+   *  moment the pooled buffer is reused). Stamping at construction ties the
+   *  generation to object identity, matching the wrapper-level persistence
+   *  model. */
   private _wrapperGen = new WeakMap<object, number>();
 
   /** Debug counters */
@@ -70,7 +85,50 @@ class StorageTracker {
    * Used by destroyUnreachable() to detect GC'd tensors.
    */
   trackTensor(storageId: number, tensorRef: object): void {
+    // Ownership attribution (task #86): a graph-owned RETENTION CLONE
+    // (_graphRetained, from _cloneForRetention) shares a saved tensor's storage
+    // and takes its own rc, but must NOT steal that storage's WeakRef owner
+    // slot from a PERSISTENT incumbent. The owner slot is what releaseStepTemps
+    // classifies (persistent vs step-temp): if a mid-step clone (never in the
+    // snapshot) stole the slot from a persistent saved tensor (the GradScaler
+    // scale scalar — shape [1], held across the explicit boundary), then
+    // releaseStepTemps — seeing a non-snapshot owner — would release the shared
+    // storage's claim and reap it while the persistent tensor is still live: a
+    // reclaimed-read false positive on the explicit-boundary path, and a
+    // genuine UAF once the pooled buffer is reused. Refusing the steal keeps
+    // the persistent incumbent as owner so its snapshot membership protects the
+    // storage; the clone still keeps it alive via its own rc + Finalization
+    // Registry. This can NOT mask a real step-temp UAF: it only fires when the
+    // incumbent is a persistent (snapshot) tensor — a snapshot tensor's storage
+    // is not reclaimable anyway, so the classification is strictly restored,
+    // not weakened. When the incumbent is a TEMP (an activation), the clone may
+    // take the slot as before (no behavior change for that path).
+    const isRetentionClone =
+      (tensorRef as { _graphRetained?: boolean })._graphRetained === true;
+    if (isRetentionClone && this._stepStartTensors) {
+      const incumbent = this.tensorWeakRefs.get(storageId)?.deref();
+      if (incumbent && this._stepStartTensors.has(incumbent)) {
+        // Persistent incumbent — leave it as owner, only stamp the clone's gen.
+        if (!this._wrapperGen.has(tensorRef)) {
+          this._wrapperGen.set(tensorRef, currentEpoch());
+        }
+        return;
+      }
+    }
     this.tensorWeakRefs.set(storageId, new WeakRef(tensorRef));
+    // Back-fill for objects that reached us un-stamped (internal handles that
+    // bypass the Tensor ctor's birth-time stampWrapperGen). Never OVERWRITE an
+    // existing stamp — birth-time gen is the attribution source of truth (#86).
+    if (!this._wrapperGen.has(tensorRef)) {
+      this._wrapperGen.set(tensorRef, currentEpoch());
+    }
+  }
+
+  /** Stamp a tensor OBJECT's generation at CONSTRUCTION (called from the
+   *  Tensor ctor). Ties the persistent-vs-next-step classification to when
+   *  the object was born rather than when its storage first materialized —
+   *  see the _wrapperGen attribution invariant. Idempotent. */
+  stampWrapperGen(tensorRef: object): void {
     if (!this._wrapperGen.has(tensorRef)) {
       this._wrapperGen.set(tensorRef, currentEpoch());
     }
@@ -168,10 +226,7 @@ class StorageTracker {
       // (at the next harvest / teardown), so releasing here too would
       // double-free the base. See StorageHandle.planOwnedBaseRetain and
       // compiled-plan.ts harvest.
-      if (
-        storage.baseStorageId !== undefined &&
-        !storage.planOwnedBaseRetain
-      ) {
+      if (storage.baseStorageId !== undefined && !storage.planOwnedBaseRetain) {
         rcRelease(storage.baseStorageId, "view.destroyed");
       }
       rcDelete(id);

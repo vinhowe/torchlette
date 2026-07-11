@@ -1,6 +1,6 @@
 import type { BackendTensor, DeviceKind, DType, Shape } from "../backend/types";
-import { storageTracker } from "../graph/storage-tracker";
 import { rcGet, rcRelease, rcRetain } from "../graph/refcount";
+import { storageTracker } from "../graph/storage-tracker";
 import type { LazyRef, StorageHandle } from "../graph/types";
 import { isMaterialized } from "../graph/types";
 
@@ -147,8 +147,7 @@ export function getLivePendingRootNodes(): object[] {
   const roots: object[] = [];
   for (const tensors of pendingTensorsByNodeId.values()) {
     for (const t of tensors) {
-      const ref = (t as { lazyRef?: { kind?: string; node?: object } })
-        .lazyRef;
+      const ref = (t as { lazyRef?: { kind?: string; node?: object } }).lazyRef;
       if (ref?.kind === "pending" && ref.node) {
         roots.push(ref.node);
         break; // one node object per registry entry
@@ -238,6 +237,19 @@ export class Tensor {
   private readonly _held: { storageId: number; pendingNodeId: number | null };
   /** Debug: creation callsite (only when debug tracking is enabled) */
   _debugCreationSite?: string;
+  /** Autograd graph-owned retention clone (task #86). Set by the ctor when
+   *  _cloneForRetention passes graphRetained=true. Such a clone shares a saved
+   *  tensor's storage and takes its OWN rc, but must not STEAL the storage's
+   *  WeakRef owner slot from a PERSISTENT saved tensor: the owner slot is what
+   *  releaseStepTemps classifies (persistent vs step-temp). If a mid-step clone
+   *  (never in the snapshot) stole the slot from a persistent tensor (e.g. the
+   *  GradScaler scale scalar), releaseStepTemps would release the shared
+   *  storage's claim and reap it under the live persistent tensor — a
+   *  reclaimed-read false positive / UAF. trackTensor consults this flag and
+   *  refuses the steal only when the incumbent owner is persistent; the clone's
+   *  lifetime is otherwise owned by the autograd graph (disposed at
+   *  cleanupAutogradGraph). */
+  _graphRetained = false;
 
   constructor(
     baseId: BaseId,
@@ -245,12 +257,17 @@ export class Tensor {
     shape: number[],
     device: DeviceKind,
     dtype: DType = "f32",
+    graphRetained = false,
   ) {
     this.baseId = baseId;
     this._lazyRef = lazyRef;
     this.device = device;
     this.shape = shape.slice();
     this.dtype = dtype;
+    // Set BEFORE the rcRetain/trackTensor block below so trackTensor sees the
+    // flag while deciding whether this clone may take the storage's owner slot
+    // (task #86).
+    this._graphRetained = graphRetained;
     if (_debugTracking) {
       _debugLiveTensors.add(this);
       // Capture creation stack for leak tracing
@@ -275,6 +292,14 @@ export class Tensor {
     // Register with FinalizationRegistry for automatic cleanup on GC
     tensorFinalizationRegistry.register(this, this._held, this);
     tensorCreatedCount++;
+
+    // Stamp the generation at OBJECT BIRTH (task #86 attribution invariant).
+    // A pending tensor's first trackTensor fires at materialize time — many
+    // generations later — so stamping there would mis-attribute an eagerly-
+    // created-but-lazily-materialized persistent param (every tensorFromArray)
+    // as next-step work, filtering it out of the persistent snapshot and
+    // reaping its live storage. Ties the stamp to when the wrapper was created.
+    storageTracker.stampWrapperGen(this);
 
     // Register as pending if this tensor has a pending lazy ref
     if (lazyRef.kind === "pending") {
@@ -383,12 +408,16 @@ export class Tensor {
    * and MUST dispose it at graph cleanup for a symmetric rc release.
    */
   _cloneForRetention(): Tensor {
+    // graphRetained=true reaches the ctor (not set after) so trackTensor sees
+    // it during construction and can refuse to steal a persistent saved
+    // tensor's owner slot (task #86).
     return new Tensor(
       this.baseId,
       this._lazyRef,
       this.shape.slice(),
       this.device,
       this.dtype,
+      /* graphRetained */ true,
     );
   }
 
