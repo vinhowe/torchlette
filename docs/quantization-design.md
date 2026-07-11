@@ -399,3 +399,20 @@ scheme-agnostic. Confirmed holds for this implementation.
 versions by format+scheme so a dtype/scheme change re-quantizes). Default OFF
 this wave via a `weightFormat` config/URL flag in the SAE demo (not a
 `TORCHLETTE_*` env).
+
+**Node gate results (A100 dw-2-1).**
+- Operand parity (`test/quant-operand-parity.spec.ts`, in-suite): `api.linear`
+  on a quantized weight == f32 control to f32 noise (drift ~1e-7 normalized by
+  output RMS) over 12 cases (N/K∈{128²,512×1024,2048×6144}, G∈{64,128}), with the
+  route asserted EXACT: M=1 → GEMV quant (qHits=1,dHits=0), M=4 → explicit dequant
+  (dHits=1). This is the invisibility+capability proof.
+- Phase-1 kernel gate (`quant-gemv-parity.spec.ts`) still 10/10, no regression
+  from the `quantB` branch.
+- Real-model: quantized Qwen3-1.7B (int8-64 projections via the loader
+  `weightFormat` path) LOADS (310 tensors) and runs a full 28-layer forward with
+  ZERO GPU uncaptured errors, producing a coherent next-token. The 2×-load
+  20-token gen gate hangs on the documented Node/Dawn full-model load/fence flake
+  (unrelated to the kernel; single load+forward is clean) — the 20-token coherent
+  generation runs on the Mac demo.
+- No regression: `test:gates` 6/6, matmul tiled/epilogue/batched 24/24,
+  matmul-view/offset-views 68/68, distilgpt2-finetune 1/1.
