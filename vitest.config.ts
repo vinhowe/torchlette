@@ -36,6 +36,7 @@ const GPU_TEST_FILES = [
   "test/optim/adam-multigroup.spec.ts",
   "test/oracle/gpt2-checkpoint-parity.spec.ts",
   "test/quant-gemv-parity.spec.ts",
+  "test/quant-operand-parity.spec.ts",
   "test/topk-kernel.spec.ts",
   "test/true-segmentation-benchmark.spec.ts",
 ];
