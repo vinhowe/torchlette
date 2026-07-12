@@ -368,10 +368,55 @@ async function requestDeviceWithFallback(
 }
 
 let _gpuUncapturedErrorCount = 0;
+// High-water mark for the step-boundary dropped-submit guard (task #94, item 3).
+let _lastCheckedUncapturedErrorCount = 0;
 
 /** Total uncaptured GPU device errors since init (each one = a dropped submit). */
 export function getGpuUncapturedErrorCount(): number {
   return _gpuUncapturedErrorCount;
+}
+
+/**
+ * LOUD dropped-submit guard (task #94, item 3).
+ *
+ * A memory-pressured device (VkOOM) drops the submit an uncaptured error occurs
+ * in: none of that work runs, downstream reads see stale/all-zero data, and
+ * training silently continues on garbage (the VULKAN_DEVICE_INDEX=1 incident —
+ * all-zero runs, no crash). The onuncapturederror handler counts these, but its
+ * in-callback throw does NOT propagate to the training loop's control flow
+ * (it fires out-of-band on the event loop), so under memory pressure the failure
+ * was silent zeros rather than an error.
+ *
+ * This is the synchronous, in-band detector: called at fence / readback points
+ * (after submits have been observed by the device), it compares the uncaptured
+ * error count to the last check and — under TORCHLETTE_STRICT_GPU — THROWS,
+ * naming device pressure, at a deterministic point in the loop. It rides the
+ * existing STRICT_GPU flag (no new env flag). Without STRICT_GPU it silently
+ * advances the high-water mark (the existing console.error already logs each
+ * error), preserving the default behavior.
+ */
+export function assertNoDroppedSubmits(context: string): void {
+  if (_gpuUncapturedErrorCount === _lastCheckedUncapturedErrorCount) return;
+  const dropped = _gpuUncapturedErrorCount - _lastCheckedUncapturedErrorCount;
+  _lastCheckedUncapturedErrorCount = _gpuUncapturedErrorCount;
+  if (ENV.TORCHLETTE_STRICT_GPU === "1") {
+    throw new Error(
+      `TORCHLETTE_STRICT_GPU: ${dropped} GPU submit(s) were DROPPED before ${context} ` +
+        `(uncaptured device error — almost always device memory pressure / VkOOM). ` +
+        `Downstream reads would see stale/all-zero data; failing loudly instead of ` +
+        `training silently on garbage. Free device memory (fewer tenants / smaller ` +
+        `model / lower batch) or select a free device (VULKAN_DEVICE_INDEX + tools/vk-shim).`,
+    );
+  }
+}
+
+/**
+ * TEST-ONLY: simulate a dropped submit by bumping the uncaptured-error count,
+ * so the item-3 submit-drop guard can be exercised without a real VkOOM. Not
+ * used in production paths.
+ */
+export function _simulateDroppedSubmitForTest(): void {
+  _gpuUncapturedErrorCount++;
 }
 
 export type InitWebGPUOptions = {
@@ -570,6 +615,9 @@ export async function syncWebGPU(): Promise<void> {
   if (typeof ctx.queue.onSubmittedWorkDone === "function") {
     await ctx.queue.onSubmittedWorkDone();
   }
+  // Fence settled: surface any dropped submit loudly under STRICT_GPU rather
+  // than letting the loop proceed on stale data (task #94, item 3).
+  assertNoDroppedSubmits("syncWebGPU fence");
   // Fence completed — quiescent point: advance the engine epoch
   // (flushes pending pool buffers).
   advanceEpoch("syncWebGPU");
@@ -604,6 +652,10 @@ export function destroyWebGPU(): void {
   }
   gpuContext.pipelines.clear();
   setGpuContext(null);
+  // A destroyed device's error count must not bleed into the next device's
+  // dropped-submit guard (task #94, item 2/3 multi-engine reclaim).
+  _gpuUncapturedErrorCount = 0;
+  _lastCheckedUncapturedErrorCount = 0;
 }
 
 /**

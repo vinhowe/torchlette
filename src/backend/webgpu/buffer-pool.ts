@@ -23,6 +23,7 @@ import {
   activeBatch,
   arenaBufferSet,
   gpuContext,
+  onTeardown,
   pinnedBufferSet,
   sharedEncoderActive,
   sharedEncoderWriteSet,
@@ -1057,6 +1058,18 @@ class SimpleBufferPool {
 /** Global buffer pool instance */
 const bufferPool = new SimpleBufferPool();
 export { bufferPool };
+
+// Multi-engine reclaim (task #94): destroyWebGPU() destroys the device and every
+// GPU buffer with it, but the pool + memory tracker are module-global singletons
+// that otherwise keep references to those now-dead buffers (and a never-decremented
+// currentBytes) into the NEXT device — a per-device-cycle leak that VkOOM'd probe
+// harnesses after ~8 engines. Reset both at teardown so a re-initWebGPU() starts
+// clean. clear() only drops references (safe — the device is being destroyed, so
+// no in-flight submit can read them).
+onTeardown(() => {
+  bufferPool.clear();
+  gpuMemoryTracker.reset();
+});
 
 // ============================================================================
 // Pool accessor functions

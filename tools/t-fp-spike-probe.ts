@@ -141,7 +141,12 @@ async function run(runIdx: number, seedBase: number): Promise<RunRec> {
 
     clipGradNorm_(api, params, 1.0);
     scaler.step(opt);
-    scaler.update();
+    // update() is async: on the CPU/elementwise path it holds the engine's
+    // exec lock across an item() readback (the fused webgpu path defers the
+    // readback to resolveDeferred, so a missing await is silently harmless
+    // there). Not awaiting it lets that lock-holding readback overlap the
+    // loss item() below → "Engine is busy". Await it (as the API documents).
+    await scaler.update();
     opt.zeroGrad();
     scaled.dispose();
     const lossVal = await lossOut.item();

@@ -671,6 +671,47 @@ export class RuntimeEngine {
     return this.defaultDevice ?? getActiveBackend().name;
   }
 
+  /**
+   * Explicitly reclaim this engine's device-side resources (task #94, item 2).
+   *
+   * The IMPLICIT new-engine path (clearTemplateCacheForNewEngine →
+   * storageTracker.disposeAllForNewEngine) deliberately ORPHANS the previous
+   * engine's GPU buffers rather than destroying them: the previous engine's
+   * tensor wrappers may still be alive, and destroying a buffer a live wrapper
+   * later GC-releases into the shared pool mid-run is the "released-to-pool
+   * mid-step" corruption class (#84). That safety leaks GPU residency for the
+   * process lifetime — building many engines in one process VkOOM'd (~8 engines).
+   *
+   * destroy() is the caller ASSERTING this engine is finished (its model /
+   * optimizer / tensors are done being read). That assertion makes full reclaim
+   * safe: on webgpu we tear down the whole device (destroyWebGPU → device.destroy
+   * frees every buffer; the teardown callbacks reset the module-global pool /
+   * arena / memory tracker), so a subsequent initWebGPU() + new engine starts
+   * from a clean device. On CPU there is no device-side residency to reclaim.
+   *
+   * After destroy(), construct a NEW engine (which re-inits WebGPU) for further
+   * work — this instance must not be reused.
+   */
+  async destroy(): Promise<void> {
+    // Drop the module-global template / compiled-plan / arena caches first: they
+    // pin GPU buffers to this engine's device, and if they survive the teardown
+    // the NEXT engine's cache walk can hand a stale old-device buffer to the new
+    // device ("[Buffer] is associated with [Device]" → dropped submit → zeros).
+    // (This is the same reset the next engine's constructor runs; doing it here
+    // means no old-device plan buffer lingers past destroy. It also ORPHANS this
+    // engine's residual storages via storageTracker.disposeAllForNewEngine, so
+    // their wrappers' later GC-time destroy() becomes a no-op on the torn-down
+    // device.)
+    clearTemplateCacheForNewEngine();
+    if (this.currentDefaultDevice === "webgpu") {
+      const { destroyWebGPU, getWebGPUDevice } = await import(
+        "../backend/webgpu/gpu-context"
+      );
+      // Only tear down if a device is actually initialized (no-op otherwise).
+      if (getWebGPUDevice()) destroyWebGPU();
+    }
+  }
+
   getBackend(device?: DeviceKind): Backend {
     const resolved = device ?? this.defaultDevice ?? getActiveBackend().name;
     const backend = getBackend(resolved);

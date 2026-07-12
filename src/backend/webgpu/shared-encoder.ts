@@ -32,6 +32,7 @@ import {
   MAX_PARAMS_POOL_SIZE_PER_CLASS,
   paramsBufferPools,
   paramsBufferSizeClass,
+  onTeardown,
   requireContext,
   resetSharedEncoderWriteSet,
   setActiveBatch,
@@ -367,3 +368,23 @@ export function submitOrCollect(commandBuffer: GPUCommandBuffer): void {
     incrementSubmitCount();
   }
 }
+
+// Multi-engine reclaim (task #94): destroyWebGPU() destroys the device, but any
+// unflushed shared-encoder instance / collected command buffers / active batch
+// belong to that OLD device. If they survive teardown, the NEXT device tries to
+// submit them → "[Invalid CommandBuffer] is associated with [Device], and cannot
+// be used with [Device]" → a DROPPED submit → all-zero reads on the new engine's
+// FIRST op (the exact silent-corruption class). Drop all in-flight encoder state
+// at teardown so the fresh device starts with no stale command buffers.
+onTeardown(() => {
+  encoderState.enabled = false;
+  encoderState.depth = 0;
+  encoderState.instance = null;
+  encoderState.passCount = 0;
+  encoderState.collectedCommandBuffers = [];
+  encoderState.deferredUniformBuffers = [];
+  encoderState.stepLevelScope = false;
+  setSharedEncoderActive(false);
+  setActiveBatch(null);
+  resetSharedEncoderWriteSet();
+});

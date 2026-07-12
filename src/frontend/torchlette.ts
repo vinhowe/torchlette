@@ -1721,6 +1721,22 @@ export class Torchlette {
   // Lifecycle management
   // ============================================================================
 
+  /**
+   * Explicitly reclaim this engine's device-side resources (task #94, item 2).
+   *
+   * Call when done with this Torchlette instance to fully release GPU memory
+   * before constructing another. On webgpu this tears down the device (a
+   * subsequent `new Torchlette("webgpu")` re-initializes it); on CPU it is a
+   * near no-op. Constructing many engines in one process WITHOUT destroy()
+   * leaks device residency (the previous engine's buffers are orphaned for
+   * safety), which VkOOM's after ~8 engines — see RuntimeEngine.destroy().
+   *
+   * This instance must not be reused after destroy(); build a new one.
+   */
+  async destroy(): Promise<void> {
+    await this.runtime.destroy();
+  }
+
   tidy<T>(fn: () => T): T {
     const tidyMode = new TidyDispatchMode();
     this.runtime.pushDispatchMode(tidyMode);
