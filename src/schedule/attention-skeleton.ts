@@ -139,6 +139,79 @@ export function onlineSoftmaxLemma(): LemmaApplication {
 }
 
 // ============================================================================
+// The RECOMPUTATION-identity admitted lemma (§7 P4) — attention backward's license
+// ============================================================================
+
+/**
+ * FlashAttention BACKWARD does NOT materialize the [S,S] probability matrix P.
+ * Instead it saves the per-row logsumexp statistic `L = m + log(ℓ)` (the running
+ * max + log of the running normalizer at forward exit) and RECOMPUTES each
+ * probability block on the fly:  `P[i,j] = exp((Q_i·K_j)·scale − L_i)`. The raw
+ * score is rebuilt from Q·K inside the backward loop; the softmax normalization
+ * comes from the saved L. This is the RECOMPUTE-FROM-SAVED-STATISTIC identity:
+ * an admitted rewrite that trades a materialized O(S²) intermediate for a saved
+ * O(S) statistic + recomputation, licensed by the algebra fact
+ * `exp(s − (m + log ℓ)) == exp(s − m) / ℓ` (the forward softmax value).
+ *
+ * CARRIED STATE: the per-row logsumexp `L` (a saved forward statistic, not a
+ * recurrence). PROOF OBLIGATION: `exp(s − L) == softmax_row(s)` for the L the
+ * forward produced — i.e. the recomputed P equals the forward P. This is the
+ * engine object the dQ/dKV backward kernels' `p = exp(sMod − L)` sites are the
+ * consumer of (attention-kernel.ts makeBackwardDQSpec / makeBackwardDKVSpec).
+ */
+export const RECOMPUTE_P_LEMMA = uid<LemmaUid>("lemma:attention-P-recompute");
+export const RECOMPUTE_P_OBLIGATION = uid<ObligationId>(
+  "obl:attention-P-recompute-equals-forward-P-from-logsumexp",
+);
+
+/** The recomputation-identity lemma application (carried statistic: L = logsumexp). */
+export function recomputePLemma(): LemmaApplication {
+  return {
+    lemma: RECOMPUTE_P_LEMMA,
+    obligation: RECOMPUTE_P_OBLIGATION,
+    // Carried STATISTIC (saved from forward, not a recurrence): the per-row
+    // logsumexp L = m + log(ℓ). P is recomputed as exp((Q·K)·scale − L).
+    carriedStateRef:
+      "carried=(L:logsumexp=m+log(l));recompute=P[i,j]=exp((Q_i.K_j)*scale-L_i)",
+  };
+}
+
+// ============================================================================
+// The D-PRECOMPUTE admitted lemma (§7 P4) — the rowsum(dO∘O) refactor
+// ============================================================================
+
+/**
+ * The attention-backward gradient of the softmax row needs the term
+ * `Σ_k P[i,k] · (dO_i · V_k)` subtracted from every `dO_i · V_j`. Naively that is
+ * a full inner sum recomputed per (i,j). The D-PRECOMPUTE refactor observes that
+ * this sum equals `dO_i · O_i` (because `O_i = Σ_k P[i,k] V_k`), so it can be
+ * PRECOMPUTED ONCE PER ROW as the statistic `D_i = rowsum(dO_i ∘ O_i)` and then
+ * carried into the dQ/dKV loops as `ds = P · (dO·V − D)`. This is an admitted
+ * rewrite: it replaces the per-(i,j) recomputed inner sum with one saved per-row
+ * statistic, licensed by the algebra fact `dO_i · O_i == Σ_k P[i,k](dO_i · V_k)`.
+ *
+ * CARRIED STATE: the per-row `D = rowsum(dO ∘ O)` (a precomputed reduction — the
+ * dedicated `makeDPrecomputeSpec` kernel's output). PROOF OBLIGATION:
+ * `rowsum(dO ∘ O) == Σ_k P[i,k]·(dO·V_k)`. The dQ/dKV kernels' `dov.sub(dVar)`
+ * sites (attention-kernel.ts) are the consumer of the carried D.
+ */
+export const D_PRECOMPUTE_LEMMA = uid<LemmaUid>("lemma:attention-D-precompute");
+export const D_PRECOMPUTE_OBLIGATION = uid<ObligationId>(
+  "obl:attention-D-equals-rowsum-dO-hadamard-O",
+);
+
+/** The D-precompute lemma application (carried statistic: D = rowsum(dO∘O)). */
+export function dPrecomputeLemma(): LemmaApplication {
+  return {
+    lemma: D_PRECOMPUTE_LEMMA,
+    obligation: D_PRECOMPUTE_OBLIGATION,
+    // Carried STATISTIC (precomputed once per row): D_i = Σ_d dO[i,d]·O[i,d].
+    carriedStateRef:
+      "carried=(D:rowsum(dO.O));refactor=sum_k P[i,k]*(dO_i.V_k)==dO_i.O_i",
+  };
+}
+
+// ============================================================================
 // The typed parameter schema (R10 + F7) — the authored attention constraint set
 // ============================================================================
 

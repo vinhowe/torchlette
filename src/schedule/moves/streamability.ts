@@ -35,7 +35,12 @@
  * engine object `ONLINE_SOFTMAX_OBLIGATION` (attention-skeleton.ts).
  */
 
-import { ONLINE_SOFTMAX_OBLIGATION } from "../attention-skeleton";
+import {
+  D_PRECOMPUTE_OBLIGATION,
+  ONLINE_SOFTMAX_OBLIGATION,
+  RECOMPUTE_P_OBLIGATION,
+} from "../attention-skeleton";
+import { WELFORD_OBLIGATION } from "../reduction-skeleton";
 import type {
   ObligationId,
   SemanticBody,
@@ -158,9 +163,97 @@ export function classifyBody(expr: SemanticBodyNode): StreamabilityVerdict {
     };
   }
 
+  // --- P4 post-lemma ADMITTED markers (§7 local self-hosting) ---------------
+  // recompute_P: the attention backward recomputes P from the saved logsumexp L
+  // instead of materializing the [S,S] matrix (recompute-from-saved-statistic).
+  // The saved L is the carried statistic; the box is block-locally producible.
+  if (isApply(expr, "recompute_P")) {
+    return {
+      streamable: true,
+      decomposition: {
+        init: { kind: "additive", zero: 0 },
+        step: { kind: "additive", zero: 0 },
+        merge: { op: "plus", associative: true, commutative: true },
+      },
+    };
+  }
+  // precomputed_D: the per-row statistic D = rowsum(dO∘O) carried into the loop
+  // (the inline per-(i,j) inner sum refactored out). Block-locally consumable.
+  if (isApply(expr, "precomputed_D")) {
+    return {
+      streamable: true,
+      decomposition: {
+        init: { kind: "additive", zero: 0 },
+        step: { kind: "additive", zero: 0 },
+        merge: { op: "plus", associative: true, commutative: true },
+      },
+    };
+  }
+  // welford_variance: the (count,mean,M2) pair-merge gives variance a stable
+  // head/body decomposition (the merge is associative under the δ correction).
+  if (isApply(expr, "welford_variance")) {
+    return {
+      streamable: true,
+      decomposition: {
+        init: { kind: "meanPair", sumZero: 0, countZero: 0 },
+        step: { kind: "meanPair", sumZero: 0, countZero: 0 },
+        merge: { op: "meanCombine", associative: true, commutative: true },
+      },
+    };
+  }
+
   // A pure associative/commutative reduction: streamable by its monoid.
   const reduceKind = reduceRoot(expr);
   if (reduceKind) return { streamable: true, decomposition: reduceKind };
+
+  // --- P4 pre-lemma REFUSED markers — refuse & name the discharging obligation.
+  // materialized_P: attention backward holding the full [S,S] P matrix — refused;
+  // the recomputation lemma (recompute P from the saved logsumexp L) discharges it.
+  if (isApply(expr, "materialized_P")) {
+    return {
+      streamable: false,
+      refusal: {
+        reason:
+          "the attention backward reads a materialized [S,S] probability matrix, an " +
+          "O(S²) intermediate that cannot be produced block-locally. The recomputation " +
+          "identity (recompute P from the saved per-row logsumexp L) supplies the " +
+          "block-local production; it is an admitted-lemma rewrite, not a free decomposition.",
+        dischargedBy: RECOMPUTE_P_OBLIGATION,
+      },
+    };
+  }
+  // inline_softmax_grad_innersum: the per-(i,j) recomputed inner sum
+  // Σ_k P[i,k]·(dO_i·V_k) — refused as a block-local body; the D-precompute
+  // refactor (carry D = rowsum(dO∘O) once per row) discharges it.
+  if (isApply(expr, "inline_softmax_grad_innersum")) {
+    return {
+      streamable: false,
+      refusal: {
+        reason:
+          "the softmax-gradient inner sum Σ_k P[i,k]·(dO_i·V_k) is recomputed per (i,j); " +
+          "there is no block-local (step, merge) that avoids re-walking the whole KV axis " +
+          "for each output. The D-precompute refactor (carry D = rowsum(dO∘O) once per row) " +
+          "supplies it — an admitted-lemma rewrite.",
+        dischargedBy: D_PRECOMPUTE_OBLIGATION,
+      },
+    };
+  }
+  // Naive variance E[x²] − E[x]²: refused (cancellation-prone, no stable block
+  // recomposition — a block's contribution depends on the global mean). The
+  // Welford pair-merge (count,mean,M2) discharges it.
+  if (isNaiveVarianceShaped(expr)) {
+    return {
+      streamable: false,
+      refusal: {
+        reason:
+          "the naive variance E[x²] − E[x]² has no numerically-sound block-local (step, merge): " +
+          "a block's deviation-sum depends on the GLOBAL mean, unknown until the whole axis is " +
+          "seen. The Welford pair-merge (carry (count,mean,M2), merge with the δ correction) " +
+          "supplies a stable recomposition — an admitted-lemma rewrite.",
+        dischargedBy: WELFORD_OBLIGATION,
+      },
+    };
+  }
 
   // The naive softmax shape: div( exp(sub(x, max(...))), sum(exp(sub(x, max(...)))) ).
   // The per-element output divides by the FULL-ROW denominator, unknown until all
@@ -253,6 +346,22 @@ function containsReduction(node: SemanticBodyNode): boolean {
   if (node.catalog.op === "sum" || node.catalog.op === "reduce_sum")
     return true;
   return node.args.some(containsReduction);
+}
+
+/**
+ * Recognize the naive variance body:  `sub(reduce_mean(mul(x,x)), <E[x]²>)` — the
+ * `E[x²] − E[x]²` form. Structural match (the discharging Welford lemma owns the
+ * rewrite; this classify seam re-checks, agreeing with lemma.ts by construction).
+ */
+function isNaiveVarianceShaped(expr: SemanticBodyNode): boolean {
+  if (!isApply(expr, "sub") || expr.args.length !== 2) return false;
+  const [lhs, rhs] = expr.args;
+  const isMean = (n: SemanticBodyNode): boolean =>
+    isApply(n, "reduce_mean") || isApply(n, "mean");
+  const lhsIsMeanSq = isMean(lhs) && lhs.kind === "apply" && isApply(lhs.args[0], "mul");
+  const rhsIsSquare =
+    isApply(rhs, "mul") || isApply(rhs, "square") || isMean(rhs);
+  return Boolean(lhsIsMeanSq && rhsIsSquare);
 }
 
 // ============================================================================
