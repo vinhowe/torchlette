@@ -2746,8 +2746,10 @@ function generateBareMatmul(
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
   const m = cached.matmul;
-  // Route-engagement signal that survives compiled-plan cutover (see counter doc).
-  if (m.label?.startsWith("_gemv")) generatedGemvDispatchCount++;
+  // Route-engagement signal that survives compiled-plan cutover (see counter
+  // doc). Read from the R9 SelectionReceipt the plan carries (single source),
+  // not a re-parse of the profiler label.
+  if (m.selection?.gemvEngaged) generatedGemvDispatchCount++;
 
   if (m.kSplit) {
     // K-split: ALLOC(out) then two dispatches over the cached partials temp

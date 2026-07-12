@@ -109,6 +109,40 @@ export interface MatmulVariant {
   candidates(ctx: MatmulVariantContext): MatmulVariantChoice[];
 }
 
+/**
+ * R9 SelectionReceipt — the record of the ONE route decision.
+ *
+ * Design-doc §7 P1 R9 note (task #95 follow-up): the route (tiled vs GEMV, incl.
+ * the #95 inputCast axis) is decided ONCE, at `selectMatmulChoice` inside
+ * `planTiledMatmul`. All three consuming paths (lowered dispatch, build-from-IR
+ * `planBareMatmul` capture, stage-4 stream `generateBareMatmul`/`generateMatmul-
+ * Epilogue`) funnel through `planTiledMatmul` and therefore consume the SAME
+ * plan — they never re-run selection. This receipt makes that decision a
+ * first-class OBJECT the plan carries, so:
+ *   (1) route engagement is a PROPERTY of the receipt (`family === "gemv"`),
+ *       readable post-cutover — NOT the replay-blind `getGemvDispatchCount`
+ *       per-dispatch counter (which reads 0 once a template cuts over to the
+ *       generated stream even when GEMV engages perfectly);
+ *   (2) the decomposition {AlgorithmFamily, ApplicabilityPredicate,
+ *       ScheduleTemplate} is legible: `family` is the AlgorithmFamily the
+ *       predicate selected, `choice` the ScheduleTemplate instance it picked.
+ *
+ * This is the interim receipt (report §8). The full three-identity Selection
+ * receipt (shape/device/realizer/version/measurement keys, §5/R20) lands with
+ * the P3 measurement-identity work; the family + choice + engagement are the P1
+ * fields the cutover needs.
+ */
+export interface SelectionReceipt {
+  /** The AlgorithmFamily the ApplicabilityPredicate selected. */
+  readonly family: MatmulVariantChoice["variant"];
+  /** The ScheduleTemplate instance chosen (config for tiled, wg/rows for gemv). */
+  readonly choice: MatmulVariantChoice;
+  /** Whether the GEMV route engaged — a receipt property, not a dispatch count. */
+  readonly gemvEngaged: boolean;
+  /** Whether a fused epilogue seam engaged on the GEMV route. */
+  readonly gemvEpilogueEngaged: boolean;
+}
+
 const tiledConfigKey = (c: MatmulKernelConfig): string =>
   `${c.tileM}_${c.tileN}_${c.tileK}_${c.threadTileM}_${c.threadTileN}_${c.vectorWidth}_${c.useSubgroups}`;
 
