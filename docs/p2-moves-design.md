@@ -424,3 +424,22 @@ companion report reproduces it.
    partition's island IR (which carries the device class per `islands-design.md §2`)? The latter
    keeps one owner of the device class; the former enables the "express-to-measure" preview
    across device classes. Prototype-agnostic; a P2 API decision.
+
+## §5 — Rulings on the §4 open questions (orchestrator, 2026-07-12; Vin may veto)
+
+1. **fuse ×2 binary, not variadic.** Composability + matches islands' binary merge contract;
+   variadic is editor-side sugar over binary gestures if ever wanted.
+2. **Defer realization to the final state of a chained transaction.** Interior states are
+   VALIDATED per merge but realized once at commit — cheaper, and consistent with
+   publish-after-validation (R17). Rollback still per the inverse chain.
+3. **`mean` is directly streamable** as the (sum, count) monoid pair — no lemma needed
+   (Welford is the numerical-stability lemma for VARIANCE, i.e. layernorm's inv-std, not
+   for the mean itself). The prototype's direct admit stands.
+4. **D-precompute / attention-backward obligations get IDs at P4**, not now — they are
+   authored-set members; P2's scope is the forward derivation.
+5. **Device-keyed merge legality reads from the island IR** (one device-class owner). The
+   workbench's cross-device "express-to-measure" preview is achieved by constructing a
+   hypothetical island IR client-side, not by parameterizing the engine gesture.
+
+Follow-up adopted: the streamability predicate gains an explicit AxisUid argument when
+loops carry the reduce-axis binding (one-line, at P2 move-algebra landing).
