@@ -45,11 +45,17 @@ import {
   type AttentionKernelRole,
   applyAttentionSchedule,
   attentionCacheKey,
+  D_PRECOMPUTE_OBLIGATION,
   deriveAttentionSkeleton,
+  naiveAttentionBackwardComposition,
   naiveAttentionComposition,
   onlineSoftmaxLemma,
+  RECOMPUTE_P_OBLIGATION,
+  softmaxBackwardRowProgram,
   softmaxRowProgram,
 } from "../../src/schedule/attention-skeleton";
+import { classifyBody } from "../../src/schedule/moves/streamability";
+import type { SemanticBodyNode, ValueUid } from "../../src/schedule/types";
 import {
   printScheduleState,
   printSkeleton,
@@ -191,7 +197,7 @@ describe("P0 attention authored-form legality (§6 / F3 / R10)", () => {
       expect(sk.visibility).toBe("opaque");
       if (sk.visibility === "opaque") {
         expect(sk.kernelRef).toContain("attention-kernel.ts");
-        expect(sk.refusalReason).toContain("authored — not yet re-derived");
+        expect(sk.refusalReason).toContain("DERIVED-MODULO-CUTOVER");
         // F3: an opaque skeleton has NO loop/staging/role field to leak.
         expect(sk).not.toHaveProperty("schedule");
       }
@@ -301,6 +307,86 @@ describe("P0 attention naive composition (QK^T → softmax → PV, family-reuse)
     expect(comp.islandFlow[0].to).toBe(comp.softmax.region);
     expect(comp.islandFlow[1].from).toBe(comp.softmax.region);
     expect(comp.islandFlow[1].to).toBe(comp.pv.region);
+  });
+});
+
+// ============================================================================
+// The NAIVE BACKWARD composition + the P4 backward derivation (§7 local self-host)
+// ============================================================================
+
+describe("P4 attention BACKWARD derivation (dV/dP/dS/dQ/dK → authored dQ/dKV/D)", () => {
+  const bapply = (op: string, ...args: SemanticBodyNode[]): SemanticBodyNode => ({
+    kind: "apply",
+    catalog: { op },
+    args,
+  });
+  const bval = (name: string): SemanticBodyNode => ({
+    kind: "value",
+    value: name as unknown as ValueUid,
+  });
+
+  it("dV region round-trips byte-identically via the matmul family", () => {
+    const c = naiveAttentionBackwardComposition(D);
+    const live = generateTiledMatmulShaderTileIR({
+      config: c.dV.desc.config,
+      transposeMode: c.dV.desc.transposeMode,
+      dtype: c.dV.desc.dtype,
+    });
+    const derived = compileTileKernel(
+      applyTiledMatmulSchedule(c.dV.state, c.dV.desc),
+    );
+    expect(derived).toBe(live);
+  });
+
+  it("dS (softmax-backward) round-trips byte-identically via the row-program family", () => {
+    const c = naiveAttentionBackwardComposition(D);
+    const live = compileTileKernel(rowProgramToSpec(softmaxBackwardRowProgram()));
+    const derived = compileTileKernel(
+      applyRowProgramSchedule(c.dS.state, c.dS.program),
+    );
+    expect(derived).toBe(live);
+  });
+
+  it("the backward island-flow connects the regions (dO→dS, dP→dS, dS→dQ/dK)", () => {
+    const c = naiveAttentionBackwardComposition(D);
+    expect(c.islandFlow.map((e) => e.via)).toEqual(["dO", "dP", "dS", "dS"]);
+  });
+
+  it("RECOMPUTATION discharge round-trip: materialized_P refuses+names → recompute_P admits", () => {
+    const before = classifyBody(bapply("materialized_P", bval("scores")));
+    expect(before.streamable).toBe(false);
+    if (before.streamable) throw new Error("unreachable");
+    expect(before.refusal.dischargedBy).toBe(RECOMPUTE_P_OBLIGATION);
+    const after = classifyBody(
+      bapply("recompute_P", bval("scores"), bval("L")),
+    );
+    expect(after.streamable).toBe(true);
+  });
+
+  it("D-PRECOMPUTE discharge round-trip: inline inner-sum refuses+names → precomputed_D admits", () => {
+    const before = classifyBody(
+      bapply("inline_softmax_grad_innersum", bval("P"), bval("dO"), bval("V")),
+    );
+    expect(before.streamable).toBe(false);
+    if (before.streamable) throw new Error("unreachable");
+    expect(before.refusal.dischargedBy).toBe(D_PRECOMPUTE_OBLIGATION);
+    const after = classifyBody(bapply("precomputed_D", bval("dO"), bval("O")));
+    expect(after.streamable).toBe(true);
+  });
+
+  it("the derivation reaches the AUTHORED dQ/dKV/D kernels byte-identically", () => {
+    for (const role of [
+      "dPrecompute",
+      "backwardDQ",
+      "backwardDKV",
+    ] as AttentionKernelRole[]) {
+      const desc: AttentionDescriptor = { role, headDim: D };
+      const live = compileTileKernel(liveSpec(role));
+      const derived = compileTileKernel(
+        applyAttentionSchedule(deriveAttentionSkeleton(desc), desc),
+      );
+      expect(derived).toBe(live);
+    }
   });
 });
 

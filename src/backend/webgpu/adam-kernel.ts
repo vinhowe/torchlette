@@ -38,7 +38,7 @@ import { onTeardown, trackSharedEncoderWrite } from "./webgpu-state";
 // Tile-IR Adam Spec Factory
 // ============================================================================
 
-function makeAdamStepSpec(
+export function makeAdamStepSpec(
   useVec4: boolean,
   emitF16: boolean,
   emitUnscale: boolean,

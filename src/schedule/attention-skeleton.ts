@@ -91,6 +91,7 @@ import type {
   SemanticRegionUid,
   Skeleton,
   TypedParamSchema,
+  ValueUid,
 } from "./types";
 
 const uid = <T>(s: string): T => s as unknown as T;
@@ -135,6 +136,79 @@ export function onlineSoftmaxLemma(): LemmaApplication {
     // applied to o whenever the running max rises (§3.4 F27, verbatim).
     carriedStateRef:
       "carried=(m:running-max,l:running-normalizer,o:partial-output);correction=exp(m_old-m_new)",
+  };
+}
+
+// ============================================================================
+// The RECOMPUTATION-identity admitted lemma (§7 P4) — attention backward's license
+// ============================================================================
+
+/**
+ * FlashAttention BACKWARD does NOT materialize the [S,S] probability matrix P.
+ * Instead it saves the per-row logsumexp statistic `L = m + log(ℓ)` (the running
+ * max + log of the running normalizer at forward exit) and RECOMPUTES each
+ * probability block on the fly:  `P[i,j] = exp((Q_i·K_j)·scale − L_i)`. The raw
+ * score is rebuilt from Q·K inside the backward loop; the softmax normalization
+ * comes from the saved L. This is the RECOMPUTE-FROM-SAVED-STATISTIC identity:
+ * an admitted rewrite that trades a materialized O(S²) intermediate for a saved
+ * O(S) statistic + recomputation, licensed by the algebra fact
+ * `exp(s − (m + log ℓ)) == exp(s − m) / ℓ` (the forward softmax value).
+ *
+ * CARRIED STATE: the per-row logsumexp `L` (a saved forward statistic, not a
+ * recurrence). PROOF OBLIGATION: `exp(s − L) == softmax_row(s)` for the L the
+ * forward produced — i.e. the recomputed P equals the forward P. This is the
+ * engine object the dQ/dKV backward kernels' `p = exp(sMod − L)` sites are the
+ * consumer of (attention-kernel.ts makeBackwardDQSpec / makeBackwardDKVSpec).
+ */
+export const RECOMPUTE_P_LEMMA = uid<LemmaUid>("lemma:attention-P-recompute");
+export const RECOMPUTE_P_OBLIGATION = uid<ObligationId>(
+  "obl:attention-P-recompute-equals-forward-P-from-logsumexp",
+);
+
+/** The recomputation-identity lemma application (carried statistic: L = logsumexp). */
+export function recomputePLemma(): LemmaApplication {
+  return {
+    lemma: RECOMPUTE_P_LEMMA,
+    obligation: RECOMPUTE_P_OBLIGATION,
+    // Carried STATISTIC (saved from forward, not a recurrence): the per-row
+    // logsumexp L = m + log(ℓ). P is recomputed as exp((Q·K)·scale − L).
+    carriedStateRef:
+      "carried=(L:logsumexp=m+log(l));recompute=P[i,j]=exp((Q_i.K_j)*scale-L_i)",
+  };
+}
+
+// ============================================================================
+// The D-PRECOMPUTE admitted lemma (§7 P4) — the rowsum(dO∘O) refactor
+// ============================================================================
+
+/**
+ * The attention-backward gradient of the softmax row needs the term
+ * `Σ_k P[i,k] · (dO_i · V_k)` subtracted from every `dO_i · V_j`. Naively that is
+ * a full inner sum recomputed per (i,j). The D-PRECOMPUTE refactor observes that
+ * this sum equals `dO_i · O_i` (because `O_i = Σ_k P[i,k] V_k`), so it can be
+ * PRECOMPUTED ONCE PER ROW as the statistic `D_i = rowsum(dO_i ∘ O_i)` and then
+ * carried into the dQ/dKV loops as `ds = P · (dO·V − D)`. This is an admitted
+ * rewrite: it replaces the per-(i,j) recomputed inner sum with one saved per-row
+ * statistic, licensed by the algebra fact `dO_i · O_i == Σ_k P[i,k](dO_i · V_k)`.
+ *
+ * CARRIED STATE: the per-row `D = rowsum(dO ∘ O)` (a precomputed reduction — the
+ * dedicated `makeDPrecomputeSpec` kernel's output). PROOF OBLIGATION:
+ * `rowsum(dO ∘ O) == Σ_k P[i,k]·(dO·V_k)`. The dQ/dKV kernels' `dov.sub(dVar)`
+ * sites (attention-kernel.ts) are the consumer of the carried D.
+ */
+export const D_PRECOMPUTE_LEMMA = uid<LemmaUid>("lemma:attention-D-precompute");
+export const D_PRECOMPUTE_OBLIGATION = uid<ObligationId>(
+  "obl:attention-D-equals-rowsum-dO-hadamard-O",
+);
+
+/** The D-precompute lemma application (carried statistic: D = rowsum(dO∘O)). */
+export function dPrecomputeLemma(): LemmaApplication {
+  return {
+    lemma: D_PRECOMPUTE_LEMMA,
+    obligation: D_PRECOMPUTE_OBLIGATION,
+    // Carried STATISTIC (precomputed once per row): D_i = Σ_d dO[i,d]·O[i,d].
+    carriedStateRef:
+      "carried=(D:rowsum(dO.O));refactor=sum_k P[i,k]*(dO_i.V_k)==dO_i.O_i",
   };
 }
 
@@ -269,18 +343,33 @@ export function attentionCacheKey(desc: AttentionDescriptor): string {
  * regeneration (applyAttentionSchedule → the live make*Spec) is byte-identical.
  */
 export function deriveAttentionSkeleton(desc: AttentionDescriptor): Skeleton {
+  const isBackward =
+    desc.role === "backwardDQ" ||
+    desc.role === "backwardDKV" ||
+    desc.role === "dPrecompute";
   return {
     visibility: "opaque",
     kernelRef: kernelRefFor(desc.role),
-    refusalReason:
-      "authored — not yet re-derived. The fused online-softmax composite is " +
-      "reachable only via the P2 FA-derivation (rungs 0–7: merge naive three " +
-      "islands [S3] → tile → stream K/V → recolor accumulator → apply the " +
-      "online-softmax admitted lemma; F17 sequence lemma→recolor→recolor→group→" +
-      "stream), which the move grammar cannot yet run (S3 merge/fuse is an " +
-      "unbuilt engine transaction). Exit: local self-hosting (attention backward " +
-      "re-derived once the recomputation-identity + D-precompute lemmas are " +
-      "admitted; §6/§7 P4).",
+    refusalReason: isBackward
+      ? // §7 P4 (local self-hosting): the backward IS re-derived in-grammar —
+        // tools/fa-backward-derivation-script.ts reaches THIS authored kernel
+        // byte-identically via the RECOMPUTATION + D-PRECOMPUTE admitted lemmas
+        // (both in the lemma library). The skeleton STAYS opaque only until the
+        // S3 merge/fuse composite transaction (islands altitude, unbuilt) flips
+        // the live path opaque→derived — a named engine deliverable, not a
+        // grammar gap. See docs/schedule-state-p4-local-self-hosting-report.md.
+        "authored — DERIVED-MODULO-CUTOVER (§7 P4). The backward is re-derived " +
+        "in-grammar (RECOMPUTATION + D-PRECOMPUTE lemmas; tools/fa-backward-" +
+        "derivation-script.ts reaches this kernel byte-identically). Opaque only " +
+        "until the S3 merge/fuse transaction flips the live path opaque→derived."
+      : // Forward: the derivation runs (tools/fa-derivation-script.ts, online-
+        // softmax lemma) but the automated cutover waits on S3.
+        "authored — DERIVED-MODULO-CUTOVER (§7 P4). The forward is re-derived " +
+        "in-grammar via the FA-derivation (rungs 0–7: merge naive three islands " +
+        "[S3] → tile → stream K/V → recolor accumulator → apply the online-" +
+        "softmax admitted lemma; F17). Opaque only until the S3 merge/fuse " +
+        "composite transaction flips the live path opaque→derived (islands " +
+        "altitude, unbuilt engine deliverable — not a grammar gap).",
     params: ATTENTION_PARAM_SCHEMA,
   };
 }
@@ -516,6 +605,160 @@ export function naiveAttentionComposition(
     islandFlow: [
       { from: qkTRegion, to: softmaxRegion, via: "scores" },
       { from: softmaxRegion, to: pvRegion, via: "P" },
+    ],
+    headDim,
+  };
+}
+
+// ============================================================================
+// The NAIVE attention BACKWARD composition (§7 P4 — the backward starting position)
+// ============================================================================
+
+/**
+ * The naive (autograd-composed) attention BACKWARD as a multi-region composition,
+ * the P4 starting position for re-deriving the authored dQ/dKV/D kernels. The
+ * naive backward MATERIALIZES the [S,S] intermediates:
+ *
+ *   dV = Pᵀ @ dO                       (matmul TN)
+ *   dP = dO @ Vᵀ                       (matmul NT)  — [S,S], materialized
+ *   dS = P ∘ (dP − rowsum(dP ∘ P))     (softmax-backward row-program)
+ *   dQ = dS @ K,  dK = dSᵀ @ Q         (matmul NN / TN)
+ *
+ * The two admitted rewrites the derivation applies:
+ *   - RECOMPUTATION: dP's materialized P (and P itself) is recomputed from the
+ *     saved logsumexp L instead of stored — `materialized_P` → `recompute_P`.
+ *   - D-PRECOMPUTE: the `rowsum(dP ∘ P) == rowsum(dO ∘ O)` inner sum is carried out
+ *     of the loop as the per-row statistic D — `inline_softmax_grad_innersum` →
+ *     `precomputed_D`. This is the dedicated D-precompute kernel's raison d'être.
+ *
+ * After both discharges + the fuse/tile/stream moves, the backward reaches the
+ * authored three-kernel shape (D-precompute + dQ + dKV). Like the forward, the
+ * per-region matmul/row-program states round-trip byte-identically via the REUSED
+ * family seams; the softmax-backward region carries the two backward markers the
+ * lemmas act on.
+ */
+export interface NaiveAttentionBackwardComposition {
+  /** dV = Pᵀ @ dO (matmul TN, no epilogue). */
+  readonly dV: {
+    region: SemanticRegionUid;
+    state: ScheduleState;
+    desc: TiledMatmulDescriptor;
+  };
+  /** dP = dO @ Vᵀ (matmul NT) — the [S,S] materialized intermediate. */
+  readonly dP: {
+    region: SemanticRegionUid;
+    state: ScheduleState;
+    desc: TiledMatmulDescriptor;
+  };
+  /** dS = softmax-backward row-program — carries the P-recompute + D-inner-sum
+   *  markers the RECOMPUTATION and D-PRECOMPUTE lemmas discharge. */
+  readonly dS: {
+    region: SemanticRegionUid;
+    state: ScheduleState;
+    program: RowProgram;
+    /** The softmax-backward body's value UID (the lemma-target for stream). */
+    dsValue: ValueUid;
+  };
+  /** dQ = dS @ K (matmul NN, no epilogue). */
+  readonly dQ: {
+    region: SemanticRegionUid;
+    state: ScheduleState;
+    desc: TiledMatmulDescriptor;
+  };
+  /** dK = dSᵀ @ Q (matmul TN, no epilogue). */
+  readonly dK: {
+    region: SemanticRegionUid;
+    state: ScheduleState;
+    desc: TiledMatmulDescriptor;
+  };
+  /** The island-flow edges: dO→{dV,dP}, dP→dS, dS→{dQ,dK}. */
+  readonly islandFlow: readonly {
+    readonly from: SemanticRegionUid;
+    readonly to: SemanticRegionUid;
+    readonly via: string;
+  }[];
+  readonly headDim: number;
+}
+
+/**
+ * The softmax-backward RowProgram (the dS region): a numerically-stable softmax
+ * gradient over the KV axis. Phase 0 reduces the inner sum `D = Σ_k dP[k]·P[k]`
+ * (the term the D-precompute lemma refactors out); the write phase emits
+ * `dS[j] = P[j]·(dP[j] − D)`. Same RowProgram shape the graph compiler detects
+ * for a real softmax-backward, so it round-trips byte-identically via the
+ * row-program family differential.
+ */
+export function softmaxBackwardRowProgram(): RowProgram {
+  const dP = (): RPExprInput => ({ kind: "input", bufferIndex: 0 });
+  const P = (): RPExprInput => ({ kind: "input", bufferIndex: 1 });
+  const Dsum = (): RPExprRef => ({ kind: "reduceResult", phaseIndex: 0 });
+  return {
+    inputs: [{ dtype: "f32" }, { dtype: "f32" }],
+    output: { dtype: "f32" },
+    dim: -1,
+    phases: [
+      // Phase 0: D = Σ_k dP[k]·P[k]  (== rowsum(dO∘O), the D-precompute statistic)
+      { kind: "reduce", reduceOp: "sum", bodyExpr: { op: "mul", inputs: [dP(), P()] } },
+      // Write: dS[j] = P[j]·(dP[j] − D)
+      {
+        kind: "write",
+        bodyExpr: {
+          op: "mul",
+          inputs: [P(), { op: "sub", inputs: [dP(), Dsum()] }],
+        },
+      },
+    ],
+    cacheKey: "attn-naive-softmax-backward-f32",
+  };
+}
+
+/**
+ * Build the naive attention-backward composition. The dV/dP/dQ/dK regions reuse
+ * the matmul family (`deriveTiledMatmulState`); the dS region reuses the
+ * row-program family over `softmaxBackwardRowProgram()`. The island-flow edges
+ * connect them. This is P4's starting position for the backward derivation.
+ */
+export function naiveAttentionBackwardComposition(
+  headDim: number,
+): NaiveAttentionBackwardComposition {
+  const dVRegion = uid<SemanticRegionUid>("region:attn-bwd-naive-dV");
+  const dPRegion = uid<SemanticRegionUid>("region:attn-bwd-naive-dP");
+  const dSRegion = uid<SemanticRegionUid>("region:attn-bwd-naive-dS");
+  const dQRegion = uid<SemanticRegionUid>("region:attn-bwd-naive-dQ");
+  const dKRegion = uid<SemanticRegionUid>("region:attn-bwd-naive-dK");
+
+  const mm = (transposeMode: TiledMatmulDescriptor["transposeMode"]) => ({
+    config: { ...DEFAULT_CONFIG },
+    transposeMode,
+    dtype: "f32" as const,
+  });
+
+  // dV = Pᵀ @ dO (TN); dP = dO @ Vᵀ (NT); dQ = dS @ K (NN); dK = dSᵀ @ Q (TN).
+  const dVDesc = mm("TN");
+  const dPDesc = mm("NT");
+  const dQDesc = mm("NN");
+  const dKDesc = mm("TN");
+
+  const dVState = deriveTiledMatmulState(dVDesc, dVRegion);
+  const dPState = deriveTiledMatmulState(dPDesc, dPRegion);
+  const dQState = deriveTiledMatmulState(dQDesc, dQRegion);
+  const dKState = deriveTiledMatmulState(dKDesc, dKRegion);
+
+  const program = softmaxBackwardRowProgram();
+  const dSState = deriveRowProgramState(program, dSRegion);
+  const dsValue = uid<ValueUid>("value:attn-bwd:dS");
+
+  return {
+    dV: { region: dVRegion, state: dVState, desc: dVDesc },
+    dP: { region: dPRegion, state: dPState, desc: dPDesc },
+    dS: { region: dSRegion, state: dSState, program, dsValue },
+    dQ: { region: dQRegion, state: dQState, desc: dQDesc },
+    dK: { region: dKRegion, state: dKState, desc: dKDesc },
+    islandFlow: [
+      { from: dVRegion, to: dSRegion, via: "dO" },
+      { from: dPRegion, to: dSRegion, via: "dP" },
+      { from: dSRegion, to: dQRegion, via: "dS" },
+      { from: dSRegion, to: dKRegion, via: "dS" },
     ],
     headDim,
   };

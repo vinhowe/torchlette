@@ -54,8 +54,11 @@ import type { RowProgram, RPExpr } from "../compiler/row-program-types";
 import { printScheduleState, reportNoSecondOwner } from "./canonical";
 import type {
   AffineExpr,
+  LemmaApplication,
+  LemmaUid,
   LoopUid,
   NamedValue,
+  ObligationId,
   ScheduleState,
   SemanticBody,
   SemanticBodyNode,
@@ -68,6 +71,54 @@ import type {
 } from "./types";
 
 const uid = <T>(s: string): T => s as unknown as T;
+
+// ============================================================================
+// The WELFORD admitted lemma (§7 P4 — the variance pair-merge; §3.4 F27)
+// ============================================================================
+
+/**
+ * VARIANCE does not stream by a plain monoid: the naive `E[x²] − E[x]²` form is
+ * catastrophically cancellation-prone, and there is no associative (step, merge)
+ * over blocks that recomposes a numerically-sound variance from block partials —
+ * a block's contribution depends on the GLOBAL mean, unknown until the whole axis
+ * is seen. The WELFORD pair-merge is the admitted lemma that GIVES variance a
+ * head/body decomposition: each block carries the triple `(count, mean, M2)`
+ * (M2 = Σ(x−mean)²), and two blocks merge by
+ *
+ *   δ = meanB − meanA
+ *   count = countA + countB
+ *   mean  = meanA + δ·countB/count
+ *   M2    = M2A + M2B + δ²·countA·countB/count
+ *
+ * The merge is associative and numerically stable (the δ correction plays the
+ * same role the online-softmax rescale does for the max). This is the
+ * deliberately-SMALL teaching lemma (NCD F27/exercise 3), now ENGINE-REAL:
+ * layernorm's inv-std path `rstd = 1/sqrt(var + eps)` is its consumer — the
+ * carried (count, mean, M2) yields `var = M2/count`, and layernorm reads the
+ * stable var the pair-merge produces.
+ *
+ * CARRIED STATE: the triple `(count, mean, M2)`. PROOF OBLIGATION: the pair-merge
+ * of any block partition equals the single-pass variance (associativity +
+ * numerical soundness). MERGE is associative but NOT commutative in the same
+ * shape as onlineSoftmax (δ is signed) — declared `welfordCombine` below.
+ */
+export const WELFORD_LEMMA = uid<LemmaUid>("lemma:welford-variance-pair-merge");
+export const WELFORD_OBLIGATION = uid<ObligationId>(
+  "obl:welford-pair-merge-equals-single-pass-variance",
+);
+
+/** The Welford lemma application (carried state: (count, mean, M2)). */
+export function welfordLemma(): LemmaApplication {
+  return {
+    lemma: WELFORD_LEMMA,
+    obligation: WELFORD_OBLIGATION,
+    // Carried STATE (the pair-merge triple): count n, running mean, M2=Σ(x−mean)².
+    // var = M2/count; layernorm's rstd = 1/sqrt(var+eps) is the consumer.
+    carriedStateRef:
+      "carried=(count:n,mean,M2:sum-sq-dev);merge=delta=meanB-meanA;" +
+      "mean+=delta*countB/count;M2+=delta^2*countA*countB/count",
+  };
+}
 
 /** dtypes the reduction/row-program families use (a subset of DType). */
 function toValueDtype(d: DType): ValueDtype {
