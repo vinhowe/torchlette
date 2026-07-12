@@ -68,8 +68,14 @@ export interface MatmulVariantContext {
    *  the ops (bias/unary chains route to its "epilogue" seam; anything else
    *  stays tiled). Optional so geometry-only callers can omit it. */
   epilogue?: EpilogueConfig;
-  /** inputCastA/inputCastB present (GEMV kernels don't implement load-casts). */
+  /** inputCastA/inputCastB present (the operand buffer is stored in a wider
+   *  dtype and cast-on-load). Both the tiled kernel and the GEMV NT/NN kernels
+   *  read-wider-cast-on-load, so this is NOT a GEMV bail-out — the actual cast
+   *  dtypes below flow into the GEMV kernel binding types. */
   hasInputCast: boolean;
+  /** The read-wider (stored) dtype of A/B when cast-on-load, else undefined. */
+  inputCastA?: DType;
+  inputCastB?: DType;
   /** Caller pinned an explicit MatmulKernelConfig (forces the tiled variant). */
   hasExplicitConfig: boolean;
   /** Subgroup ops available (tiled `useSubgroups` config axis). */
@@ -124,10 +130,15 @@ const gemvVariant: MatmulVariant = {
       const route = computeGemvRoute(ctx.n, ctx.k, ctx.transB);
       if (!route || route.splitK >= 2) return false;
     }
+    // Read-wider-cast-on-load: the NT route reads each operand and widens to
+    // f32 in the row dot (scalar `.toF32()` / `loadVec4` widens at the load
+    // site), so an f32-stored-as-logical-f16 operand is handled by declaring
+    // the binding as the stored dtype — the AMP f16 decode case (#95). The NN
+    // route's cast handling is unproven here, so casts stay tiled for NN.
+    if (ctx.hasInputCast && !ctx.transB) return false;
     return (
       ctx.m === 1 &&
       ctx.batchSize === 1 &&
-      !ctx.hasInputCast &&
       !ctx.hasExplicitConfig &&
       ENV.TORCHLETTE_GEMV !== "0" &&
       computeGemvRoute(ctx.n, ctx.k, ctx.transB) !== null

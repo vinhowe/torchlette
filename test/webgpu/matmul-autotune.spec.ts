@@ -556,7 +556,24 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       expect(gemv.isApplicable(mkCtx({ m: 2 }))).toBe(false);
       expect(gemv.isApplicable(mkCtx({ batchSize: 2 }))).toBe(false);
       expect(gemv.isApplicable(mkCtx({ epiloguePresent: true }))).toBe(false);
-      expect(gemv.isApplicable(mkCtx({ hasInputCast: true }))).toBe(false);
+      // Read-wider-cast-on-load (#95): the NT route reads-wider-casts on load,
+      // so an input cast is APPLICABLE on the NT route (transB=true, the mkCtx
+      // default — the AMP f16 decode case) ...
+      expect(
+        gemv.isApplicable(mkCtx({ hasInputCast: true, inputCastA: "f32" })),
+      ).toBe(true);
+      // ... but casts stay tiled on the NN route (unproven there).
+      expect(
+        gemv.isApplicable(
+          mkCtx({
+            hasInputCast: true,
+            inputCastA: "f32",
+            transB: false,
+            n: 8192,
+            k: 768,
+          }),
+        ),
+      ).toBe(false);
       expect(gemv.isApplicable(mkCtx({ hasExplicitConfig: true }))).toBe(false);
       // Geometry the GEMV route itself rejects (NN small grid: gx*splitK < 16)
       expect(gemv.isApplicable(mkCtx({ transB: false, n: 128, k: 1024 }))).toBe(
