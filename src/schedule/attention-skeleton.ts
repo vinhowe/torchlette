@@ -91,6 +91,7 @@ import type {
   SemanticRegionUid,
   Skeleton,
   TypedParamSchema,
+  ValueUid,
 } from "./types";
 
 const uid = <T>(s: string): T => s as unknown as T;
@@ -589,6 +590,160 @@ export function naiveAttentionComposition(
     islandFlow: [
       { from: qkTRegion, to: softmaxRegion, via: "scores" },
       { from: softmaxRegion, to: pvRegion, via: "P" },
+    ],
+    headDim,
+  };
+}
+
+// ============================================================================
+// The NAIVE attention BACKWARD composition (§7 P4 — the backward starting position)
+// ============================================================================
+
+/**
+ * The naive (autograd-composed) attention BACKWARD as a multi-region composition,
+ * the P4 starting position for re-deriving the authored dQ/dKV/D kernels. The
+ * naive backward MATERIALIZES the [S,S] intermediates:
+ *
+ *   dV = Pᵀ @ dO                       (matmul TN)
+ *   dP = dO @ Vᵀ                       (matmul NT)  — [S,S], materialized
+ *   dS = P ∘ (dP − rowsum(dP ∘ P))     (softmax-backward row-program)
+ *   dQ = dS @ K,  dK = dSᵀ @ Q         (matmul NN / TN)
+ *
+ * The two admitted rewrites the derivation applies:
+ *   - RECOMPUTATION: dP's materialized P (and P itself) is recomputed from the
+ *     saved logsumexp L instead of stored — `materialized_P` → `recompute_P`.
+ *   - D-PRECOMPUTE: the `rowsum(dP ∘ P) == rowsum(dO ∘ O)` inner sum is carried out
+ *     of the loop as the per-row statistic D — `inline_softmax_grad_innersum` →
+ *     `precomputed_D`. This is the dedicated D-precompute kernel's raison d'être.
+ *
+ * After both discharges + the fuse/tile/stream moves, the backward reaches the
+ * authored three-kernel shape (D-precompute + dQ + dKV). Like the forward, the
+ * per-region matmul/row-program states round-trip byte-identically via the REUSED
+ * family seams; the softmax-backward region carries the two backward markers the
+ * lemmas act on.
+ */
+export interface NaiveAttentionBackwardComposition {
+  /** dV = Pᵀ @ dO (matmul TN, no epilogue). */
+  readonly dV: {
+    region: SemanticRegionUid;
+    state: ScheduleState;
+    desc: TiledMatmulDescriptor;
+  };
+  /** dP = dO @ Vᵀ (matmul NT) — the [S,S] materialized intermediate. */
+  readonly dP: {
+    region: SemanticRegionUid;
+    state: ScheduleState;
+    desc: TiledMatmulDescriptor;
+  };
+  /** dS = softmax-backward row-program — carries the P-recompute + D-inner-sum
+   *  markers the RECOMPUTATION and D-PRECOMPUTE lemmas discharge. */
+  readonly dS: {
+    region: SemanticRegionUid;
+    state: ScheduleState;
+    program: RowProgram;
+    /** The softmax-backward body's value UID (the lemma-target for stream). */
+    dsValue: ValueUid;
+  };
+  /** dQ = dS @ K (matmul NN, no epilogue). */
+  readonly dQ: {
+    region: SemanticRegionUid;
+    state: ScheduleState;
+    desc: TiledMatmulDescriptor;
+  };
+  /** dK = dSᵀ @ Q (matmul TN, no epilogue). */
+  readonly dK: {
+    region: SemanticRegionUid;
+    state: ScheduleState;
+    desc: TiledMatmulDescriptor;
+  };
+  /** The island-flow edges: dO→{dV,dP}, dP→dS, dS→{dQ,dK}. */
+  readonly islandFlow: readonly {
+    readonly from: SemanticRegionUid;
+    readonly to: SemanticRegionUid;
+    readonly via: string;
+  }[];
+  readonly headDim: number;
+}
+
+/**
+ * The softmax-backward RowProgram (the dS region): a numerically-stable softmax
+ * gradient over the KV axis. Phase 0 reduces the inner sum `D = Σ_k dP[k]·P[k]`
+ * (the term the D-precompute lemma refactors out); the write phase emits
+ * `dS[j] = P[j]·(dP[j] − D)`. Same RowProgram shape the graph compiler detects
+ * for a real softmax-backward, so it round-trips byte-identically via the
+ * row-program family differential.
+ */
+export function softmaxBackwardRowProgram(): RowProgram {
+  const dP = (): RPExprInput => ({ kind: "input", bufferIndex: 0 });
+  const P = (): RPExprInput => ({ kind: "input", bufferIndex: 1 });
+  const Dsum = (): RPExprRef => ({ kind: "reduceResult", phaseIndex: 0 });
+  return {
+    inputs: [{ dtype: "f32" }, { dtype: "f32" }],
+    output: { dtype: "f32" },
+    dim: -1,
+    phases: [
+      // Phase 0: D = Σ_k dP[k]·P[k]  (== rowsum(dO∘O), the D-precompute statistic)
+      { kind: "reduce", reduceOp: "sum", bodyExpr: { op: "mul", inputs: [dP(), P()] } },
+      // Write: dS[j] = P[j]·(dP[j] − D)
+      {
+        kind: "write",
+        bodyExpr: {
+          op: "mul",
+          inputs: [P(), { op: "sub", inputs: [dP(), Dsum()] }],
+        },
+      },
+    ],
+    cacheKey: "attn-naive-softmax-backward-f32",
+  };
+}
+
+/**
+ * Build the naive attention-backward composition. The dV/dP/dQ/dK regions reuse
+ * the matmul family (`deriveTiledMatmulState`); the dS region reuses the
+ * row-program family over `softmaxBackwardRowProgram()`. The island-flow edges
+ * connect them. This is P4's starting position for the backward derivation.
+ */
+export function naiveAttentionBackwardComposition(
+  headDim: number,
+): NaiveAttentionBackwardComposition {
+  const dVRegion = uid<SemanticRegionUid>("region:attn-bwd-naive-dV");
+  const dPRegion = uid<SemanticRegionUid>("region:attn-bwd-naive-dP");
+  const dSRegion = uid<SemanticRegionUid>("region:attn-bwd-naive-dS");
+  const dQRegion = uid<SemanticRegionUid>("region:attn-bwd-naive-dQ");
+  const dKRegion = uid<SemanticRegionUid>("region:attn-bwd-naive-dK");
+
+  const mm = (transposeMode: TiledMatmulDescriptor["transposeMode"]) => ({
+    config: { ...DEFAULT_CONFIG },
+    transposeMode,
+    dtype: "f32" as const,
+  });
+
+  // dV = Pᵀ @ dO (TN); dP = dO @ Vᵀ (NT); dQ = dS @ K (NN); dK = dSᵀ @ Q (TN).
+  const dVDesc = mm("TN");
+  const dPDesc = mm("NT");
+  const dQDesc = mm("NN");
+  const dKDesc = mm("TN");
+
+  const dVState = deriveTiledMatmulState(dVDesc, dVRegion);
+  const dPState = deriveTiledMatmulState(dPDesc, dPRegion);
+  const dQState = deriveTiledMatmulState(dQDesc, dQRegion);
+  const dKState = deriveTiledMatmulState(dKDesc, dKRegion);
+
+  const program = softmaxBackwardRowProgram();
+  const dSState = deriveRowProgramState(program, dSRegion);
+  const dsValue = uid<ValueUid>("value:attn-bwd:dS");
+
+  return {
+    dV: { region: dVRegion, state: dVState, desc: dVDesc },
+    dP: { region: dPRegion, state: dPState, desc: dPDesc },
+    dS: { region: dSRegion, state: dSState, program, dsValue },
+    dQ: { region: dQRegion, state: dQState, desc: dQDesc },
+    dK: { region: dKRegion, state: dKState, desc: dKDesc },
+    islandFlow: [
+      { from: dVRegion, to: dSRegion, via: "dO" },
+      { from: dPRegion, to: dSRegion, via: "dP" },
+      { from: dSRegion, to: dQRegion, via: "dS" },
+      { from: dSRegion, to: dKRegion, via: "dS" },
     ],
     headDim,
   };
