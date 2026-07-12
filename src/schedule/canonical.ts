@@ -612,3 +612,50 @@ export function scheduleDigest(state: ScheduleState): string {
 export function semanticDigest(state: ScheduleState): string {
   return digestText(printSemanticIdentity(state));
 }
+
+/**
+ * The REALIZER COORDINATE (§5 artifact-cache identity). The artifact-cache
+ * identity = compilation identity + "the realization-receipt coordinate keyed to
+ * the produced binary". A `ScheduleState` is realizer-agnostic (the same object
+ * lowers through WGSL/Dawn OR Triton/CUDA — the cross-backend differential's whole
+ * premise), so the produced ARTIFACT is keyed by WHICH realizer emitted it. This
+ * is the coordinate that field: two byte-different artifacts (one WGSL, one Triton
+ * source) from the ONE schedule digest must not collide in the artifact cache.
+ *
+ * A realizer coordinate names the realizer + its capability-profile version + the
+ * pinned target (Appendix A: a v2 profile must pin a release/commit + target arch).
+ */
+export interface RealizerCoordinate {
+  /** The realizer that produced the artifact (e.g. "wgsl-dawn", "triton"). */
+  readonly realizer: string;
+  /** The capability-profile version (§5 compilation-identity input). */
+  readonly capabilityProfileVersion: number;
+  /** The pinned target the artifact was emitted for (e.g. "sm_70", "webgpu"). */
+  readonly targetArch: string;
+}
+
+/** Canonically serialize a realizer coordinate (sorted, explicit — R27). */
+export function printRealizerCoordinate(coord: RealizerCoordinate): string {
+  return (
+    `realizer ${coord.realizer}` +
+    ` profile-v${coord.capabilityProfileVersion}` +
+    ` target ${coord.targetArch}`
+  );
+}
+
+/**
+ * The ARTIFACT identity digest (§5) — the schedule's FULL canonical print PLUS
+ * the realizer coordinate. Two realizers lowering the SAME `ScheduleState` produce
+ * DISTINCT artifact identities (their emitted text differs), so the artifact cache
+ * keys correctly across the cross-backend split. `scheduleDigest` (realizer-blind)
+ * is the artifact-cache coordinate's CONTENT half; this composes the realizer
+ * coordinate onto it.
+ */
+export function artifactDigest(
+  state: ScheduleState,
+  coord: RealizerCoordinate,
+): string {
+  return digestText(
+    `${printScheduleState(state)}\n${printRealizerCoordinate(coord)}`,
+  );
+}
