@@ -645,6 +645,29 @@ predicate, AND a measured per-shape selection. P1 decomposes the registry into:
   swapGrid (now a `program-map`), and epilogues BEFORE any registry-deletion claim (R9). No
   "the old registry dies" until the proof is complete.
 
+**R9 note — route decision must be SINGLE-SELECTION-POINT across the compiled-plan cutover
+(task #95 follow-up, 2026-07-12).** The matmul route (tiled vs GEMV, and the #95 inputCast
+axis of `gemvVariant.isApplicable`) is currently decided at `planTiledMatmul`
+(`selectMatmulChoice`), which the lowered dispatch, the build-from-IR `planBareMatmul` capture,
+and the stream generators (`generateBareMatmul` / `generateMatmulEpilogue`) each call
+INDEPENDENTLY. They agree today (verified: mixed f32×f16 M=1 decode routes GEMV in the
+generated stream — `test/gemv-generated-route.spec.ts`), but this is the same distributed-
+decision shape that let the #93 int8 bypass ship: a routing fact added at one call site can
+silently not reach another. When P1 collapses the registry to
+`{ApplicabilityPredicate + ScheduleTemplate + SelectionReceipt}`, the route must be selected
+ONCE and every path (lowered / capture / generate / tape-replay) must consume that same
+`SelectionReceipt` — not re-run selection. Two observability corollaries P1 should absorb:
+(1) route engagement must be a property of the receipt (readable post-cutover), NOT a
+per-dispatch counter — `getGemvDispatchCount` (in `dispatchTiledMatmul`) is REPLAY-BLIND
+and reads 0 once a decode template cuts over to the generated stream even when GEMV engages
+perfectly (this replay-blindness is exactly the "gemvHits=0 ⇒ route bypassed" red herring
+that motivated this task); (2) any route-engagement gate must cross the activation threshold
+(Corollary 2) — `getGeneratedGemvDispatchCount` (stream-generate.ts) is the interim
+replay-surviving signal until the receipt exists. The #95 `GemvDescriptor` is still
+inputCast-blind at the schedule-derivation layer; that is untouched here (this fix is
+generation-side counting only, no WGSL derivation change) and P1 must reconcile it when the
+GEMV template's applicability predicate becomes the single source.
+
 ### P2 — macro moves incl. program-map + the pre-registered protocol (R23 + R24)
 
 The acceptance narrative IS the flashattention derivation, rungs 0–7: start from naive
