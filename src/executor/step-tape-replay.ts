@@ -150,7 +150,7 @@ interface Skeleton {
    *  SCALAR SLOT primitive (core/live-scalar.ts) rides — its in-place scatter
    *  IS the `stridedScatterCopy(dst, tensorFromArray([v]))` chain, re-dressed
    *  here from the scalar-slots host value the setter noted. */
-  scalarDresses: Array<{ writeNode: LazyIRNode; resultId: number }>;
+  scalarDresses: Array<{ writeNode: LazyIRNode; resultId: number; scatterNode: LazyIRNode }>;
 }
 
 /** One captured compiled plan of the current step, keyed by the active appKey;
@@ -184,8 +184,24 @@ interface Candidate {
    *  reads the scalar THROUGH this chain, so on replay the value is the
    *  recorded upload payload — frozen. Each entry pairs the recorded WRITE
    *  node (payload re-dressed per replay) with the owning persistent tensor
-   *  (source of the CURRENT value via its pending chain). */
-  scalarDresses: Array<{ writeNode: LazyIRNode; owner: TensorOwner }>;
+   *  (source of the CURRENT value via its pending chain).
+   *
+   *  `scatterNode` is the recorded in-place scatter that consumes `writeNode`.
+   *  Its DST (input[0]) is the LiveScalar's FIXED physical buffer. A consumer
+   *  ref frozen at an EARLIER in-place storage of that same buffer (adam's lr
+   *  input — replace-and-hold moved the LiveScalar past the recorded storage
+   *  id, so the storage-id-keyed cross-plan link never connects the fresh
+   *  scatter output to it) reads the buffer's contents directly. On a HIT the
+   *  scatter's fresh value can land AFTER that consumer read (same-plan
+   *  ordering / double-buffer phase), so the consumer trails by one step — the
+   *  #87b stale 0-d external. We deliver the fresh value into the fixed buffer
+   *  in queue order BEFORE the replay's submits (the sanctioned pre-replay
+   *  writeBuffer channel, same as the rebind `!curStorage` path). */
+  scalarDresses: Array<{
+    writeNode: LazyIRNode;
+    owner: TensorOwner;
+    scatterNode: LazyIRNode;
+  }>;
 }
 
 /** Minimal owner surface (the runtime Tensor): its live lazyRef. */
@@ -378,7 +394,7 @@ export function stCaptureCompiledStep(
     // chain's output storage (registering the backref) after this force
     // completes; the storage survives the recording sweep because the
     // persistent wrapper holds it.
-    if (out) scalarDresses.push({ writeNode: srcRef.node, resultId: out.id });
+    if (out) scalarDresses.push({ writeNode: srcRef.node, resultId: out.id, scatterNode: node });
   }
 
   // Owner snapshot for materialized refs (see Candidate.matOwners): captured
@@ -613,6 +629,7 @@ export function stPromoteEligibleSkeleton(): void {
         scalarDresses.push({
           writeNode: d.writeNode,
           owner: owner as TensorOwner,
+          scatterNode: d.scatterNode,
         });
     }
   }
@@ -805,6 +822,30 @@ export async function stTryReplay(
       );
     if (bytes) {
       d.writeNode.payload = { values: bytes, dtype: "f32" };
+      // #87b stale 0-d external: deliver the fresh value into the LiveScalar's
+      // FIXED buffer (the scatter's DST, input[0]) in queue order BEFORE the
+      // replay's submits. A consumer ref frozen at an earlier in-place storage
+      // of this same buffer (adam's lr input — the storage-id-keyed cross-plan
+      // link can't reach the fresh scatter output because replace-and-hold gave
+      // the scatter a NEW output id) reads the buffer's raw contents; the
+      // recorded scatter's own fresh write can land AFTER that read on a HIT
+      // (same-plan ordering / double-buffer phase), trailing by one step. The
+      // pre-replay writeBuffer is the sanctioned delivery (same primitive as the
+      // rebind `!curStorage` path) — the scatter still re-executes and writes
+      // the identical value, so this only removes the one-step phase lag.
+      const dstRef = d.scatterNode.inputs[0] as { kind: string; storage?: StorageHandle };
+      const dst = dstRef?.storage;
+      const dbt = dst?.backendTensor as unknown as { buffer?: GPUBuffer; offset?: number; dtype?: string } | undefined;
+      const dev = (backend as unknown as { device?: GPUDevice }).device;
+      if (dbt?.buffer && dev && (dbt.dtype ?? "f32") === "f32") {
+        dev.queue.writeBuffer(
+          dbt.buffer,
+          (dbt.offset ?? 0) * 4,
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength,
+        );
+      }
     }
   }
 
