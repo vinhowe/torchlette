@@ -9,7 +9,13 @@
  * CSE deduplicates common subexpressions, LICM hoists loop-invariant code.
  */
 
-import { applyFusedOp } from "../fusion-tile-ir";
+import {
+  realizeBinaryBroadcastSpec,
+  realizeCastSpec,
+  realizeContiguousSpec,
+  realizeUnaryStridedSpec,
+  realizeWhereSpec,
+} from "../../../schedule/elementwise-skeleton";
 import {
   contiguousStrides,
   F32_NEG_MAX,
@@ -270,47 +276,13 @@ export function whereSpec(
   xOffset: number,
   yOffset: number,
 ): TileKernelSpec {
-  return elementwiseKernel({
-    name: "where",
-    uniforms: {
-      [COND_OFFSET_UNIFORM]: "u32",
-      [X_OFFSET_UNIFORM]: "u32",
-      [Y_OFFSET_UNIFORM]: "u32",
-    },
-    bindings: {
-      cond: { storage: "read", type: "f32" },
-      x: { storage: "read", type: "f32" },
-      y: { storage: "read", type: "f32" },
-      out: { storage: "read_write", type: "f32" },
-    },
-    kernel(ctx, idx) {
-      void condOffset; // Task #71: offsets via uniforms, not baked.
-      void xOffset;
-      void yOffset;
-      const condVal = ctx.stridedLoad(
-        "cond",
-        idx,
-        indexShape,
-        condStrides,
-        ctx.uniform(COND_OFFSET_UNIFORM),
-      );
-      const xVal = ctx.stridedLoad(
-        "x",
-        idx,
-        indexShape,
-        xStrides,
-        ctx.uniform(X_OFFSET_UNIFORM),
-      );
-      const yVal = ctx.stridedLoad(
-        "y",
-        idx,
-        indexShape,
-        yStrides,
-        ctx.uniform(Y_OFFSET_UNIFORM),
-      );
-      ctx.emitStore("out", idx, condVal.ne(ctx.f32(0)).select(xVal, yVal));
-    },
-  });
+  void condOffset; // Task #71: offsets via uniforms, not baked (see realizeWhereSpec).
+  void xOffset;
+  void yOffset;
+  // Cutover (P2 wave A): the loop-nest / strided-load / select / store structure
+  // LOWERS FROM the ScheduleState — this spec is what dispatch compiles, and the
+  // elementwise differential guards it byte-for-byte against the pre-cutover WGSL.
+  return realizeWhereSpec(indexShape, condStrides, xStrides, yStrides);
 }
 
 /**
@@ -342,17 +314,6 @@ export function whereWGSL(
 // Binary Broadcast Kernel (tile-IR)
 // ============================================================================
 
-/** WGSL infix operator → fusion op name */
-const WGSL_OP_TO_FUSION: Record<string, string> = {
-  "+": "add",
-  "-": "sub",
-  "*": "mul",
-  "/": "div",
-  pow: "pow",
-  min: "minimum",
-  max: "maximum",
-};
-
 /**
  * Build a TileKernelSpec for a binary broadcast op.
  * Used by both direct dispatch (compiled to WGSL) and chunked dispatch.
@@ -366,38 +327,18 @@ export function binaryBroadcastSpec(
   bOffset: number,
   dtype: DataType,
 ): TileKernelSpec {
-  const fusionOp = WGSL_OP_TO_FUSION[op];
-  if (!fusionOp) throw new Error(`binaryBroadcastSpec: unsupported op "${op}"`);
-
-  return elementwiseKernel({
-    name: `binary_${fusionOp}`,
-    enableF16: dtype === "f16",
-    uniforms: { [A_OFFSET_UNIFORM]: "u32", [B_OFFSET_UNIFORM]: "u32" },
-    bindings: {
-      a: { storage: "read", type: dtype },
-      b: { storage: "read", type: dtype },
-      out: { storage: "read_write", type: dtype },
-    },
-    kernel(ctx, idx) {
-      void aOffset; // Task #71: both offsets via uniforms, not baked.
-      void bOffset;
-      const aVal = ctx.stridedLoad(
-        "a",
-        idx,
-        indexShape,
-        aStrides,
-        ctx.uniform(A_OFFSET_UNIFORM),
-      );
-      const bVal = ctx.stridedLoad(
-        "b",
-        idx,
-        indexShape,
-        bStrides,
-        ctx.uniform(B_OFFSET_UNIFORM),
-      );
-      ctx.emitStore("out", idx, applyFusedOp(ctx, fusionOp, [aVal, bVal]));
-    },
-  });
+  void aOffset; // Task #71: both offsets via uniforms, not baked (see realize*).
+  void bOffset;
+  // Cutover (P2 wave A): loop nest / strided-load / fused-op / store lower FROM
+  // the ScheduleState. `op` (WGSL infix) → fusion op mapping lives ONCE in the
+  // realizer (the `stays-as-semantic-builder` catalog map).
+  return realizeBinaryBroadcastSpec(
+    op,
+    indexShape,
+    aStrides,
+    bStrides,
+    dtype as "f32" | "f16" | "i32" | "u32",
+  );
 }
 
 /**
@@ -468,29 +409,18 @@ export function unaryStridedSpec(
   // `dtype` for the dtype-preserving majority.
   outDtype: DataType = dtype,
 ): TileKernelSpec {
-  return elementwiseKernel({
-    name: `unary_${opKey}`,
-    enableF16: dtype === "f16" || outDtype === "f16",
-    uniforms: { [OFFSET_UNIFORM]: "u32" },
-    bindings: {
-      a: { storage: "read", type: dtype },
-      out: { storage: "read_write", type: outDtype },
-    },
-    kernel(ctx, idx) {
-      // Task #71: offset delivered as a uniform (volatile), NOT baked. WGSL is
-      // offset-independent → distinct offsets collapse to one template. The
-      // `offset` argument is retained only for chunked/offset-0 call sites
-      // whose value is a compile-time constant 0 (their uniform packs to 0).
-      void offset;
-      ctx.emitStore(
-        "out",
-        idx,
-        applyFusedOp(ctx, opKey, [
-          ctx.stridedLoad("a", idx, shape, strides, ctx.uniform(OFFSET_UNIFORM)),
-        ]),
-      );
-    },
-  });
+  // Task #71: offset delivered as a uniform (volatile), NOT baked; the `offset`
+  // arg is retained only for chunked/offset-0 call sites (uniform packs to 0).
+  void offset;
+  // Cutover (P2 wave A): loop nest / strided-load / fused-op / store lower FROM
+  // the ScheduleState (§11.5 "elementwise loop scaffolding → dies").
+  return realizeUnaryStridedSpec(
+    opKey,
+    shape,
+    strides,
+    dtype as "f32" | "f16" | "i32" | "u32",
+    outDtype as "f32" | "f16" | "i32" | "u32",
+  );
 }
 
 /**
@@ -527,32 +457,15 @@ export function castSpec(
   strides: number[],
   offset: number,
 ): TileKernelSpec {
-  const castOp = `cast_${dstDtype}`;
-
-  return elementwiseKernel({
-    name: `cast_${srcDtype}_${dstDtype}`,
-    enableF16: srcDtype === "f16" || dstDtype === "f16",
-    uniforms: { [OFFSET_UNIFORM]: "u32" },
-    bindings: {
-      a: { storage: "read", type: srcDtype },
-      out: { storage: "read_write", type: dstDtype },
-    },
-    kernel(ctx, idx) {
-      void offset; // Task #71: offset via uniform, not baked (see unaryStridedSpec).
-      const val = ctx.stridedLoad(
-        "a",
-        idx,
-        shape,
-        strides,
-        ctx.uniform(OFFSET_UNIFORM),
-      );
-      ctx.emitStore(
-        "out",
-        idx,
-        srcDtype === dstDtype ? val : applyFusedOp(ctx, castOp, [val]),
-      );
-    },
-  });
+  void offset; // Task #71: offset via uniform, not baked (see unaryStridedSpec).
+  // Cutover (P2 wave A): the strided-load / cast-body / store lower FROM the
+  // ScheduleState; the src==dst identity-copy shortcut lives once in the realizer.
+  return realizeCastSpec(
+    srcDtype as "f32" | "f16" | "i32" | "u32",
+    dstDtype as "f32" | "f16" | "i32" | "u32",
+    shape,
+    strides,
+  );
 }
 
 /**
@@ -595,29 +508,14 @@ export function contiguousSpec(
   offset: number,
   dtype: DataType,
 ): TileKernelSpec {
-  return elementwiseKernel({
-    name: `contiguous_${dtype}`,
-    enableF16: dtype === "f16",
-    uniforms: { [OFFSET_UNIFORM]: "u32" },
-    bindings: {
-      input: { storage: "read", type: dtype },
-      out: { storage: "read_write", type: dtype },
-    },
-    kernel(ctx, idx) {
-      void offset; // Task #71: offset via uniform, not baked.
-      ctx.emitStore(
-        "out",
-        idx,
-        ctx.stridedLoad(
-          "input",
-          idx,
-          shape,
-          strides,
-          ctx.uniform(OFFSET_UNIFORM),
-        ),
-      );
-    },
-  });
+  void offset; // Task #71: offset via uniform, not baked.
+  // Cutover (P2 wave A): the identity strided-load / store lower FROM the
+  // ScheduleState (§11.5 "elementwise loop scaffolding → dies").
+  return realizeContiguousSpec(
+    shape,
+    strides,
+    dtype as "f32" | "f16" | "i32" | "u32",
+  );
 }
 
 // ============================================================================

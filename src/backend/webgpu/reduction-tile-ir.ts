@@ -32,10 +32,10 @@ const WG = WORKGROUP_SIZE; // 256
 // Types
 // ============================================================================
 
-type ReduceOp = "sum" | "max" | "min";
+export type ReduceOp = "sum" | "max" | "min";
 
 /** Shape metadata for dimension-wise reduction. */
-interface DimInfo {
+export interface DimInfo {
   inputShape: number[];
   inputStrides: number[];
   normalizedDims: number[];
@@ -64,7 +64,7 @@ export type ReductionEpilogueOpDesc = {
 };
 
 /** Config for the unified reduction spec factory. */
-interface ReductionConfig {
+export interface ReductionConfig {
   reduceOp: ReduceOp;
   /** undefined = full reduction (single scalar output). */
   dim?: DimInfo;

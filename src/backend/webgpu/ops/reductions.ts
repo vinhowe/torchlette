@@ -30,13 +30,15 @@ import type {
   WebGPUContext,
   WebGPUTensor,
 } from "../gpu-types";
+import {
+  realizeMeanDivSpec as makeMeanDivSpec,
+  realizeReductionSpec as makeReductionSpec,
+} from "../../../schedule/reduction-skeleton";
 import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
 import {
   dimInfo,
   getChunkedSumWGSL,
   getFinalSumWGSL,
-  makeMeanDivSpec,
-  makeReductionSpec,
   type PreambleChainKernelOp,
   type ReductionEpilogueOpDesc,
 } from "../reduction-tile-ir";
