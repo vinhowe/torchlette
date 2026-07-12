@@ -18,6 +18,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { argReduceWGSL } from "../../src/backend/webgpu/ops/ops-tile-ir";
 import {
   makeMeanDivSpec,
   makeReductionSpec,
@@ -37,10 +38,12 @@ import {
   scheduleDigest,
 } from "../../src/schedule/canonical";
 import {
+  applyArgReduceSchedule,
   applyMeanDivSchedule,
   applyReductionSchedule,
   applyRowProgramSchedule,
   type DimReductionInfo,
+  deriveArgReduceState,
   deriveReductionState,
   deriveRowProgramState,
   type ReductionDescriptor,
@@ -326,9 +329,41 @@ describe("P0 reduction + row-program walking-skeleton byte differential", () => 
     covered++;
   });
 
+  // ---- ARG-REDUCE (argmax / argmin — the wave-1 leftover derivable kernel) ----
+  const argCases: Array<{ op: ">" | "<"; shape: number[]; dim: number }> = [
+    { op: ">", shape: [4, 8], dim: 1 }, // argmax over last dim
+    { op: "<", shape: [3, 5], dim: 1 }, // argmin over last dim
+    { op: ">", shape: [4, 8], dim: 0 }, // argmax over first dim
+  ];
+  for (const c of argCases) {
+    it(`arg-reduce ${c.op === ">" ? "argmax" : "argmin"} ${c.shape.join("x")} d${c.dim}`, () => {
+      const dim = dimSetup(c.shape, [c.dim], false);
+      const desc = {
+        compareOp: c.op,
+        inputShape: dim.inputShape,
+        inputStrides: dim.inputStrides,
+        outShape: dim.outShape,
+        dim: c.dim,
+        inputToOutDim: dim.inputToOutDim,
+      };
+      const live = argReduceWGSL(
+        c.op,
+        c.shape,
+        dim.inputStrides as number[],
+        dim.outShape as number[],
+        c.dim,
+        dim.inputToOutDim as number[],
+      );
+      const state = deriveArgReduceState(desc, REGION);
+      const derived = applyArgReduceSchedule(state, desc);
+      expect(derived).toBe(live);
+      covered++;
+    });
+  }
+
   it("reports the covered kernel count", () => {
-    // 3 full + 5 dim + 1 preamble + 1 epilogue + 1 meanDiv + 2 row-program = 13
-    expect(covered).toBeGreaterThanOrEqual(13);
+    // 3 full + 5 dim + 1 preamble + 1 epilogue + 1 meanDiv + 2 row-program + 3 arg = 16
+    expect(covered).toBeGreaterThanOrEqual(16);
     // eslint-disable-next-line no-console
     console.log(
       `[P0 reduction+row-program differential] byte-identical kernels covered: ${covered}`,

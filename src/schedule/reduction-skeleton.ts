@@ -39,7 +39,7 @@
  */
 
 import type { DType } from "../backend/types";
-import { dtypeToTileIR } from "../backend/webgpu/fusion-tile-ir";
+import { argReduceWGSL } from "../backend/webgpu/ops/ops-tile-ir";
 import {
   dimInfo,
   makeMeanDivSpec,
@@ -355,6 +355,160 @@ export function applyReductionSchedule(
 /** The mean-div elementwise kernel round-trips through its own single source. */
 export function applyMeanDivSchedule(): TileKernelSpec {
   return makeMeanDivSpec();
+}
+
+// ============================================================================
+// FAMILY 2c — ARG-REDUCE (argmax / argmin — the wave-1 leftover derivable kernel)
+// ============================================================================
+
+/**
+ * A structured description of ONE arg-reduce kernel (argmax/argmin along a dim).
+ * Round-trips byte-identically via `argReduceWGSL`. Arg-reduce is a reduction
+ * whose reduce OP is `argmax`/`argmin`: a flat parallel output loop enclosing a
+ * SEQUENTIAL search over `dimSize`. The (bestVal, bestIndex) state-machine is the
+ * REALIZER's (like wgReduce for plain reductions, S2) — the schedule records the
+ * argmax reduceOp fact + the loop nest + the store edge, NOT the index-tracking.
+ */
+export interface ArgReduceDescriptor {
+  readonly compareOp: ">" | "<"; // ">" = argmax, "<" = argmin
+  readonly inputShape: readonly number[];
+  readonly inputStrides: readonly number[];
+  readonly outShape: readonly number[];
+  readonly dim: number;
+  readonly inputToOutDim: readonly number[];
+}
+
+export function deriveArgReduceState(
+  desc: ArgReduceDescriptor,
+  region: SemanticRegionUid,
+): ScheduleState {
+  const reduceOp = desc.compareOp === ">" ? "argmax" : "argmin";
+  // input (global) → the reduced (index) result (register) → the global output.
+  const inUid = uid<ValueUid>("in:input");
+  const resultUid = uid<ValueUid>("result");
+  const outUid = uid<ValueUid>("out:out");
+  const values: NamedValue[] = [
+    {
+      uid: inUid,
+      entity: uid("ent:in:input"),
+      allocation: "global",
+      dtype: "f32",
+      aliasOf: null,
+    },
+    {
+      uid: resultUid,
+      entity: uid("ent:result"),
+      allocation: "register",
+      // The output is the INDEX (u32-valued, stored as f32 by the live kernel).
+      dtype: "u32",
+      aliasOf: null,
+    },
+    {
+      uid: outUid,
+      entity: uid("ent:out:out"),
+      allocation: "global",
+      dtype: "f32",
+      aliasOf: null,
+    },
+  ];
+
+  const outLoopUid = uid<LoopUid>("loop:out");
+  const redLoopUid = uid<LoopUid>("loop:reduce");
+  const redLoop: SemanticLoop = {
+    uid: redLoopUid,
+    entity: uid("ent:loop:reduce"),
+    axis: uid("axis:reduce"),
+    kind: "sequential",
+    bound: {
+      kind: "affineLeaf",
+      leaf: { kind: "uniformRef", name: "dimSize" },
+    },
+    children: [],
+  };
+  const outLoop: SemanticLoop = {
+    uid: outLoopUid,
+    entity: uid("ent:loop:out"),
+    axis: uid("axis:out"),
+    kind: "parallel",
+    bound: {
+      kind: "affineLeaf",
+      leaf: { kind: "uniformRef", name: "outSize" },
+    },
+    children: [redLoop],
+  };
+
+  // The per-element body is the loaded input; the reduce body wraps it in the
+  // argmax/argmin catalog op (the index-tracking is the realizer's).
+  const bodies: SemanticBody[] = [
+    { result: resultUid, expr: { kind: "value", value: inUid } },
+    {
+      result: uid<ValueUid>("reduced"),
+      expr: {
+        kind: "apply",
+        catalog: { op: `reduce_${reduceOp}` },
+        args: [{ kind: "value", value: resultUid }],
+      },
+    },
+  ];
+
+  const semantic: SemanticSchedule = {
+    blockShapes: [[...desc.outShape]],
+    loopNest: [outLoop],
+    ordering: { kind: "flat" },
+    programGridMap: { kind: "identity" },
+    values,
+    noMaterialization: [],
+    stores: [{ source: resultUid, target: outUid, atLoop: outLoopUid }],
+    bodies,
+    roles: [],
+    sync: [],
+    atoms: [],
+    lemmas: [],
+  };
+  return {
+    semantic,
+    requests: {
+      warpBudget: null,
+      pipeline: { kind: "none" },
+      placementPreferences: [],
+      cachePolicy: [],
+    },
+    receipts: {},
+    region,
+  };
+}
+
+/**
+ * `applyArgReduceSchedule`: assert the state agrees (the argmax reduceOp fact),
+ * then call the single-source `argReduceWGSL`. Returns the WGSL string directly
+ * (argReduceWGSL already compiles), matching the byte-differential seam.
+ */
+export function applyArgReduceSchedule(
+  state: ScheduleState,
+  desc: ArgReduceDescriptor,
+): string {
+  assertNoOpaqueLeak(state);
+  const s = state.semantic;
+  if (s.stores.length !== 1)
+    reportNoSecondOwner(
+      `no-second-owner[arg-reduce]: expected exactly one store edge, got ${s.stores.length}.`,
+    );
+  const reduceOp = desc.compareOp === ">" ? "argmax" : "argmin";
+  const op = s.bodies[1]?.expr;
+  const rootOp = op && op.kind === "apply" ? findReduceOp(op) : null;
+  if (rootOp !== `reduce_${reduceOp}`)
+    reportNoSecondOwner(
+      `no-second-owner[arg-reduce]: schedule reduceOp "${rootOp}" disagrees with ` +
+        `descriptor "reduce_${reduceOp}".`,
+    );
+  return argReduceWGSL(
+    desc.compareOp,
+    [...desc.inputShape],
+    [...desc.inputStrides],
+    [...desc.outShape],
+    desc.dim,
+    [...desc.inputToOutDim],
+  );
 }
 
 // ============================================================================
