@@ -633,6 +633,18 @@ export interface GemvDescriptor {
   readonly mode: "nt" | "nn";
   readonly dtypeA: MatmulDType;
   readonly dtypeB: MatmulDType;
+  /**
+   * Read-wider-cast-on-load axis (#95 — twice flagged as cast-blind). The A/B
+   * operand is physically stored in this (wider) dtype but participates in the
+   * dot as the logical dtypeA/dtypeB; mirrors the tiled path's inputCastA/B. It
+   * is a REALIZATION fact (the binding's stored dtype), NOT schedule structure —
+   * so it rides on the descriptor and the derived A/B NamedValue records the
+   * STORED dtype, exactly as the tiled skeleton does. Adding it here closes the
+   * GEMV template's cast-blindness so the P1 applicability predicate can route
+   * the f16-via-cast decode class (report §5) once GEMV grows a load-cast path.
+   */
+  readonly inputCastA?: MatmulDType;
+  readonly inputCastB?: MatmulDType;
   readonly outputDtype: MatmulDType;
   readonly kSplit: boolean;
   readonly wgSize?: number;
@@ -659,7 +671,10 @@ export function deriveGemvState(
     uid: aUid,
     entity: uid("ent:in:a"),
     allocation: "global",
-    dtype: toValueDtype(desc.dtypeA),
+    // #95 cast axis: when inputCastA is set the operand is STORED wider (f32) and
+    // cast on load — the NamedValue records the stored dtype, mirroring the tiled
+    // skeleton's `desc.inputCastA ? "f32" : desc.dtype`.
+    dtype: toValueDtype(desc.inputCastA ?? desc.dtypeA),
     aliasOf: null,
   });
   // B carries the quant metadata as OPERAND metadata (via its dtype: packed
@@ -669,7 +684,7 @@ export function deriveGemvState(
     uid: bUid,
     entity: uid("ent:in:b"),
     allocation: "global",
-    dtype: toValueDtype(desc.dtypeB),
+    dtype: toValueDtype(desc.inputCastB ?? desc.dtypeB),
     aliasOf: null,
   });
   values.push({
@@ -889,6 +904,8 @@ export function applyGemvSchedule(
     mode: desc.mode,
     dtypeA: desc.dtypeA,
     dtypeB: desc.dtypeB,
+    inputCastA: desc.inputCastA,
+    inputCastB: desc.inputCastB,
     outputDtype: desc.outputDtype,
     kSplit: desc.kSplit,
     wgSize: desc.wgSize,
@@ -898,6 +915,75 @@ export function applyGemvSchedule(
     quantB: desc.quantB,
   };
   return generateGemvShaderTileIR(options);
+}
+
+// ============================================================================
+// THE LIVE REALIZER ENTRY POINTS (P1 cutover — the schedule object is the SOLE
+// WGSL writer for the matmul family). `matmul/dispatch.ts` calls THESE instead
+// of the raw `generate*ShaderTileIR` generators; each derives a `ScheduleState`
+// and applies it, so the WGSL is what the byte-differential guards on the LIVE
+// path. `CodegenOptions` is structurally a `TiledMatmulDescriptor` (same fields).
+// ============================================================================
+
+/**
+ * The region UID stamped on every LIVE-path matmul ScheduleState. The region is
+ * a FOREIGN KEY (R8) — it identifies the semantic region behind the schedule,
+ * not its contents — and does NOT enter the WGSL, so one constant is correct for
+ * every live matmul kernel (the compilation identity that drives the pipeline
+ * cache is `getShaderCacheKey`, unchanged).
+ */
+const LIVE_MATMUL_REGION = uid<SemanticRegionUid>("region:live-matmul");
+
+/**
+ * Realize the tiled-matmul `TileKernelSpec` THROUGH the schedule object: derive
+ * a ScheduleState from the options, assert no-second-owner at the seam, and apply
+ * it. Byte-identical to the retired `createTiledMatmulKernel(options)` because
+ * `applyTiledMatmulSchedule` funnels back to the same builder — the difference is
+ * that the schedule object is now the sole writer and the seam assertions run on
+ * the live path.
+ */
+export function realizeTiledMatmulKernel(
+  options: CodegenOptions,
+): TileKernelSpec {
+  const desc: TiledMatmulDescriptor = options;
+  const state = deriveTiledMatmulState(desc, LIVE_MATMUL_REGION);
+  return applyTiledMatmulSchedule(state, desc);
+}
+
+/**
+ * Realize the GEMV WGSL THROUGH the schedule object. Same contract as the tiled
+ * realizer; consumes `GemvKernelOptions` (the live GEMV plan's option bag) and
+ * round-trips through `deriveGemvState`/`applyGemvSchedule`.
+ */
+export function realizeGemvWgsl(options: GemvKernelOptions): string {
+  const desc: GemvDescriptor = {
+    mode: options.mode,
+    dtypeA: options.dtypeA,
+    dtypeB: options.dtypeB,
+    inputCastA: options.inputCastA,
+    inputCastB: options.inputCastB,
+    outputDtype: options.outputDtype,
+    kSplit: options.kSplit,
+    wgSize: options.wgSize,
+    rowsPerWg: options.rowsPerWg,
+    vec4: options.vec4,
+    epilogue: options.epilogue,
+    quantB: options.quantB,
+  };
+  const state = deriveGemvState(desc, LIVE_MATMUL_REGION);
+  return applyGemvSchedule(state, desc);
+}
+
+/**
+ * Realize the split-K reduction WGSL THROUGH the schedule object. The reduction
+ * pass is the second half of the K-split `tile`+reduce (family 3b); it round-
+ * trips via `kSplitReductionWgsl`.
+ */
+export function realizeKSplitReductionWgsl(
+  kSplitCount: number,
+  outputDtype: MatmulDType,
+): string {
+  return kSplitReductionWgsl({ kSplitCount, outputDtype });
 }
 
 // ============================================================================

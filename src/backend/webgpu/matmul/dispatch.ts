@@ -24,16 +24,16 @@ import { splitWorkgroups2d, type TileKernelSpec } from "../tile-ir";
 import { onTeardown } from "../webgpu-state";
 import { cacheTuningResult } from "./autotune";
 import {
+  realizeGemvWgsl,
+  realizeKSplitReductionWgsl,
+  realizeTiledMatmulKernel,
+} from "../../../schedule/matmul-skeleton";
+import {
   computeGemvRoute,
   type GemvKernelOptions,
   gemvSupportsEpilogue,
-  generateGemvShaderTileIR,
   getGemvShaderCacheKey,
 } from "./gemv";
-import {
-  generateKSplitReductionShaderTileIR,
-  generateTiledMatmulShaderTileIR,
-} from "./tile-matmul";
 import {
   type CodegenOptions,
   classifyShape,
@@ -51,6 +51,7 @@ import {
   MATMUL_VARIANTS,
   type MatmulVariantChoice,
   type MatmulVariantContext,
+  type SelectionReceipt,
 } from "./variants";
 
 /**
@@ -611,7 +612,10 @@ function getOrCreatePipeline(
   options: CodegenOptions,
 ): GPUComputePipeline {
   return cachedPipeline(device, pipelineCache, getShaderCacheKey(options), () =>
-    generateTiledMatmulShaderTileIR(options),
+    // P1 cutover: the schedule object is the sole WGSL writer (was
+    // generateTiledMatmulShaderTileIR). realizeTiledMatmulKernel derives a
+    // ScheduleState + applies it; the byte-differential guards this live path.
+    compileTileKernel(realizeTiledMatmulKernel(options)),
   );
 }
 
@@ -726,7 +730,9 @@ function getOrCreateReductionPipeline(
     device,
     reductionPipelineCache,
     `ksplit_reduce_${kSplitCount}_${outputDtype}`,
-    () => generateKSplitReductionShaderTileIR(kSplitCount, outputDtype),
+    // P1 cutover: schedule object is sole writer (was
+    // generateKSplitReductionShaderTileIR).
+    () => realizeKSplitReductionWgsl(kSplitCount, outputDtype),
   );
 }
 
@@ -793,6 +799,10 @@ export interface MatmulStandardPlan {
   numEpilogueInputs: number;
   /** Profiler label suffix (e.g. "_gemv" for the M=1 GEMV kernel). */
   label?: string;
+  /** R9 SelectionReceipt: the ONE route decision, carried on the plan so every
+   *  consuming path reads the same choice (never re-selects). Engagement is a
+   *  property of this object, not the replay-blind per-dispatch counter. */
+  selection?: SelectionReceipt;
 }
 
 /**
@@ -813,6 +823,8 @@ export interface MatmulKSplitPlan {
   reduceDispatch: [number, number, number];
   /** Profiler label suffix (e.g. "_gemv" for the M=1 GEMV kernel). */
   label?: string;
+  /** R9 SelectionReceipt (see MatmulStandardPlan). */
+  selection?: SelectionReceipt;
 }
 
 // --- GEMV (M=1) routing ---
@@ -892,7 +904,8 @@ export function dispatchQuantizedGemvNT(
     device,
     pipelineCache,
     getGemvShaderCacheKey(kernelOpts),
-    () => generateGemvShaderTileIR(kernelOpts),
+    // P1 cutover: schedule object is sole writer (was generateGemvShaderTileIR).
+    () => realizeGemvWgsl(kernelOpts),
   );
   const paramsBuffer = sharedCreateParamsBuffer(
     device,
@@ -1078,7 +1091,8 @@ function planGemvRowMatmul(
     device,
     pipelineCache,
     getGemvShaderCacheKey(kernelOpts),
-    () => generateGemvShaderTileIR(kernelOpts),
+    // P1 cutover: schedule object is sole writer (was generateGemvShaderTileIR).
+    () => realizeGemvWgsl(kernelOpts),
   );
   if (route.splitK >= 2) {
     const reduceParamsBuf = new ArrayBuffer(8);
@@ -1177,9 +1191,30 @@ export function planTiledMatmul(
       inputCastA,
       inputCastB,
     );
-    if (gemvPlan) return gemvPlan;
+    if (gemvPlan) {
+      // R9 SelectionReceipt: the ONE route decision, stamped where selection
+      // happens (single point). Engagement is a receipt PROPERTY — the GEMV
+      // route DID engage (the plan built) — not a replay-blind dispatch count.
+      gemvPlan.selection = {
+        family: "gemv",
+        choice,
+        gemvEngaged: true,
+        gemvEpilogueEngaged: gemvPlan.label === "_gemv_epi",
+      };
+      return gemvPlan;
+    }
     // Route degenerated for this choice — fall through to the tiled family.
   }
+
+  // The tiled route: the receipt records the family the predicate selected and
+  // that GEMV did NOT engage (either not selected, or its route degenerated).
+  const tiledSelection: SelectionReceipt = {
+    family: "tiled",
+    choice:
+      choice.variant === "tiled" ? choice : tiledChoiceForContext(ctx),
+    gemvEngaged: false,
+    gemvEpilogueEngaged: false,
+  };
 
   const config =
     choice.variant === "tiled"
@@ -1250,6 +1285,7 @@ export function planTiledMatmul(
       reducePipeline,
       reduceParamsData: reduceU32,
       reduceDispatch: [Math.ceil(totalElements / 256), 1, 1],
+      selection: tiledSelection,
     };
   }
 
@@ -1288,6 +1324,7 @@ export function planTiledMatmul(
     dispatchY: swapGrid ? workgroupsX : workgroupsY,
     dispatchZ: batchSize,
     numEpilogueInputs: epilogueInputs.length,
+    selection: tiledSelection,
   };
 }
 
@@ -1298,9 +1335,13 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   // single-sourced in planTiledMatmul (the stream generator consumes the
   // same plan — standard or K-split or GEMV).
   const plan = planTiledMatmul(options);
-  if (plan.label?.startsWith("_gemv")) {
+  // Route engagement is a PROPERTY of the R9 SelectionReceipt (single source),
+  // not a re-parse of the profiler label. The lowered-path counters remain for
+  // back-compat with existing probes; the replay-surviving signal is the
+  // generated-stream counter (see getGeneratedGemvDispatchCount).
+  if (plan.selection?.gemvEngaged) {
     gemvDispatchCount++;
-    if (plan.label === "_gemv_epi") gemvEpilogueDispatchCount++;
+    if (plan.selection.gemvEpilogueEngaged) gemvEpilogueDispatchCount++;
   }
 
   if (plan.kSplit) {
