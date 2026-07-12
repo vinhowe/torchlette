@@ -41,10 +41,10 @@ import {
 // Tiling Parameters
 // ============================================================================
 
-const BR = 64; // Q rows per workgroup (forward, dQ)
-const BC = 32; // KV rows per tile (forward, dQ)
-const BQ_BW = 16; // Q rows per tile (backward dKV)
-const BC_BW = 64; // KV rows per workgroup (backward dKV)
+export const BR = 64; // Q rows per workgroup (forward, dQ)
+export const BC = 32; // KV rows per tile (forward, dQ)
+export const BQ_BW = 16; // Q rows per tile (backward dKV)
+export const BC_BW = 64; // KV rows per workgroup (backward dKV)
 
 // ============================================================================
 // Attention modifier seams (task #64 — FlexAttention-class score/mask mods)
@@ -226,7 +226,7 @@ function withModKey(base: string, mod?: AttnModifierSpec): string {
 /** Backward is inference-first for score modifiers: the paired-derivative
  *  ("attn_dscore") emission is designed (doc §2) but not implemented. Mask
  *  mods are constant structure (no derivative) and are supported. */
-function assertBackwardSupportsModifier(mod?: AttnModifierSpec): void {
+export function assertBackwardSupportsModifier(mod?: AttnModifierSpec): void {
   if (mod?.scoreMod) {
     throw new Error(
       `attention backward with scoreMod '${mod.scoreMod.kind}' is not ` +
@@ -344,7 +344,7 @@ function getOrCreateConfigBuffer(
 // Kernel Specs (tile-IR)
 // ============================================================================
 
-function makeForwardAttentionSpec(
+export function makeForwardAttentionSpec(
   headDim: number,
   mod?: AttnModifierSpec,
 ): TileKernelSpec {
@@ -482,7 +482,7 @@ function makeForwardAttentionSpec(
   };
 }
 
-function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
+export function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
   const D = headDim;
   const WG = WORKGROUP_SIZE;
 
@@ -517,7 +517,7 @@ function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
   };
 }
 
-function makeBackwardDQSpec(
+export function makeBackwardDQSpec(
   headDim: number,
   mod?: AttnModifierSpec,
 ): TileKernelSpec {
@@ -656,7 +656,7 @@ function makeBackwardDQSpec(
   };
 }
 
-function makeBackwardDKVSpec(
+export function makeBackwardDKVSpec(
   headDim: number,
   mod?: AttnModifierSpec,
 ): TileKernelSpec {

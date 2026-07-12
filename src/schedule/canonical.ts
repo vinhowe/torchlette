@@ -42,6 +42,7 @@ import type {
   AffineExpr,
   BackendRequests,
   CacheHint,
+  LemmaApplication,
   NamedValue,
   NestOrderingRule,
   ParticipantSet,
@@ -54,9 +55,11 @@ import type {
   SemanticBodyNode,
   SemanticLoop,
   SemanticSchedule,
+  Skeleton,
   StoreEdge,
   StridedAccess,
   SyncRelation,
+  TypedParamSchema,
 } from "./types";
 
 // ============================================================================
@@ -397,6 +400,81 @@ export function printSemanticIdentity(state: ScheduleState): string {
   p.line(0, `region ${state.region}`);
   printSemantic(p, state.semantic);
   return p.toString();
+}
+
+// ============================================================================
+// The authored (opaque) skeleton print form (§6 / F3) — typed params VISIBLE,
+// skeleton SEALED. The authored hatch is the ONLY permitted opacity: the print
+// shows the kernel reference, the refusal reason, and the DECLARED typed
+// parameter schema (params + dependent constraints + capability predicate), but
+// the skeleton's internals stay opaque (F3 forbids loop/staging/role data — the
+// opaque `Skeleton` variant has no field to hold them, so there is nothing to
+// print). This makes an authored kernel legible WITHOUT letting it masquerade
+// as a derived state: a `derived` skeleton prints its full ScheduleState; an
+// `opaque` one prints only its declared surface.
+// ============================================================================
+
+/** Print a typed parameter schema (§6 R10/F7): params with domains + defaults,
+ *  dependent constraints, and the capability predicate — a total schema walk. */
+function printParamSchema(
+  p: Printer,
+  indent: number,
+  s: TypedParamSchema,
+): void {
+  p.line(indent, "params:");
+  for (const [name, spec] of sortedEntries(s.params))
+    p.line(
+      indent + 1,
+      `param ${name} domain=[${spec.domain.join(",")}] default=${spec.default}`,
+    );
+  p.line(indent, "constraints:");
+  for (const c of s.constraints) p.line(indent + 1, printPredicate(c));
+  p.line(indent, `capability ${printPredicate(s.capabilityPredicate)}`);
+}
+
+/**
+ * Print an admitted-lemma application (§3.4 F27/F28) — its LemmaUid, the
+ * proof-obligation it discharges, and its first-class carried-state reference.
+ */
+function printLemma(l: LemmaApplication): string {
+  return `lemma uid=${l.lemma} obligation=${l.obligation} carried=${l.carriedStateRef}`;
+}
+
+/**
+ * Print an authored (opaque) or derived skeleton (§6 / F3). A `derived`
+ * skeleton delegates to the full `printScheduleState`; an `opaque` one prints
+ * the `authored` block: the sealed kernelRef + refusal reason + the typed
+ * params. Optional `lemmas` (the admitted-lemma applications the authored kernel
+ * carries, e.g. online-softmax) print under the block. Total over the union.
+ */
+export function printSkeleton(
+  skeleton: Skeleton,
+  lemmas: readonly LemmaApplication[] = [],
+): string {
+  if (skeleton.visibility === "derived")
+    return printScheduleState(skeleton.schedule);
+  if (skeleton.visibility === "opaque") {
+    const p = new Printer();
+    p.line(0, `authored-skeleton v${CANONICAL_SCHEMA_VERSION}`);
+    p.line(0, "authored:");
+    p.line(1, `kernelRef ${skeleton.kernelRef}`);
+    p.line(1, `refusal ${skeleton.refusalReason}`);
+    p.line(1, "skeleton sealed=opaque (F3: no loop/staging/role data)");
+    printParamSchema(p, 1, skeleton.params);
+    p.line(1, "admittedLemmas:");
+    for (const l of lemmas) p.line(2, printLemma(l));
+    return p.toString();
+  }
+  return assertNever(skeleton, "skeleton");
+}
+
+/** The digest of an authored skeleton's canonical print (the authored analogue
+ *  of `scheduleDigest`). */
+export function skeletonDigest(
+  skeleton: Skeleton,
+  lemmas: readonly LemmaApplication[] = [],
+): string {
+  return digestText(printSkeleton(skeleton, lemmas));
 }
 
 // ============================================================================
