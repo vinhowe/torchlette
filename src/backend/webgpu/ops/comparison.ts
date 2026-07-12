@@ -27,8 +27,9 @@ import {
   WORKGROUP_SIZE,
   F32_BYTES,
 } from "../shape-utils";
+import { realizeArgReduceWgsl as argReduceWGSL } from "../../../schedule/reduction-skeleton";
 import { createTensor, createTrackedBuffer } from "../tensor";
-import { argReduceWGSL, comparisonWGSL } from "./ops-tile-ir";
+import { comparisonWGSL } from "./ops-tile-ir";
 
 function comparisonOp(
   wgslOp: string,
@@ -101,7 +102,7 @@ type ArgReduceFn = (
   options: ArgReduceOptions,
 ) => BackendTensor;
 const argReduce =
-  (name: string, op: string): ArgReduceFn =>
+  (name: string, op: ">" | "<"): ArgReduceFn =>
   (a, options) =>
     argReduceOp(name, op, a, options);
 
@@ -110,7 +111,7 @@ export const argmin = argReduce("argmin", "<");
 
 function argReduceOp(
   opName: string,
-  compareOp: string,
+  compareOp: ">" | "<",
   a: BackendTensor,
   options: ArgReduceOptions,
 ): BackendTensor {

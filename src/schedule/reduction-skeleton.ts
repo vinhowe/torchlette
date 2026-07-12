@@ -45,6 +45,7 @@ import {
   makeMeanDivSpec,
   makeReductionSpec,
   type PreambleChainKernelOp,
+  type ReductionConfig,
   type ReductionEpilogueOpDesc,
 } from "../backend/webgpu/reduction-tile-ir";
 import { rowProgramToSpec } from "../backend/webgpu/row-program-codegen";
@@ -679,6 +680,64 @@ export function applyRowProgramSchedule(
 ): TileKernelSpec {
   assertRowProgramSeam(state, program);
   return rowProgramToSpec(program);
+}
+
+// ============================================================================
+// realize* — the LIVE-PATH cutover (P2 wave A, item 1)
+// ============================================================================
+//
+// The chokepoints the live reduction / row-program / arg-reduce dispatch route
+// THROUGH (the P1 matmul pattern). Each derives the ScheduleState, runs the
+// no-second-owner seam, and lowers via `apply*` — so the schedule object is the
+// SOLE live WGSL writer at the dispatch seam (`makeReductionSpec` / `argReduceWGSL`
+// / `rowProgramToSpec` are now realizer-internals of `apply*`, unreachable from
+// live dispatch except through the schedule object). Byte-identical by
+// construction; the reduction differential now guards the LIVE path.
+
+const LIVE_REDUCTION_REGION = uid<SemanticRegionUid>("region:live-reduction");
+
+/** A `ReductionConfig` IS the descriptor (same fields); no conversion needed. */
+function configToDescriptor(config: ReductionConfig): ReductionDescriptor {
+  return config as ReductionDescriptor;
+}
+
+/** Realize a reduction spec THROUGH the schedule object (live chokepoint). */
+export function realizeReductionSpec(config: ReductionConfig): TileKernelSpec {
+  const desc = configToDescriptor(config);
+  const state = deriveReductionState(desc, LIVE_REDUCTION_REGION);
+  return applyReductionSchedule(state, desc);
+}
+
+/** Realize the mean-div elementwise kernel THROUGH the schedule object. */
+export function realizeMeanDivSpec(): TileKernelSpec {
+  return applyMeanDivSchedule();
+}
+
+/** Realize the row-program spec THROUGH the schedule object (live chokepoint). */
+export function realizeRowProgramSpec(program: RowProgram): TileKernelSpec {
+  const state = deriveRowProgramState(program, LIVE_REDUCTION_REGION);
+  return applyRowProgramSchedule(state, program);
+}
+
+/** Realize the arg-reduce WGSL THROUGH the schedule object (live chokepoint). */
+export function realizeArgReduceWgsl(
+  compareOp: ">" | "<",
+  inputShape: readonly number[],
+  inputStrides: readonly number[],
+  outShape: readonly number[],
+  dim: number,
+  inputToOutDim: readonly number[],
+): string {
+  const desc: ArgReduceDescriptor = {
+    compareOp,
+    inputShape,
+    inputStrides,
+    outShape,
+    dim,
+    inputToOutDim,
+  };
+  const state = deriveArgReduceState(desc, LIVE_REDUCTION_REGION);
+  return applyArgReduceSchedule(state, desc);
 }
 
 // ============================================================================

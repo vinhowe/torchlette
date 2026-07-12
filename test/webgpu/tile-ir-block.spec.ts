@@ -28,13 +28,13 @@ import type {
   GPUQueue,
 } from "../../src/backend/webgpu/gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "../../src/backend/webgpu/gpu-types";
-import { createTiledMatmulKernel } from "../../src/backend/webgpu/matmul/tile-matmul";
 import type { EpilogueConfig } from "../../src/backend/webgpu/matmul/types";
 import { DEFAULT_CONFIG } from "../../src/backend/webgpu/matmul/types";
 import { compileTileKernel } from "../../src/backend/webgpu/tile-compiler";
 import { createTileKernelDispatcher } from "../../src/backend/webgpu/tile-dispatch";
 import type { TileKernelSpec } from "../../src/backend/webgpu/tile-ir";
 import { BlockOps } from "../../src/backend/webgpu/tile-ops";
+import { realizeTiledMatmulKernel } from "../../src/schedule/matmul-skeleton";
 
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -375,7 +375,7 @@ describe("Block API WGSL compilation", () => {
   });
 
   it("matmul shared×shared dot uses scalar shared memory (vec4 causes regression)", () => {
-    const spec = createTiledMatmulKernel({
+    const spec = realizeTiledMatmulKernel({
       config: {
         tileM: 32,
         tileN: 32,
@@ -397,7 +397,7 @@ describe("Block API WGSL compilation", () => {
   });
 
   it("matmul uses scalar shared memory with f16 dtype", () => {
-    const spec = createTiledMatmulKernel({
+    const spec = realizeTiledMatmulKernel({
       config: {
         tileM: 32,
         tileN: 32,
@@ -1585,7 +1585,7 @@ describe.runIf(isWebGPUEnabled)(
         additionalInputCount: 1,
         outputDtype: "f32",
       };
-      const spec = createTiledMatmulKernel({
+      const spec = realizeTiledMatmulKernel({
         config,
         transposeMode: "NN",
         dtype: "f32",
@@ -1624,7 +1624,7 @@ describe.runIf(isWebGPUEnabled)(
         additionalInputCount: 0,
         outputDtype: "f32",
       };
-      const spec = createTiledMatmulKernel({
+      const spec = realizeTiledMatmulKernel({
         config,
         transposeMode: "NN",
         dtype: "f32",
@@ -1664,7 +1664,7 @@ describe.runIf(isWebGPUEnabled)(
         additionalInputCount: 1,
         outputDtype: "f32",
       };
-      const spec = createTiledMatmulKernel({
+      const spec = realizeTiledMatmulKernel({
         config,
         transposeMode: "NN",
         dtype: "f32",
@@ -1707,7 +1707,7 @@ describe.runIf(isWebGPUEnabled)(
         additionalInputCount: 1,
         outputDtype: "f32",
       };
-      const spec = createTiledMatmulKernel({
+      const spec = realizeTiledMatmulKernel({
         config,
         transposeMode: "NN",
         dtype: "f32",
@@ -1758,7 +1758,7 @@ describe.runIf(isWebGPUEnabled)(
         additionalInputCount: 2,
         outputDtype: "f32",
       };
-      const spec = createTiledMatmulKernel({
+      const spec = realizeTiledMatmulKernel({
         config,
         transposeMode: "NN",
         dtype: "f32",
@@ -1809,7 +1809,7 @@ describe.runIf(isWebGPUEnabled)(
         additionalInputCount: 0,
         outputDtype: "f32",
       };
-      const spec = createTiledMatmulKernel({
+      const spec = realizeTiledMatmulKernel({
         config,
         transposeMode: "NN",
         dtype: "f32",

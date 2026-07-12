@@ -13,7 +13,7 @@ import {
   wgslContentEqual,
 } from "./cache-key-guard";
 import type { GPUBuffer } from "./gpu-types";
-import { rowProgramToSpec } from "./row-program-codegen";
+import { realizeRowProgramSpec as rowProgramToSpec } from "../../schedule/reduction-skeleton";
 import { dtypeBytes } from "./shape-utils";
 import {
   createTileKernelDispatcher,

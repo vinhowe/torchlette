@@ -27,10 +27,7 @@ import {
   type GemvKernelOptions,
   generateGemvShaderTileIR,
 } from "../../src/backend/webgpu/matmul/gemv";
-import {
-  generateKSplitReductionShaderTileIR,
-  generateTiledMatmulShaderTileIR,
-} from "../../src/backend/webgpu/matmul/tile-matmul";
+import { generateKSplitReductionShaderTileIR } from "../../src/backend/webgpu/matmul/tile-matmul";
 import type {
   CodegenOptions,
   EpilogueConfig,
@@ -51,6 +48,7 @@ import {
   deriveGemvState,
   deriveTiledMatmulState,
   type GemvDescriptor,
+  generateTiledMatmulShaderTileIR,
   type KSplitReductionDescriptor,
   kSplitReductionWgsl,
   type TiledMatmulDescriptor,

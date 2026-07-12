@@ -51,16 +51,14 @@
  * of the staging INTENT the realizer honors.
  */
 
+import { applyFusedOp } from "../backend/webgpu/fusion-tile-ir";
 import {
   type GemvKernelOptions,
   gemvSupportsEpilogue,
   generateGemvShaderTileIR,
   type QuantB,
 } from "../backend/webgpu/matmul/gemv";
-import {
-  createTiledMatmulKernel,
-  generateKSplitReductionShaderTileIR,
-} from "../backend/webgpu/matmul/tile-matmul";
+import { generateKSplitReductionShaderTileIR } from "../backend/webgpu/matmul/tile-matmul";
 import type {
   CodegenOptions,
   EpilogueConfig,
@@ -68,8 +66,19 @@ import type {
   MatmulKernelConfig,
   TransposeMode,
 } from "../backend/webgpu/matmul/types";
-import { validateConfig } from "../backend/webgpu/matmul/types";
-import type { TileKernelSpec } from "../backend/webgpu/tile-ir";
+import {
+  getWorkgroupSize,
+  validateConfig,
+} from "../backend/webgpu/matmul/types";
+import { compileTileKernel } from "../backend/webgpu/tile-compiler";
+import {
+  type BlockExpr,
+  type DataType,
+  type KernelContext,
+  singleWorkgroup,
+  type TileKernelSpec,
+} from "../backend/webgpu/tile-ir";
+import type { Block, BlockOps, TileRange } from "../backend/webgpu/tile-ops";
 import { printScheduleState, reportNoSecondOwner } from "./canonical";
 import type {
   AffineExpr,
@@ -576,19 +585,384 @@ export function applyTiledMatmulSchedule(
   desc: TiledMatmulDescriptor,
 ): TileKernelSpec {
   assertTiledSeam(state, desc);
-  const options: CodegenOptions = {
-    config: desc.config,
-    transposeMode: desc.transposeMode,
-    dtype: desc.dtype,
-    dtypeB: desc.dtypeB,
-    epilogue: desc.epilogue,
-    batched: desc.batched,
-    inputCastA: desc.inputCastA,
-    inputCastB: desc.inputCastB,
-    kSplit: desc.kSplit,
-    swapGrid: desc.swapGrid,
+  return lowerTiledMatmul(state, desc);
+}
+
+// ============================================================================
+// The tiled-matmul LOWERING — block-op ABSORPTION (P2 wave A, Commit B)
+// ============================================================================
+//
+// `matmulKernelBlockOps`' structural knowledge is ABSORBED here: the loop-nest /
+// cooperative-load staging / barrier / dot / epilogue structure LOWERS FROM the
+// ScheduleState. Byte-identical to the retired `createTiledMatmulKernel` (the
+// 25-kernel differential is the safety net). What the STATE owns is READ FROM the
+// state at the seam (so the fact has no second owner in a `desc` branch):
+//   - the K-reduction loop            ← state.semantic.loopNest (the sequential kLoop)
+//   - the kSplit fp-reorder license   ← state.semantic.lemmas (KSPLIT_LEMMA)
+//   - the swapGrid traversal          ← state.semantic.programGridMap.kind === "swap"
+//   - the logical block shapes        ← state.semantic.blockShapes [[tileM,tileN],[tileK]]
+//   - the cooperative-load staging    ← state.semantic.values (stage:*) + sync (barrier)
+// The VIEW / RECEIPT facts (transposeMode, dtypes, thread tiles, epilogue chain)
+// ride on `desc` — §11.4 classes them no-materialization view / receipts, NOT
+// semantic identity. `assertTiledSeam` already proved desc and state AGREE, so the
+// lowering reads structure from whichever is the canonical owner of each fact.
+
+/** Addressing info passed to the epilogue (post-accumulate) helper. */
+interface EpilogueAddressing {
+  offsN: TileRange;
+  threadOutBase: BlockExpr;
+  threadOutStride: BlockExpr;
+}
+
+/**
+ * The tiled-matmul lowering. Emits the TileKernelSpec whose kernel body is the
+ * cooperative-load K-loop; reads the K-loop / kSplit / swapGrid / block-shape
+ * facts FROM the state (the absorbed structural knowledge), and the transpose /
+ * dtype / thread-tile / epilogue facts from `desc`.
+ */
+function lowerTiledMatmul(
+  state: ScheduleState,
+  desc: TiledMatmulDescriptor,
+): TileKernelSpec {
+  const s = state.semantic;
+  const { config, transposeMode, epilogue, batched } = desc;
+  const { tileM, tileN, tileK, threadTileM, threadTileN } = config;
+
+  const wgSize = getWorkgroupSize(config);
+  const wgSizeX = wgSize.x;
+  const wgSizeY = wgSize.y;
+
+  // kSplit / swapGrid are READ FROM THE STATE (the schedule owns these facts):
+  // kSplit is the fp-reorder lemma; swapGrid is the ProgramGridMap `swap`.
+  const kSplit = desc.kSplit; // magnitude (N-way) rides on desc; PRESENCE is the lemma
+  const hasKSplitLemma = s.lemmas.some((l) => l.lemma === KSPLIT_LEMMA);
+  const swapGrid = s.programGridMap.kind === "swap";
+
+  const dtypeB = desc.dtypeB ?? desc.dtype;
+  const wgslDtypeA: DataType = (
+    desc.inputCastA ? "f32" : desc.dtype
+  ) as DataType;
+  const wgslDtypeB: DataType = (desc.inputCastB ? "f32" : dtypeB) as DataType;
+
+  const outputDtype: MatmulDType = hasKSplitLemma
+    ? "f32"
+    : (epilogue?.outputDtype ??
+      (desc.dtype === "f32" || dtypeB === "f32" ? "f32" : desc.dtype));
+  const needsF16 =
+    wgslDtypeA === "f16" || wgslDtypeB === "f16" || outputDtype === "f16";
+
+  const bindings: Record<
+    string,
+    { storage: "read" | "read_write"; type: DataType }
+  > = {
+    a: { storage: "read", type: wgslDtypeA },
+    b: { storage: "read", type: wgslDtypeB },
+    out: {
+      storage: "read_write",
+      type: (epilogue?.outputDtype ?? outputDtype) as DataType,
+    },
   };
-  return createTiledMatmulKernel(options);
+  if (epilogue) {
+    for (let i = 0; i < epilogue.additionalInputCount; i++) {
+      bindings[`epilogue_in${i}`] = { storage: "read", type: "f32" };
+    }
+  }
+
+  // Transpose flags — the no-materialization view fact (§11.4), from desc.
+  const transA = transposeMode === "TN" || transposeMode === "TT";
+  const transB = transposeMode === "NT" || transposeMode === "TT";
+
+  return {
+    name: "tiledMatmul",
+    workgroupSize: [wgSizeX, wgSizeY],
+    enableF16: needsF16,
+    uniformBindingIndex: 3,
+    bindings,
+    uniforms: {
+      m: "u32",
+      n: "u32",
+      k: "u32",
+      lda: "u32",
+      ldb: "u32",
+      ldc: "u32",
+      alpha: "f32",
+      batchSize: "u32",
+      batchStrideA: "u32",
+      batchStrideB: "u32",
+      batchStrideC: "u32",
+    },
+    grid: singleWorkgroup(), // Actual grid computed at dispatch time in dispatch.ts
+
+    kernel: (ctx) =>
+      emitTiledMatmulBody(ctx, {
+        tileM,
+        tileN,
+        tileK,
+        threadTileM,
+        threadTileN,
+        transA,
+        transB,
+        outputDtype,
+        batched: !!batched,
+        kSplit,
+        swapGrid,
+        epilogue:
+          epilogue && epilogue.ops.length > 0 && !kSplit ? epilogue : undefined,
+      }),
+  };
+}
+
+interface TiledMatmulBodyParams {
+  tileM: number;
+  tileN: number;
+  tileK: number;
+  threadTileM: number;
+  threadTileN: number;
+  transA: boolean;
+  transB: boolean;
+  outputDtype: MatmulDType;
+  batched: boolean;
+  kSplit?: number;
+  swapGrid: boolean;
+  epilogue?: EpilogueConfig;
+}
+
+/**
+ * The cooperative-load K-loop body (the absorbed `matmulKernelBlockOps`). The
+ * loop nest / staging / dot / store emission that USED to live in tile-matmul.ts;
+ * relocated here so the schedule object is the sole owner. Byte-identical to the
+ * retired builder (differential-gated). The barriers are inserted by the
+ * shared×shared `dotAccum` lowering (tile-lowering.ts) — S2: they do NOT derive,
+ * they are the realizer's, so they are not re-emitted here.
+ */
+function emitTiledMatmulBody(
+  ctx: KernelContext,
+  p: TiledMatmulBodyParams,
+): void {
+  const {
+    tileM,
+    tileN,
+    tileK,
+    threadTileM,
+    threadTileN,
+    transA,
+    transB,
+    outputDtype,
+    batched,
+    kSplit,
+    swapGrid,
+    epilogue,
+  } = p;
+
+  const { threadRow, threadCol } = ctx.configureTiles({
+    threadTileM,
+    threadTileN,
+  });
+
+  // 1. Uniforms
+  const m = ctx.emitLet("m", ctx.uniform("m"));
+  const n = ctx.emitLet("n", ctx.uniform("n"));
+  const k = ctx.emitLet("k", ctx.uniform("k"));
+  const lda = ctx.emitLet("lda", ctx.uniform("lda"));
+  const ldb = ctx.emitLet("ldb", ctx.uniform("ldb"));
+  const ldc = ctx.emitLet("ldc", ctx.uniform("ldc"));
+  const alpha = ctx.emitLet("alpha", ctx.uniform("alpha"));
+
+  // 2. Batch / K-split offsets
+  let batchOffA: BlockExpr;
+  let batchOffB: BlockExpr;
+  let batchOffC: BlockExpr;
+  let splitIdx: BlockExpr | undefined;
+
+  if (kSplit) {
+    splitIdx = ctx.emitLet("split_idx", ctx.programId(2));
+    batchOffA = ctx.emitLet("batch_offset_a", ctx.const(0, "u32"));
+    batchOffB = ctx.emitLet("batch_offset_b", ctx.const(0, "u32"));
+    batchOffC = ctx.const(0, "u32");
+  } else if (batched) {
+    const batchIdx = ctx.emitLet("batch_idx", ctx.programId(2));
+    batchOffA = ctx.emitLet(
+      "batch_offset_a",
+      batchIdx.mul(ctx.uniform("batchStrideA")),
+    );
+    batchOffB = ctx.emitLet(
+      "batch_offset_b",
+      batchIdx.mul(ctx.uniform("batchStrideB")),
+    );
+    batchOffC = ctx.emitLet(
+      "batch_offset_c",
+      batchIdx.mul(ctx.uniform("batchStrideC")),
+    );
+  } else {
+    const zero = ctx.const(0, "u32");
+    batchOffA = zero;
+    batchOffB = zero;
+    batchOffC = zero;
+  }
+
+  // 3. Workgroup positions (swapGrid: X iterates M, Y iterates N).
+  const pidRow = swapGrid ? ctx.programId(0) : ctx.programId(1);
+  const pidCol = swapGrid ? ctx.programId(1) : ctx.programId(0);
+  const wgRow = ctx.emitLet("wg_row", pidRow.mul(ctx.const(tileM, "u32")));
+  const wgCol = ctx.emitLet("wg_col", pidCol.mul(ctx.const(tileN, "u32")));
+
+  // 4. Block ranges — ≈ tl.arange(wgRow, wgRow + BLOCK_M)
+  const offsM = ctx.arange(wgRow, tileM);
+  const offsN = ctx.arange(wgCol, tileN);
+
+  // 5. Transpose strides
+  const cOne = ctx.const(1, "u32");
+  const strideAm = transA ? cOne : lda;
+  const strideAk = transA ? lda : cOne;
+  const strideBk = transB ? cOne : ldb;
+  const strideBn = transB ? ldb : cOne;
+
+  // 6. Accumulator — ≈ tl.zeros([BLOCK_M, BLOCK_N])
+  const acc = ctx.zeros(threadTileM, threadTileN);
+
+  // 7. K-loop bounds
+  let kStart: BlockExpr;
+  let kEnd: BlockExpr;
+  let numKTiles: BlockExpr;
+  const cTK = ctx.const(tileK, "u32");
+
+  if (kSplit) {
+    const kPerSplit = ctx.emitLet(
+      "k_per_split",
+      k.add(ctx.const(kSplit - 1, "u32")).div(ctx.const(kSplit, "u32")),
+    );
+    kStart = ctx.emitLet("k_start", splitIdx!.mul(kPerSplit));
+    kEnd = ctx.emitLet("k_end", kStart.add(kPerSplit).min(k));
+    numKTiles = ctx.emitLet(
+      "num_k_tiles",
+      kEnd
+        .sub(kStart)
+        .add(ctx.const(tileK - 1, "u32"))
+        .div(cTK),
+    );
+  } else {
+    numKTiles = ctx.emitLet(
+      "num_k_tiles",
+      k.add(ctx.const(tileK - 1, "u32")).div(cTK),
+    );
+    kStart = ctx.const(0, "u32");
+    kEnd = k;
+  }
+
+  // 8. K-loop — the core matmul
+  ctx.forRange(ctx.const(0, "u32"), numKTiles, (kTile) => {
+    const kOffset = ctx.emitLet("k_offset", kStart.add(kTile.mul(cTK)));
+    const offsK = ctx.arange(kOffset, tileK);
+
+    const aPtr = ctx.tilePtr(
+      batchOffA,
+      offsM.outer(strideAm),
+      offsK.inner(strideAk),
+    );
+    const aMask = ctx.tileMask(offsM.lt(m), offsK.lt(kEnd));
+    const a = ctx.load2D("a", aPtr, aMask);
+
+    const bPtr = ctx.tilePtr(
+      batchOffB,
+      offsK.outer(strideBk),
+      offsN.inner(strideBn),
+    );
+    const bMask = ctx.tileMask(offsK.lt(kEnd), offsN.lt(n));
+    const b = ctx.load2D("b", bPtr, bMask);
+
+    ctx.dotAccum(a, b, acc);
+  });
+
+  // 9. Store — K-split (raw partials) vs normal (optional post-accumulate).
+  if (kSplit) {
+    const splitBase = ctx.emitLet("split_base", splitIdx!.mul(m.mul(n)));
+    const outPtr = ctx.tilePtr(splitBase, offsM.outer(ldc), offsN.inner(cOne));
+    const outMask = ctx.tileMask(offsM.lt(m), offsN.lt(n));
+    ctx.store2D("out", acc, outPtr, outMask);
+  } else {
+    acc.mul_(alpha.toF32());
+
+    if (epilogue) {
+      const threadOutBase = ctx.emitLet(
+        "thread_out_base",
+        batchOffC.add(
+          wgRow
+            .add(threadRow.mul(ctx.const(threadTileM, "u32")))
+            .mul(ldc)
+            .add(wgCol.add(threadCol.mul(ctx.const(threadTileN, "u32")))),
+        ),
+      );
+      applyBlockEpilogue(ctx, ctx.tileOps, acc, epilogue, {
+        offsN,
+        threadOutBase,
+        threadOutStride: ldc,
+      });
+    } else if (outputDtype === "f16") {
+      acc.castTo_("f16");
+    }
+
+    const outPtr = ctx.tilePtr(batchOffC, offsM.outer(ldc), offsN.inner(cOne));
+    const outMask = ctx.tileMask(offsM.lt(m), offsN.lt(n));
+    ctx.store2D("out", acc, outPtr, outMask);
+  }
+}
+
+/**
+ * Apply composable epilogue ops to the accumulator Block (the semantic-body
+ * helper §11.4 permits to remain). Relocated from tile-matmul.ts verbatim so the
+ * matmul lowering owns its epilogue realization. `epilogueToBody` (above) is the
+ * SEMANTIC mirror of this in the ScheduleState; this is its lowering.
+ */
+function applyBlockEpilogue(
+  ctx: KernelContext,
+  ops: BlockOps,
+  acc: Block,
+  epilogue: EpilogueConfig,
+  addressing: EpilogueAddressing,
+): void {
+  const { offsN, threadOutBase, threadOutStride } = addressing;
+  for (const op of epilogue.ops) {
+    switch (op.kind) {
+      case "none":
+        break;
+      case "bias":
+        acc.add_(ops.load1d(`epilogue_in${op.inputIndex}`, offsN));
+        break;
+      case "unary":
+        acc.apply_((x) => applyFusedOp(ctx, op.op!, [x]));
+        break;
+      case "binary": {
+        const binBlock = ops.load(
+          `epilogue_in${op.inputIndex}`,
+          { kind: "thread", base: threadOutBase, stride: threadOutStride },
+          { rows: acc.rows, cols: acc.cols },
+        );
+        switch (op.op) {
+          case "add":
+            acc.add_(binBlock);
+            break;
+          case "sub":
+            acc.sub_(binBlock);
+            break;
+          case "mul":
+            acc.mul_(binBlock);
+            break;
+          default:
+            throw new Error(`Unsupported binary epilogue: ${op.op}`);
+        }
+        break;
+      }
+      case "cast":
+        if (op.toDtype === "f16") acc.castTo_("f16");
+        break;
+    }
+  }
+  if (
+    epilogue.outputDtype === "f16" &&
+    !epilogue.ops.some((o) => o.kind === "cast")
+  ) {
+    acc.castTo_("f16");
+  }
 }
 
 // ============================================================================
@@ -937,10 +1311,9 @@ const LIVE_MATMUL_REGION = uid<SemanticRegionUid>("region:live-matmul");
 /**
  * Realize the tiled-matmul `TileKernelSpec` THROUGH the schedule object: derive
  * a ScheduleState from the options, assert no-second-owner at the seam, and apply
- * it. Byte-identical to the retired `createTiledMatmulKernel(options)` because
- * `applyTiledMatmulSchedule` funnels back to the same builder — the difference is
- * that the schedule object is now the sole writer and the seam assertions run on
- * the live path.
+ * it. The loop-nest / staging / dot / epilogue structure LOWERS FROM the state
+ * (`lowerTiledMatmul`, Commit B absorption) — the schedule object is the sole
+ * writer at the dispatch seam; the retired `createTiledMatmulKernel` is gone.
  */
 export function realizeTiledMatmulKernel(
   options: CodegenOptions,
@@ -948,6 +1321,17 @@ export function realizeTiledMatmulKernel(
   const desc: TiledMatmulDescriptor = options;
   const state = deriveTiledMatmulState(desc, LIVE_MATMUL_REGION);
   return applyTiledMatmulSchedule(state, desc);
+}
+
+/**
+ * Compile the tiled-matmul WGSL through the schedule object (the tests' live
+ * comparison target; formerly `tile-matmul.ts generateTiledMatmulShaderTileIR`,
+ * relocated here now that the schedule owns the tiled lowering).
+ */
+export function generateTiledMatmulShaderTileIR(
+  options: CodegenOptions,
+): string {
+  return compileTileKernel(realizeTiledMatmulKernel(options));
 }
 
 /**

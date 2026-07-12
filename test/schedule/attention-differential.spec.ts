@@ -38,7 +38,6 @@ import {
   makeDPrecomputeSpec,
   makeForwardAttentionSpec,
 } from "../../src/backend/webgpu/attention-kernel";
-import { generateTiledMatmulShaderTileIR } from "../../src/backend/webgpu/matmul/tile-matmul";
 import { rowProgramToSpec } from "../../src/backend/webgpu/row-program-codegen";
 import { compileTileKernel } from "../../src/backend/webgpu/tile-compiler";
 import {
@@ -57,7 +56,10 @@ import {
   scheduleDigest,
   skeletonDigest,
 } from "../../src/schedule/canonical";
-import { applyTiledMatmulSchedule } from "../../src/schedule/matmul-skeleton";
+import {
+  applyTiledMatmulSchedule,
+  generateTiledMatmulShaderTileIR,
+} from "../../src/schedule/matmul-skeleton";
 import { applyRowProgramSchedule } from "../../src/schedule/reduction-skeleton";
 
 const D = 64;

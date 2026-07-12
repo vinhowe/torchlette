@@ -288,6 +288,177 @@ function evalBody(
 }
 
 // ============================================================================
+// realize* — the LIVE-PATH cutover (P2 wave A, item 1)
+// ============================================================================
+//
+// These are the chokepoint the live elementwise builders route THROUGH. Each
+// takes the same strided-view args the old `ops-tile-ir.ts` spec builder took,
+// constructs the family-specific descriptor (the "semantic builder" — the
+// op→catalog mapping that §11.5 classes `stays-as-semantic-builder`), derives
+// the ScheduleState, runs the no-second-owner gate, and lowers via
+// `applySchedule`. The old inline `elementwiseKernel(...)` scaffolding in the
+// spec builders is DELETED — its loop nest / strided-load / store structure now
+// lowers from the schema ONCE, in `applySchedule` (§11.5 "elementwise loop
+// scaffolding → dies"). The differential (test/schedule/elementwise-differential)
+// now guards the LIVE path: `compileTileKernel(realize*(...))` is what dispatch
+// compiles, and it is byte-identical to the old builder by construction.
+
+const LIVE_REGION = uid<SemanticRegionUid>("region:live-elementwise");
+const EMPTY_REGION: SemanticRegion = { uid: LIVE_REGION, nodes: [] };
+
+/** WGSL infix operator → fusion op name (the binary op catalog map). */
+const WGSL_OP_TO_FUSION: Record<string, string> = {
+  "+": "add",
+  "-": "sub",
+  "*": "mul",
+  "/": "div",
+  pow: "pow",
+  min: "minimum",
+  max: "maximum",
+};
+
+const val = (binding: string): SemanticBodyNode => ({
+  kind: "value",
+  value: uid<ValueUid>(`in:${binding}`),
+});
+
+/** One strided input: binding + dtype + (indexShape, strides, offset-uniform). */
+function inp(
+  binding: string,
+  dtype: ValueDtype,
+  indexShape: readonly number[],
+  strides: readonly number[],
+  offsetUniform: string,
+): ElementwiseInput {
+  return {
+    binding,
+    dtype,
+    access: { indexShape: [...indexShape], strides: [...strides], offsetUniform },
+  };
+}
+
+/**
+ * Realize ANY elementwise-family kernel from its descriptor: derive → gate →
+ * apply. The per-family `realize*` entry points below are the semantic BUILDERS
+ * (op→catalog-body mapping); this is their common lowering chokepoint.
+ */
+function realize(
+  name: string,
+  enableF16: boolean,
+  inputs: readonly ElementwiseInput[],
+  outDtype: ValueDtype,
+  body: SemanticBodyNode,
+): TileKernelSpec {
+  const desc: ElementwiseKernelDescriptor = {
+    name,
+    enableF16,
+    inputs,
+    output: { binding: "out", dtype: outDtype },
+    body,
+  };
+  const state = deriveScheduleState(desc, LIVE_REGION);
+  assertNoSecondOwnerElementwise(state);
+  return applySchedule(EMPTY_REGION, state, desc);
+}
+
+/** Realize a strided unary op spec through the schedule object. */
+export function realizeUnaryStridedSpec(
+  opKey: string,
+  shape: readonly number[],
+  strides: readonly number[],
+  dtype: ValueDtype,
+  outDtype: ValueDtype,
+): TileKernelSpec {
+  return realize(
+    `unary_${opKey}`,
+    dtype === "f16" || outDtype === "f16",
+    [inp("a", dtype, shape, strides, "base_offset")],
+    outDtype,
+    { kind: "apply", catalog: { op: opKey }, args: [val("a")] },
+  );
+}
+
+/** Realize a binary broadcast op spec through the schedule object. */
+export function realizeBinaryBroadcastSpec(
+  op: string,
+  indexShape: readonly number[],
+  aStrides: readonly number[],
+  bStrides: readonly number[],
+  dtype: ValueDtype,
+): TileKernelSpec {
+  const fusionOp = WGSL_OP_TO_FUSION[op];
+  if (!fusionOp)
+    throw new Error(`realizeBinaryBroadcastSpec: unsupported op "${op}"`);
+  return realize(
+    `binary_${fusionOp}`,
+    dtype === "f16",
+    [
+      inp("a", dtype, indexShape, aStrides, "a_offset"),
+      inp("b", dtype, indexShape, bStrides, "b_offset"),
+    ],
+    dtype,
+    { kind: "apply", catalog: { op: fusionOp }, args: [val("a"), val("b")] },
+  );
+}
+
+/** Realize a strided dtype cast spec through the schedule object. */
+export function realizeCastSpec(
+  srcDtype: ValueDtype,
+  dstDtype: ValueDtype,
+  shape: readonly number[],
+  strides: readonly number[],
+): TileKernelSpec {
+  return realize(
+    `cast_${srcDtype}_${dstDtype}`,
+    srcDtype === "f16" || dstDtype === "f16",
+    [inp("a", srcDtype, shape, strides, "base_offset")],
+    dstDtype,
+    srcDtype === dstDtype
+      ? val("a")
+      : { kind: "apply", catalog: { op: `cast_${dstDtype}` }, args: [val("a")] },
+  );
+}
+
+/** Realize a strided-to-contiguous copy spec through the schedule object. */
+export function realizeContiguousSpec(
+  shape: readonly number[],
+  strides: readonly number[],
+  dtype: ValueDtype,
+): TileKernelSpec {
+  return realize(
+    `contiguous_${dtype}`,
+    dtype === "f16",
+    [inp("input", dtype, shape, strides, "base_offset")],
+    dtype,
+    val("input"),
+  );
+}
+
+/** Realize the broadcast where (ternary select) spec through the schedule object. */
+export function realizeWhereSpec(
+  indexShape: readonly number[],
+  condStrides: readonly number[],
+  xStrides: readonly number[],
+  yStrides: readonly number[],
+): TileKernelSpec {
+  return realize(
+    "where",
+    false,
+    [
+      inp("cond", "f32", indexShape, condStrides, "cond_offset"),
+      inp("x", "f32", indexShape, xStrides, "x_offset"),
+      inp("y", "f32", indexShape, yStrides, "y_offset"),
+    ],
+    "f32",
+    {
+      kind: "apply",
+      catalog: { op: "select" },
+      args: [val("cond"), val("x"), val("y")],
+    },
+  );
+}
+
+// ============================================================================
 // The no-second-owner assertion PROTOTYPE (P0 deliverable 4, elementwise)
 // ============================================================================
 
