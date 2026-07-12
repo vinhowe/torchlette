@@ -20,6 +20,7 @@ const GPU_TEST_FILES = [
   "test/distilgpt2-finetune.spec.ts",
   "test/distilgpt2-full-finetuning.spec.ts",
   "test/frontend-dtype.spec.ts",
+  "test/gemv-generated-route.spec.ts",
   "test/implied-step-boundary.spec.ts",
   "test/lazy-materialize-gen-lifetime.spec.ts",
   "test/matmul-view-input.spec.ts",

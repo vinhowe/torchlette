@@ -119,6 +119,23 @@ export interface GeneratedStream {
 const F32_BYTES = 4;
 
 /**
+ * Count of GEMV (M=1) matmul dispatches emitted into GENERATED command streams
+ * (bare matmul + matmul-epilogue directive). The `getGemvDispatchCount` counter
+ * in matmul/dispatch.ts only ticks on the LOWERED path (dispatchTiledMatmul) —
+ * it is REPLAY-BLIND, so it reads 0 once a decode template cuts over to the
+ * compiled/generated plan even when the GEMV route engages perfectly. This
+ * counter is the route-engagement signal that SURVIVES the compiled-plan
+ * activation threshold: it ticks each time the generator bakes a `_gemv`-labeled
+ * plan into a TAG_DISPATCH. A route-engagement gate must read THIS (not the
+ * lowered counter) to detect a #93/#95-class bypass in the generated stream.
+ * See test/gemv-generated-route.spec.ts.
+ */
+let generatedGemvDispatchCount = 0;
+export function getGeneratedGemvDispatchCount(): number {
+  return generatedGemvDispatchCount;
+}
+
+/**
  * Generate the command stream for a lowered plan. Mirrors the recording's
  * slot-numbering protocol exactly (it must — the differential compares
  * canonical streams where buffers ARE slot indices):
@@ -2729,6 +2746,8 @@ function generateBareMatmul(
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
   const m = cached.matmul;
+  // Route-engagement signal that survives compiled-plan cutover (see counter doc).
+  if (m.label?.startsWith("_gemv")) generatedGemvDispatchCount++;
 
   if (m.kSplit) {
     // K-split: ALLOC(out) then two dispatches over the cached partials temp
@@ -2892,6 +2911,8 @@ function generateMatmulEpilogue(
     inputCastB: cfg.inputCastB as never,
   });
   if (plan.kSplit) return "ksplit";
+  // Route-engagement signal that survives compiled-plan cutover (see counter doc).
+  if (plan.label?.startsWith("_gemv")) generatedGemvDispatchCount++;
 
   const outBytes = sizeOf(cfg.outShape) * dtypeBytes(cfg.outputDtype);
   const outSlot = slots.length;
