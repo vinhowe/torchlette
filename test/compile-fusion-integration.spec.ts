@@ -361,7 +361,7 @@ describe("§15 Optimized Execution", () => {
       expect(result.stats.sequentialNodes).toBe(plan.nodes.length);
     });
 
-    it("detects fusion opportunities", async () => {
+    it("capability-gates fusion off on CPU even when enableFusion:true is requested (task #94)", async () => {
       const a = engine.tensorFromArray([1, 2, 3, 4], [4]);
       const b = engine.tensorFromArray([5, 6, 7, 8], [4]);
       const c = engine.add(a, b);
@@ -370,13 +370,19 @@ describe("§15 Optimized Execution", () => {
       const plan = buildPlan(getPendingNode(d.lazyRef));
       const backend = getBackend("cpu") as Backend;
 
-      // CPU backend doesn't support fusion, but should detect the opportunity
+      // The fusion machinery (epilogue/prologue/row-program directives + fused
+      // kernels + the compiled-plan/stream-generator path) is webgpu-only — its
+      // dispatches require an initialized WebGPU context. The BACKEND's capability
+      // (isFusedBackend), not the caller's requested flag, decides whether it
+      // engages: a non-fused backend can NEVER fuse. So CPU takes the plain
+      // sequential path even when enableFusion:true is requested — this is the
+      // fix that unbroke the CPU reference arm for the canonical training loop.
       const result = await executePlanOptimized(plan, backend, {
         enableFusion: true,
       });
 
-      expect(result.stats.fusionEnabled).toBe(true);
-      // Stats will show what was attempted
+      expect(result.stats.fusionEnabled).toBe(false);
+      expect(result.stats.sequentialNodes).toBe(plan.nodes.length);
       expect(result.stats.totalNodes).toBe(plan.nodes.length);
     });
 

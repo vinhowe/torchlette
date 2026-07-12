@@ -1113,6 +1113,14 @@ function captureActionLayouts(
   backendName: string,
   observeResult: boolean,
 ): void {
+  // Every layout captured here is consumed ONLY by the webgpu stream generator
+  // (stream-generate.ts) — the compiled-plan machinery is webgpu-only. On other
+  // backends (CPU) there is nothing to capture and backend tensors carry no
+  // `.buffer.size` (they are plain arrays), so touching that field crashes.
+  // Bail cleanly for non-webgpu backends: CPU execution never engages the
+  // compiled-plan / stream-generator machinery.
+  if (backendName !== "webgpu") return;
+
   // Stage-4 phase-3: capture bare-matmul geometry (transpose detection needs
   // live strides). Geometry is shape/dtype-pure → valid for every step.
   if (
@@ -3310,8 +3318,17 @@ export async function executePlanOptimized(
   // Pre-tune matmul shapes if backend supports it
   await pretunePlanMatmuls(plan, backend);
 
-  const { enableFusion = isFusedBackend(backend), enableVectorization = true } =
-    options;
+  // Fusion (epilogue/prologue/row-program directives, fused elementwise
+  // kernels, and the whole compiled-plan / stream-generator machinery) is
+  // webgpu-only — its dispatch paths call into dispatchMatmul/dispatchFusedKernel
+  // which require an initialized WebGPU context. The backend's capability, not
+  // the caller's requested flag, is the source of truth: a non-fused backend
+  // (CPU) can NEVER fuse, even if enableFusion:true is passed. Otherwise the CPU
+  // path builds webgpu-only directives and crashes at dispatch. AND the request
+  // with the backend capability so CPU cleanly takes the sequential path.
+  const enableFusion =
+    (options.enableFusion ?? isFusedBackend(backend)) && isFusedBackend(backend);
+  const enableVectorization = options.enableVectorization ?? true;
 
   // Fall back to simple sequential execution when fusion is disabled entirely.
   if (!enableFusion) {

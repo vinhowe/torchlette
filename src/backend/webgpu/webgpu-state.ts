@@ -224,8 +224,13 @@ export function onTeardown(cb: () => void): void {
 }
 
 export function runTeardownCallbacks(): void {
+  // Do NOT clear the registry: modules self-register their reset callbacks at
+  // IMPORT time (once per process), but destroyWebGPU()/initWebGPU() can cycle
+  // many times in one process (the multi-engine reclaim path, task #94). If we
+  // emptied the array here, the 2nd+ teardown would run zero callbacks and leak
+  // every kernel/pool/tracker's state into the next device. The callbacks are
+  // idempotent resets, so re-running them across cycles is safe.
   for (const cb of teardownCallbacks) cb();
-  teardownCallbacks.length = 0;
 }
 
 // ============================================================================

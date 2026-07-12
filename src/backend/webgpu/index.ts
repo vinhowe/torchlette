@@ -43,6 +43,8 @@ export {
   planBareMatmul,
 } from "./dispatch";
 export {
+  _simulateDroppedSubmitForTest,
+  assertNoDroppedSubmits,
   destroyWebGPU,
   getGpuUncapturedErrorCount,
   getMaxStorageBufferBindingSize,

@@ -8,6 +8,7 @@ import { allocateOutputBuffer } from "../buffer-arena";
 import { bufferPool, destroyCopy } from "../buffer-pool";
 import { advanceEpoch } from "../epoch";
 import {
+  assertNoDroppedSubmits,
   f16ArrayToF32Array,
   f16WeightCache,
   requireContext,
@@ -914,6 +915,11 @@ export async function read(a: BackendTensor): Promise<number[]> {
   if (typeof ctx.queue.onSubmittedWorkDone === "function") {
     await ctx.queue.onSubmittedWorkDone();
   }
+  // The fence has settled — any dropped submit's uncaptured error has been
+  // delivered by now. Under STRICT_GPU, throw (naming device pressure) rather
+  // than read back the stale/all-zero data a dropped submit leaves behind
+  // (task #94, item 3 — the VULKAN_DEVICE_INDEX=1 all-zero incident).
+  assertNoDroppedSubmits("tensor readback");
   // GPU work is complete — quiescent point: advance the engine epoch
   // (flushes pending pool buffers).
   advanceEpoch("readback");

@@ -28,6 +28,7 @@ import {
   arenaBufferSet,
   pinnedBufferSet,
   getOutputSeqIndex,
+  onTeardown,
   requireContext,
   setOutputSeqIndex,
   trackSharedEncoderWrite,
@@ -640,3 +641,14 @@ export function resetArenaState(): void {
   arenaLocal.resolveIndex = 0;
   arenaLocal.allocIndex = 0;
 }
+
+// Multi-engine reclaim (task #94): destroyWebGPU() destroys the device; the
+// arena's module-global tracking sets otherwise keep references to dead buffers
+// into the next device. Per-template arenas are torn down via the template-cache
+// eviction, but these leaf sets + the resolve cursor must be reset at teardown so
+// a re-initWebGPU() starts clean.
+onTeardown(() => {
+  resetArenaState();
+  arenaBufferSet.clear();
+  pinnedBufferSet.clear();
+});
