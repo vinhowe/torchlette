@@ -197,7 +197,7 @@ describe("P0 attention authored-form legality (§6 / F3 / R10)", () => {
       expect(sk.visibility).toBe("opaque");
       if (sk.visibility === "opaque") {
         expect(sk.kernelRef).toContain("attention-kernel.ts");
-        expect(sk.refusalReason).toContain("authored — not yet re-derived");
+        expect(sk.refusalReason).toContain("DERIVED-MODULO-CUTOVER");
         // F3: an opaque skeleton has NO loop/staging/role field to leak.
         expect(sk).not.toHaveProperty("schedule");
       }

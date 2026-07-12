@@ -343,18 +343,33 @@ export function attentionCacheKey(desc: AttentionDescriptor): string {
  * regeneration (applyAttentionSchedule → the live make*Spec) is byte-identical.
  */
 export function deriveAttentionSkeleton(desc: AttentionDescriptor): Skeleton {
+  const isBackward =
+    desc.role === "backwardDQ" ||
+    desc.role === "backwardDKV" ||
+    desc.role === "dPrecompute";
   return {
     visibility: "opaque",
     kernelRef: kernelRefFor(desc.role),
-    refusalReason:
-      "authored — not yet re-derived. The fused online-softmax composite is " +
-      "reachable only via the P2 FA-derivation (rungs 0–7: merge naive three " +
-      "islands [S3] → tile → stream K/V → recolor accumulator → apply the " +
-      "online-softmax admitted lemma; F17 sequence lemma→recolor→recolor→group→" +
-      "stream), which the move grammar cannot yet run (S3 merge/fuse is an " +
-      "unbuilt engine transaction). Exit: local self-hosting (attention backward " +
-      "re-derived once the recomputation-identity + D-precompute lemmas are " +
-      "admitted; §6/§7 P4).",
+    refusalReason: isBackward
+      ? // §7 P4 (local self-hosting): the backward IS re-derived in-grammar —
+        // tools/fa-backward-derivation-script.ts reaches THIS authored kernel
+        // byte-identically via the RECOMPUTATION + D-PRECOMPUTE admitted lemmas
+        // (both in the lemma library). The skeleton STAYS opaque only until the
+        // S3 merge/fuse composite transaction (islands altitude, unbuilt) flips
+        // the live path opaque→derived — a named engine deliverable, not a
+        // grammar gap. See docs/schedule-state-p4-local-self-hosting-report.md.
+        "authored — DERIVED-MODULO-CUTOVER (§7 P4). The backward is re-derived " +
+        "in-grammar (RECOMPUTATION + D-PRECOMPUTE lemmas; tools/fa-backward-" +
+        "derivation-script.ts reaches this kernel byte-identically). Opaque only " +
+        "until the S3 merge/fuse transaction flips the live path opaque→derived."
+      : // Forward: the derivation runs (tools/fa-derivation-script.ts, online-
+        // softmax lemma) but the automated cutover waits on S3.
+        "authored — DERIVED-MODULO-CUTOVER (§7 P4). The forward is re-derived " +
+        "in-grammar via the FA-derivation (rungs 0–7: merge naive three islands " +
+        "[S3] → tile → stream K/V → recolor accumulator → apply the online-" +
+        "softmax admitted lemma; F17). Opaque only until the S3 merge/fuse " +
+        "composite transaction flips the live path opaque→derived (islands " +
+        "altitude, unbuilt engine deliverable — not a grammar gap).",
     params: ATTENTION_PARAM_SCHEMA,
   };
 }
