@@ -197,6 +197,12 @@ function printValue(p: Printer, indent: number, v: NamedValue): void {
     `dtype=${v.dtype}`,
     `alias=${v.aliasOf ?? "-"}`,
   ];
+  // A `shared`-tier value is a STAGED tile (matmul A/B tiles, GEMV NN a-tile):
+  // its residency is a workgroup-cooperative staging buffer, not an owned global.
+  // The `[staged]` tag makes the staging edge legible without changing any state
+  // that has no shared value (wave-0/1 states carry none, so their digest is
+  // untouched — the tag is purely additive text on shared-tier lines).
+  if (v.allocation === "shared") parts.push("[staged]");
   if (v.load) parts.push(printAccess(v.load));
   p.line(indent, `value ${parts.join(" ")}`);
 }
