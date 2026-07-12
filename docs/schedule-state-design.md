@@ -674,6 +674,28 @@ softmax is correctly refused because ordinary softmax has no head/body decomposi
 - A failed case is REPORTED, never averaged away.
 - (Vin may override the 1.5× / 2.0× before P2 starts; they are the recorded defaults.)
 
+**P2-readiness after the P0-FULL attention wave (wave 3, `attention-skeleton.ts`).**
+The census wave landed both ENDS of the P2 derivation and the online-softmax
+lemma as an engine object; the full buildable-now-vs-needs-design breakdown is in
+`docs/schedule-state-wave3-attention-report.md §6`. Summary:
+- **Starting position (buildable-now, DELIVERED):** naive attention as a
+  three-region composition (QK^T matmul → softmax row-program → PV matmul) built
+  from the existing family skeletons + the island-flow edges — the input to the
+  `merge` transaction.
+- **Target (buildable-now, DELIVERED):** the authored fused `fusedAttention`
+  schedule (opaque skeleton + typed param schema incl. the vec4 constraint and
+  the 256-head-dim 32KB-workgroup-storage capability). Its `skeletonDigest` IS
+  the R24 baseline PIN ("the authored `fusedAttention` commit at merge time").
+- **Online-softmax lemma (buildable-now, DELIVERED as the APPLICATION):** the
+  `LemmaApplication` with first-class carried state `(m, ℓ, o)` + correction
+  `exp(m_old − m_new)` and the proof-obligation ID. Still needs (P2): the
+  lemma's `BoxRewrite` + its own differential gate.
+- **NEEDS-DESIGN (P2 macro-move altitude, correctly out of a census wave):**
+  (a) the `merge`/`fuse` composite transaction (S3 — engine side, islands
+  altitude, unbuilt); (b) the `stream` move algebra + the engine-side
+  streamability predicate (typed head/body + recomposition law; the predicate
+  SHAPE is buildable on `PredicateAstNode`, the move body is P2).
+
 ### P3 — the workbench: zoom-in + the perf feedback loop (measurement identity, R20)
 
 Sol's islands editor gains the intra-island view: click an island → skeleton + declared
