@@ -1,14 +1,15 @@
 /**
  * P4 byte differential — FUSED ADAM family (§7 LOCAL self-hosting, deliverable 3).
  *
- * (1) AUTHORED (opaque, F3) fused-Adam kernel. For each variant (useVec4 × emitF16
- *     × emitUnscale),
+ * (1) AUTHORED (opaque, F3) fused-Adam kernel — CUTOVER-FLIPPED. For each variant
+ *     (useVec4 × emitF16 × emitUnscale),
  *
  *       compileTileKernel(applyAdamSchedule(deriveAdamSkeleton(desc), desc))
- *         ==BYTES== compileTileKernel(makeAdamStepSpec(...))
+ *         ==BYTES== generateAdamShaderTileIR(...)   // the live schedule chokepoint
  *
- *     applyAdamSchedule re-calls the SAME live single-source makeAdamStepSpec
- *     factory (nowhere in an opaque skeleton to store a generator — R22).
+ *     The body now LOWERS FROM the schedule (lowerAdamStepBody); the live dispatch
+ *     (getAdamDispatcher) routes through realizeAdamStepSpec. Nowhere in an opaque
+ *     skeleton to store a generator (R22).
  *
  * (2) The HORIZONTAL-PACK derivation (the §3 pack move's real tenant): N per-param
  *     elementwise Adam loops pack (concatenate) into ONE pack loop over segments —
@@ -21,7 +22,6 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { makeAdamStepSpec } from "../../src/backend/webgpu/adam-kernel";
 import { compileTileKernel } from "../../src/backend/webgpu/tile-compiler";
 import {
   type AdamDescriptor,
@@ -30,6 +30,7 @@ import {
   applyAdamSchedule,
   deriveAdamSkeleton,
   deriveHorizontalPackedAdam,
+  generateAdamShaderTileIR,
 } from "../../src/schedule/adam-skeleton";
 import { printScheduleState } from "../../src/schedule/canonical";
 import type { ScheduleState, ValueUid } from "../../src/schedule/types";
@@ -48,8 +49,12 @@ const variants: AdamDescriptor[] = [
 describe("P4 fused-Adam byte differential (authored / opaque)", () => {
   for (const desc of variants) {
     it(`adamStep [${adamCacheKey(desc)}]`, () => {
-      const live = compileTileKernel(
-        makeAdamStepSpec(desc.useVec4, desc.emitF16, desc.emitUnscale),
+      // The LIVE path IS the schedule chokepoint now (the cutover-flip): the
+      // dispatcher routes through realizeAdamStepSpec / generateAdamShaderTileIR.
+      const live = generateAdamShaderTileIR(
+        desc.useVec4,
+        desc.emitF16,
+        desc.emitUnscale,
       );
       const derived = compileTileKernel(
         applyAdamSchedule(deriveAdamSkeleton(desc), desc),
@@ -68,8 +73,11 @@ describe("P4 fused-Adam authored-form legality (§6 / F3 / R10)", () => {
     });
     expect(sk.visibility).toBe("opaque");
     if (sk.visibility === "opaque") {
-      expect(sk.kernelRef).toContain("adam-kernel.ts");
+      // Post-cutover-flip: the body was ABSORBED into the schedule module, so
+      // the kernelRef names the schedule-owned lowering (single source).
+      expect(sk.kernelRef).toContain("adam-skeleton.ts");
       expect(sk.refusalReason).toContain("HORIZONTAL-PACK");
+      expect(sk.refusalReason).toContain("LIVE-PATH FLIPPED");
       expect(sk).not.toHaveProperty("schedule");
       expect(sk.params).toBe(ADAM_PARAM_SCHEMA);
     }

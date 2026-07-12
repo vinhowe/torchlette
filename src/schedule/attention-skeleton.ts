@@ -1,8 +1,14 @@
 /**
- * Walking skeleton — ATTENTION family (campaign P0-FULL wave 3, the last census
- * block + the P2 prerequisite). Side-by-side with the live path; NO behavior
- * change; NO dispatch cutover. Exercised only by
- * test/schedule/attention-differential.spec.ts.
+ * ATTENTION family schedule module (P0-FULL wave 3 + §7 P4 CUTOVER-FLIP). The
+ * live attention dispatch/plan path now ROUTES THROUGH this module: the four
+ * fused-FlashAttention kernel bodies were ABSORBED here from attention-kernel.ts
+ * (`lowerAttention*Body`), so the ScheduleState OWNS the kernel structure and
+ * `realizeAttentionSpec` is the live dispatch chokepoint (the P1/matmul/reduction
+ * `realize*` pattern). NO behavior change — the bodies are byte-identical to the
+ * retired `make*Spec` factories (the 14-kernel modifier differential guards the
+ * LIVE path). The skeleton STAYS opaque (F3): the online-softmax composite is
+ * still authored (not yet reached by the move grammar's `merge` transaction — S3
+ * unbuilt), but the body it names lives here, so there is one owner.
  *
  * ------------------------------------------------------------------------
  * TWO SHAPES, ONE FAMILY (why attention is different from matmul)
@@ -64,17 +70,18 @@ import type { AttnModifierSpec } from "../backend/types";
 import {
   assertBackwardSupportsModifier,
   attnModifierKey,
-  BC,
-  BC_BW,
-  BQ_BW,
-  BR,
-  makeBackwardDKVSpec,
-  makeBackwardDQSpec,
-  makeDPrecomputeSpec,
-  makeForwardAttentionSpec,
+  hasCausalMask,
 } from "../backend/webgpu/attention-kernel";
 import { DEFAULT_CONFIG } from "../backend/webgpu/matmul/types";
-import type { TileKernelSpec } from "../backend/webgpu/tile-ir";
+import { F32_NEG_MAX, WORKGROUP_SIZE } from "../backend/webgpu/shape-utils";
+import { compileTileKernel } from "../backend/webgpu/tile-compiler";
+import type {
+  BlockExpr,
+  KernelContext,
+  SeamFn,
+  TileKernelSpec,
+} from "../backend/webgpu/tile-ir";
+import { tiledGrid } from "../backend/webgpu/tile-ir";
 import type { RowProgram } from "../compiler/row-program-types";
 import { reportNoSecondOwner } from "./canonical";
 import {
@@ -95,6 +102,20 @@ import type {
 } from "./types";
 
 const uid = <T>(s: string): T => s as unknown as T;
+
+// ============================================================================
+// Tiling parameters (the fused-attention block shapes — the ScheduleState's
+// declared block-shape params). OWNED HERE now (the cutover-flip): the schedule
+// module owns the kernel body, so the block sizes it lowers are its facts; the
+// dispatch layer (attention-kernel.ts) imports them back for grid/plan math.
+// Kept as leaf constants so attention-kernel↔attention-skeleton has no eval-time
+// circular dependency (the bodies + ATTENTION_PARAM_SCHEMA read them at eval).
+// ============================================================================
+
+export const BR = 64; // Q rows per workgroup (forward, dQ)
+export const BC = 32; // KV rows per tile (forward, dQ)
+export const BQ_BW = 16; // Q rows per tile (backward dKV)
+export const BC_BW = 64; // KV rows per workgroup (backward dKV)
 
 // ============================================================================
 // The online-softmax admitted lemma (§3.4) — the fused kernel's license
@@ -351,53 +372,69 @@ export function deriveAttentionSkeleton(desc: AttentionDescriptor): Skeleton {
     visibility: "opaque",
     kernelRef: kernelRefFor(desc.role),
     refusalReason: isBackward
-      ? // §7 P4 (local self-hosting): the backward IS re-derived in-grammar —
-        // tools/fa-backward-derivation-script.ts reaches THIS authored kernel
-        // byte-identically via the RECOMPUTATION + D-PRECOMPUTE admitted lemmas
-        // (both in the lemma library). The skeleton STAYS opaque only until the
-        // S3 merge/fuse composite transaction (islands altitude, unbuilt) flips
-        // the live path opaque→derived — a named engine deliverable, not a
-        // grammar gap. See docs/schedule-state-p4-local-self-hosting-report.md.
-        "authored — DERIVED-MODULO-CUTOVER (§7 P4). The backward is re-derived " +
-        "in-grammar (RECOMPUTATION + D-PRECOMPUTE lemmas; tools/fa-backward-" +
-        "derivation-script.ts reaches this kernel byte-identically). Opaque only " +
-        "until the S3 merge/fuse transaction flips the live path opaque→derived."
-      : // Forward: the derivation runs (tools/fa-derivation-script.ts, online-
-        // softmax lemma) but the automated cutover waits on S3.
-        "authored — DERIVED-MODULO-CUTOVER (§7 P4). The forward is re-derived " +
+      ? // §7 P4 CUTOVER-FLIP: the LIVE-PATH flip is DONE — the backward body
+        // (lowerBackward*Body / lowerDPrecomputeBody) LOWERS FROM the schedule
+        // now; realizeAttentionSpec is the live dispatch chokepoint. The skeleton
+        // STAYS opaque because its INTERNALS are still authored: the recompute-
+        // from-logsumexp + D-precompute composite is proven in-grammar
+        // (tools/fa-backward-derivation-script.ts reaches this kernel byte-
+        // identically via the RECOMPUTATION + D-PRECOMPUTE admitted lemmas), but
+        // the AUTOMATED internal opaque→derived flip waits on the S3 merge/fuse
+        // composite transaction (islands altitude, unbuilt engine deliverable —
+        // not a grammar gap). See docs/schedule-state-p4-local-self-hosting-report.md.
+        "authored (LIVE-PATH FLIPPED, §7 P4). The backward body lowers FROM this " +
+        "schedule module (realizeAttentionSpec is the live dispatch chokepoint); " +
+        "the internals stay authored — the recompute-from-logsumexp + D-precompute " +
+        "composite is re-derived in-grammar (RECOMPUTATION + D-PRECOMPUTE lemmas) " +
+        "but the automated internal opaque→derived flip waits on the S3 merge/fuse " +
+        "transaction (unbuilt engine deliverable, not a grammar gap)."
+      : // Forward: LIVE-PATH flipped (body lowers from the schedule); the internal
+        // online-softmax composite stays authored until S3.
+        "authored (LIVE-PATH FLIPPED, §7 P4). The forward body lowers FROM this " +
+        "schedule module (realizeAttentionSpec is the live dispatch chokepoint); " +
+        "the internals stay authored — the online-softmax composite is re-derived " +
         "in-grammar via the FA-derivation (rungs 0–7: merge naive three islands " +
-        "[S3] → tile → stream K/V → recolor accumulator → apply the online-" +
-        "softmax admitted lemma; F17). Opaque only until the S3 merge/fuse " +
-        "composite transaction flips the live path opaque→derived (islands " +
-        "altitude, unbuilt engine deliverable — not a grammar gap).",
+        "[S3] → tile → stream K/V → recolor accumulator → apply the online-softmax " +
+        "admitted lemma; F17) but the automated internal opaque→derived flip waits " +
+        "on the S3 merge/fuse composite transaction (unbuilt engine deliverable, " +
+        "not a grammar gap).",
     params: ATTENTION_PARAM_SCHEMA,
   };
 }
 
 function kernelRefFor(role: AttentionKernelRole): string {
+  // The body was ABSORBED into this schedule module (the cutover-flip); the
+  // kernelRef names the schedule-owned lowering (single source), not the retired
+  // attention-kernel.ts factory.
   switch (role) {
     case "forward":
-      return "src/backend/webgpu/attention-kernel.ts::makeForwardAttentionSpec";
+      return "src/schedule/attention-skeleton.ts::lowerForwardAttentionBody";
     case "dPrecompute":
-      return "src/backend/webgpu/attention-kernel.ts::makeDPrecomputeSpec";
+      return "src/schedule/attention-skeleton.ts::lowerDPrecomputeBody";
     case "backwardDQ":
-      return "src/backend/webgpu/attention-kernel.ts::makeBackwardDQSpec";
+      return "src/schedule/attention-skeleton.ts::lowerBackwardDQBody";
     case "backwardDKV":
-      return "src/backend/webgpu/attention-kernel.ts::makeBackwardDKVSpec";
+      return "src/schedule/attention-skeleton.ts::lowerBackwardDKVBody";
   }
 }
 
 /**
  * `applyAttentionSchedule` for the authored family: assert the opaque skeleton
  * is well-formed at the seam (no loop/staging/role data leaked into it — F3),
- * then call the live single-source `make*Spec` factory the kernelRef names,
- * reconstructing its inputs from the descriptor. Returns the `TileKernelSpec`
- * the differential compiles (its WGSL equals the live make*Spec byte-for-byte).
+ * then LOWER the authored kernel body from the schedule object. Returns the
+ * `TileKernelSpec` the differential compiles.
  *
- * This is the R22-defeating shape: there is nowhere in the opaque skeleton to
- * store a generator; `applyAttentionSchedule` re-CALLS the named factory, it
- * does not replay a captured one. The skeleton owns the DECLARED params; the
- * kernel emission stays the live single source.
+ * CUTOVER-FLIP (§7 P4): the four `make*Spec` kernel bodies (the online-softmax
+ * K/V staging loops, the recompute-from-logsumexp backward structure, the
+ * register×shared vec4 dot, the D-precompute reduction) were ABSORBED from
+ * attention-kernel.ts INTO this schedule module (`lowerAttention*Body`). The
+ * schedule object is now the SOLE owner of the attention kernel body at the
+ * live dispatch seam (`realizeAttentionSpec`); the retired `make*Spec` factories
+ * are gone. The skeleton STAYS opaque (F3) — its internals are still authored (a
+ * locked online-softmax composite, not yet reached by the move grammar's `merge`
+ * transaction; S3 unbuilt) — but the body they name now lives here, so the
+ * schedule module is the single source. The BYTE DIFFERENTIAL proves the lowered
+ * WGSL is byte-identical across the modifier corpus.
  */
 export function applyAttentionSchedule(
   skeleton: Skeleton,
@@ -407,10 +444,10 @@ export function applyAttentionSchedule(
   const mod = desc.modifier;
   switch (desc.role) {
     case "forward":
-      return makeForwardAttentionSpec(desc.headDim, mod);
+      return lowerForwardAttentionBody(desc.headDim, mod);
     case "dPrecompute":
       // D-precompute has no score/mask seam sites — one template for all mods.
-      return makeDPrecomputeSpec(desc.headDim);
+      return lowerDPrecomputeBody(desc.headDim);
     case "backwardDQ":
       // Backward is inference-first for score modifiers (#64): the paired
       // derivative ("attn_dscore") is designed but unimplemented. The live
@@ -418,11 +455,41 @@ export function applyAttentionSchedule(
       // — re-call it here so the authored seam preserves the SAME refusal (one
       // owner of the backward-scoreMod legality fact).
       assertBackwardSupportsModifier(mod);
-      return makeBackwardDQSpec(desc.headDim, mod);
+      return lowerBackwardDQBody(desc.headDim, mod);
     case "backwardDKV":
       assertBackwardSupportsModifier(mod);
-      return makeBackwardDKVSpec(desc.headDim, mod);
+      return lowerBackwardDKVBody(desc.headDim, mod);
   }
+}
+
+/**
+ * Realize an attention `TileKernelSpec` THROUGH the schedule object (the live
+ * dispatch chokepoint — the P1/reduction/matmul `realize*` pattern). The live
+ * attention dispatch/plan sites in attention-kernel.ts route their spec factories
+ * here: derive the authored (opaque) skeleton for the role, assert no-second-
+ * owner at the seam, and lower the body FROM the state. The schedule object is
+ * the sole WGSL writer at the dispatch seam; `lowerAttention*Body` are realizer-
+ * internals of `applyAttentionSchedule`, unreachable from live dispatch except
+ * through the schedule object.
+ */
+export function realizeAttentionSpec(
+  role: AttentionKernelRole,
+  headDim: number,
+  mod?: AttnModifierSpec,
+): TileKernelSpec {
+  const desc: AttentionDescriptor = { role, headDim, modifier: mod };
+  return applyAttentionSchedule(deriveAttentionSkeleton(desc), desc);
+}
+
+/** Compile the attention WGSL through the schedule object (the differential's
+ *  live comparison target; formerly attention-kernel.ts `make*Spec` compiled
+ *  directly, relocated here now that the schedule owns the body). */
+export function generateAttentionShaderTileIR(
+  role: AttentionKernelRole,
+  headDim: number,
+  mod?: AttnModifierSpec,
+): string {
+  return compileTileKernel(realizeAttentionSpec(role, headDim, mod));
 }
 
 /**
@@ -761,5 +828,584 @@ export function naiveAttentionBackwardComposition(
       { from: dSRegion, to: dKRegion, via: "dS" },
     ],
     headDim,
+  };
+}
+
+// ============================================================================
+// The ABSORBED authored attention kernel bodies (§7 P4 cutover-flip)
+// ============================================================================
+//
+// The four fused-FlashAttention kernel bodies — RELOCATED from
+// attention-kernel.ts `make*Spec` — so the schedule module is the SOLE owner of
+// the attention kernel structure at the live dispatch seam (`realizeAttentionSpec`).
+// The K/V staging loops, the online-softmax (m,ℓ,o) accumulation with the
+// exp-rescale correction, the register×shared vec4 dot, and the backward
+// recompute-from-logsumexp structure LOWER FROM here now (the P4 derivations —
+// tools/fa-derivation-script.ts + tools/fa-backward-derivation-script.ts — prove
+// these states carry everything, operand-residency decorations included). The
+// bodies are BYTE-IDENTICAL to the retired factories (the 14-kernel modifier
+// differential is the safety net). The skeleton STAYS opaque (F3): the internals
+// are still authored (a locked online-softmax composite; S3 merge/fuse — the
+// automated opaque→derived flip — is the remaining engine deliverable), but the
+// body they name lives here, so there is one owner. The seam parameters
+// (scoreMod/maskMod, #64) survive as typed modifier data threaded through
+// buildAttentionSeams / modifierUniformFields.
+
+/** Build the seam functions for a modifier (undefined for the null modifier
+ *  — applySeam is identity, the kernel is the bare bounds-checked softmax).
+ *  RELOCATED from attention-kernel.ts (the body's #64 seam emission). */
+function buildAttentionSeams(
+  mod: AttnModifierSpec | undefined,
+): Record<string, SeamFn> | undefined {
+  if (!mod) return undefined;
+  const seams: Record<string, SeamFn> = {};
+  const maskMods = mod.maskMods ?? [];
+  if (maskMods.length > 0) {
+    seams.attn_mask = (
+      ctx: KernelContext,
+      active: BlockExpr,
+      args: Record<string, BlockExpr>,
+    ) => {
+      let a = active;
+      for (const m of maskMods) {
+        if (m.kind === "causal") {
+          a = a.and(args.kvIdx.le(args.qIdx));
+        } else if (m.kind === "slidingWindow") {
+          // active iff kv > q − window, computed u32-underflow-safe as
+          // kv + window > q. The window value is uniform DATA (mod_window)
+          // — same template serves any window size.
+          a = a.and(args.kvIdx.add(ctx.uniform("mod_window")).gt(args.qIdx));
+        } else {
+          throw new Error(
+            `attention maskMod '${(m as { kind: string }).kind}' not implemented in kernel emission`,
+          );
+        }
+      }
+      return a;
+    };
+  }
+  if (mod.scoreMod) {
+    if (mod.scoreMod.kind !== "softcap") {
+      throw new Error(
+        `attention scoreMod '${(mod.scoreMod as { kind: string }).kind}' not implemented in kernel emission`,
+      );
+    }
+    // Logit soft-cap: s' = cap · tanh(s / cap) (Gemma-2). Emitted in f32 —
+    // modifier arithmetic stays f32 under f16 QKV (mandatory f16 gate).
+    // Backward's paired "attn_dscore" (1 − (s'/cap)²) is inference-first —
+    // backward entries throw via assertBackwardSupportsModifier.
+    seams.attn_score = (ctx: KernelContext, sVal: BlockExpr) => {
+      const cap = ctx.uniform("mod_softcap").bitcastTo("f32");
+      return sVal.div(cap).tanh().mul(cap);
+    };
+  }
+  return seams;
+}
+
+/** Uniform struct fields for modifier params — paired with the config-buffer's
+ *  modifierParamWords (same order). Spread after scale_u32 in each seam-site
+ *  spec's uniforms. RELOCATED from attention-kernel.ts (body uniform layout). */
+function modifierUniformFields(mod?: AttnModifierSpec): Record<string, "u32"> {
+  if (!mod) return {};
+  const fields: Record<string, "u32"> = {};
+  if (mod.scoreMod) fields.mod_softcap = "u32";
+  for (const m of mod.maskMods ?? []) {
+    if (m.kind === "slidingWindow") fields.mod_window = "u32";
+  }
+  return fields;
+}
+
+/** WGSL-identifier-safe name fragment ("" for null modifier). RELOCATED from
+ *  attention-kernel.ts (the body's spec name). */
+function modNameFragment(mod?: AttnModifierSpec): string {
+  const k = attnModifierKey(mod);
+  return k ? `_${k.replace(/[^A-Za-z0-9]/g, "_")}` : "";
+}
+
+/** The fused FlashAttention FORWARD body (online softmax over KV tiles). */
+function lowerForwardAttentionBody(
+  headDim: number,
+  mod?: AttnModifierSpec,
+): TileKernelSpec {
+  if (headDim % 4 !== 0)
+    throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  const D = headDim;
+  const WG = BR;
+
+  return {
+    name: `tileAttnFwd_D${D}${modNameFragment(mod)}`,
+    workgroupSize: WG,
+    autoBarriers: true,
+    seams: buildAttentionSeams(mod),
+    bindings: {
+      Q: { storage: "read", type: "f32" },
+      K: { storage: "read", type: "f32" },
+      V: { storage: "read", type: "f32" },
+      O: { storage: "read_write", type: "f32" },
+      L: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      ...modifierUniformFields(mod),
+    },
+    grid: tiledGrid({
+      x: { uniform: "seq_len", tileSize: BR },
+      y: "num_heads",
+      z: "batch_size",
+    }),
+
+    kernel(ctx) {
+      const tidx = ctx.localIndex();
+      const qBlock = ctx.programId(0);
+      const hIdx = ctx.programId(1);
+      const bIdx = ctx.programId(2);
+
+      const N = ctx.uniform("seq_len");
+      const Dim = ctx.u32(D);
+      const numHeads = ctx.uniform("num_heads");
+      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
+
+      const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
+      const valid = qRow.lt(N);
+
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const qBase = bhOff.add(qRow.mul(Dim));
+
+      const Q = ctx.tileLoad(
+        "Q",
+        {
+          kind: "thread",
+          base: qBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
+
+      const mPrev = ctx.full(1, 1, F32_NEG_MAX);
+      const lPrev = ctx.full(1, 1, 0);
+      const oAcc = ctx.zeros(1, D);
+
+      const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
+
+      ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
+        const kvStart = tile.mul(ctx.u32(BC));
+
+        const offsR = ctx.arange(kvStart, BC);
+        const offsD = ctx.arange(ctx.u32(0), D);
+        const tilePtr = ctx.tilePtr(
+          bhOff,
+          offsR.outer(Dim),
+          offsD.inner(ctx.u32(1)),
+        );
+        const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+        const K = ctx.load2D("K", tilePtr, tileMask);
+
+        const scores = ctx.dot(Q, K.T());
+
+        ctx.range(0, BC, (j) => {
+          const kvPos = kvStart.add(j);
+          const seamArgs = {
+            qIdx: qRow,
+            kvIdx: kvPos,
+            head: hIdx,
+            batch: bIdx,
+          };
+          // Seam "attn_mask": mask predicates (incl. causal) are structural
+          // modifier emissions AND'ed onto the bounds check.
+          const isActive = ctx.applySeam(
+            "attn_mask",
+            valid.and(kvPos.lt(N)),
+            seamArgs,
+          );
+          // Seam "attn_score": wraps the scaled pre-softmax score.
+          const s = ctx.applySeam(
+            "attn_score",
+            scores.get(j).mul(scale),
+            seamArgs,
+          );
+          scores.set(j, isActive.select(s, ctx.f32(F32_NEG_MAX)));
+        });
+
+        const mNew = scores.max(1);
+        const mMax = mNew.max(mPrev);
+        const correction = mPrev.sub(mMax).exp();
+
+        oAcc.mul_(correction);
+        lPrev.mul_(correction);
+
+        scores.sub_(mMax);
+        scores.exp_();
+        lPrev.add_(scores.sum(1));
+        mPrev.assign(mMax);
+
+        const V = ctx.load2D("V", tilePtr, tileMask, { reuseShared: K });
+        ctx.dotAccum(scores, V, oAcc);
+      });
+
+      ctx.ifThen(valid, () => {
+        const l = lPrev.get(ctx.u32(0));
+        const invL = l.gt(ctx.f32(0)).select(ctx.f32(1).div(l), ctx.f32(0));
+        oAcc.mul_(invL);
+        ctx.tileStore("O", oAcc, { base: qBase, stride: ctx.u32(1) });
+
+        const m = mPrev.get(ctx.u32(0));
+        const lse = m.add(l.max(ctx.f32(1e-10)).log());
+        ctx.emitStore("L", bhOffL.add(qRow), lse);
+      });
+    },
+  };
+}
+
+/** The D-precompute body (per-row D = rowsum(dO ∘ O), the D-precompute lemma's
+ *  carried statistic). No seam sites — one template for all modifiers. */
+function lowerDPrecomputeBody(headDim: number): TileKernelSpec {
+  const D = headDim;
+  const WG = WORKGROUP_SIZE;
+
+  return {
+    name: `tileAttnDPrecompute_D${D}`,
+    workgroupSize: WG,
+    bindings: {
+      dO: { storage: "read", type: "f32" },
+      Out: { storage: "read", type: "f32" },
+      D_val: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+    },
+    grid: (u) => [u.batch_size * u.num_heads * u.seq_len],
+
+    kernel(ctx) {
+      const row = ctx.programId(0);
+      const tid = ctx.localIndex();
+      const Dim = ctx.uniform("head_dim");
+      const base = row.mul(Dim);
+
+      const dotProd = ctx.wgReduce("sum", tid, Dim, WG, (i) =>
+        ctx.load("dO", base.add(i)).mul(ctx.load("Out", base.add(i))),
+      );
+      ctx.guardedStore("D_val", tid.eq(ctx.u32(0)), row, dotProd);
+    },
+  };
+}
+
+/** The FlashAttention backward-dQ body (recompute P from saved logsumexp L). */
+function lowerBackwardDQBody(
+  headDim: number,
+  mod?: AttnModifierSpec,
+): TileKernelSpec {
+  if (headDim % 4 !== 0)
+    throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  const D = headDim;
+  const WG = BR;
+
+  return {
+    name: `tileAttnBwdDQ_D${D}${modNameFragment(mod)}`,
+    workgroupSize: WG,
+    autoBarriers: true,
+    seams: buildAttentionSeams(mod),
+    bindings: {
+      Q: { storage: "read", type: "f32" },
+      K: { storage: "read", type: "f32" },
+      V: { storage: "read", type: "f32" },
+      L_buf: { storage: "read", type: "f32" },
+      D_buf: { storage: "read", type: "f32" },
+      dO: { storage: "read", type: "f32" },
+      dQ: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      ...modifierUniformFields(mod),
+    },
+    grid: tiledGrid({
+      x: { uniform: "seq_len", tileSize: BR },
+      y: "num_heads",
+      z: "batch_size",
+    }),
+
+    kernel(ctx) {
+      const tidx = ctx.localIndex();
+      const qBlock = ctx.programId(0);
+      const hIdx = ctx.programId(1);
+      const bIdx = ctx.programId(2);
+
+      const N = ctx.uniform("seq_len");
+      const Dim = ctx.u32(D);
+      const numHeads = ctx.uniform("num_heads");
+      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
+
+      const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
+      const valid = qRow.lt(N);
+
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const rowBase = bhOff.add(qRow.mul(Dim));
+
+      const Q = ctx.tileLoad(
+        "Q",
+        {
+          kind: "thread",
+          base: rowBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
+
+      const dO = ctx.tileLoad(
+        "dO",
+        {
+          kind: "thread",
+          base: rowBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
+
+      const lVar = ctx.emitVar("_Li", "f32", ctx.f32(0));
+      const dVar = ctx.emitVar("_Di", "f32", ctx.f32(0));
+      ctx.ifThen(valid, () => {
+        lVar.set(ctx.load("L_buf", bhOffL.add(qRow)));
+        dVar.set(ctx.load("D_buf", bhOffL.add(qRow)));
+      });
+
+      const dqAcc = ctx.zeros(1, D);
+
+      const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
+
+      ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
+        const kvStart = tile.mul(ctx.u32(BC));
+
+        const offsR = ctx.arange(kvStart, BC);
+        const offsD = ctx.arange(ctx.u32(0), D);
+        const tilePtr = ctx.tilePtr(
+          bhOff,
+          offsR.outer(Dim),
+          offsD.inner(ctx.u32(1)),
+        );
+        const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+        const K = ctx.load2D("K", tilePtr, tileMask);
+        const V = ctx.load2D("V", tilePtr, tileMask);
+
+        // Fused single-loop: compute score, p, ds per KV-row, accumulate dQ inline
+        ctx.range(0, BC, (j) => {
+          const kvPos = kvStart.add(j);
+          const seamArgs = {
+            qIdx: qRow,
+            kvIdx: kvPos,
+            head: hIdx,
+            batch: bIdx,
+          };
+          const isActive = ctx.applySeam(
+            "attn_mask",
+            valid.and(kvPos.lt(N)),
+            seamArgs,
+          );
+          // Flash-style recompute: raw score is rebuilt from Q·K, so the
+          // score modifier's forward AND its local derivative (the
+          // "attn_dscore" seam, chain factor d(modded)/d(raw)) are available
+          // inline — no extra saved tensor.
+          const s = ctx.dotRow(Q, K, j).mul(scale);
+          const sMod = ctx.applySeam("attn_score", s, seamArgs);
+          const dov = ctx.dotRow(dO, V, j);
+          const p = isActive.select(sMod.sub(lVar.get()).exp(), ctx.f32(0));
+          const ds = ctx.applySeam("attn_dscore", p.mul(dov.sub(dVar.get())), {
+            ...seamArgs,
+            raw: s,
+            modded: sMod,
+          });
+          ctx.accumRow(dqAcc, ds, K, j);
+        });
+      });
+
+      ctx.ifThen(valid, () => {
+        dqAcc.mul_(scale);
+        ctx.tileStore("dQ", dqAcc, { base: rowBase, stride: ctx.u32(1) });
+      });
+    },
+  };
+}
+
+/** The FlashAttention backward-dK/dV body (recompute P from L; accumulate dK,dV). */
+function lowerBackwardDKVBody(
+  headDim: number,
+  mod?: AttnModifierSpec,
+): TileKernelSpec {
+  if (headDim % 4 !== 0)
+    throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  const D = headDim;
+  const WG = BC_BW;
+
+  return {
+    name: `tileAttnBwdDKV_D${D}${modNameFragment(mod)}`,
+    workgroupSize: WG,
+    autoBarriers: true,
+    seams: buildAttentionSeams(mod),
+    bindings: {
+      Q: { storage: "read", type: "f32" },
+      K: { storage: "read", type: "f32" },
+      V: { storage: "read", type: "f32" },
+      L_buf: { storage: "read", type: "f32" },
+      D_buf: { storage: "read", type: "f32" },
+      dO: { storage: "read", type: "f32" },
+      dK: { storage: "read_write", type: "f32" },
+      dV: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      ...modifierUniformFields(mod),
+    },
+    grid: tiledGrid({
+      x: { uniform: "seq_len", tileSize: BC_BW },
+      y: "num_heads",
+      z: "batch_size",
+    }),
+
+    kernel(ctx) {
+      const tidx = ctx.localIndex();
+      const kvBlock = ctx.programId(0);
+      const hIdx = ctx.programId(1);
+      const bIdx = ctx.programId(2);
+
+      const N = ctx.uniform("seq_len");
+      const Dim = ctx.u32(D);
+      const numHeads = ctx.uniform("num_heads");
+      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
+
+      const kvRow = kvBlock.mul(ctx.u32(BC_BW)).add(tidx);
+      const valid = kvRow.lt(N);
+
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const rowBase = bhOff.add(kvRow.mul(Dim));
+
+      const K = ctx.tileLoad(
+        "K",
+        {
+          kind: "thread",
+          base: rowBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
+
+      const V = ctx.tileLoad(
+        "V",
+        {
+          kind: "thread",
+          base: rowBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
+
+      const dkAcc = ctx.zeros(1, D);
+      const dvAcc = ctx.zeros(1, D);
+
+      const lTile = ctx.sharedArray("L_tile", BQ_BW, "f32");
+      const dTile = ctx.sharedArray("D_tile", BQ_BW, "f32");
+
+      const numQTiles = N.add(ctx.u32(BQ_BW - 1)).div(ctx.u32(BQ_BW));
+
+      ctx.forRange(ctx.u32(0), numQTiles, (qt) => {
+        const qStart = qt.mul(ctx.u32(BQ_BW));
+
+        // Causal tile-skip: Q-tiles entirely above the diagonal contribute
+        // nothing — baked structurally when a causal maskMod is present (the
+        // affine-mask → loop-bound rule's precedent; window bounds land with
+        // #64 iii). Workgroup-uniform (qStart/kvBlock only).
+        const skipTile = hasCausalMask(mod)
+          ? qStart.add(ctx.u32(BQ_BW - 1)).lt(kvBlock.mul(ctx.u32(BC_BW)))
+          : undefined;
+
+        const emitTileBody = () => {
+          const offsR = ctx.arange(qStart, BQ_BW);
+          const offsD = ctx.arange(ctx.u32(0), D);
+          const tilePtr = ctx.tilePtr(
+            bhOff,
+            offsR.outer(Dim),
+            offsD.inner(ctx.u32(1)),
+          );
+          const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+          const QTile = ctx.load2D("Q", tilePtr, tileMask);
+          const dOTile = ctx.load2D("dO", tilePtr, tileMask);
+
+          ctx.ifThen(tidx.lt(ctx.u32(BQ_BW)), () => {
+            const qi = qStart.add(tidx);
+            const inBounds = qi.lt(N);
+            const lIdx = bhOffL.add(qi);
+            lTile.write(
+              tidx,
+              inBounds.select(ctx.load("L_buf", lIdx), ctx.f32(0)),
+            );
+            dTile.write(
+              tidx,
+              inBounds.select(ctx.load("D_buf", lIdx), ctx.f32(0)),
+            );
+          });
+
+          ctx.barrier();
+
+          // Fused single-loop: compute score, p, ds per Q-row, accumulate dK/dV inline
+          ctx.range(0, BQ_BW, (j) => {
+            const qi = qStart.add(j);
+            const seamArgs = {
+              qIdx: qi,
+              kvIdx: kvRow,
+              head: hIdx,
+              batch: bIdx,
+            };
+            const isActive = ctx.applySeam(
+              "attn_mask",
+              valid.and(qi.lt(N)),
+              seamArgs,
+            );
+            const s = ctx.dotRow(K, QTile, j).mul(scale);
+            const sMod = ctx.applySeam("attn_score", s, seamArgs);
+            const p = isActive.select(
+              sMod.sub(lTile.read(j)).exp(),
+              ctx.f32(0),
+            );
+            const dov = ctx.dotRow(V, dOTile, j);
+            // "attn_dscore" applies BEFORE the trailing d(raw)/d(QK) scale
+            // factor — the chain multiplies d(modded)/d(raw) into dS first.
+            const ds = ctx
+              .applySeam("attn_dscore", p.mul(dov.sub(dTile.read(j))), {
+                ...seamArgs,
+                raw: s,
+                modded: sMod,
+              })
+              .mul(scale);
+            ctx.accumRow(dkAcc, ds, QTile, j);
+            ctx.accumRow(dvAcc, p, dOTile, j);
+          });
+
+          ctx.barrier();
+        };
+        if (skipTile) ctx.ifThen(skipTile.not(), emitTileBody);
+        else emitTileBody();
+      });
+
+      ctx.ifThen(valid, () => {
+        ctx.tileStore("dK", dkAcc, { base: rowBase, stride: ctx.u32(1) });
+        ctx.tileStore("dV", dvAcc, { base: rowBase, stride: ctx.u32(1) });
+      });
+    },
   };
 }

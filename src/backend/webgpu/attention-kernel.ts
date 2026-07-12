@@ -16,35 +16,24 @@
  */
 
 import { ENV } from "../../core/env";
+import {
+  BC_BW,
+  BR,
+  realizeAttentionSpec,
+} from "../../schedule/attention-skeleton";
 import type { AttnModifierSpec } from "../types";
 import { cachedCreateBindGroup } from "./bind-group-cache";
 import { allocateOutputBuffer } from "./buffer-arena";
 import { dispatchComputePass, getPipeline } from "./dispatch";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
-import { F32_NEG_MAX, WORKGROUP_SIZE } from "./shape-utils";
 import { compileTileKernel } from "./tile-compiler";
-import type {
-  BlockExpr,
-  KernelContext,
-  SeamFn,
-  TileKernelSpec,
-} from "./tile-ir";
-import { tiledGrid } from "./tile-ir";
+import type { TileKernelSpec } from "./tile-ir";
 import {
   onTeardown,
   requireContext,
   trackSharedEncoderWrite,
 } from "./webgpu-state";
-
-// ============================================================================
-// Tiling Parameters
-// ============================================================================
-
-export const BR = 64; // Q rows per workgroup (forward, dQ)
-export const BC = 32; // KV rows per tile (forward, dQ)
-export const BQ_BW = 16; // Q rows per tile (backward dKV)
-export const BC_BW = 64; // KV rows per workgroup (backward dKV)
 
 // ============================================================================
 // Attention modifier seams (task #64 — FlexAttention-class score/mask mods)
@@ -87,58 +76,8 @@ export function attnModifierKey(mod?: AttnModifierSpec): string {
   return parts.join("+");
 }
 
-function hasCausalMask(mod?: AttnModifierSpec): boolean {
+export function hasCausalMask(mod?: AttnModifierSpec): boolean {
   return (mod?.maskMods ?? []).some((m) => m.kind === "causal");
-}
-
-/** Build the seam functions for a modifier (undefined for the null modifier
- *  — applySeam is identity, the kernel is the bare bounds-checked softmax). */
-function buildAttentionSeams(
-  mod: AttnModifierSpec | undefined,
-): Record<string, SeamFn> | undefined {
-  if (!mod) return undefined;
-  const seams: Record<string, SeamFn> = {};
-  const maskMods = mod.maskMods ?? [];
-  if (maskMods.length > 0) {
-    seams.attn_mask = (
-      ctx: KernelContext,
-      active: BlockExpr,
-      args: Record<string, BlockExpr>,
-    ) => {
-      let a = active;
-      for (const m of maskMods) {
-        if (m.kind === "causal") {
-          a = a.and(args.kvIdx.le(args.qIdx));
-        } else if (m.kind === "slidingWindow") {
-          // active iff kv > q − window, computed u32-underflow-safe as
-          // kv + window > q. The window value is uniform DATA (mod_window)
-          // — same template serves any window size.
-          a = a.and(args.kvIdx.add(ctx.uniform("mod_window")).gt(args.qIdx));
-        } else {
-          throw new Error(
-            `attention maskMod '${(m as { kind: string }).kind}' not implemented in kernel emission`,
-          );
-        }
-      }
-      return a;
-    };
-  }
-  if (mod.scoreMod) {
-    if (mod.scoreMod.kind !== "softcap") {
-      throw new Error(
-        `attention scoreMod '${(mod.scoreMod as { kind: string }).kind}' not implemented in kernel emission`,
-      );
-    }
-    // Logit soft-cap: s' = cap · tanh(s / cap) (Gemma-2). Emitted in f32 —
-    // modifier arithmetic stays f32 under f16 QKV (mandatory f16 gate).
-    // Backward's paired "attn_dscore" (1 − (s'/cap)²) is inference-first —
-    // backward entries throw via assertBackwardSupportsModifier.
-    seams.attn_score = (ctx: KernelContext, sVal: BlockExpr) => {
-      const cap = ctx.uniform("mod_softcap").bitcastTo("f32");
-      return sVal.div(cap).tanh().mul(cap);
-    };
-  }
-  return seams;
 }
 
 const _f32BitsBuf = new Float32Array(1);
@@ -160,19 +99,6 @@ function modifierParamWords(mod?: AttnModifierSpec): number[] {
     if (m.kind === "slidingWindow") words.push(m.window >>> 0);
   }
   return words;
-}
-
-/** Uniform struct fields for modifier params — paired with
- *  modifierParamWords (same order; see its doc). Spread after scale_u32 in
- *  each seam-site spec's uniforms. */
-function modifierUniformFields(mod?: AttnModifierSpec): Record<string, "u32"> {
-  if (!mod) return {};
-  const fields: Record<string, "u32"> = {};
-  if (mod.scoreMod) fields.mod_softcap = "u32";
-  for (const m of mod.maskMods ?? []) {
-    if (m.kind === "slidingWindow") fields.mod_window = "u32";
-  }
-  return fields;
 }
 
 /** True when the modifier adds nothing — canonicalized to undefined so `{}`
@@ -233,12 +159,6 @@ export function assertBackwardSupportsModifier(mod?: AttnModifierSpec): void {
         `implemented (inference-first; see docs/attention-modifier-seams-design.md §2)`,
     );
   }
-}
-
-/** WGSL-identifier-safe name fragment ("" for null modifier). */
-function modNameFragment(mod?: AttnModifierSpec): string {
-  const k = attnModifierKey(mod);
-  return k ? `_${k.replace(/[^A-Za-z0-9]/g, "_")}` : "";
 }
 
 // ============================================================================
@@ -341,491 +261,18 @@ function getOrCreateConfigBuffer(
 }
 
 // ============================================================================
-// Kernel Specs (tile-IR)
+// Kernel Specs (tile-IR) — ABSORBED into the schedule module (§7 P4 cutover-flip)
 // ============================================================================
-
-export function makeForwardAttentionSpec(
-  headDim: number,
-  mod?: AttnModifierSpec,
-): TileKernelSpec {
-  if (headDim % 4 !== 0)
-    throw new Error(`headDim must be divisible by 4, got ${headDim}`);
-  const D = headDim;
-  const WG = BR;
-
-  return {
-    name: `tileAttnFwd_D${D}${modNameFragment(mod)}`,
-    workgroupSize: WG,
-    autoBarriers: true,
-    seams: buildAttentionSeams(mod),
-    bindings: {
-      Q: { storage: "read", type: "f32" },
-      K: { storage: "read", type: "f32" },
-      V: { storage: "read", type: "f32" },
-      O: { storage: "read_write", type: "f32" },
-      L: { storage: "read_write", type: "f32" },
-    },
-    uniforms: {
-      batch_size: "u32",
-      num_heads: "u32",
-      seq_len: "u32",
-      head_dim: "u32",
-      scale_u32: "u32",
-      ...modifierUniformFields(mod),
-    },
-    grid: tiledGrid({
-      x: { uniform: "seq_len", tileSize: BR },
-      y: "num_heads",
-      z: "batch_size",
-    }),
-
-    kernel(ctx) {
-      const tidx = ctx.localIndex();
-      const qBlock = ctx.programId(0);
-      const hIdx = ctx.programId(1);
-      const bIdx = ctx.programId(2);
-
-      const N = ctx.uniform("seq_len");
-      const Dim = ctx.u32(D);
-      const numHeads = ctx.uniform("num_heads");
-      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
-
-      const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
-      const valid = qRow.lt(N);
-
-      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
-      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
-      const qBase = bhOff.add(qRow.mul(Dim));
-
-      const Q = ctx.tileLoad(
-        "Q",
-        {
-          kind: "thread",
-          base: qBase,
-          stride: ctx.u32(1),
-        },
-        { rows: 1, cols: D, guard: valid },
-      );
-
-      const mPrev = ctx.full(1, 1, F32_NEG_MAX);
-      const lPrev = ctx.full(1, 1, 0);
-      const oAcc = ctx.zeros(1, D);
-
-      const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
-
-      ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
-        const kvStart = tile.mul(ctx.u32(BC));
-
-        const offsR = ctx.arange(kvStart, BC);
-        const offsD = ctx.arange(ctx.u32(0), D);
-        const tilePtr = ctx.tilePtr(
-          bhOff,
-          offsR.outer(Dim),
-          offsD.inner(ctx.u32(1)),
-        );
-        const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
-        const K = ctx.load2D("K", tilePtr, tileMask);
-
-        const scores = ctx.dot(Q, K.T());
-
-        ctx.range(0, BC, (j) => {
-          const kvPos = kvStart.add(j);
-          const seamArgs = {
-            qIdx: qRow,
-            kvIdx: kvPos,
-            head: hIdx,
-            batch: bIdx,
-          };
-          // Seam "attn_mask": mask predicates (incl. causal) are structural
-          // modifier emissions AND'ed onto the bounds check.
-          const isActive = ctx.applySeam(
-            "attn_mask",
-            valid.and(kvPos.lt(N)),
-            seamArgs,
-          );
-          // Seam "attn_score": wraps the scaled pre-softmax score.
-          const s = ctx.applySeam(
-            "attn_score",
-            scores.get(j).mul(scale),
-            seamArgs,
-          );
-          scores.set(j, isActive.select(s, ctx.f32(F32_NEG_MAX)));
-        });
-
-        const mNew = scores.max(1);
-        const mMax = mNew.max(mPrev);
-        const correction = mPrev.sub(mMax).exp();
-
-        oAcc.mul_(correction);
-        lPrev.mul_(correction);
-
-        scores.sub_(mMax);
-        scores.exp_();
-        lPrev.add_(scores.sum(1));
-        mPrev.assign(mMax);
-
-        const V = ctx.load2D("V", tilePtr, tileMask, { reuseShared: K });
-        ctx.dotAccum(scores, V, oAcc);
-      });
-
-      ctx.ifThen(valid, () => {
-        const l = lPrev.get(ctx.u32(0));
-        const invL = l.gt(ctx.f32(0)).select(ctx.f32(1).div(l), ctx.f32(0));
-        oAcc.mul_(invL);
-        ctx.tileStore("O", oAcc, { base: qBase, stride: ctx.u32(1) });
-
-        const m = mPrev.get(ctx.u32(0));
-        const lse = m.add(l.max(ctx.f32(1e-10)).log());
-        ctx.emitStore("L", bhOffL.add(qRow), lse);
-      });
-    },
-  };
-}
-
-export function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
-  const D = headDim;
-  const WG = WORKGROUP_SIZE;
-
-  return {
-    name: `tileAttnDPrecompute_D${D}`,
-    workgroupSize: WG,
-    bindings: {
-      dO: { storage: "read", type: "f32" },
-      Out: { storage: "read", type: "f32" },
-      D_val: { storage: "read_write", type: "f32" },
-    },
-    uniforms: {
-      batch_size: "u32",
-      num_heads: "u32",
-      seq_len: "u32",
-      head_dim: "u32",
-      scale_u32: "u32",
-    },
-    grid: (u) => [u.batch_size * u.num_heads * u.seq_len],
-
-    kernel(ctx) {
-      const row = ctx.programId(0);
-      const tid = ctx.localIndex();
-      const Dim = ctx.uniform("head_dim");
-      const base = row.mul(Dim);
-
-      const dotProd = ctx.wgReduce("sum", tid, Dim, WG, (i) =>
-        ctx.load("dO", base.add(i)).mul(ctx.load("Out", base.add(i))),
-      );
-      ctx.guardedStore("D_val", tid.eq(ctx.u32(0)), row, dotProd);
-    },
-  };
-}
-
-export function makeBackwardDQSpec(
-  headDim: number,
-  mod?: AttnModifierSpec,
-): TileKernelSpec {
-  if (headDim % 4 !== 0)
-    throw new Error(`headDim must be divisible by 4, got ${headDim}`);
-  const D = headDim;
-  const WG = BR;
-
-  return {
-    name: `tileAttnBwdDQ_D${D}${modNameFragment(mod)}`,
-    workgroupSize: WG,
-    autoBarriers: true,
-    seams: buildAttentionSeams(mod),
-    bindings: {
-      Q: { storage: "read", type: "f32" },
-      K: { storage: "read", type: "f32" },
-      V: { storage: "read", type: "f32" },
-      L_buf: { storage: "read", type: "f32" },
-      D_buf: { storage: "read", type: "f32" },
-      dO: { storage: "read", type: "f32" },
-      dQ: { storage: "read_write", type: "f32" },
-    },
-    uniforms: {
-      batch_size: "u32",
-      num_heads: "u32",
-      seq_len: "u32",
-      head_dim: "u32",
-      scale_u32: "u32",
-      ...modifierUniformFields(mod),
-    },
-    grid: tiledGrid({
-      x: { uniform: "seq_len", tileSize: BR },
-      y: "num_heads",
-      z: "batch_size",
-    }),
-
-    kernel(ctx) {
-      const tidx = ctx.localIndex();
-      const qBlock = ctx.programId(0);
-      const hIdx = ctx.programId(1);
-      const bIdx = ctx.programId(2);
-
-      const N = ctx.uniform("seq_len");
-      const Dim = ctx.u32(D);
-      const numHeads = ctx.uniform("num_heads");
-      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
-
-      const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
-      const valid = qRow.lt(N);
-
-      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
-      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
-      const rowBase = bhOff.add(qRow.mul(Dim));
-
-      const Q = ctx.tileLoad(
-        "Q",
-        {
-          kind: "thread",
-          base: rowBase,
-          stride: ctx.u32(1),
-        },
-        { rows: 1, cols: D, guard: valid },
-      );
-
-      const dO = ctx.tileLoad(
-        "dO",
-        {
-          kind: "thread",
-          base: rowBase,
-          stride: ctx.u32(1),
-        },
-        { rows: 1, cols: D, guard: valid },
-      );
-
-      const lVar = ctx.emitVar("_Li", "f32", ctx.f32(0));
-      const dVar = ctx.emitVar("_Di", "f32", ctx.f32(0));
-      ctx.ifThen(valid, () => {
-        lVar.set(ctx.load("L_buf", bhOffL.add(qRow)));
-        dVar.set(ctx.load("D_buf", bhOffL.add(qRow)));
-      });
-
-      const dqAcc = ctx.zeros(1, D);
-
-      const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
-
-      ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
-        const kvStart = tile.mul(ctx.u32(BC));
-
-        const offsR = ctx.arange(kvStart, BC);
-        const offsD = ctx.arange(ctx.u32(0), D);
-        const tilePtr = ctx.tilePtr(
-          bhOff,
-          offsR.outer(Dim),
-          offsD.inner(ctx.u32(1)),
-        );
-        const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
-        const K = ctx.load2D("K", tilePtr, tileMask);
-        const V = ctx.load2D("V", tilePtr, tileMask);
-
-        // Fused single-loop: compute score, p, ds per KV-row, accumulate dQ inline
-        ctx.range(0, BC, (j) => {
-          const kvPos = kvStart.add(j);
-          const seamArgs = {
-            qIdx: qRow,
-            kvIdx: kvPos,
-            head: hIdx,
-            batch: bIdx,
-          };
-          const isActive = ctx.applySeam(
-            "attn_mask",
-            valid.and(kvPos.lt(N)),
-            seamArgs,
-          );
-          // Flash-style recompute: raw score is rebuilt from Q·K, so the
-          // score modifier's forward AND its local derivative (the
-          // "attn_dscore" seam, chain factor d(modded)/d(raw)) are available
-          // inline — no extra saved tensor.
-          const s = ctx.dotRow(Q, K, j).mul(scale);
-          const sMod = ctx.applySeam("attn_score", s, seamArgs);
-          const dov = ctx.dotRow(dO, V, j);
-          const p = isActive.select(sMod.sub(lVar.get()).exp(), ctx.f32(0));
-          const ds = ctx.applySeam("attn_dscore", p.mul(dov.sub(dVar.get())), {
-            ...seamArgs,
-            raw: s,
-            modded: sMod,
-          });
-          ctx.accumRow(dqAcc, ds, K, j);
-        });
-      });
-
-      ctx.ifThen(valid, () => {
-        dqAcc.mul_(scale);
-        ctx.tileStore("dQ", dqAcc, { base: rowBase, stride: ctx.u32(1) });
-      });
-    },
-  };
-}
-
-export function makeBackwardDKVSpec(
-  headDim: number,
-  mod?: AttnModifierSpec,
-): TileKernelSpec {
-  if (headDim % 4 !== 0)
-    throw new Error(`headDim must be divisible by 4, got ${headDim}`);
-  const D = headDim;
-  const WG = BC_BW;
-
-  return {
-    name: `tileAttnBwdDKV_D${D}${modNameFragment(mod)}`,
-    workgroupSize: WG,
-    autoBarriers: true,
-    seams: buildAttentionSeams(mod),
-    bindings: {
-      Q: { storage: "read", type: "f32" },
-      K: { storage: "read", type: "f32" },
-      V: { storage: "read", type: "f32" },
-      L_buf: { storage: "read", type: "f32" },
-      D_buf: { storage: "read", type: "f32" },
-      dO: { storage: "read", type: "f32" },
-      dK: { storage: "read_write", type: "f32" },
-      dV: { storage: "read_write", type: "f32" },
-    },
-    uniforms: {
-      batch_size: "u32",
-      num_heads: "u32",
-      seq_len: "u32",
-      head_dim: "u32",
-      scale_u32: "u32",
-      ...modifierUniformFields(mod),
-    },
-    grid: tiledGrid({
-      x: { uniform: "seq_len", tileSize: BC_BW },
-      y: "num_heads",
-      z: "batch_size",
-    }),
-
-    kernel(ctx) {
-      const tidx = ctx.localIndex();
-      const kvBlock = ctx.programId(0);
-      const hIdx = ctx.programId(1);
-      const bIdx = ctx.programId(2);
-
-      const N = ctx.uniform("seq_len");
-      const Dim = ctx.u32(D);
-      const numHeads = ctx.uniform("num_heads");
-      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
-
-      const kvRow = kvBlock.mul(ctx.u32(BC_BW)).add(tidx);
-      const valid = kvRow.lt(N);
-
-      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
-      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
-      const rowBase = bhOff.add(kvRow.mul(Dim));
-
-      const K = ctx.tileLoad(
-        "K",
-        {
-          kind: "thread",
-          base: rowBase,
-          stride: ctx.u32(1),
-        },
-        { rows: 1, cols: D, guard: valid },
-      );
-
-      const V = ctx.tileLoad(
-        "V",
-        {
-          kind: "thread",
-          base: rowBase,
-          stride: ctx.u32(1),
-        },
-        { rows: 1, cols: D, guard: valid },
-      );
-
-      const dkAcc = ctx.zeros(1, D);
-      const dvAcc = ctx.zeros(1, D);
-
-      const lTile = ctx.sharedArray("L_tile", BQ_BW, "f32");
-      const dTile = ctx.sharedArray("D_tile", BQ_BW, "f32");
-
-      const numQTiles = N.add(ctx.u32(BQ_BW - 1)).div(ctx.u32(BQ_BW));
-
-      ctx.forRange(ctx.u32(0), numQTiles, (qt) => {
-        const qStart = qt.mul(ctx.u32(BQ_BW));
-
-        // Causal tile-skip: Q-tiles entirely above the diagonal contribute
-        // nothing — baked structurally when a causal maskMod is present (the
-        // affine-mask → loop-bound rule's precedent; window bounds land with
-        // #64 iii). Workgroup-uniform (qStart/kvBlock only).
-        const skipTile = hasCausalMask(mod)
-          ? qStart.add(ctx.u32(BQ_BW - 1)).lt(kvBlock.mul(ctx.u32(BC_BW)))
-          : undefined;
-
-        const emitTileBody = () => {
-          const offsR = ctx.arange(qStart, BQ_BW);
-          const offsD = ctx.arange(ctx.u32(0), D);
-          const tilePtr = ctx.tilePtr(
-            bhOff,
-            offsR.outer(Dim),
-            offsD.inner(ctx.u32(1)),
-          );
-          const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
-          const QTile = ctx.load2D("Q", tilePtr, tileMask);
-          const dOTile = ctx.load2D("dO", tilePtr, tileMask);
-
-          ctx.ifThen(tidx.lt(ctx.u32(BQ_BW)), () => {
-            const qi = qStart.add(tidx);
-            const inBounds = qi.lt(N);
-            const lIdx = bhOffL.add(qi);
-            lTile.write(
-              tidx,
-              inBounds.select(ctx.load("L_buf", lIdx), ctx.f32(0)),
-            );
-            dTile.write(
-              tidx,
-              inBounds.select(ctx.load("D_buf", lIdx), ctx.f32(0)),
-            );
-          });
-
-          ctx.barrier();
-
-          // Fused single-loop: compute score, p, ds per Q-row, accumulate dK/dV inline
-          ctx.range(0, BQ_BW, (j) => {
-            const qi = qStart.add(j);
-            const seamArgs = {
-              qIdx: qi,
-              kvIdx: kvRow,
-              head: hIdx,
-              batch: bIdx,
-            };
-            const isActive = ctx.applySeam(
-              "attn_mask",
-              valid.and(qi.lt(N)),
-              seamArgs,
-            );
-            const s = ctx.dotRow(K, QTile, j).mul(scale);
-            const sMod = ctx.applySeam("attn_score", s, seamArgs);
-            const p = isActive.select(
-              sMod.sub(lTile.read(j)).exp(),
-              ctx.f32(0),
-            );
-            const dov = ctx.dotRow(V, dOTile, j);
-            // "attn_dscore" applies BEFORE the trailing d(raw)/d(QK) scale
-            // factor — the chain multiplies d(modded)/d(raw) into dS first.
-            const ds = ctx
-              .applySeam("attn_dscore", p.mul(dov.sub(dTile.read(j))), {
-                ...seamArgs,
-                raw: s,
-                modded: sMod,
-              })
-              .mul(scale);
-            ctx.accumRow(dkAcc, ds, QTile, j);
-            ctx.accumRow(dvAcc, p, dOTile, j);
-          });
-
-          ctx.barrier();
-        };
-        if (skipTile) ctx.ifThen(skipTile.not(), emitTileBody);
-        else emitTileBody();
-      });
-
-      ctx.ifThen(valid, () => {
-        ctx.tileStore("dK", dkAcc, { base: rowBase, stride: ctx.u32(1) });
-        ctx.tileStore("dV", dvAcc, { base: rowBase, stride: ctx.u32(1) });
-      });
-    },
-  };
-}
+//
+// The four fused-attention kernel bodies (forward, D-precompute, backward-dQ,
+// backward-dKV) were RELOCATED into src/schedule/attention-skeleton.ts, where
+// the ScheduleState now OWNS the loop-nest / K-V staging / online-softmax /
+// backward-recompute structure. The live dispatch/plan sites below route their
+// spec factories through `realizeAttentionSpec` (the schedule chokepoint) — the
+// schedule object is the sole WGSL writer at the dispatch seam. The retired
+// `make*Spec` factories (and their body-only seam/uniform/name helpers) are gone;
+// the byte differential (test/schedule/attention-differential.spec.ts) guards the
+// LIVE path.
 
 // ============================================================================
 // Dispatch Functions
@@ -954,7 +401,7 @@ export function planFlashAttentionForward(
     plan: planAttentionStep(
       `fwd:${headDim}`,
       "faFwd",
-      () => makeForwardAttentionSpec(headDim, norm.mod),
+      () => realizeAttentionSpec("forward", headDim, norm.mod),
       headDim,
       norm.mod,
       cfg,
@@ -996,7 +443,7 @@ export function planFlashAttentionBackward(
     dPlan: planAttentionStep(
       `bwdD:${headDim}`,
       "faBwdD",
-      () => makeDPrecomputeSpec(headDim),
+      () => realizeAttentionSpec("dPrecompute", headDim),
       headDim,
       undefined, // D-precompute has no score/mask sites — one template
       cfg,
@@ -1005,7 +452,7 @@ export function planFlashAttentionBackward(
     dqPlan: planAttentionStep(
       `bwdDQ:${headDim}`,
       "faBwdDQ",
-      () => makeBackwardDQSpec(headDim, norm.mod),
+      () => realizeAttentionSpec("backwardDQ", headDim, norm.mod),
       headDim,
       norm.mod,
       cfg,
@@ -1014,7 +461,7 @@ export function planFlashAttentionBackward(
     dkvPlan: planAttentionStep(
       `bwdDKV:${headDim}`,
       "faBwdDKV",
-      () => makeBackwardDKVSpec(headDim, norm.mod),
+      () => realizeAttentionSpec("backwardDKV", headDim, norm.mod),
       headDim,
       norm.mod,
       cfg,
@@ -1047,7 +494,7 @@ export function dispatchFlashAttentionForward(
   dispatchAttention(
     `fwd:${headDim}`,
     "faFwd",
-    () => makeForwardAttentionSpec(headDim, norm.mod),
+    () => realizeAttentionSpec("forward", headDim, norm.mod),
     headDim,
     batchSize,
     numHeads,
@@ -1081,7 +528,7 @@ export function dispatchFlashAttentionBackwardD(
   dispatchAttention(
     `bwdD:${headDim}`,
     "faBwdD",
-    () => makeDPrecomputeSpec(headDim),
+    () => realizeAttentionSpec("dPrecompute", headDim),
     headDim,
     batchSize,
     numHeads,
@@ -1119,7 +566,7 @@ export function dispatchFlashAttentionBackwardDQ(
   dispatchAttention(
     `bwdDQ:${headDim}`,
     "faBwdDQ",
-    () => makeBackwardDQSpec(headDim, norm.mod),
+    () => realizeAttentionSpec("backwardDQ", headDim, norm.mod),
     headDim,
     batchSize,
     numHeads,
@@ -1162,7 +609,7 @@ export function dispatchFlashAttentionBackwardDKV(
   dispatchAttention(
     `bwdDKV:${headDim}`,
     "faBwdDKV",
-    () => makeBackwardDKVSpec(headDim, norm.mod),
+    () => realizeAttentionSpec("backwardDKV", headDim, norm.mod),
     headDim,
     batchSize,
     numHeads,

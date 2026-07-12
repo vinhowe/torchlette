@@ -31,8 +31,8 @@ import {
   applyAdamSchedule,
   deriveAdamSkeleton,
   deriveHorizontalPackedAdam,
+  generateAdamShaderTileIR,
 } from "../src/schedule/adam-skeleton";
-import { makeAdamStepSpec } from "../src/backend/webgpu/adam-kernel";
 import { compileTileKernel } from "../src/backend/webgpu/tile-compiler";
 import { printScheduleState } from "../src/schedule/canonical";
 import type { ValueUid } from "../src/schedule/types";
@@ -100,8 +100,12 @@ function runDerivation(): void {
     { useVec4: true, emitF16: true, emitUnscale: true },
   ];
   for (const desc of variants) {
-    const live = compileTileKernel(
-      makeAdamStepSpec(desc.useVec4, desc.emitF16, desc.emitUnscale),
+    // The AUTHORED kernel body now LOWERS FROM the schedule (the cutover-flip);
+    // the live realize chokepoint IS the schedule path.
+    const live = generateAdamShaderTileIR(
+      desc.useVec4,
+      desc.emitF16,
+      desc.emitUnscale,
     );
     const derived = compileTileKernel(
       applyAdamSchedule(deriveAdamSkeleton(desc), desc),

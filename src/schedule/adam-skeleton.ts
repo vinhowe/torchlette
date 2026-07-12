@@ -1,7 +1,11 @@
 /**
- * Walking skeleton — FUSED ADAM (§7 P4 LOCAL self-hosting). Side-by-side with the
- * live path; NO behavior change; NO dispatch cutover. Exercised only by
- * test/schedule/adam-differential.spec.ts + tools/fa-adam-derivation-script.ts.
+ * FUSED ADAM schedule module (§7 P4 LOCAL self-hosting + CUTOVER-FLIP). The live
+ * Adam dispatch path now ROUTES THROUGH this module: the fused-Adam kernel body
+ * was ABSORBED here from adam-kernel.ts (`lowerAdamStepBody`), so the ScheduleState
+ * OWNS the kernel structure and `realizeAdamStepSpec` is the live dispatch
+ * chokepoint (the adam-kernel.ts `getAdamDispatcher` builds through it). NO
+ * behavior change — the body is byte-identical to the retired `makeAdamStepSpec`
+ * factory (the 5-variant differential guards the LIVE path).
  *
  * ------------------------------------------------------------------------
  * THE AUTHORED KERNEL + THE HORIZONTAL-PACK DERIVATION
@@ -9,11 +13,11 @@
  * The fused Adam kernel (adamStep, single WGSL dispatch: reads grad/param/m/v/t/lr,
  * writes param/m/v) is AUTHORED — its per-element update body (bias-corrected
  * step-size, expm1 bias correction, L2/decoupled weight decay) is a locked
- * numeric formula (the seam's single source, adam-kernel.ts `emitAdamScalarBody`).
- * So it wears an OPAQUE skeleton (F3) with a TYPED PARAMETER SCHEMA, exactly as
- * the attention kernels do. `applyAdamSchedule` re-CALLS the live `makeAdamStepSpec`
- * factory the kernelRef names; the byte differential proves the regeneration is
- * byte-identical. There is nowhere in the opaque skeleton to store a generator (R22).
+ * numeric formula (the seam's single source, `emitAdamScalarBody` — relocated
+ * here). So it wears an OPAQUE skeleton (F3) with a TYPED PARAMETER SCHEMA, exactly
+ * as the attention kernels do. `applyAdamSchedule` LOWERS the body FROM the state;
+ * the byte differential proves the lowering is byte-identical. There is nowhere in
+ * the opaque skeleton to store a generator (R22).
  *
  * The DERIVABLE part — the §7 P4 deliverable-3 tenant of the `pack` move — is the
  * HORIZONTAL PACKING at parameter altitude. The optimizer's own words
@@ -28,10 +32,20 @@
  * group, not N) is the perf-parity target (the 8-dispatch/step baseline class).
  */
 
+import { compileTileKernel } from "../backend/webgpu/tile-compiler";
+import type {
+  BindingSpec,
+  BlockExpr,
+  KernelContext,
+  TileKernelSpec,
+  UniformType,
+  VarHandle,
+} from "../backend/webgpu/tile-ir";
 import {
-  makeAdamStepSpec,
-} from "../backend/webgpu/adam-kernel";
-import type { TileKernelSpec } from "../backend/webgpu/tile-ir";
+  F32_ONE_BITS,
+  MAX_WORKGROUPS_PER_DIM,
+  WORKGROUP_SIZE,
+} from "../backend/webgpu/shape-utils";
 import { reportNoSecondOwner } from "./canonical";
 import { applyMove } from "./moves/moves";
 import type {
@@ -114,7 +128,10 @@ export interface AdamDescriptor {
   readonly emitUnscale: boolean;
 }
 
-const KERNEL_REF = "src/backend/webgpu/adam-kernel.ts::makeAdamStepSpec";
+// The body was ABSORBED into this schedule module (the cutover-flip); the
+// kernelRef names the schedule-owned lowering (single source), not the retired
+// adam-kernel.ts factory.
+const KERNEL_REF = "src/schedule/adam-skeleton.ts::lowerAdamStepBody";
 
 /**
  * The canonical cache-key encoder (R10) for an authored Adam kernel: the SAME
@@ -138,29 +155,68 @@ export function deriveAdamSkeleton(_desc: AdamDescriptor): Skeleton {
     visibility: "opaque",
     kernelRef: KERNEL_REF,
     refusalReason:
-      "authored — the per-element Adam update is a LOCKED numeric formula " +
-      "(bias-corrected step-size via expm1, L2/decoupled weight decay; the seam's " +
-      "single source emitAdamScalarBody). The DERIVABLE part is the HORIZONTAL-PACK " +
-      "move (§7 P4 deliverable 3): N per-param elementwise Adam bodies pack into one " +
-      "flat dispatch — the per-param definition is the semantics, the packed form is " +
-      "the batched execution of the same tensor program. §6/§7 P4.",
+      "authored (LIVE-PATH FLIPPED, §7 P4). The fused-Adam body lowers FROM this " +
+      "schedule module (realizeAdamStepSpec is the live dispatch chokepoint); the " +
+      "per-element update stays authored — a LOCKED numeric formula (bias-corrected " +
+      "step-size via expm1, L2/decoupled weight decay; the seam's single source " +
+      "lowerAdamStepBody/emitAdamScalarBody). The DERIVABLE part is the HORIZONTAL-" +
+      "PACK move (§7 P4 deliverable 3): N per-param elementwise Adam bodies pack into " +
+      "one flat dispatch — the per-param definition is the semantics, the packed form " +
+      "is the batched execution of the same tensor program. §6/§7 P4.",
     params: ADAM_PARAM_SCHEMA,
   };
 }
 
 /**
  * `applyAdamSchedule` for the authored family: assert the opaque skeleton is
- * well-formed at the seam (no loop/staging/role leaked — F3), then call the live
- * single-source `makeAdamStepSpec` factory the kernelRef names, reconstructing
- * its inputs from the descriptor. Returns the `TileKernelSpec` the differential
- * compiles (its WGSL equals the live makeAdamStepSpec byte-for-byte).
+ * well-formed at the seam (no loop/staging/role leaked — F3), then LOWER the
+ * authored fused-Adam body from the schedule object. Returns the `TileKernelSpec`
+ * the differential compiles.
+ *
+ * CUTOVER-FLIP (§7 P4): the `makeAdamStepSpec` body (the bias-corrected step-size
+ * via expm1, the L2/decoupled weight decay, the atomic-guarded unscale vec4 path)
+ * was ABSORBED from adam-kernel.ts INTO this schedule module (`lowerAdamStepBody`).
+ * The schedule object is now the SOLE owner of the fused-Adam kernel body at the
+ * live dispatch seam (`realizeAdamStepSpec`); the retired `makeAdamStepSpec`
+ * factory is gone. The skeleton STAYS opaque (F3) — the per-element update is a
+ * locked numeric formula — but the body it names now lives here. The BYTE
+ * DIFFERENTIAL proves the lowered WGSL is byte-identical across all 5 variants.
  */
 export function applyAdamSchedule(
   skeleton: Skeleton,
   desc: AdamDescriptor,
 ): TileKernelSpec {
   assertAuthoredSeam(skeleton, desc);
-  return makeAdamStepSpec(desc.useVec4, desc.emitF16, desc.emitUnscale);
+  return lowerAdamStepBody(desc.useVec4, desc.emitF16, desc.emitUnscale);
+}
+
+/**
+ * Realize the fused-Adam `TileKernelSpec` THROUGH the schedule object (the live
+ * dispatch chokepoint — the P1/matmul/reduction `realize*` pattern). The live
+ * Adam dispatcher (adam-kernel.ts `getAdamDispatcher`) routes here: derive the
+ * authored (opaque) skeleton for the variant, assert no-second-owner at the seam,
+ * and lower the body FROM the state. The schedule object is the sole WGSL writer
+ * at the dispatch seam; `lowerAdamStepBody` is a realizer-internal of
+ * `applyAdamSchedule`, unreachable from live dispatch except through the schedule.
+ */
+export function realizeAdamStepSpec(
+  useVec4: boolean,
+  emitF16: boolean,
+  emitUnscale: boolean,
+): TileKernelSpec {
+  const desc: AdamDescriptor = { useVec4, emitF16, emitUnscale };
+  return applyAdamSchedule(deriveAdamSkeleton(desc), desc);
+}
+
+/** Compile the fused-Adam WGSL through the schedule object (the differential's
+ *  live comparison target; formerly adam-kernel.ts `makeAdamStepSpec` compiled
+ *  directly, relocated here now that the schedule owns the body). */
+export function generateAdamShaderTileIR(
+  useVec4: boolean,
+  emitF16: boolean,
+  emitUnscale: boolean,
+): string {
+  return compileTileKernel(realizeAdamStepSpec(useVec4, emitF16, emitUnscale));
 }
 
 /**
@@ -185,7 +241,7 @@ export function assertAuthoredSeam(
   if (skeleton.kernelRef !== KERNEL_REF)
     reportNoSecondOwner(
       `no-second-owner[adam]: skeleton kernelRef "${skeleton.kernelRef}" disagrees ` +
-        `with the live makeAdamStepSpec (${KERNEL_REF}).`,
+        `with the schedule-owned lowerAdamStepBody (${KERNEL_REF}).`,
     );
   if (skeleton.params !== ADAM_PARAM_SCHEMA)
     reportNoSecondOwner(
@@ -384,4 +440,285 @@ export function deriveHorizontalPackedAdam(segments: readonly AdamParamSegment[]
     totalElements,
     perParamLoopCount: segments.length,
   };
+}
+
+// ============================================================================
+// The ABSORBED authored fused-Adam kernel body (§7 P4 cutover-flip)
+// ============================================================================
+//
+// The fused-Adam kernel body — RELOCATED from adam-kernel.ts `makeAdamStepSpec` —
+// so the schedule module is the SOLE owner of the Adam kernel structure at the
+// live dispatch seam (`realizeAdamStepSpec`). The bias-corrected step-size
+// (expm1-form bias correction from the on-device t/lr tensor inputs), the
+// L2/decoupled weight-decay branches, and the atomic-guarded unscale vec4 path
+// LOWER FROM here now. BYTE-IDENTICAL to the retired factory (the 5-variant
+// differential is the safety net). The skeleton STAYS opaque (F3): the per-element
+// update is a locked numeric formula, but the body it names lives here — one owner.
+// The horizontal-pack derivation (deriveHorizontalPackedAdam, above) is the
+// DERIVABLE part; this body is the authored per-element update the pack batches.
+
+/** The fused Adam/AdamW body (single WGSL dispatch per param/segment). */
+function lowerAdamStepBody(
+  useVec4: boolean,
+  emitF16: boolean,
+  emitUnscale: boolean,
+): TileKernelSpec {
+  const bindings: Record<string, BindingSpec> = {
+    grad: { storage: "read", type: "f32" },
+    param: { storage: "read_write", type: "f32" },
+    m: { storage: "read_write", type: "f32" },
+    v: { storage: "read_write", type: "f32" },
+    // inc-2a: t (step counter) and lr flow as persistent 1-element f32 tensor
+    // DATA, not per-step-varying uniforms. The recorder sees stable buffers
+    // (TAG_WRITE), which kills the frozen-scalar / volatile-repack class.
+    t: { storage: "read", type: "f32" },
+    lr: { storage: "read", type: "f32" },
+  };
+  if (emitF16) {
+    bindings.param_f16 = { storage: "read_write", type: "f16" };
+  }
+  if (emitUnscale) {
+    bindings.inf_flag = { storage: "atomic", type: "u32" };
+  }
+
+  // Build uniforms. inc-2a: the config is now FULLY STATIC — beta1/beta2/
+  // eps(orig)/weight_decay/decoupled_wd never vary per step. ln_beta1/ln_beta2
+  // are precomputed f64->f32 on the CPU and used by the in-kernel expm1-form
+  // bias correction (bc = -expm1(t*lnBeta)); they replace the retired
+  // step_size / lr_times_wd per-step fields.
+  const uniforms: Record<string, UniformType> = {
+    beta1: "f32",
+    beta2: "f32",
+    ln_beta1: "f32",
+    ln_beta2: "f32",
+    eps: "f32",
+    weight_decay: "f32",
+    decoupled_wd: "u32",
+    num_elements: "u32",
+  };
+  if (emitUnscale) {
+    // Unscale path keeps grid_stride for manual 2D indexing (atomics prevent auto-vec4)
+    uniforms.grid_stride = "u32";
+    uniforms.inv_scale = "f32";
+    uniforms._pad0 = "u32";
+    uniforms._pad1 = "u32";
+  } else {
+    // Non-unscale: compiler handles 2D grid via flatGlobalId, no grid_stride needed
+    uniforms._pad0 = "u32";
+    uniforms._pad1 = "u32";
+    uniforms._pad2 = "u32";
+    uniforms._pad3 = "u32";
+  }
+
+  // Non-unscale path: pure elementwise, auto-vectorized by the compiler.
+  // Unscale path: atomics prevent auto-vec4, so manual vec4 with grid_stride.
+  if (!emitUnscale) {
+    return {
+      name: `adamStep${emitF16 ? "F16" : ""}`,
+      workgroupSize: WORKGROUP_SIZE,
+      bindings,
+      uniforms,
+      enableF16: emitF16,
+      autoVectorize: true,
+      kernel(ctx) {
+        const bc = emitBiasCorrection(ctx);
+        const idx = ctx.elementIndex(WORKGROUP_SIZE, "num_elements");
+        const gVar = ctx.emitVar("g", "f32", ctx.load("grad", idx));
+        emitAdamScalarBody(ctx, idx, gVar, emitF16, bc);
+      },
+    };
+  }
+
+  // Unscale path: manual vec4 with per-element inf checks + atomicMax
+  return {
+    name: `adamStepUnscale${emitF16 ? "F16" : ""}${useVec4 ? "Vec4" : ""}`,
+    workgroupSize: WORKGROUP_SIZE,
+    bindings,
+    uniforms,
+    enableF16: emitF16,
+    grid: (u) => {
+      const workItems = useVec4
+        ? Math.ceil(u.num_elements / 4)
+        : u.num_elements;
+      const wg = Math.ceil(workItems / WORKGROUP_SIZE);
+      if (wg <= MAX_WORKGROUPS_PER_DIM) return [wg];
+      const x = Math.min(wg, MAX_WORKGROUPS_PER_DIM);
+      return [x, Math.ceil(wg / x)];
+    },
+    kernel(ctx) {
+      const numElements = ctx.uniform("num_elements");
+      const gridStride = ctx.uniform("grid_stride");
+      const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
+      const bc = emitBiasCorrection(ctx);
+
+      if (useVec4) {
+        const flatId = ctx.emitLet(
+          "flatId",
+          ctx.globalId(0).add(ctx.globalId(1).mul(gridStride)),
+        );
+        const base = ctx.emitLet("base", flatId.mul(ctx.u32(4)));
+        ctx.ifThen(base.ge(numElements), () => {
+          ctx.emitReturn();
+        });
+
+        // Load and unscale 4 grads, check each for inf/nan
+        const gVars: VarHandle[] = [];
+        for (let e = 0; e < 4; e++) {
+          const off = e === 0 ? base : base.add(ctx.u32(e));
+          const gVar = ctx.emitVar(
+            `g${e}`,
+            "f32",
+            ctx.load("grad", off).mul(invScale),
+          );
+          gVars.push(gVar);
+          const bits = gVar.get().bitcastTo("u32");
+          const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xff));
+          ctx.ifThen(exponent.eq(ctx.u32(0xff)), () => {
+            ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
+            gVar.set(ctx.f32(0.0));
+          });
+        }
+        for (let e = 0; e < 4; e++) {
+          const off = e === 0 ? base : base.add(ctx.u32(e));
+          emitAdamScalarBody(ctx, off, gVars[e], emitF16, bc, `${e}`);
+        }
+      } else {
+        const idx = ctx.emitLet(
+          "idx",
+          ctx.globalId(0).add(ctx.globalId(1).mul(gridStride)),
+        );
+        ctx.ifThen(idx.ge(numElements), () => {
+          ctx.emitReturn();
+        });
+
+        const gVar = ctx.emitVar(
+          "g",
+          "f32",
+          ctx.load("grad", idx).mul(invScale),
+        );
+        const bits = gVar.get().bitcastTo("u32");
+        const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xff));
+        ctx.ifThen(exponent.eq(ctx.u32(0xff)), () => {
+          ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
+          gVar.set(ctx.f32(0.0));
+        });
+
+        emitAdamScalarBody(ctx, idx, gVar, emitF16, bc);
+      }
+    },
+  };
+}
+
+// ----------------------------------------------------------------------------
+// Adam update logic (shared between scalar and vec4 paths) — RELOCATED from
+// adam-kernel.ts (the body's single-source per-element update).
+// ----------------------------------------------------------------------------
+
+function loadAdamUniforms(ctx: KernelContext) {
+  return {
+    beta1: ctx.uniform("beta1").bitcastTo("f32"),
+    beta2: ctx.uniform("beta2").bitcastTo("f32"),
+    lnBeta1: ctx.uniform("ln_beta1").bitcastTo("f32"),
+    lnBeta2: ctx.uniform("ln_beta2").bitcastTo("f32"),
+    eps: ctx.uniform("eps").bitcastTo("f32"),
+    weightDecay: ctx.uniform("weight_decay").bitcastTo("f32"),
+    decoupledWd: ctx.uniform("decoupled_wd"),
+  };
+}
+
+/**
+ * LOCKED formula (single source at the seam; mirrored by
+ * `test/optim/adam-biascorrection-formula.spec.ts`'s `expm1F32`):
+ *   expm1(y):  |y| < 0.25 → 5-term Horner series
+ *                y*(1 + y*(1/2 + y*(1/6 + y*(1/24 + y/120))))
+ *              else       → exp(y) - 1
+ * y = t * lnBeta (≤ 0), so the naive `1-pow(beta,t)` cancellation is avoided.
+ * Returns expm1(y) as a BlockExpr. `select` computes both branches — fine for
+ * a scalar derivation evaluated once per thread.
+ */
+function emitExpm1(ctx: KernelContext, y: BlockExpr): BlockExpr {
+  // 5-term Horner series (small-|y| branch).
+  let r: BlockExpr = ctx.f32(1 / 120);
+  r = ctx.f32(1 / 24).add(y.mul(r));
+  r = ctx.f32(1 / 6).add(y.mul(r));
+  r = ctx.f32(1 / 2).add(y.mul(r));
+  r = ctx.f32(1.0).add(y.mul(r));
+  const series = y.mul(r);
+  const large = y.exp().sub(ctx.f32(1.0));
+  return y.abs().lt(ctx.f32(0.25)).select(series, large);
+}
+
+/**
+ * Derive the bias-corrected step size and epsilon from the on-device step
+ * counter `t` and learning rate `lr` (both read from 1-element storage
+ * bindings). Replaces the retired JS-computed `stepSize`/`lrTimesWd` config
+ * fields. bc = -expm1(t*lnBeta); the PyTorch-equivalent update is
+ *   p -= (lr*sqrt(bc2)/bc1) * m / (sqrt(v) + eps*sqrt(bc2))
+ * i.e. p -= lr * (m/bc1) / (sqrt(v/bc2) + eps_orig).
+ */
+function emitBiasCorrection(ctx: KernelContext): {
+  stepSize: BlockExpr;
+  epsAdjusted: BlockExpr;
+  lr: BlockExpr;
+} {
+  const t = ctx.load("t", ctx.u32(0));
+  const lr = ctx.load("lr", ctx.u32(0));
+  const { lnBeta1, lnBeta2, eps } = loadAdamUniforms(ctx);
+  const bc1 = ctx.emitLet("bc1", emitExpm1(ctx, t.mul(lnBeta1)).neg());
+  const bc2 = ctx.emitLet("bc2", emitExpm1(ctx, t.mul(lnBeta2)).neg());
+  const sqrtBc2 = ctx.emitLet("sqrt_bc2", bc2.sqrt());
+  const stepSize = ctx.emitLet("step_size", lr.mul(sqrtBc2).div(bc1));
+  const epsAdjusted = ctx.emitLet("eps_adj", eps.mul(sqrtBc2));
+  return { stepSize, epsAdjusted, lr };
+}
+
+/** Emit the Adam update logic for a single element at `idx`. */
+function emitAdamScalarBody(
+  ctx: KernelContext,
+  idx: BlockExpr,
+  gVar: VarHandle,
+  emitF16: boolean,
+  bc: { stepSize: BlockExpr; epsAdjusted: BlockExpr; lr: BlockExpr },
+  suffix = "",
+): void {
+  const p = ctx.emitLet(`p${suffix}`, ctx.load("param", idx));
+  const { beta1, beta2, weightDecay, decoupledWd } = loadAdamUniforms(ctx);
+
+  // L2 weight decay (Adam): grad += wd * param
+  ctx.ifThen(
+    decoupledWd.eq(ctx.u32(0)).and(weightDecay.bitcastTo("u32").gt(ctx.u32(0))),
+    () => {
+      gVar.set(gVar.get().add(weightDecay.mul(p)));
+    },
+  );
+
+  const g = gVar.get();
+  const mNew = ctx.emitLet(
+    `m_new${suffix}`,
+    beta1.mul(ctx.load("m", idx)).add(ctx.f32(1.0).sub(beta1).mul(g)),
+  );
+  const vNew = ctx.emitLet(
+    `v_new${suffix}`,
+    beta2.mul(ctx.load("v", idx)).add(ctx.f32(1.0).sub(beta2).mul(g).mul(g)),
+  );
+
+  const pNewVar = ctx.emitVar(
+    `p_new${suffix}`,
+    "f32",
+    p.sub(bc.stepSize.mul(mNew).div(vNew.sqrt().add(bc.epsAdjusted))),
+  );
+
+  // Decoupled weight decay (AdamW): p -= lr*wd*p
+  ctx.ifThen(decoupledWd.eq(ctx.u32(1)), () => {
+    pNewVar.set(pNewVar.get().sub(bc.lr.mul(weightDecay).mul(p)));
+  });
+
+  // Write outputs
+  ctx.emitStore("param", idx, pNewVar.get());
+  ctx.emitStore("m", idx, mNew);
+  ctx.emitStore("v", idx, vNew);
+
+  if (emitF16) {
+    ctx.emitStore("param_f16", idx, pNewVar.get().toF16());
+  }
 }
