@@ -17,6 +17,15 @@ existing machinery refers to code in-tree at commit ed779c6.*
 > opt-outs (separate flags, out of this campaign's scope). Deletion is gated on
 > 4.4-coverage (full generator coverage) + stage-3 rematerialization unification,
 > both designed-but-not-built. Per the campaign's STOP rule, no deletion forced.
+> **UPDATE 2026-07-12 (4.4-residues pass):** the four residues are worked to a
+> verdict apiece (see § "Task #43 4.4-COVERAGE — the four RESIDUES revisited").
+> (c) decode strided-view+max and (d) config-missing transients are resolved
+> ACCEPTABLE-BY-DESIGN (d does NOT block deletion; c is inference-only). (a)
+> row-program-scalar-steptemp and (b) data-source:full remain the TWO recurring
+> TRAINING-path bails that BLOCK deletion — both need the same captured-state
+> "materialized value → compiled-replay slot, per-step, no over-harvest"
+> primitive; (b) was attempted via generation and reverted on the ledger gate
+> (the generate-more-plans path entangles with the fundamental over-harvest).
 
 ## Why (tied to the ledger)
 
@@ -2438,4 +2447,159 @@ build at offset A, replay at B, assert B's region; the offset-0-builds-first
 trap, now permanent). offset-views 48/48; fullstack compiled==lowered 8.6e-6/30
 steps. Real-decode (gpt2 substitute — qwen3-1.7B loader stalls on this box):
 16 decode steps forked **15→1** templates (steady 12→0), no PAYLOAD-THRASH.
+
+## Task #43 4.4-COVERAGE — the four RESIDUES revisited (2026-07-12)
+
+Re-ran the census on the three workloads (`t-coverage-census.ts`, arena-on /
+CHECKPOINTING=0) and worked the four named residues to a verdict apiece. The
+census is UNCHANGED before/after — no new coverage LANDED — because the two
+coding residues (a)+(b) both bottom out on the SAME missing infrastructure
+(per-step delivery of a materialized value into a compiled-replay slot without
+inflating the harvest), and (b) was ATTEMPTED and reverted on the non-negotiable
+ledger gate. The value of this pass is the SHARPENED verdicts + the bounded
+acceptable set below, and the two "assess" residues (c)+(d) resolved as
+acceptable-by-design.
+
+**AFTER census (== BEFORE — recurring bails only):**
+| workload | recurring-bail fp | nodes | reaches | classes |
+|---|---|---:|---:|---|
+| distil-train | 0x466ad4a | 479 | 5 | `row-program[scalar-steptemp-input]` |
+| distil-train | 0xc0b32ce5 | 296 | 3 | `data-source:full` |
+| gpt2-decode | 0xeee0065e | 339 | 4 | `data-source:bernoulli, fused[no-storage], op:max` |
+| 124M-diloco | 0xea2ddb2d | 925 | 5 | `row-program[scalar-steptemp-input]` |
+| 124M-diloco | 0x36e345f5 | 566 | 3 | `data-source:full` |
+
+Gates on the (reverted-clean) tree: build ✓; `test:gates` **6/6**;
+`t-ledger-attack-probe` (CHECKPOINT=0) reachDrift/totalDrift **0/0**;
+`t-stream-generate` **PASS** (3 plans FULLY GENERATED 0 diverged, 1 partial with
+the deliberate `row-program[scalar-steptemp-input]×1` bail); `parity-fullstack-tl`
+compiled-vs-lowered max |Δloss| **8.6e-6 / 30 steps**; full suite green.
+
+### (a) row-program[scalar-steptemp-input] — DEFERRED (captured-state, cross-seam)
+The bail is `ref.kind==="materialized" && shape.length===0` for a row-program
+external input (the clip/scaler scale fused as a `mul` preamble,
+`sum(mul(loss, scale))`; `stream-generate.ts:1179`). Two sub-cases, and BOTH
+need infra we don't have:
+- **destroyed 0-d input** → the executor takes `executeRowProgram`'s SEQUENTIAL
+  FALLBACK (`segment-executors.ts:439`, `isDestroyed` → run mul+sum as separate
+  dispatches, NOT the fused kernel). To cover this the generator would emit the
+  same two dispatches — but the input's storage is GONE at build time, so a
+  compiled replay has no data to bind. This is the captured-state class (like
+  `mean`'s invCount): it needs scalar-table-style per-step delivery of a
+  MATERIALIZED 0-d value (not a `kind:"scalar"` ref — the existing scalar table
+  `scalar-table.ts` only handles value-carrying scalar refs).
+- **live 0-d input** → the executor runs the FUSED kernel; the generator could
+  bind the 0-d storage IF it were persistent, but the scaler scale is a per-step
+  step-temp (`full([],v)`), so binding the record-time buffer freezes a
+  step-varying scale (silent corruption — the exact hazard the bail cites).
+The #87 `scalarDress`/pre-replay-writeBuffer mechanism (`step-tape-replay.ts`)
+is the CLOSEST existing delivery seam (fresh per-step scalar → fixed consumer),
+but it is wired for the step-TAPE replay path and keyed on an in-place scatter
+consumer; generalizing it to a row-program's fused-kernel 0-d INPUT slot is the
+cross-seam work this residue needs. Not landed — silent-corruption stakes, no
+clean seam yet. **Bail stays; plan stays recorded.**
+
+### (b) data-source creation ops (full/arange/rand/randn/bernoulli) — ATTEMPTED, REVERTED on the ledger gate
+Implemented the doc's named requirement: generate `ALLOC(planner slot)+WRITE`
+for the f32 creation ops (`generateDataSource`) + a **data-source-INTO-SLOT**
+TAG_WRITE executor path (`compiled-plan.ts`): when a preceding planner ALLOC
+populated `slots[cmd.slot]`, produce the op's data into that planner-owned buffer
+(full/arange via CPU `writeBuffer`; rand/randn/bernoulli via kernel→`copyBufferToBuffer`
++ fence-gated temp destroy) instead of the legacy re-execute-into-a-FRESH-pool-buffer.
+- **The into-slot path is correct and fires** (verified via `TORCHLETTE_DEBUG_WRITES`:
+  build-time `full` nodes route into their planner slot, no fresh alloc).
+- **BUT the ledger gate FAILED: reachDrift/totalDrift = 9 (> tol 8).** Root cause
+  is NOT the into-slot path — it is that making the creation ops generatable
+  flips additional (warmup) plans to FULLY-COVERED → they cut over → and
+  build-from-IR's documented OVER-HARVEST (harvest the full action-output set,
+  which is fundamental and irreducible — see "THE OVER-HARVEST IS FUNDAMENTAL")
+  adds ~9 exclusive result entries. The trajectory is a one-time +9 STEP at the
+  warmup-cutover boundary, then flat (426→435→flat) — a harvest/memory tradeoff,
+  not a growing UAF, but it still trips the non-negotiable ledger tolerance.
+  Critically, the per-step scaler `full` (the recurring `data-source:full` bail)
+  does NOT route through the generated ALLOC+WRITE — it stays recorded — so this
+  change does NOT even close the recurring training bail; it only newly-covers
+  warmup plans and pays the over-harvest. Net: no recurring-bail closure, ledger
+  regression. **Reverted.** The prior pass's "separate executor change, out of
+  scope" verdict STANDS, now with this sharper reason: covering data-source ops
+  via generation cannot pass the ledger gate because it entangles with the
+  fundamental build-from-IR over-harvest; a clean close needs the recurring `full`
+  itself to route into a planner slot WITHOUT flipping extra plans to cutover —
+  which the generate-more-plans mechanism inherently does the opposite of.
+
+### (c) decode strided-view + op:max — ACCEPTABLE-BY-DESIGN (inference-only, DEFER)
+Re-measured post-#71: the decode recurring bail (0xeee0065e) is STILL
+`fused[no-storage], op:max` (+ `data-source:bernoulli`, a census-harness
+artifact — the harness never `.eval()`s so `Dropout` fires bernoulli;
+`nn/module.ts` defaults `trainingMode=true`). Findings:
+- `fused[no-storage]` still fires and #71 did NOT touch it. Origin: the causal
+  mask `causalBias.narrow(2,…).narrow(3,…)` (`examples/gpt2/model.ts:188`) — a
+  released double-narrow STRIDED view — feeds a fused `add`, and `generateFused`
+  bails `no-storage` on a released `VIEW_OPS` input (`stream-generate.ts:3064`).
+  #71's `cachedStridedInputs` volatile-offset rescue lives ONLY in the
+  sequential/direct-elementwise path (`generateSequential`), never in
+  `generateFused` (zero refs there) — so covering it needs a phase-3-style
+  strided-input capture GENERALIZED to the fused path.
+- `op:max` is softmax's stability max (a DIM reduction). Routing is mechanically
+  trivial (`planFullReductionDispatch`/`planDimReductionDispatch` already take a
+  ReduceOp; `reductions.ts:376,432`) — but `generateFullReduction`/`generateDimReduction`
+  hardcode `"sum"`. HOWEVER `op:max` and `fused[no-storage]` co-occur in the SAME
+  plan, so covering max ALONE cannot flip the plan to fully-covered — zero
+  standalone value here.
+Decode is inference-only (`api.noGrad`), not a training gate. **Verdict:
+acceptable-by-design; leave decode recorded. If desired later, route max/min
+(cheap) AND add a fused-path strided capture — both needed to actually close it.**
+
+### (d) first-exec config-missing transients — ACCEPTABLE-BY-DESIGN, does NOT block deletion
+The `*[config-missing]` / `matmul-epilogue[no-config]` / `fused[no-input-pattern]`
+classes are a pure cold-start ORDERING property with NO recording dependency.
+The generator's `plan()` returns a config buffer only if a prior DISPATCH
+populated the cache (`tile-dispatch.ts:337`); that cache entry is created
+UNCONDITIONALLY at first dispatch (`tile-dispatch.ts:237`, independent of
+recording state). So on a template's FIRST execution build-from-IR bails
+(cache empty) and falls through to a LOWERED-WITHOUT-RECORD path
+(`shouldCompile` is false when the arena is empty — "populated from prior
+execution", `executor.ts:2254`); that lowered pass populates the config cache as
+a side effect; the SECOND execution builds from IR and returns with no recording.
+So config-missing transients are ALREADY record-free today. **The precise
+deletion-readiness answer: a first execution ALWAYS lowers, and it need NOT
+record — it never did for this class. Deleting the recorded build changes
+nothing here.** The only thing the deletion pass must preserve is that a
+first-exec build-from-IR bail keeps falling through to lowered-without-record
+(it does, via `shouldCompile===false` on the empty arena). No config-buffer
+pre-derivation is required (that is the `BUILD_FROM_IR` build-without-execution
+ambition, orthogonal to recorded-build deletion).
+
+### Deletion-readiness verdict (updated)
+The recorded build is **NOT deletable yet**, and the acceptable set is now
+precisely bounded to TWO recurring correctness bails on the TRAINING path plus
+the inference-only decode plan:
+- **(a) `row-program[scalar-steptemp-input]`** (distil + 124M) — needs
+  captured-state per-step delivery of a MATERIALIZED 0-d value into a fused
+  row-program input slot. The scalar table + #87 scalarDress are the nearest
+  seams; neither yet reaches a fused-kernel input slot. **BLOCKS deletion.**
+- **(b) `data-source:full`** (distil + 124M) — the recurring scaler `full` stays
+  recorded; generating creation ops entangles with the fundamental build-from-IR
+  over-harvest → ledger regression, so generation-based coverage cannot close it.
+  A close needs the recurring `full` to route into a planner slot WITHOUT
+  flipping extra plans to cutover (a targeted executor write-into-slot for the
+  ALREADY-cutover plan, not a generate-more-plans path). **BLOCKS deletion.**
+- **(c) decode `fused[no-storage]` + `op:max`** — inference-only; acceptable
+  recorded. Does not block the TRAINING-path sunset but would need coverage for a
+  full no-record decode.
+- **(d) config-missing transients** — acceptable-by-design, record-free already.
+  **Does NOT block deletion.**
+
+When (a) and (b) close (both need the same "materialized value → compiled-replay
+slot, per-step, no over-harvest" primitive — a phase-3-style captured-state
+delivery, NOT a generate-more-plans extension), no recurring TRAINING plan needs
+the recorded fallback and the deletion harvest (A4's `record*` refs +
+params-sequence cache + `buildCompiledPlan` + `BUILD_FROM_IR=0` opt-out) becomes
+safe. The deletion pass must ALSO sunset the census flag `TORCHLETTE_COVERAGE_CENSUS`
++ `dumpCoverageCensus`/`resetCoverageCensus` + `t-coverage-census.ts` (tied to the
+recorded build per `executor.ts:568`). The `TORCHLETTE_GENERATED_PLAN` sunset the
+original pass named is ALREADY executed (dead since 2026-07-08). No `src/`
+deletion is warranted in THIS pass — the two coding residues remain infrastructure-
+gated (verified: the one attempt that touched `src/` regressed the ledger and was
+reverted).
 
