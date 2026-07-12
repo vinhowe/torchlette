@@ -17,7 +17,6 @@
 
 import { ENV } from "../../core/env";
 import {
-  type AttentionKernelRole,
   BC_BW,
   BR,
   realizeAttentionSpec,

@@ -556,6 +556,24 @@ self-hosting milestone — needs the recomputation-identity and D-precompute lem
 (re-derive — needs a horizontal-`pack` move at multi-tensor altitude), scatter-add (NOT
 authored: composed around the `atomicAdd<f32>` atom from P0).
 
+**Cutover-flip update (2026-07-12 — the shrink rule executed).** Attention
+(fwd/D/dQ/dKV) and fused Adam have had their **live-path body ownership FLIPPED into
+the schedule**: the kernel bodies now LOWER FROM the ScheduleState
+(`attention-skeleton.ts lowerAttention*Body`, `adam-skeleton.ts lowerAdamStepBody`)
+and the live dispatch routes through the `realize*` chokepoints
+(`realizeAttentionSpec` / `realizeAdamStepSpec`, the P1/matmul/reduction pattern).
+The `make*Spec` / `makeAdamStepSpec` factories that were the second owner of the
+body are DELETED — the schedule module is the sole WGSL writer at the dispatch seam.
+The skeletons stay `visibility:"opaque"` because their INTERNALS are still authored
+(the online-softmax composite; the locked per-element Adam formula), and the
+AUTOMATED internal `opaque→derived` flip waits on the S3 merge/fuse transaction (the
+one remaining engine deliverable). **The authored set is now, on the LIVE path,
+atoms-only in the sense that matters here: no un-re-derived whole KERNEL BODY owns
+its own second copy — every attention/Adam/matmul/reduction/elementwise body lowers
+from the schedule. The irreducible base is `{atomicAdd<f32>, the enumerated subgroup
+primitives}` (§3.3 mechanical atoms).** See
+`docs/schedule-state-p4-local-self-hosting-report.md §2.0`.
+
 ## 7. Phases (each independently shippable, stage-4 style)
 
 ### P0 entry criteria (the CURRENT task-board truth — R21 modified ruling)
