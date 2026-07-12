@@ -36,6 +36,7 @@
     "test:coverage": "vitest run --coverage",
     "test:webgpu": "vitest run test/webgpu.spec.ts",
     "test:gates": "vitest run --project webgpu test/compiled-plan-parity.spec.ts",
+    "conformance": "tsx tools/conformance/run-all.ts",
     "test:browser": "vitest run --config vitest.config.browser.ts",
     "size": "size-limit"
   },
