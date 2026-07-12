@@ -1043,6 +1043,8 @@ function planGemvRowMatmul(
   rowsPerWg?: number,
   epilogue?: EpilogueConfig,
   epilogueInputCount = 0,
+  inputCastA?: DType,
+  inputCastB?: DType,
 ): MatmulStandardPlan | MatmulKSplitPlan | null {
   const route = computeGemvRoute(n, k, transB, wgSize, rowsPerWg);
   if (!route) return null;
@@ -1063,6 +1065,8 @@ function planGemvRowMatmul(
     mode: route.mode,
     dtypeA: dtype,
     dtypeB,
+    inputCastA,
+    inputCastB,
     outputDtype,
     kSplit: route.splitK >= 2,
     wgSize,
@@ -1150,6 +1154,8 @@ export function planTiledMatmul(
     epiloguePresent: !!epilogue || epilogueInputs.length > 0,
     epilogue,
     hasInputCast: !!inputCastA || !!inputCastB,
+    inputCastA,
+    inputCastB,
     hasExplicitConfig: !!options.config,
     subgroupSupported: getSubgroupSupport()?.supported ?? false,
   };
@@ -1168,6 +1174,8 @@ export function planTiledMatmul(
       choice.rowsPerWg,
       epilogue,
       epilogueInputs.length,
+      inputCastA,
+      inputCastB,
     );
     if (gemvPlan) return gemvPlan;
     // Route degenerated for this choice — fall through to the tiled family.

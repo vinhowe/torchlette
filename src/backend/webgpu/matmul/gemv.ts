@@ -84,6 +84,15 @@ export interface GemvKernelOptions {
   mode: "nt" | "nn";
   dtypeA: DType;
   dtypeB: DType;
+  /** Read-wider-cast-on-load: the operand buffer is physically stored in this
+   *  (wider) dtype but participates in the matmul as the logical dtypeA/dtypeB
+   *  (AMP f16 decode reads an f32 activation/weight and casts on load). When
+   *  set, the binding is declared as this stored dtype; the kernel's loads
+   *  already widen to f32 (scalar `.toF32()`, `loadVec4` widens at the load
+   *  site), so the accumulation math is unchanged — mirrors the tiled kernel's
+   *  `inputCastA`/`inputCastB`. Ignored on the quantized-B route (B is u32). */
+  inputCastA?: DType;
+  inputCastB?: DType;
   /** Ignored (partials are f32) when mode === "nn" && kSplit. */
   outputDtype: DType;
   /** NN only: write f32 partials [split_k, N]; the reduction applies alpha. */
@@ -275,6 +284,11 @@ export function getGemvShaderCacheKey(o: GemvKernelOptions): string {
     "gemv",
     o.mode,
     `${o.dtypeA}x${o.dtypeB}`,
+    // Load-cast axis: the binding's declared (stored) dtype is baked into the
+    // WGSL, so it must key the shader (#91 rule). Only emitted when a cast is
+    // present, so bare-dtype keys are byte-identical to pre-cast keys.
+    o.inputCastA ? `castA_${o.inputCastA}` : "",
+    o.inputCastB ? `castB_${o.inputCastB}` : "",
     `out_${o.outputDtype}`,
     `wg${o.wgSize ?? GEMV_DEFAULT_WG_SIZE}`,
     o.mode === "nt" ? `r${o.rowsPerWg ?? GEMV_NT_DEFAULT_ROWS_PER_WG}` : "",
@@ -297,21 +311,29 @@ export function getGemvShaderCacheKey(o: GemvKernelOptions): string {
 export function createGemvKernel(o: GemvKernelOptions): TileKernelSpec {
   const wgSize = o.wgSize ?? GEMV_DEFAULT_WG_SIZE;
   const outDtype: DType = o.mode === "nn" && o.kSplit ? "f32" : o.outputDtype;
-  const needsF16 =
-    o.dtypeA === "f16" || o.dtypeB === "f16" || outDtype === "f16";
   const quantB = o.quantB;
   if (quantB) {
     if (o.mode !== "nt") throw new Error("gemv quantB: NT mode only");
     if (o.kSplit) throw new Error("gemv quantB: incompatible with kSplit");
+    if (o.inputCastA || o.inputCastB) {
+      throw new Error("gemv quantB: incompatible with input casts");
+    }
   }
+  // Read-wider-cast-on-load: the binding is declared as the physically stored
+  // (wider) dtype; the kernel's loads already widen to f32, so the math is
+  // unchanged. Mirrors tile-matmul's wgslDtypeA/B. (quantB's B stays u32.)
+  const wgslDtypeA: DType = o.inputCastA ?? o.dtypeA;
+  const wgslDtypeB: DType = o.inputCastB ?? o.dtypeB;
+  const needsF16 =
+    wgslDtypeA === "f16" || wgslDtypeB === "f16" || outDtype === "f16";
   const bindings: Record<
     string,
     { storage: "read" | "read_write"; type: DataType }
   > = {
-    a: { storage: "read", type: o.dtypeA as DataType },
+    a: { storage: "read", type: wgslDtypeA as DataType },
     // Quantized B: packed int8 in a u32 array (4/word), + f16 scales packed as
     // u32 (2/word). Both u32 bindings by construction (#59 load lesson).
-    b: { storage: "read", type: quantB ? "u32" : (o.dtypeB as DataType) },
+    b: { storage: "read", type: quantB ? "u32" : (wgslDtypeB as DataType) },
     out: { storage: "read_write", type: outDtype as DataType },
   };
   if (quantB) {
