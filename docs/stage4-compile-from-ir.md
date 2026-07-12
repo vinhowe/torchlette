@@ -2603,3 +2603,121 @@ deletion is warranted in THIS pass — the two coding residues remain infrastruc
 gated (verified: the one attempt that touched `src/` regressed the ledger and was
 reverted).
 
+## The CAPTURE PRIMITIVE pass (2026-07-12): (a)+(b) are ONE value chain; half-built, half-blocked
+
+Built the primitive's constant-value half (`constFill`), measured it end-to-end
+on all three census workloads + the four gates, and pinned down WHY residues
+(a) and (b) cannot close independently. The load-bearing new fact: **(a) and (b)
+are the SAME gradient-clip value chain across a plan boundary, and closing (b)
+alone creates the exact +9 cross-plan hold that only (a) can drain** — so the
+primitive genuinely has two halves that must land TOGETHER.
+
+### What the residues actually are (traced, not assumed)
+Instrumenting the census (`TORCHLETTE_DEBUG_STEPTEMP`) resolved both recurring
+TRAINING bails to the `clipGradNorm_` chain (`src/nn/clip-grad.ts`):
+- **(b) `data-source:full`** in the 296-node plan (distil fp `0xc0b32ce5`, 124M
+  `0x36e345f5`) is a single node `full([], 1.0)` — the `minimum(div(maxNorm,
+  norm+eps), 1.0)` CEILING (`nn/functional.ts:19` promotes the scalar `1.0` to a
+  0-d `full`). It is a **compile-time HOST CONSTANT** (fillValue=1, invariant
+  across steps), NOT a GPU-computed value. The earlier "recurring scaler `full`"
+  framing was imprecise: it is the clip ceiling, and it is constant.
+- **(a) `row-program[scalar-steptemp-input]`** in the 479-node plan (distil
+  `0x466ad4a`, 124M `0xea2ddb2d`) is the `mul(g, clipCoef)` fused into a reduction
+  row-program, with `clipCoef` (the 0-d `minimum` OUTPUT — a per-step GPU value)
+  as a materialized input. `clipCoef` is produced in plan-(b) and consumed in
+  plan-(a): a **cross-plan 0-d GPU value**, `stamp=none` (plan-(b) bailed, so its
+  output was never harvested/stamped), record-time storage swept between steps
+  (`destroyed=false` on the build reach, `destroyed=true` on later reaches — the
+  exact live/destroyed split `executeRowProgram`'s fallback branches on).
+
+So the chain is: `full([], 1.0)` → `minimum` = `clipCoef` (plan b) → cross-plan →
+`mul(g, clipCoef)` row-program (plan a). Two residues, one clip.
+
+### The primitive, constant half: `constFill` (BUILT, PROVEN, then REVERTED)
+`SlotSource { kind: "constFill"; elements; fillValue; cachedBuffer? }` — a
+compile-time-constant `full([...], const)` as a per-replay INPUT slot backed by a
+PLAN-OWNED FIXED buffer (created once at first replay like `params`, pre-filled
+with the constant via `queue.writeBuffer`, reused byte-identical every replay,
+pinned, destroyed fence-gated at teardown). NO alloc/write command is emitted:
+the buffer is born at build and sits OUTSIDE the arena AND the harvest ledger
+(neither a pool acquire nor a `NodeResult`). That is the STRUCTURAL reason it does
+not repeat the reverted `generateDataSource(full)` ALLOC+WRITE over-harvest — that
+path fed a fresh pool/arena buffer AND got harvested; a `constFill` slot is
+neither. `generateDataSource` emits it for `full` with a finite host `fillValue`;
+gated `coverConstFill` (recurring templates only, reach≥2) so transient warmup
+plans stay lowered. **Measured:** census `data-source:full` GONE on both training
+workloads (`covered-and-compiled` 3→6); `t-stream-generate` PASS (0 diverged, the
+constFill segments verify byte-identical against the recording); `test:gates`
+6/6; `parity-fullstack-tl` compiled-vs-lowered **1.05e-5 / 30 steps** (noise
+floor). The primitive is SOUND.
+
+### Why (b) alone still trips the NON-NEGOTIABLE ledger (the +9)
+`t-ledger-attack-probe` (default STEPS=24): a deterministic **one-time step
+426→435 at ~step 13** (reachDrift=totalDrift=9 > tol 8), then perfectly flat
+through step 47. At STEPS=30/48 the settle falls OUTSIDE the `[STEPS/2..]` late
+window and the probe **PASSES** — proving it is a one-time template settle, NOT a
+monotone leak. But 24-step 0/0 is non-negotiable, and totalDrift=9 means **9
+genuinely-NEW persistent storages** appear and stay (livediff s12→s14: net-+9
+inside a 248-storage convergence-rebuild churn of param/grad views).
+
+Root cause: covering (b) makes plan-(b) COMPILE, so its `clipCoef` output is now
+a HARVESTED compiled registry result held across steps — and the still-lowered
+plan-(a) row-program consumes `clipCoef` via a materialized ref, keeping the whole
+clip chain alive as compiled results. On the pre-(b) tree plan-(b) ran lowered and
+`clipCoef` was freed each step by actual-refcount pruning. **The +9 is exactly the
+un-drained cross-plan `clipCoef` hold.** It drains only when plan-(a) ALSO compiles
+and claims `clipCoef` as a stage-3-B released-external (the last-reader overlay
+release) — i.e., only when (a) closes. Closing (b) without (a) is provably a
+half-primitive that regresses the ledger; reverted (ledger back to 0/0, verified).
+
+### Why (a) can't close: the missing cross-seam rebind (confirmed absent)
+Covering (a) means emitting the fused row-program binding `clipCoef` as an
+external slot. At compiled-plan replay `executeCompiledPlan` populates an
+`external` slot by `getInputStorage(ref)` → `gpuBuffer(...)`, and for a
+MATERIALIZED ref that returns the FROZEN record-time `ref.storage`
+(`compiled-plan.ts:1368-1385`, `op-dispatch.ts:146-197`) — which for `clipCoef`
+is a swept per-step temp (stale bytes / `[lifetime]` throw). **Verified (targeted
+audit): compiled-plan replay has ZERO stamp→live-registry-entry rebind for
+materialized cross-plan externals.** The only replay-time rebind of a materialized
+ref to its owner's CURRENT storage is the step-TAPE path (`sk.rebinds`,
+`step-tape-replay.ts:852-920`) — and even there it is OWNER-based and SCALAR-scoped
+(`numel>1 → continue`), not a stamp/registry resolution. The stamp/`resultEntryFor`/
+`plannerRegistry` machinery that DOES touch compiled externals runs at BUILD time
+and does the inverse (marks a producer entry overlay-releasable, `executor.ts:2089-2122`)
+or poisons overlaid storages at replay (`compiled-plan.ts:2029-2047`). So closing
+(a) requires BUILDING a new compiled-replay rebind: resolve the row-program's 0-d
+materialized external via its stamp to plan-(b)'s live `clipCoef` registry-entry
+buffer each replay (which ALSO requires plan-(b)'s `clipCoef` to be stamped — a
+consequence of (b) compiling, so the two are mutually enabling). Silent-corruption
+stakes (a frozen or mis-resolved clip coefficient trains with the wrong gradient
+scale); no clean seam exists yet.
+
+### Deletion-readiness RE-VERDICT (2026-07-12): still NOT READY — but the primitive is now half-specified
+The census (before == after on the reverted tree) still shows the same two
+recurring TRAINING bails; `constFill` is proven to close (b)'s COVERAGE but is
+inseparable from (a) at the ledger. **NOT DELETABLE.** The remaining work is now
+precisely scoped as ONE two-part mechanism on the clip value chain:
+1. **`constFill`** (constant half — this pass, ready to re-land) delivers
+   `full([], 1.0)` into a plan-owned fixed slot with no over-harvest. Correct in
+   isolation.
+2. **compiled-replay stamp-rebind** (GPU-value half — NOT built) resolves the
+   row-program's 0-d materialized external to plan-(b)'s live `clipCoef` entry
+   each replay (the `sk.rebinds` idea lifted from step-tape into `executeCompiledPlan`,
+   generalized past scalars, keyed on the stamp/registry instead of the owner).
+   This is the piece that (i) covers (a) and (ii) DRAINS (b)'s +9 by letting
+   plan-(a) claim `clipCoef` as a released-external. Both land together or neither
+   passes the ledger.
+
+**Deletion-pass spec (unchanged, restated precisely for when both halves land):**
+once the census shows zero recurring TRAINING bails AND `t-ledger-attack-probe` is
+0/0 with both halves, the deletion removes: the recorded-build harvest (A4's
+`record*` refs + the params-sequence cache + `buildCompiledPlan` + the
+`TORCHLETTE_BUILD_FROM_IR=0` opt-out, ~800 SLOC); the census surface
+(`TORCHLETTE_COVERAGE_CENSUS` + `dumpCoverageCensus`/`resetCoverageCensus` +
+`tools/t-coverage-census.ts`, tied to the recorded build at `executor.ts:568`);
+and re-bases the verify gates that pin `BUILD_FROM_IR=0` as their reference
+(`compiled-plan-parity.spec.ts` determinism gate) onto the generated build.
+Residue (c) (decode `fused[no-storage]` + `op:max`) stays acceptable-by-design
+(inference-only, `api.noGrad`); residue (d) (config-missing transients) stays
+record-free already. Neither blocks the TRAINING-path sunset.
+
