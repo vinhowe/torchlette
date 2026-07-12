@@ -32,12 +32,6 @@
 
 import { describe, expect, it } from "vitest";
 import type { AttnModifierSpec } from "../../src/backend/types";
-import {
-  makeBackwardDKVSpec,
-  makeBackwardDQSpec,
-  makeDPrecomputeSpec,
-  makeForwardAttentionSpec,
-} from "../../src/backend/webgpu/attention-kernel";
 import { rowProgramToSpec } from "../../src/backend/webgpu/row-program-codegen";
 import { compileTileKernel } from "../../src/backend/webgpu/tile-compiler";
 import {
@@ -47,6 +41,7 @@ import {
   attentionCacheKey,
   D_PRECOMPUTE_OBLIGATION,
   deriveAttentionSkeleton,
+  generateAttentionShaderTileIR,
   naiveAttentionBackwardComposition,
   naiveAttentionComposition,
   onlineSoftmaxLemma,
@@ -95,17 +90,14 @@ const counts = {
   naive: 0,
 };
 
-function liveSpec(role: AttentionKernelRole, mod?: AttnModifierSpec) {
-  switch (role) {
-    case "forward":
-      return makeForwardAttentionSpec(D, mod);
-    case "dPrecompute":
-      return makeDPrecomputeSpec(D);
-    case "backwardDQ":
-      return makeBackwardDQSpec(D, mod);
-    case "backwardDKV":
-      return makeBackwardDKVSpec(D, mod);
-  }
+// The LIVE path IS the schedule chokepoint now (the cutover-flip): the dispatch
+// sites in attention-kernel.ts route their spec factories through
+// `realizeAttentionSpec` / `generateAttentionShaderTileIR`. The differential
+// compiles the schedule-lowered WGSL twice — once via `applyAttentionSchedule`
+// directly (derived), once via the live realize chokepoint — asserting they
+// agree byte-for-byte (determinism + seam exercise across the modifier corpus).
+function liveWgsl(role: AttentionKernelRole, mod?: AttnModifierSpec): string {
+  return generateAttentionShaderTileIR(role, D, mod);
 }
 
 describe("P0 attention walking-skeleton byte differential (authored / opaque)", () => {
@@ -117,7 +109,7 @@ describe("P0 attention walking-skeleton byte differential (authored / opaque)", 
         headDim: D,
         modifier: c.mod,
       };
-      const live = compileTileKernel(liveSpec("forward", c.mod));
+      const live = liveWgsl("forward", c.mod);
       const skeleton = deriveAttentionSkeleton(desc);
       const derived = compileTileKernel(applyAttentionSchedule(skeleton, desc));
       expect(derived).toBe(live);
@@ -128,7 +120,7 @@ describe("P0 attention walking-skeleton byte differential (authored / opaque)", 
   // ---- D-PRECOMPUTE: one template for all mods (no score/mask seam sites) ----
   it("D-precompute (one template, mod-invariant)", () => {
     const desc: AttentionDescriptor = { role: "dPrecompute", headDim: D };
-    const live = compileTileKernel(liveSpec("dPrecompute"));
+    const live = liveWgsl("dPrecompute");
     const skeleton = deriveAttentionSkeleton(desc);
     const derived = compileTileKernel(applyAttentionSchedule(skeleton, desc));
     expect(derived).toBe(live);
@@ -144,7 +136,7 @@ describe("P0 attention walking-skeleton byte differential (authored / opaque)", 
         headDim: D,
         modifier: c.mod,
       };
-      const live = compileTileKernel(liveSpec("backwardDQ", c.mod));
+      const live = liveWgsl("backwardDQ", c.mod);
       const skeleton = deriveAttentionSkeleton(desc);
       const derived = compileTileKernel(applyAttentionSchedule(skeleton, desc));
       expect(derived).toBe(live);
@@ -156,7 +148,7 @@ describe("P0 attention walking-skeleton byte differential (authored / opaque)", 
         headDim: D,
         modifier: c.mod,
       };
-      const live = compileTileKernel(liveSpec("backwardDKV", c.mod));
+      const live = liveWgsl("backwardDKV", c.mod);
       const skeleton = deriveAttentionSkeleton(desc);
       const derived = compileTileKernel(applyAttentionSchedule(skeleton, desc));
       expect(derived).toBe(live);
@@ -196,8 +188,10 @@ describe("P0 attention authored-form legality (§6 / F3 / R10)", () => {
       const sk = deriveAttentionSkeleton({ role, headDim: D });
       expect(sk.visibility).toBe("opaque");
       if (sk.visibility === "opaque") {
-        expect(sk.kernelRef).toContain("attention-kernel.ts");
-        expect(sk.refusalReason).toContain("DERIVED-MODULO-CUTOVER");
+        // Post-cutover-flip: the body was ABSORBED into the schedule module, so
+        // the kernelRef names the schedule-owned lowering (single source).
+        expect(sk.kernelRef).toContain("attention-skeleton.ts");
+        expect(sk.refusalReason).toContain("LIVE-PATH FLIPPED");
         // F3: an opaque skeleton has NO loop/staging/role field to leak.
         expect(sk).not.toHaveProperty("schedule");
       }
@@ -381,7 +375,7 @@ describe("P4 attention BACKWARD derivation (dV/dP/dS/dQ/dK → authored dQ/dKV/D
       "backwardDKV",
     ] as AttentionKernelRole[]) {
       const desc: AttentionDescriptor = { role, headDim: D };
-      const live = compileTileKernel(liveSpec(role));
+      const live = liveWgsl(role);
       const derived = compileTileKernel(
         applyAttentionSchedule(deriveAttentionSkeleton(desc), desc),
       );

@@ -38,11 +38,7 @@ import {
   RECOMPUTE_P_OBLIGATION,
 } from "../src/schedule/attention-skeleton";
 import { compileTileKernel } from "../src/backend/webgpu/tile-compiler";
-import {
-  makeBackwardDKVSpec,
-  makeBackwardDQSpec,
-  makeDPrecomputeSpec,
-} from "../src/backend/webgpu/attention-kernel";
+import { generateAttentionShaderTileIR } from "../src/schedule/attention-skeleton";
 import {
   applyTiledMatmulSchedule,
   generateTiledMatmulShaderTileIR,
@@ -154,13 +150,9 @@ function runDerivation(): void {
   console.log("\n  6/7: the derived backward reaches the AUTHORED dQ/dKV/D kernels (byte-identical)");
   for (const role of ["dPrecompute", "backwardDQ", "backwardDKV"] as const) {
     const desc: AttentionDescriptor = { role, headDim: D };
-    const live = compileTileKernel(
-      role === "dPrecompute"
-        ? makeDPrecomputeSpec(D)
-        : role === "backwardDQ"
-          ? makeBackwardDQSpec(D)
-          : makeBackwardDKVSpec(D),
-    );
+    // The AUTHORED kernel body now LOWERS FROM the schedule (the cutover-flip);
+    // the live realize chokepoint IS the schedule path.
+    const live = generateAttentionShaderTileIR(role, D);
     const derived = compileTileKernel(
       applyAttentionSchedule(deriveAttentionSkeleton(desc), desc),
     );
