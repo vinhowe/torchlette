@@ -32,6 +32,7 @@ const GPU_TEST_FILES = [
   "test/scope-surface.spec.ts",
   "test/scope-training.spec.ts",
   "test/second-run-determinism.spec.ts",
+  "test/stale-external-rebind.spec.ts",
   "test/static-kv-harvest-lifetime.spec.ts",
   "test/optim/fused-vs-elementwise.spec.ts",
   "test/optim/adam-multigroup.spec.ts",

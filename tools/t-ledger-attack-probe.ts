@@ -174,6 +174,31 @@ async function main() {
 
     const st = storageTracker.stats();
     traj.push({ step, total: st.totalStorages, reachable: st.reachableStorages, loss: lossVal });
+    // TEMP livediff (task #96 residual attribution; env-gated):
+    if (process.env.TORCHLETTE_LIVEDIFF === "1") {
+      type LiveEntry = { id: number; shape: readonly number[]; dtype: string; view: boolean; base?: number };
+      const g = globalThis as Record<string, unknown>;
+      if (step === 8) g.__live8 = storageTracker.debugLiveSet();
+      if (step === STEPS - 2 && g.__live8) {
+        const a = g.__live8 as LiveEntry[];
+        const b = storageTracker.debugLiveSet();
+        const aIds = new Set(a.map((x) => x.id));
+        const bIds = new Set(b.map((x) => x.id));
+        const added = b.filter((x) => !aIds.has(x.id));
+        const removed = a.filter((x) => !bIds.has(x.id));
+        log(`LIVEDIFF s8->s${step}: +${added.length} -${removed.length} (net ${b.length - a.length})`);
+        const hist = (xs: LiveEntry[]) => {
+          const m = new Map<string, number>();
+          for (const x of xs) {
+            const k = `[${x.shape.join(",")}] ${x.dtype}${x.view ? " view" : ""}`;
+            m.set(k, (m.get(k) ?? 0) + 1);
+          }
+          return [...m.entries()].sort((p, q) => q[1] - p[1]);
+        };
+        for (const [k, v] of hist(added).slice(0, 30)) log(`  LIVEDIFF + ${v}x ${k}`);
+        for (const [k, v] of hist(removed).slice(0, 10)) log(`  LIVEDIFF - ${v}x ${k}`);
+      }
+    }
     if (step < 4 || step % 4 === 0 || step === STEPS - 1) {
       log(
         `step ${step}: loss=${lossVal.toFixed(6)} total=${st.totalStorages} ` +
