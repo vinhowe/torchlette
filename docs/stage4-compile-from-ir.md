@@ -2893,3 +2893,79 @@ A resolution requires NET-NEW code, so it is reported, not built:
 **VERDICT: the recorded build is NOT deletable until observed-liveness
 stage-3 B is made sound without the compiled-only `guardMiss` fallback (option
 1/2) or is retired (option 3). Stages (b)+(c) landed; (a) reverted clean.**
+
+## Task #97 — LIVENESS UNIFICATION: the derived oracle at the overlay-release seam (2026-07-14)
+
+This resolves the #43(a) blocker by **option 2 done as DERIVATION** (the campaign
+ruling, the third application of the maneuver that gave #70 derived ownership and
+the planner replacing pin-the-recorded-buffers): the cross-plan liveness stage-3 B
+was GUESSING becomes a single-source DERIVED fact that governs the overlay-release
+on all paths, so the recorded build's compiled-only `guardMiss` net is no longer
+load-bearing for soundness.
+
+### Stage-1 interview — DESIGN-OR-BUG verdict: analytically WRONG (not aggressive-by-design)
+
+The overlay-release (`_claimedExternal` → a producer's registry entry handed to a
+consumer's temps, `releasedOverlay` set) is decided at the claim seam
+(`executor.ts` ~1967) by `releasableLastReader` — the EMPIRICAL last-reader
+observation. That observation is fed by `observeConsumed`, which is called at
+**exactly one site**: the compiled external-slot bind (`compiled-plan.ts` ~1435).
+Every other cross-plan read — a consumer running LOWERED, a persistent-slot bind
+(`debugCrossPlanPersistentBindings`), a view resolved inline — is **structurally
+invisible** to it. So "template C has been the SAME stable last reader for K steps"
+can be TRUE while a *different* consumer also reads the producer every step. The
+canonical invisible consumer is the **BACKWARD pass re-reading a saved-for-backward
+forward activation**, resolved lowered through `getInputStorage`. The overlay
+clobbers the activation after the forward consumer's read; backward then reads
+garbage. This is analytical unsoundness — the observation is INCOMPLETE, not
+merely aggressive.
+
+**Planner-scope answer:** the memory planner is PER-PLAN and analytical only for
+*intra-plan* liveness; the *cross-plan* consumption fact it needs
+(`externalReleases`) is FED to it, derived from `releasableLastReader`. So the
+planner does not independently know cross-plan liveness — it trusts observed-
+liveness. Derivation at the lowered seam is nonetheless feasible: the value read
+again in backward is exactly a **graph-retained** (saved-for-backward) value, and
+graph retention (`G(s)>0`, the `_graphRetained` retention clone minted DURING
+forward by `saveForBackward`/`_cloneForRetention`) is a single-source fact live in
+the storage tracker AT CLAIM TIME.
+
+**Baseline guardMiss counts (the measurable symptom):** on the DEFAULT recorded
+build, `t-ledger-attack-probe` (STEPS=24) and `t-compiled-parity-probe` (STEPS=20)
+report `cleanMisses=0, claimMisses=0` — the guardMiss net is NOT exercised at
+baseline; the over-prune is MASKED because the second consumer also compiles and
+its recorded replay reads a still-correct buffer. The symptom only MANIFESTS when
+the recorded build is deleted (the harvest-deletion diff): the second consumer
+falls to lowered → `[lifetime] reading step-globally RELEASED storage (stage-3 B)`
+throws deterministically on both probes (shapes `[4,128,128]` / `[2,32,64]`). The
+throwing storage is, in every case, exactly the one that is `graphHeldAt=true` at
+claim time; the safe claims (grads after the optimizer, casts after their sole
+read) are `graphHeldAt=false`.
+
+### Stage-2 — the derived oracle
+
+`storageTracker.graphHeldAt(storageId)` (a first-class derived query in the same
+single-source form as `viewBaseIsLive` / `_derived`'s `graphHeld` axis): true iff
+∃ a live `_graphRetained` owner (G(s)>0), or the flattened view-base chain reaches
+one (backward reads the base through the view). Gen-INDEPENDENT, matching
+`_derived`. The claim seam gains ONE gate: **`if (graphHeldAt(storage.id))
+continue`** — a saved-for-backward producer is never overlay-released.
+
+**Why it cannot over- OR under-prune (the memory argument = the UAF argument):**
+- *No under-protection (soundness):* a graph-held value has a GUARANTEED future
+  backward reader (the retention clone is live precisely until `cleanupAutogradGraph`
+  after backward). Declining its overlay makes the over-prune UNCONSTRUCTIBLE, so
+  the lowered `getInputStorage` `releasedOverlay` throw can no longer fire on it and
+  the compiled-only guardMiss net stops being load-bearing.
+- *No over-protection (memory):* a graph-held value is LIVE until backward reads it
+  REGARDLESS of the overlay — the retention clone keeps its rc>0. Overlaying it was
+  therefore never a real memory win. Declining the claim frees nothing that was
+  actually reclaimable. The genuinely-boundary-dead values (`graphHeldAt=false`)
+  still claim and overlay, so the +34%-over-harvest reduction is preserved. A/B
+  profile (distil@512, same tree/device, pre-vs-post) is BYTE-IDENTICAL: peak
+  5397 MB, current 5233 MB, 849 live buffers, ~40 ms/step — the derived oracle
+  BEATS the no-pruning scenario at parity, not by accepting a regression.
+
+Gate: `test/derived-liveness-oracle.spec.ts` (the derivation the claim seam relies
+on) + the harvest-deleted parity/gate-2 trajectory (stage 3). guardMiss recovery
+demotes to a should-never-fire loud assertion in stage 4.

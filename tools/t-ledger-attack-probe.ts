@@ -290,6 +290,19 @@ async function main() {
     }),
   );
 
+  // Observed-liveness guardMiss telemetry (task #97 stage-1 baseline symptom):
+  // cleanMisses = RecoverableGuardMiss recoveries at the compiled external-slot
+  // seam (the count the recorded build's guardMiss net was silently absorbing);
+  // claimMisses = misses on a stage-3 B RELEASED pair (a wrong last-reader
+  // observation). Both must fall to ZERO once the lowered seam is governed by
+  // derived liveness rather than the empirical last-reader guess.
+  const { getObservedLivenessStats } = await import(
+    "../src/executor/observed-liveness"
+  );
+  log(
+    `=== OBSERVED-LIVENESS STATS: ${JSON.stringify(getObservedLivenessStats())} ===`,
+  );
+
   await destroyWebGPU();
   process.exit(fail ? 2 : 0);
 }

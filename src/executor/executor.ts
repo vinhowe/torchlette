@@ -1991,6 +1991,24 @@ export async function executeLoweredPlan(
           if (!stamp) continue;
           if (releasableLastReader(stamp.fp, stamp.ni, stamp.oi) !== fp)
             continue;
+          // [task #97] DERIVED cross-plan liveness governs the overlay-release,
+          // not the empirical last-reader alone. The last-reader observation is
+          // fed ONLY by the compiled external-slot seam (observeConsumed); a
+          // consumer that reads the producer LOWERED — the canonical case is the
+          // BACKWARD pass re-reading a saved-for-backward forward activation,
+          // resolved through getInputStorage — is structurally invisible to it,
+          // so a forward consumer can be misclassified "last reader" while
+          // backward still holds a read. graphHeldAt is the single-source derived
+          // fact (∃ live _graphRetained clone / G(s)>0, the same axis _derived
+          // trusts): a saved-for-backward producer WILL be re-read, so its entry
+          // must NOT be overlaid. Declining the claim here is not a memory
+          // regression — a graph-held value is live until backward reads it
+          // REGARDLESS of the overlay, so it was never a real overlay win; the
+          // genuinely-boundary-dead values (grads after the optimizer, casts
+          // after their sole read — graphHeld=false) still claim and overlay.
+          // This makes the over-prune UNCONSTRUCTIBLE, so the recorded build's
+          // compiled-only guardMiss net is no longer load-bearing for soundness.
+          if (storageTracker.graphHeldAt(storage.id)) continue;
           const entry = resultEntryFor(stamp.fp, stamp.ni, stamp.oi);
           if (!entry || !plannerEntryClaimable(entry.entryIdx, entry.gen))
             continue;
@@ -3232,7 +3250,8 @@ export async function executePlanOptimized(
   // path builds webgpu-only directives and crashes at dispatch. AND the request
   // with the backend capability so CPU cleanly takes the sequential path.
   const enableFusion =
-    (options.enableFusion ?? isFusedBackend(backend)) && isFusedBackend(backend);
+    (options.enableFusion ?? isFusedBackend(backend)) &&
+    isFusedBackend(backend);
   const enableVectorization = options.enableVectorization ?? true;
 
   // Fall back to simple sequential execution when fusion is disabled entirely.

@@ -307,6 +307,42 @@ class StorageTracker {
     return { sets: this._ownerSet.size, liveMembers };
   }
 
+  /**
+   * Is this storage GRAPH-HELD — saved for backward (∃ live `_graphRetained`
+   * clone, G(s)>0), or the flattened base of such a graph-held view? (task #97).
+   *
+   * A first-class DERIVED query (the same single-source form as `viewBaseIsLive`
+   * / `_derived`'s `graphHeld` axis), consumed by the stage-3 B overlay-release
+   * claim seam: a producer whose value is saved for backward WILL be re-read by
+   * the backward pass, so its registry entry MUST NOT be overlaid by an earlier
+   * consumer's temps — no matter what the empirical last-reader observation
+   * concluded (the observation is blind to the backward read, which resolves
+   * lowered through getInputStorage). Gen-INDEPENDENT (a retention clone minted
+   * during backward is still a live graph hold), matching `_derived`.
+   */
+  graphHeldAt(storageId: number): boolean {
+    for (const w of this._liveOwners(storageId)) {
+      if ((w as { _graphRetained?: boolean })._graphRetained === true) {
+        return true;
+      }
+    }
+    // A saved-for-backward VIEW retains its base; the base's value is read
+    // through the view in backward. Flatten to the root and check it too.
+    const sh = this.allStorages.get(storageId);
+    let baseId = sh?.baseStorageId;
+    const seen = new Set<number>();
+    while (baseId !== undefined && !seen.has(baseId)) {
+      seen.add(baseId);
+      for (const w of this._liveOwners(baseId)) {
+        if ((w as { _graphRetained?: boolean })._graphRetained === true) {
+          return true;
+        }
+      }
+      baseId = this.allStorages.get(baseId)?.baseStorageId;
+    }
+    return false;
+  }
+
   /** Stamp a tensor OBJECT's generation at CONSTRUCTION (called from the
    *  Tensor ctor). Ties the persistent-vs-next-step classification to when
    *  the object was born rather than when its storage first materialized —
