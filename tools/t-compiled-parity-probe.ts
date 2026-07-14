@@ -115,16 +115,6 @@ async function main() {
   }
   void paddedVocab;
   console.log(JSON.stringify({ losses }));
-  // Coverage census dump (task #96 stale-external gate): under
-  // TORCHLETTE_COVERAGE_CENSUS=1 the census records which plan classes bailed
-  // out of build-from-IR. The clip-chain gate asserts the two TRAINING bail
-  // classes (data-source:full, row-program[scalar-steptemp-input]) are gone —
-  // i.e. the clipCoef row-program actually COMPILED, so the trajectory parity
-  // above crossed the fused path, not the bail's lowered fallback.
-  if (process.env.TORCHLETTE_COVERAGE_CENSUS === "1") {
-    const { dumpCoverageCensus } = await import("../src/executor/executor.ts");
-    console.log(dumpCoverageCensus());
-  }
   try {
     destroyWebGPU();
   } catch {

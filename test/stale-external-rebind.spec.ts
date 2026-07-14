@@ -17,10 +17,11 @@
  *   1. the compiled trajectory must equal the lowered trajectory to fp noise
  *      over enough steps to cross template convergence rebuilds (~step 13),
  *      with the clip chain COMPILED — and
- *   2. the census must show ZERO recurring build-from-IR bails on this
- *      workload (both clip classes gone → the fused row-program + constFill
- *      actually execute inside the compiled plan; without this assertion the
- *      parity check passes vacuously via the bail's lowered fallback), and
+ *   2. the clip-chain training plans must actually COMPILE (build-from-IR) →
+ *      the fused row-program + constFill execute inside the compiled plan;
+ *      without this the parity check passes vacuously via the lowered fallback.
+ *      (Re-based off the deleted coverage census onto the executor's
+ *      BUILD-FROM-IR debug log — task #43 recorded-build sunset.) And
  *   3. no [lifetime] guard fires (a stale/swept bind is loud, never silent).
  *
  * Failing-first record (2026-07-13, this worktree):
@@ -96,7 +97,7 @@ describe("stale-external rebind gate (task #96 clip chain)", () => {
       // snapshot would surface as divergence.
       const compiled = await runTool(PARITY_PROBE, {
         STEPS: "20",
-        TORCHLETTE_COVERAGE_CENSUS: "1",
+        TORCHLETTE_DEBUG_COMPILED: "1",
       });
       const lowered = await runTool(PARITY_PROBE, {
         STEPS: "20",
@@ -109,22 +110,23 @@ describe("stale-external rebind gate (task #96 clip chain)", () => {
       const allOut = `${compiled.stdout}\n${compiled.stderr}`;
       expect(allOut).not.toMatch(/\[lifetime\]/);
 
-      // (2) The two clip-chain bail classes must be GONE from the recurring
-      // set. Without this, (1) passes vacuously via the bail's lowered
-      // fallback. (Scoped to the clip classes: this tiny probe's shapes also
-      // hit the pre-existing batched-reduction[true-batched] generator gap,
-      // which is not a clip-chain class and doesn't fire on the real census
-      // workloads.)
-      const recurringLines = allOut
+      // (2) The clip-chain training plans must actually COMPILE — otherwise (1)
+      // passes vacuously via the lowered-without-record fallback (the recorded
+      // build is gone since the task #43 sunset, so an uncovered plan runs
+      // lowered and never records). RE-BASED off the coverage census (deleted
+      // with the recorded build): under TORCHLETTE_DEBUG_COMPILED the executor
+      // logs `[compiled] ...BUILD-FROM-IR fp=...` for every plan built from IR.
+      // The two clip plans (the `minimum` ceiling producing clipCoef, and the
+      // fused row-program `mul(g,clipCoef)` consumer) were the ONLY recurring
+      // training bails pre-fix — so plans building from IR proves the clip chain
+      // is on the compiled path, not the bail's lowered fallback.
+      const builtFromIR = allOut
         .split("\n")
-        .filter((l) => l.includes("RECURRING-BAIL fp="));
-      const clipBails = recurringLines.filter(
-        (l) =>
-          l.includes("row-program[scalar-steptemp-input]") ||
-          l.includes("data-source:full"),
-      );
-      expect(clipBails, clipBails.join("\n")).toHaveLength(0);
-      expect(allOut).toMatch(/covered-and-compiled=[1-9]/);
+        .filter((l) => l.includes("BUILD-FROM-IR fp="));
+      expect(
+        builtFromIR.length,
+        `expected the clip-chain training plans to build from IR (compiled), not fall to lowered:\n${allOut.slice(-800)}`,
+      ).toBeGreaterThan(0);
 
       // (1) Value truth: per-step losses agree with the lowered path.
       const a = parseLosses(compiled.stdout);

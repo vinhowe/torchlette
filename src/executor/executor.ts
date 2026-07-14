@@ -558,123 +558,12 @@ function buildFromIRActive(): boolean {
   );
 }
 
-// [4.4-coverage census] Aggregate bail-class frequency across every plan that
-// was ELIGIBLE for build-from-IR but bailed (fullyCovered=false). Keyed by the
-// generator's uncovered-class label; the value counts distinct plans (by
-// template fingerprint) that hit that class at least once. TORCHLETTE_COVERAGE_CENSUS=1
-// enables the accounting (no-op otherwise); dumpCoverageCensus() prints the
-// table. This is the measured-frequency oracle the 4.4-coverage work is
-// prioritized against (see docs/stage4-compile-from-ir.md § "Task #43
-// 4.4-COVERAGE"). SUNSET: the flag + this accounting die with the recorded-build
-// sunset — once every recurring plan covers, the census has nothing to report.
-const coverageCensus = {
-  classToPlans: new Map<string, Set<number>>(),
-  totalEligible: new Set<number>(),
-  totalBailed: new Set<number>(),
-  // fp → number of times it reached the build-from-IR block (recurrence).
-  fpReaches: new Map<number, number>(),
-  // fp → node count (for identifying steady-state plans).
-  fpNodes: new Map<number, number>(),
-  // fp → its most recent uncovered class set (empty ⇒ covered on last reach).
-  fpLastUncovered: new Map<number, string[]>(),
-};
-const censusGateSkips = new Map<string, number>();
-// fp → number of times it reached the build-from-IR block (ALWAYS tracked, not
-// census-gated). Distinguishes recurring templates (reach ≥2 ⇒ recurs, since a
-// covered template caches+replays and never re-enters the block) from one-shot
-// warmup graph variants (reach 1). Gates constFill coverage so a transient
-// plan's `full` never triggers a compile that leaks its plan-owned buffer.
+// fp → number of times it reached the build-from-IR block. Distinguishes
+// recurring templates (reach ≥2 ⇒ recurs, since a covered template
+// caches+replays and never re-enters the block) from one-shot warmup graph
+// variants (reach 1). Gates constFill coverage so a transient plan's `full`
+// never triggers a compile that leaks its plan-owned buffer.
 const buildReaches = new Map<number, number>();
-function recordCoverageCensus(
-  fp: number | undefined,
-  uncovered: Map<string, number>,
-  nodeCount?: number,
-): void {
-  if (ENV.TORCHLETTE_COVERAGE_CENSUS !== "1") return;
-  const key = fp ?? -1;
-  coverageCensus.totalEligible.add(key);
-  coverageCensus.fpReaches.set(
-    key,
-    (coverageCensus.fpReaches.get(key) ?? 0) + 1,
-  );
-  if (nodeCount !== undefined) coverageCensus.fpNodes.set(key, nodeCount);
-  coverageCensus.fpLastUncovered.set(key, [...uncovered.keys()]);
-  if (uncovered.size === 0) return;
-  coverageCensus.totalBailed.add(key);
-  for (const label of uncovered.keys()) {
-    let s = coverageCensus.classToPlans.get(label);
-    if (!s) {
-      s = new Set();
-      coverageCensus.classToPlans.set(label, s);
-    }
-    s.add(key);
-  }
-}
-export function dumpCoverageCensus(): string {
-  const lines: string[] = [];
-  lines.push(
-    `[coverage-census] eligible plans=${coverageCensus.totalEligible.size} bailed=${coverageCensus.totalBailed.size} fullyCovered=${coverageCensus.totalEligible.size - coverageCensus.totalBailed.size}`,
-  );
-  const rows = [...coverageCensus.classToPlans.entries()].sort(
-    (a, b) => b[1].size - a[1].size,
-  );
-  for (const [label, plans] of rows) {
-    lines.push(`  ${plans.size}\t${label}`);
-  }
-  if (rows.length === 0) lines.push("  (no bail classes — all plans covered)");
-  // A COVERED plan reaches the block exactly ONCE (build succeeds, sets
-  // compiledPlan, then replays without re-entering). A BAILING plan re-enters
-  // the block on EVERY execution (never compiles). So reach-count ≥3 = a
-  // recurring (per-step) plan that keeps bailing — a REAL 4.4-coverage gap;
-  // reach-count 1-2 = a transient warmup plan (running it lowered is fine).
-  const recurringBailed: Array<{
-    fp: number;
-    nodes: number;
-    reaches: number;
-    cls: string[];
-  }> = [];
-  let coveredOnce = 0;
-  for (const [fp, reaches] of coverageCensus.fpReaches) {
-    const cls = coverageCensus.fpLastUncovered.get(fp) ?? [];
-    if (cls.length === 0) {
-      coveredOnce++;
-      continue;
-    }
-    if (reaches >= 3)
-      recurringBailed.push({
-        fp,
-        nodes: coverageCensus.fpNodes.get(fp) ?? 0,
-        reaches,
-        cls,
-      });
-  }
-  lines.push(
-    `  --- covered-and-compiled=${coveredOnce}  RECURRING-BAIL (reached ≥3×, keeps bailing)=${recurringBailed.length} ---`,
-  );
-  for (const rb of recurringBailed.sort((a, b) => b.nodes - a.nodes))
-    lines.push(
-      `  RECURRING-BAIL fp=0x${rb.fp.toString(16)} nodes=${rb.nodes} reaches=${rb.reaches}: ${rb.cls.join(", ")}`,
-    );
-  if (censusGateSkips.size > 0) {
-    lines.push("  --- ineligible (never reached build-from-IR) ---");
-    for (const [r, c] of [...censusGateSkips.entries()].sort(
-      (a, b) => b[1] - a[1],
-    ))
-      lines.push(`  ${c}\tGATE:${r}`);
-  }
-  const out = lines.join("\n");
-  console.log(out);
-  return out;
-}
-export function resetCoverageCensus(): void {
-  coverageCensus.classToPlans.clear();
-  coverageCensus.totalEligible.clear();
-  coverageCensus.totalBailed.clear();
-  coverageCensus.fpReaches.clear();
-  coverageCensus.fpNodes.clear();
-  coverageCensus.fpLastUncovered.clear();
-  censusGateSkips.clear();
-}
 
 // [observed-liveness] The module observes cross-plan liveness only when
 // build-from-IR is active (the over-harvest it fixes exists only there). Set
@@ -1989,28 +1878,6 @@ export async function executeLoweredPlan(
   // the lowered path with zero residue — so opt-out behaviour and the fallback
   // are byte-identical to the unmodified normal path, and an uncovered plan
   // simply records on its next execution (the census-driven fallback).
-  if (ENV.TORCHLETTE_COVERAGE_CENSUS === "1" && !loweredPlan.compiledPlan) {
-    const reasons: string[] = [];
-    if (options.forceLowered) reasons.push("forceLowered");
-    if (scalarAdaptPending) reasons.push("scalarAdaptPending");
-    if (!buildFromIRActive()) reasons.push("!buildFromIRActive");
-    if (backend.name !== "webgpu") reasons.push("!webgpu");
-    if (!useTopLevelSharedEncoder) reasons.push("!topLevelSharedEncoder");
-    if (!options.bufferArena) reasons.push("!bufferArena");
-    if (!(!arenaLivenessEnabled() || compiledPlannedEnabled()))
-      reasons.push("!plannedEnabled");
-    if (options.templateFp === undefined) reasons.push("noFp");
-    if (reasons.length > 0)
-      censusGateSkips.set(
-        reasons.join("+"),
-        (censusGateSkips.get(reasons.join("+")) ?? 0) + 1,
-      );
-    else
-      censusGateSkips.set(
-        "ELIGIBLE-reached-block",
-        (censusGateSkips.get("ELIGIBLE-reached-block") ?? 0) + 1,
-      );
-  }
   if (
     !options.forceLowered &&
     !scalarAdaptPending &&
@@ -2049,11 +1916,6 @@ export async function executeLoweredPlan(
       // asserts the stamp at every replay.
       fuseStampedScalarExternals: true,
     });
-    recordCoverageCensus(
-      options.templateFp,
-      gen?.uncovered ?? new Map(),
-      planNodes.length,
-    );
     if (gen?.fullyCovered) {
       // [observed-liveness] The conservative full action-output harvest is the
       // safe default (see the proof above); once observation has converged a
