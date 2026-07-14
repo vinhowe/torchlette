@@ -2814,3 +2814,82 @@ tied to `executor.ts`); re-base the verify gates that pin `BUILD_FROM_IR=0`
 (`compiled-plan-parity.spec.ts` determinism gate) onto the generated build.
 Residues (c)/(d) unchanged and non-blocking. The deletion was NOT performed in
 this pass (out of scope by design).
+
+## Task #43 recorded-build DELETION PASS (2026-07-14): (b)+(c) LANDED, (a) BLOCKED by an observed-liveness coupling
+
+The authorized deletion pass ran the three staged commits. **Two landed green
+and stay; the third (the harvest itself) is BLOCKED by a newly-surfaced
+correctness coupling — the recorded build is load-bearing for
+observed-liveness (stage-3 B) correctness on cross-plan consumers that run
+lowered.** No harvest deletion was forced (campaign STOP rule).
+
+### LANDED (green, committed)
+- **(c) verify-gate re-basing** (`task #43 (c)`): the determinism gate
+  (`t-stream-determinism.ts` + its `compiled-plan-parity.spec.ts` arm) is
+  re-based off `BUILD_FROM_IR=0` onto the GENERATED build under the default
+  flag state (build a template from IR twice, diff the LABEL-MATCHED
+  intersection of compiled streams — build-from-IR coverage is per-plan gated
+  so the SET can differ; determinism = every plan compiled on both passes is
+  byte-identical). The observed-liveness gate-2 reference (`BUILD_FROM_IR=0`
+  recorded cutover) is re-based onto the LOWERED reference
+  (`TORCHLETTE_COMPILED_PLAN=0`). Both verified green WITH the recorded build
+  still present (sound re-base, not deletion-forced).
+- **(b) census sunset** (`task #43 (b)`): deleted `coverageCensus`,
+  `recordCoverageCensus`, `dumpCoverageCensus`/`resetCoverageCensus`, the
+  census-skip instrumentation, and `tools/t-coverage-census.ts`; retired the
+  `TORCHLETTE_COVERAGE_CENSUS` flag (envFlags 69→68). KEPT `buildReaches`
+  (drives `coverConstFill`, NOT census-gated). The task #96 gate
+  (`stale-external-rebind.spec.ts`) assertion-(2) "clip chain compiled, not
+  vacuous" is re-based off the census onto the executor's existing
+  `[compiled] ...BUILD-FROM-IR fp=...` debug log (TORCHLETTE_DEBUG_COMPILED) —
+  no new mechanism.
+
+### (a) BLOCKED — the harvest deletion is correct but exposes an observed-liveness over-prune
+The recorded-build harvest was fully removed and BUILDS (−~1132 SLOC:
+`buildCompiledPlan`, `startCompilationRecording`/`stop`, all `record*` bodies
++ their call sites, the `if (compilationRecording)` action-loop + finally
+blocks, the `STREAM_GENERATE` verify apparatus, the `BUILD_FROM_IR=0` opt-out
+clause; `recordedCopyBufferToBuffer`'s real `enc.copyBufferToBuffer` preserved;
+`createParamsBuffer`/`releaseParamsBuffer`/`paramsSequenceSet` preserved,
+`if(compiling)` tails stripped). But it FAILS RUNTIME on real training:
+```
+[lifetime] reading step-globally RELEASED storage id=… (shape=[4,128,128]).
+  Its registry entry was overlaid by the last observed reader's temps
+  (stage-3 B); … invisible to observation — report it.
+```
+Deterministic on `t-compiled-parity-probe` (STEPS=20) AND `t-ledger-attack-probe`
+(real GPT-2 trainer). Root-caused:
+- **The over-prune is real and comes from OBSERVED-LIVENESS (stage-3 B), not
+  the harvest deletion per se.** Disabling observed-liveness
+  (`setObservedLivenessEnabled(false)`) makes the deleted tree byte-correct
+  (baseline losses). So the deletion is mechanically clean; it removes a
+  correctness NET.
+- **The recorded build was that net.** `guardMiss` recovery
+  (`RecoverableGuardMiss` → evict + re-collect lowered) exists ONLY at the
+  COMPILED-plan external-slot seam (`compiled-plan.ts` `executeCompiledPlan`,
+  ~line 1416). The LOWERED path's `getInputStorage` (`op-dispatch.ts:161`) has
+  NO such recovery — a `releasedOverlay` materialized read throws hard. At
+  baseline the cross-plan consumer of an over-pruned producer ran via the
+  RECORDED compiled replay → hit `guardMiss` → recovered. Post-deletion that
+  consumer falls to lowered-without-record → reads the overlaid buffer → hard
+  throw. So observed-liveness's stage-3 B pruning is UNSOUND standalone for
+  cross-plan producers whose consumer does not itself compile; the recorded
+  build's `guardMiss` seam silently absorbed it. This coupling was never
+  exercised by prior passes (they measured coverage/ledger, not the deletion's
+  effect on the pruning's fallback).
+
+### What this needs (out of THIS pass's scope — deletions + assertions only)
+A resolution requires NET-NEW code, so it is reported, not built:
+1. extend the `guardMiss` recovery to the lowered `getInputStorage`
+   `releasedOverlay` seam (a second recovery site — mechanism), OR
+2. make observed-liveness stage-3 B not over-prune a cross-plan producer whose
+   consumer may run lowered (convergence/needed-set logic — mechanism), OR
+3. DISABLE observed-liveness pruning when the recorded build is deleted (a
+   DELETION, and its stated rationale — "prune the +34% over-harvest toward
+   the recorded cutover survivor set" — evaporates with the recorded cutover;
+   but it is a real memory regression + a scope-expansion decision for the
+   coordinator, not a recorded-build-deletion sub-task).
+
+**VERDICT: the recorded build is NOT deletable until observed-liveness
+stage-3 B is made sound without the compiled-only `guardMiss` fallback (option
+1/2) or is retired (option 3). Stages (b)+(c) landed; (a) reverted clean.**
