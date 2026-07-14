@@ -374,7 +374,10 @@ export function generateStream(
         // divergence. Instead emit no segment (like an alias view) and let the
         // constFill-aware flat-count check reconcile the delta.
         if (gen.commands.length > 0)
-          segments.push({ nodeIndex: action.nodeIndex, commands: gen.commands });
+          segments.push({
+            nodeIndex: action.nodeIndex,
+            commands: gen.commands,
+          });
         mapNodeResult(node, gen.outSlot, bufferToSlot);
         nodeSlot.set(action.nodeIndex, gen.outSlot);
         coveredActions++;
@@ -1209,7 +1212,9 @@ function generateRowProgram(
     // covered subgraph nodes, but never bind blind).
     const cp = action.inputRefConsumerPositions?.[ri];
     const freshNode = cp && cp.pos >= 0 ? planNodes[cp.pos] : undefined;
-    const ref = freshNode?.inputs[cp!.inputIndex] ?? action.inputRefs[ri];
+    const ref =
+      (cp ? freshNode?.inputs[cp.inputIndex] : undefined) ??
+      action.inputRefs[ri];
     if (ref.kind === "scalar") return "scalar-input";
     // A MATERIALIZED 0-d scalar cross-plan input (clipGradNorm_'s per-step
     // clipCoef feeding the `mul(g, clipCoef)` reduction preamble) is the
@@ -3532,7 +3537,11 @@ function generateDataSource(
       // fillValue is not a finite host number falls through to bail.
       const fillValue = (node.payload as { fillValue?: number } | undefined)
         ?.fillValue;
-      if (!coverConstFill || fillValue === undefined || !Number.isFinite(fillValue))
+      if (
+        !coverConstFill ||
+        fillValue === undefined ||
+        !Number.isFinite(fillValue)
+      )
         return null;
       const slot = slots.length;
       slots.push({ kind: "constFill", elements, fillValue });
