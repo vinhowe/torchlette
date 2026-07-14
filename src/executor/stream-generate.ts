@@ -144,11 +144,31 @@ export function getGeneratedGemvDispatchCount(): number {
  *  2. allocs take fresh slots in action order (recordAlloc lifetime split
  *     always yields a fresh slot for a fresh logical lifetime).
  */
+export interface GenerateStreamOptions {
+  /** When true (RECURRING template, build-reach ≥2) a compile-time-constant
+   *  `full([...], const)` is covered via a plan-owned constFill slot instead
+   *  of bailing. Transient warmup plans (reach 1) pass false so they stay
+   *  lowered (a one-shot plan-owned buffer would sit until idle-retire). */
+  coverConstFill?: boolean;
+  /** When true (the BUILD path), a row-program whose 0-d materialized
+   *  cross-plan input (clipGradNorm_'s clipCoef) is STAMPED emits the fused
+   *  kernel — the external slot resolves the CURRENT step's ref at replay and
+   *  the stamp is asserted at the bind seam. The VERIFY path
+   *  (TORCHLETTE_STREAM_GENERATE=1) passes false: it diffs against a RECORDING
+   *  whose executor took the sequential fallback (mul + sum, two dispatches)
+   *  for exactly this input class, so generating the fused kernel there would
+   *  be a spurious segment DIVERGE, not a bug. */
+  fuseStampedScalarExternals?: boolean;
+}
+
 export function generateStream(
   loweredPlan: LoweredPlan,
   planNodes: LazyIRNode[],
   backend?: import("../backend/types").Backend,
+  opts: GenerateStreamOptions = {},
 ): GeneratedStream {
+  const coverConstFill = opts.coverConstFill ?? false;
+  const fuseStampedScalarExternals = opts.fuseStampedScalarExternals ?? false;
   const commands: GpuCommand[] = [];
   const slots: SlotSource[] = [];
   const uncovered = new Map<string, number>();
@@ -333,7 +353,12 @@ export function generateStream(
         break;
       case "data-source": {
         const node = planNodes[action.nodeIndex];
-        const gen = generateDataSource(node, action.nodeIndex, slots);
+        const gen = generateDataSource(
+          node,
+          action.nodeIndex,
+          slots,
+          coverConstFill,
+        );
         if (!gen) {
           miss(
             `data-source:${node.op}${node.dtype !== "f32" ? `:${node.dtype}` : ""}`,
@@ -341,12 +366,17 @@ export function generateStream(
           phantom(node, action.nodeIndex);
           break;
         }
-        commands.push(...gen);
-        segments.push({ nodeIndex: action.nodeIndex, commands: gen });
-        const dsSlot =
-          gen[0].tag === TAG_ALLOC ? (gen[0] as { slot: Slot }).slot : -1;
-        mapNodeResult(node, dsSlot, bufferToSlot);
-        if (dsSlot >= 0) nodeSlot.set(action.nodeIndex, dsSlot);
+        commands.push(...gen.commands);
+        // A constFill data-source emits NO commands (its buffer is born at
+        // build and populated at replay from the slot source, replacing the
+        // recorded TAG_WRITE). Emitting an empty segment for it would compare
+        // 0 gen commands against the recorded 1 write → a spurious count
+        // divergence. Instead emit no segment (like an alias view) and let the
+        // constFill-aware flat-count check reconcile the delta.
+        if (gen.commands.length > 0)
+          segments.push({ nodeIndex: action.nodeIndex, commands: gen.commands });
+        mapNodeResult(node, gen.outSlot, bufferToSlot);
+        nodeSlot.set(action.nodeIndex, gen.outSlot);
         coveredActions++;
         break;
       }
@@ -579,6 +609,7 @@ export function generateStream(
         const rp = action as {
           program: import("../compiler/row-program-types").RowProgram;
           inputRefs: LazyIRNode["inputs"];
+          inputRefConsumerPositions: Array<{ pos: number; inputIndex: number }>;
           outputNodeIndex: number;
           numRows: number;
           dimSize: number;
@@ -589,6 +620,7 @@ export function generateStream(
           slots,
           resolveRefSlot,
           bufferSlot,
+          fuseStampedScalarExternals,
         );
         if (typeof gen === "string") {
           miss(`row-program[${gen}]`);
@@ -1154,6 +1186,7 @@ function generateRowProgram(
   action: {
     program: import("../compiler/row-program-types").RowProgram;
     inputRefs: LazyIRNode["inputs"];
+    inputRefConsumerPositions: Array<{ pos: number; inputIndex: number }>;
     outputNodeIndex: number;
     numRows: number;
     dimSize: number;
@@ -1162,23 +1195,37 @@ function generateRowProgram(
   slots: SlotSource[],
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+  fuseStampedScalarExternals: boolean,
 ): { commands: GpuCommand[]; outSlot: Slot } | string {
   const inSlots: Slot[] = [];
-  for (const ref of action.inputRefs) {
+  for (let ri = 0; ri < action.inputRefs.length; ri++) {
+    // Resolve the CURRENT step's ref through consumer provenance — never the
+    // action's lowering-time snapshot. The snapshot's materialized refs point
+    // at the DETECTION step's storages (swept temps on template reuse: the
+    // clipGradNorm_ clipCoef class — same frozen storage id on every reach),
+    // while planNodes are re-created fresh every step. Single source: the node
+    // graph. Falls back to the snapshot only when the consumer position is
+    // unavailable (pos -1: consumer outside this plan — should not happen for
+    // covered subgraph nodes, but never bind blind).
+    const cp = action.inputRefConsumerPositions?.[ri];
+    const freshNode = cp && cp.pos >= 0 ? planNodes[cp.pos] : undefined;
+    const ref = freshNode?.inputs[cp!.inputIndex] ?? action.inputRefs[ri];
     if (ref.kind === "scalar") return "scalar-input";
-    // A MATERIALIZED 0-d scalar step-temp input (e.g. the clip/scaler scale
-    // multiplicand feeding a `mul` preamble) is exactly the stale-external
-    // condition executeRowProgram detects (a materialized ref to a per-step
-    // temp): it takes the SEQUENTIAL FALLBACK and runs the covered nodes as
-    // separate dispatches (mul then sum), NOT the fused row-program kernel. If
-    // the generator emitted the fused kernel it would DIVERGE from the recorded
-    // fallback (one dispatch vs two) AND risk freezing the step-varying scalar.
-    // Bail whenever a materialized inputRef is a 0-d scalar — the executor's
-    // own fallback path, mirrored. (Non-scalar materialized inputs are stable
-    // params / prior-plan results the fused kernel handles.)
+    // A MATERIALIZED 0-d scalar cross-plan input (clipGradNorm_'s per-step
+    // clipCoef feeding the `mul(g, clipCoef)` reduction preamble) is the
+    // stale-external class executeRowProgram's sequential fallback exists for.
+    // Task #96: when the FRESH ref's storage is STAMPED — the harvested result
+    // of a prior COMPILED plan, re-harvested into node-visible results every
+    // step — the fused kernel is safe: its external slot resolves the CURRENT
+    // step's ref at every replay, and the bind seam asserts the resolved
+    // storage still carries this stamp identity (compiled-plan.ts). Emit it
+    // (build path only; the verify path mirrors the recorded sequential
+    // fallback). If UNSTAMPED (producer lowered → swept pool temp with no
+    // cross-plan identity), keep bailing.
     if (
       ref.kind === "materialized" &&
-      (ref.storage.backendTensor as WebGPUTensor).shape.length === 0
+      (ref.storage.backendTensor as WebGPUTensor).shape.length === 0 &&
+      (!fuseStampedScalarExternals || !ref.storage.stamp)
     ) {
       return "scalar-steptemp-input";
     }
@@ -3467,27 +3514,56 @@ function generateDataSource(
   node: LazyIRNode,
   nodeIndex: number,
   slots: SlotSource[],
-): GpuCommand[] | null {
+  coverConstFill: boolean,
+): { commands: GpuCommand[]; outSlot: Slot } | null {
   if (node.dtype !== "f32" && node.dtype !== undefined) return null;
-  const bytes = sizeOf(node.shape) * F32_BYTES;
+  const elements = sizeOf(node.shape);
+  const bytes = elements * F32_BYTES;
   switch (node.op) {
+    case "full": {
+      // Compile-time-CONSTANT full([...], const) — the grad-clip `1.0` ceiling
+      // (clipCoef = minimum(., 1.0)), GradScaler no-op scales. Emit a plan-owned
+      // constFill slot: a FIXED buffer born at build, pre-filled with the host
+      // constant, reused byte-identical every replay. NO alloc/write command —
+      // it is neither a pool acquire nor a harvested NodeResult, so it cannot
+      // repeat the reverted generateDataSource(full) ALLOC+WRITE over-harvest.
+      // Only for RECURRING templates (coverConstFill): a transient warmup plan
+      // stays lowered so its one-shot buffer never leaks. A full whose
+      // fillValue is not a finite host number falls through to bail.
+      const fillValue = (node.payload as { fillValue?: number } | undefined)
+        ?.fillValue;
+      if (!coverConstFill || fillValue === undefined || !Number.isFinite(fillValue))
+        return null;
+      const slot = slots.length;
+      slots.push({ kind: "constFill", elements, fillValue });
+      return { commands: [], outSlot: slot };
+    }
     case "tensorFromArray": {
       const slot = slots.length;
       slots.push({ kind: "arena" });
-      return [
-        { tag: TAG_ALLOC, slot, bytes, allocKind: 0, inputSlots: [] },
-        { tag: TAG_WRITE, slot, nodeIndex },
-      ];
+      return {
+        commands: [
+          { tag: TAG_ALLOC, slot, bytes, allocKind: 0, inputSlots: [] },
+          { tag: TAG_WRITE, slot, nodeIndex },
+        ],
+        outSlot: slot,
+      };
     }
-    // NOTE (2026-07-11): full / arange / rand / randn / bernoulli are NOT
-    // generated here. They are pure shape+payload creation ops, but their
-    // TAG_WRITE replay takes the LEGACY executeOpSync path (compiled-plan.ts),
-    // which ALLOCATES A FRESH buffer each replay (designed for one-time weight
-    // loading, not per-step recurring creation). That fresh-per-replay storage
-    // is not planner-managed → a storage-ledger LEAK (rc-ledger drift
-    // reachable+13/total+8 on the clip/scaler trainer; tools/t-ledger-attack-probe.ts).
-    // tensorFromArray is safe (small stable-upload fast path, plan-owned buffer)
-    // and zeros is safe (TAG_CLEAR into the slot). Covering full/rand/etc. needs
+    // NOTE (2026-07-12): `full` IS now generated — as a constFill slot (see the
+    // `full` case above), NOT via the TAG_WRITE legacy path. The reason the old
+    // TAG_WRITE approach leaked is exactly why constFill sidesteps it: the
+    // legacy executeOpSync path ALLOCATES A FRESH buffer each replay (designed
+    // for one-time weight loading, not per-step recurring creation) AND that
+    // storage got harvested — a storage-ledger LEAK (rc drift reachable+13/
+    // total+8 on the clip/scaler trainer; tools/t-ledger-attack-probe.ts). A
+    // constFill slot is a plan-owned FIXED buffer (no fresh alloc) that is NOT
+    // harvested (no NodeResult), so it leaks nothing.
+    //
+    // arange / rand / randn / bernoulli are STILL NOT generated: they are not
+    // compile-time constants (rng state / index ramps) and would need the
+    // TAG_WRITE legacy path to write INTO a planned slot instead of allocating
+    // fresh. tensorFromArray is safe (small stable-upload fast path, plan-owned
+    // buffer) and zeros is safe (TAG_CLEAR into the slot). Covering rand/etc. needs
     // the TAG_WRITE legacy path to write INTO the planned slot instead of
     // allocating fresh — a separate executor change. They stay bailed (lowered).
     case "zeros": {
@@ -3498,11 +3574,14 @@ function generateDataSource(
       // re-uploads zero data the clear already produced — redundant but
       // recorded reality; mirror it (candidate cleanup: skip the write for
       // zeros at the executor seam, which would also shrink replays).
-      return [
-        { tag: TAG_ALLOC, slot, bytes, allocKind: 0, inputSlots: [] },
-        { tag: TAG_CLEAR, slot, bytes: alignBufferSize(bytes) },
-        { tag: TAG_WRITE, slot, nodeIndex },
-      ];
+      return {
+        commands: [
+          { tag: TAG_ALLOC, slot, bytes, allocKind: 0, inputSlots: [] },
+          { tag: TAG_CLEAR, slot, bytes: alignBufferSize(bytes) },
+          { tag: TAG_WRITE, slot, nodeIndex },
+        ],
+        outSlot: slot,
+      };
     }
     default:
       return null;

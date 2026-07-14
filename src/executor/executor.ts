@@ -579,6 +579,12 @@ const coverageCensus = {
   fpLastUncovered: new Map<number, string[]>(),
 };
 const censusGateSkips = new Map<string, number>();
+// fp → number of times it reached the build-from-IR block (ALWAYS tracked, not
+// census-gated). Distinguishes recurring templates (reach ≥2 ⇒ recurs, since a
+// covered template caches+replays and never re-enters the block) from one-shot
+// warmup graph variants (reach 1). Gates constFill coverage so a transient
+// plan's `full` never triggers a compile that leaks its plan-owned buffer.
+const buildReaches = new Map<number, number>();
 function recordCoverageCensus(
   fp: number | undefined,
   uncovered: Map<string, number>,
@@ -2022,7 +2028,27 @@ export async function executeLoweredPlan(
       backend.name,
     );
     let genPlan: CompiledPlan | undefined;
-    const gen = generateStream(loweredPlan, planNodes, backend);
+    // constFill gate: a plan-owned FIXED constant buffer (the grad-clip `1.0`
+    // ceiling) is only emitted for RECURRING templates (build-block reach ≥2).
+    // The build block is re-entered every execution of an uncovered template
+    // (a covered one caches + replays), so reach≥2 ⇒ this template recurs;
+    // covering a `full` on it is safe. A one-shot warmup graph variant
+    // (reach 1) is NOT covered — it would compile once, never recur, and its
+    // constFill buffer would sit until idle-retire. Threaded so transient
+    // plans stay lowered (docs/stage4 CAPTURE PRIMITIVE).
+    let coverConstFill = false;
+    if (options.templateFp !== undefined) {
+      const r = (buildReaches.get(options.templateFp) ?? 0) + 1;
+      buildReaches.set(options.templateFp, r);
+      coverConstFill = r >= 2;
+    }
+    const gen = generateStream(loweredPlan, planNodes, backend, {
+      coverConstFill,
+      // BUILD path: a stamped 0-d cross-plan external may compile into the
+      // fused row-program kernel (the clip chain, residue a) — the bind seam
+      // asserts the stamp at every replay.
+      fuseStampedScalarExternals: true,
+    });
     recordCoverageCensus(
       options.templateFp,
       gen?.uncovered ?? new Map(),
@@ -3155,7 +3181,14 @@ export async function executeLoweredPlan(
       const wantStreamGen = ENV.TORCHLETTE_STREAM_GENERATE === "1";
       const gen =
         wantStreamGen && compiled.valid
-          ? generateStream(loweredPlan, planNodes, backend)
+          ? // VERIFY path: constFill applies (a plan reaching the recording
+            // path recurs), but the fused row-program for stamped scalars does
+            // NOT — the recording being diffed used the sequential fallback
+            // for that input class, so the generator must mirror it.
+            generateStream(loweredPlan, planNodes, backend, {
+              coverConstFill: true,
+              fuseStampedScalarExternals: false,
+            })
           : undefined;
 
       // Phase-2 cross-check (TORCHLETTE_STREAM_GENERATE=1): diff the generated
@@ -3183,10 +3216,20 @@ export async function executeLoweredPlan(
           );
         }
         if (gen.fullyCovered) {
-          const countMatch = gen.commands.length === compiled.commands.length;
+          // Each constFill slot replaces exactly ONE recorded data-source
+          // command (the `full` node's TAG_WRITE): its buffer is pre-filled at
+          // build, so the generated stream is shorter by the constFill count.
+          // Reconcile before comparing so a covered constFill isn't a false
+          // divergence — the VALUE equivalence (pre-fill == write of the same
+          // constant) is gated by parity-fullstack + test:gates, not here.
+          const constFillCount = gen.slots.filter(
+            (s) => s.kind === "constFill",
+          ).length;
+          const countMatch =
+            gen.commands.length + constFillCount === compiled.commands.length;
           if (!countMatch) {
             console.warn(
-              `[stream-gen] DIVERGE flat command count: generated ${gen.commands.length} vs recorded ${compiled.commands.length}`,
+              `[stream-gen] DIVERGE flat command count: generated ${gen.commands.length} (+${constFillCount} constFill) vs recorded ${compiled.commands.length}`,
             );
           }
           // Params/uniform DATA multiset must agree. diffSegmentsAligned

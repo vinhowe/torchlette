@@ -86,6 +86,13 @@ export interface RowProgramMatch {
   outputNodeId: number;
   /** External input refs (for resolving buffers at execution time). */
   inputRefs: LazyRef[];
+  /** CONSUMER provenance per input ref: which subgraph node's input slot the
+   *  ref was captured from. The refs above are a lowering-time SNAPSHOT that
+   *  goes stale on template reuse (a materialized ref's storage is a previous
+   *  step's swept temp — the clipGradNorm_ clipCoef class); the consuming node
+   *  is re-created fresh every step, so the CURRENT ref is
+   *  planNodes[posOf(nodeId)].inputs[inputIndex] — the single source. */
+  inputRefConsumers: Array<{ nodeId: number; inputIndex: number }>;
   /** Reduction dimension (normalized). */
   dim: number;
   /** Number of rows (product of dims before reduction dim in the first reduction's input). */

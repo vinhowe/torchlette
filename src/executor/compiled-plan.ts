@@ -47,7 +47,24 @@ export type SlotSource =
     }
   | { kind: "arena" } // Populated by an alloc command during execution
   | { kind: "write" } // Populated by a write command during execution
-  | { kind: "persistent"; buffer: GPUBuffer }; // Cached/singleton buffer (e.g. attention config)
+  | { kind: "persistent"; buffer: GPUBuffer } // Cached/singleton buffer (e.g. attention config)
+  | {
+      // Compile-time-CONSTANT full([...], const) (the grad-clip `1.0` ceiling,
+      // GradScaler no-op scales). A PLAN-OWNED FIXED buffer, created once at
+      // first replay (like `params`), pre-filled with the constant via
+      // queue.writeBuffer, reused byte-identical every replay, destroyed
+      // fence-gated at teardown. NO alloc/write command is emitted: the buffer
+      // is born at build and sits OUTSIDE the arena AND the harvest ledger
+      // (neither a pool acquire nor a NodeResult) — the STRUCTURAL reason it
+      // does not repeat the reverted generateDataSource(full) ALLOC+WRITE
+      // over-harvest (that path fed a fresh pool/arena buffer AND got
+      // harvested; a constFill slot is neither). See docs/stage4 CAPTURE
+      // PRIMITIVE.
+      kind: "constFill";
+      elements: number;
+      fillValue: number;
+      cachedBuffer?: GPUBuffer;
+    };
 
 // ============================================================================
 // GPU commands
@@ -225,6 +242,11 @@ export interface CompiledPlan {
    *  Released at the start of the next harvest so view-base retains don't
    *  accumulate per replay (the clip+optimizer storage-handle leak). */
   _viewBaseRetains?: number[];
+  /** Plan-owned constFill buffers (grad-clip `1.0` ceiling etc.). Created once
+   *  at first replay from a constFill slot, pinned, destroyed fence-gated at
+   *  teardown. Tracked here so teardown unpins+frees them (they are outside the
+   *  arena/pool). */
+  _constFillBufs?: GPUBuffer[];
   /** [step-tape 1b] Template fingerprint, stamped by the executor when
    *  recording (TORCHLETTE_STEP_TAPE=record) so plan invalidation cascades
    *  to tapes referencing this template (guard 4). Absent when off. */
@@ -272,6 +294,7 @@ import {
 import { bufferPool } from "../backend/webgpu/buffer-pool";
 import { gpuMemoryTracker } from "../backend/webgpu/memory-tracker";
 import { pinnedBufferSet } from "../backend/webgpu/webgpu-state";
+import { alignBufferSize, F32_BYTES } from "../backend/webgpu/shape-utils";
 /** Recorded dispatch entry — the subset of fields needed by the compiled plan. */
 export interface RecordedDispatch {
   pipeline: GPUComputePipeline;
@@ -855,6 +878,19 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
       cmd.stableBuf = undefined;
     }
   }
+  // Destroy plan-owned constFill buffers (same fence-gated discipline).
+  if (compiled._constFillBufs) {
+    for (const buf of compiled._constFillBufs) {
+      pinnedBufferSet.delete(buf);
+      bufferPool.deferredDestroy(buf, (buf as { size?: number }).size ?? 0);
+    }
+    compiled._constFillBufs = undefined;
+  }
+  // Clear cachedBuffer on the slots so a re-built plan reallocates (the buffers
+  // above are being freed).
+  for (const src of compiled.slots) {
+    if (src.kind === "constFill") src.cachedBuffer = undefined;
+  }
 }
 
 // ============================================================================
@@ -1381,6 +1417,21 @@ export async function executeCompiledPlan(
           }
           throw e;
         }
+        // Cross-plan external soundness (task #96): the resolution above is
+        // FRESH by construction — planNodes are THIS step's nodes, so a
+        // materialized cross-plan ref carries this step's storage
+        // (re-materialized after the producer plan ran; verified empirically:
+        // the bound storage id advances every replay — the clipGradNorm_
+        // clipCoef external is per-step correct here). The consumer's own
+        // template-fp match fixes the input's semantic role; a resolution
+        // that isn't materialized/live fails LOUDLY here (getInputStorage's
+        // [lifetime] guards + the guardMiss recovery above) — never a silent
+        // stale bind. NOTE a recorded producer-stamp equality assertion was
+        // tried at this seam and reverted: the producer TEMPLATE legitimately
+        // changes across warmup/steady graph variants while the value's role
+        // is unchanged (same-ni different-fp false positives on grads, and
+        // the mid-step RecoverableGuardMiss recovery is unsound from
+        // non-initial plans — "Input not ready" on released intermediates).
         observeConsumed(storage, compiled.templateFp);
         slots[i] = gpuBuffer(storage.backendTensor);
         if (dbgSlots?.includes(i)) {
@@ -1425,6 +1476,28 @@ export async function executeCompiledPlan(
           src.cachedBuffer = buf;
           slots[i] = buf;
         }
+      } else if (src.kind === "constFill") {
+        // Plan-owned FIXED constant buffer. Created once, pre-filled with the
+        // host constant, reused byte-identical every replay, pinned so no
+        // destroy/aliasing path reclaims it, freed fence-gated at teardown.
+        // Outside the arena and the harvest ledger by construction.
+        if (!src.cachedBuffer) {
+          const bytes = alignBufferSize(src.elements * F32_BYTES);
+          const buf = device.createBuffer({
+            size: bytes,
+            usage:
+              GPUBufferUsage.STORAGE |
+              GPUBufferUsage.COPY_SRC |
+              GPUBufferUsage.COPY_DST,
+          });
+          gpuMemoryTracker.trackAllocation(buf, bytes);
+          const fill = new Float32Array(src.elements).fill(src.fillValue);
+          device.queue.writeBuffer(buf, 0, fill);
+          src.cachedBuffer = buf;
+          (compiled._constFillBufs ??= []).push(buf);
+        }
+        pinnedBufferSet.add(src.cachedBuffer);
+        slots[i] = src.cachedBuffer;
       }
     }
 

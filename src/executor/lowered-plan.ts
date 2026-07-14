@@ -234,6 +234,17 @@ interface LoweredRowProgramAction {
    * Used by executeLoweredPlan to remap stale inputRefs to current-step nodes.
    */
   inputRefPositions: number[];
+  /**
+   * CONSUMER provenance per inputRef: the plan-node position + input index the
+   * ref was captured from at detection (pos -1 if the consumer isn't in this
+   * plan). The inputRefs array is a lowering-time SNAPSHOT that goes stale on
+   * template reuse; a MATERIALIZED ref (cross-plan value — clipGradNorm_'s
+   * clipCoef) has no producer position, but its CONSUMER is a covered node
+   * re-created fresh each step, so the current ref is always
+   * planNodes[pos].inputs[inputIndex]. Task #96: the stream generator resolves
+   * materialized externals through this — never the snapshot.
+   */
+  inputRefConsumerPositions: Array<{ pos: number; inputIndex: number }>;
 }
 
 /** Union of all lowered action types. */
@@ -731,8 +742,12 @@ function emitSequentialActions(
         if (ref.kind === "pending") {
           return posMap.get(ref.node.id) ?? -1;
         }
-        return -1; // materialized or scalar — no remapping needed
+        return -1; // materialized/scalar have no PRODUCER position (see consumers)
       });
+      const inputRefConsumerPositions = m.inputRefConsumers.map((c) => ({
+        pos: posMap.get(c.nodeId) ?? -1,
+        inputIndex: c.inputIndex,
+      }));
       actions.push({
         kind: "row-program",
         coveredNodeIndices: m.coveredNodeIds.map(
@@ -745,6 +760,7 @@ function emitSequentialActions(
         program: m.program,
         inputRefs: m.inputRefs,
         inputRefPositions,
+        inputRefConsumerPositions,
       });
       maybeReclaim(m.coveredNodeIds.length);
       continue;

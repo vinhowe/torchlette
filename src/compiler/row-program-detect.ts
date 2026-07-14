@@ -324,6 +324,7 @@ function buildExpr(
   inputRefs: LazyRef[], // ordered input refs
   inputDtypes: DType[], // ordered input dtypes
   nodeCount: { value: number },
+  inputRefConsumers: Array<{ nodeId: number; inputIndex: number }>,
 ): RPExpr | null {
   if (nodeCount.value > MAX_EXPR_NODES) return null;
   nodeCount.value++;
@@ -336,7 +337,8 @@ function buildExpr(
 
   // This node must be a fusible elementwise op
   const inputExprs: RPExpr[] = [];
-  for (const ref of node.inputs) {
+  for (let i = 0; i < node.inputs.length; i++) {
+    const ref = node.inputs[i];
     const expr = buildRefExpr(
       ref,
       subgraphIds,
@@ -345,6 +347,8 @@ function buildExpr(
       inputRefs,
       inputDtypes,
       nodeCount,
+      inputRefConsumers,
+      { nodeId: node.id, inputIndex: i },
     );
     if (!expr) return null;
     inputExprs.push(expr);
@@ -368,13 +372,21 @@ function buildRefExpr(
   inputRefs: LazyRef[],
   inputDtypes: DType[],
   nodeCount: { value: number },
+  inputRefConsumers: Array<{ nodeId: number; inputIndex: number }>,
+  consumer: { nodeId: number; inputIndex: number },
 ): RPExpr | null {
   if (ref.kind === "scalar") {
     return { kind: "const", value: ref.value };
   }
 
   if (ref.kind === "materialized") {
-    // External materialized input
+    // External materialized input. Record CONSUMER provenance (which subgraph
+    // node's input this ref is): the ref itself is a lowering-time SNAPSHOT
+    // that goes stale on template reuse (its storage is a previous step's —
+    // the clipGradNorm_ clipCoef class), while the consuming node is re-created
+    // fresh every step. Consumers of this match resolve the CURRENT ref as
+    // planNodes[consumerPos].inputs[inputIndex] — single source, never the
+    // snapshot.
     const key = `m:${ref.storage.id}`;
     let idx = inputRefMap.get(key);
     if (idx === undefined) {
@@ -383,6 +395,7 @@ function buildRefExpr(
       inputRefMap.set(key, idx);
       inputRefs.push(ref);
       inputDtypes.push(getRefDtype(ref));
+      inputRefConsumers.push(consumer);
     }
     return { kind: "input", bufferIndex: idx };
   }
@@ -400,6 +413,7 @@ function buildRefExpr(
       inputRefMap.set(key, idx);
       inputRefs.push(ref);
       inputDtypes.push(getRefDtype(ref));
+      inputRefConsumers.push(consumer);
     }
     return { kind: "input", bufferIndex: idx };
   }
@@ -413,6 +427,7 @@ function buildRefExpr(
     inputRefs,
     inputDtypes,
     nodeCount,
+    inputRefConsumers,
   );
 }
 
@@ -432,7 +447,12 @@ function buildRowProgram(
   consumers: Map<number, LazyIRNode[]>,
   consumerCount: Map<number, number>,
   dim: number,
-): { program: RowProgram; inputRefs: LazyRef[]; outputNodeId: number } | null {
+): {
+  program: RowProgram;
+  inputRefs: LazyRef[];
+  inputRefConsumers: Array<{ nodeId: number; inputIndex: number }>;
+  outputNodeId: number;
+} | null {
   // Topological sort of subgraph nodes
   const sorted = topoSortSubgraph(subgraphIds, nodeById);
   if (!sorted) return null;
@@ -460,6 +480,7 @@ function buildRowProgram(
   const completedReducePhases = new Map<number, number>(); // nodeId → phaseIndex
   const inputRefMap = new Map<string, number>(); // refKey → bufferIndex
   const inputRefs: LazyRef[] = [];
+  const inputRefConsumers: Array<{ nodeId: number; inputIndex: number }> = [];
   const inputDtypes: DType[] = [];
 
   for (const node of sorted) {
@@ -477,6 +498,8 @@ function buildRowProgram(
       inputRefs,
       inputDtypes,
       { value: 0 },
+      inputRefConsumers,
+      { nodeId: node.id, inputIndex: 0 },
     );
     if (!bodyExpr) return null;
 
@@ -507,6 +530,7 @@ function buildRowProgram(
       inputRefs,
       inputDtypes,
       { value: 0 },
+      inputRefConsumers,
     );
   }
   if (!writeExpr) return null;
@@ -534,7 +558,7 @@ function buildRowProgram(
     cacheKey,
   };
 
-  return { program, inputRefs, outputNodeId: outputNode.id };
+  return { program, inputRefs, inputRefConsumers, outputNodeId: outputNode.id };
 }
 
 // ============================================================================
@@ -696,6 +720,7 @@ export function detectRowPrograms(
       coveredNodeIds,
       outputNodeId: result.outputNodeId,
       inputRefs: result.inputRefs,
+      inputRefConsumers: result.inputRefConsumers,
       dim: result.program.dim,
       numRows,
       dimSize,
