@@ -2721,3 +2721,96 @@ Residue (c) (decode `fused[no-storage]` + `op:max`) stays acceptable-by-design
 (inference-only, `api.noGrad`); residue (d) (config-missing transients) stays
 record-free already. Neither blocks the TRAINING-path sunset.
 
+
+## Task #96 LANDED (2026-07-13): the clip-chain capture — both halves in, the audit corrected
+
+Both halves of the CAPTURE PRIMITIVE are in on `task96-clip-chain-capture`:
+`constFill` re-landed per the spec above, and the "compiled-replay stamp-rebind"
+landed in a SHARPER form than sketched, because the targeted audit's central
+claim was falsified by instrumentation.
+
+### The audit correction (load-bearing)
+**The compiled-replay external binding was never frozen.** At replay,
+`executeCompiledPlan` receives THIS step's `planNodes` (template hits re-apply
+rewrites to fresh nodes), so `planNodes[src.planNodeIndex].inputs[src.inputIndex]`
+re-resolves a materialized cross-plan ref to the CURRENT step's storage every
+replay — verified empirically (`TORCHLETTE_DEBUG_REBIND` trace: the bound
+storage id advances monotonically per replay, destroyed=false). What IS frozen
+is the **row-program ACTION's `inputRefs` snapshot**, captured at lowering and
+reused verbatim on every template hit (`m:` storage-keyed, same storage id at
+every build reach, stamp=none — the pre-plan-b-compile handle). Every OTHER
+action resolves refs through `planNodes`; the row-program action was the lone
+snapshot, and both the bail decision AND the slot lookup ran on it.
+
+### The mechanism as landed
+1. **Consumer provenance** (`row-program-detect.ts` → `RowProgramMatch.
+   inputRefConsumers` → `lowered-plan.ts` `inputRefConsumerPositions`): each
+   external inputRef records WHICH covered node's input slot it was captured
+   from. `generateRowProgram` resolves the CURRENT ref as
+   `planNodes[pos].inputs[inputIndex]` — single source (the node graph), never
+   the snapshot. This is the "rebind": the existing fresh-ref channel extended
+   to the one action that bypassed it.
+2. **Stamp-gated fuse eligibility** (`GenerateStreamOptions.
+   fuseStampedScalarExternals`, BUILD path only): the 0-d-materialized bail
+   lifts iff the FRESH ref's storage is STAMPED — i.e. the producer plan is
+   compiled and re-harvests the value into node-visible results every step, so
+   the external slot's per-replay resolution always finds this step's value.
+   Unstamped (producer lowered → swept pool temp) keeps the sequential-fallback
+   bail. The VERIFY path (`TORCHLETTE_STREAM_GENERATE=1`) passes false and
+   keeps the bail — the recording it diffs against used the sequential
+   fallback, so the fused kernel there would be a spurious segment DIVERGE.
+3. **`constFill`** re-landed exactly per spec (plan-owned fixed buffer, outside
+   arena + harvest ledger; `coverConstFill` gated on build-reach ≥2 via the
+   executor's `buildReaches` so one-shot warmup variants stay lowered; the
+   verify path's flat-count check reconciles the per-constFill command delta).
+
+**Why it cannot bind wrong (the ownership argument):** (i) the consumer's own
+template-fp match fixes the input ref's semantic role; (ii) resolution is
+per-replay through the current graph — fresh by construction; (iii) a
+resolution that is not materialized/live fails LOUDLY (`getInputStorage`
+[lifetime] guards + `guardMiss` clean recovery), never silently stale; (iv) the
+stamp gate at build ensures the fused kernel only exists where the producer
+re-materializes the value each step. A recorded producer-stamp EQUALITY
+assertion at the replay seam was built and REVERTED: the producer template
+legitimately differs across warmup/steady graph variants while the value's
+role is unchanged (same-ni different-fp false positives on grads), and a
+mid-step RecoverableGuardMiss recovery is unsound from non-initial plans
+("Input not ready" on released intermediates). Do not re-add it.
+
+### Measurements (V100 sivri, 2026-07-13)
+- **Census: BOTH recurring TRAINING bails GONE** on distil-train AND
+  124M-diloco (`covered-and-compiled` 3→6 each, RECURRING-BAIL=0). gpt2-decode
+  keeps residue (c) (bernoulli/fused[no-storage]/op:max — acceptable-by-design).
+- **Ledger (`t-ledger-attack-probe`)**: default STEPS=24 **PASS**, late-window
+  [431..435] reachDrift=totalDrift=4; STEPS=48 **0/0 flat** ([435..435] over
+  steps 24..47). The steady state is +9 handles over the 426 baseline —
+  livediff (s8→s22): ±260 view-handle churn at the convergence rebuilds
+  netting +9 **view handles** (grad/param views held per-replay by the two
+  newly-compiled clip plans' harvests, prior set released at next harvest —
+  byte-free: views alias pooled buffers). This CORRECTS the prior pass's drain
+  theory: the +9 was never a clipCoef VALUE hold that a claim could drain; it
+  is the by-design per-replay view-handle hold of two more plans being
+  compiled, settling once (by step 16) and perfectly flat after.
+- **Failing-first gate** (`test/stale-external-rebind.spec.ts`, in-suite):
+  pre-fix tree fails on exactly the two clip classes (row-program[scalar-
+  steptemp-input] ×5 reaches + data-source:full ×3); post-fix passes (clip
+  classes gone, compiled==lowered over 20 steps crossing the rebuilds, no
+  [lifetime]).
+- `t-stream-generate` PASS (0 diverged); parity-fullstack compiled-vs-lowered
+  and the remaining wall recorded in the task #96 report.
+
+### Deletion-readiness VERDICT (2026-07-13): READY (training path), one named caveat
+The census shows zero recurring TRAINING bails and every gate holds. The
+deletion-pass precondition "ledger 0/0" is met at STEPS=48 (flat steady state);
+at the default 24-step window the one-time convergence settle leaves drift 4/4
+(within the probe's own LEAK_TOL=8, probe PASSES — attributed byte-free view
+handles, above). If the deletion pass insists on literal 0/0-at-24, the settle
+must complete before step 12, which is an observed-liveness convergence-timing
+question, not a coverage one. **Deletion-pass spec (restated, unchanged):**
+remove the recorded-build harvest (A4 `record*` refs + params-sequence cache +
+`buildCompiledPlan` + the `TORCHLETTE_BUILD_FROM_IR=0` opt-out, ~800 SLOC); the
+census surface (`TORCHLETTE_COVERAGE_CENSUS` + dump/reset + the census tool,
+tied to `executor.ts`); re-base the verify gates that pin `BUILD_FROM_IR=0`
+(`compiled-plan-parity.spec.ts` determinism gate) onto the generated build.
+Residues (c)/(d) unchanged and non-blocking. The deletion was NOT performed in
+this pass (out of scope by design).
