@@ -51,7 +51,15 @@ async function runProbe(): Promise<Verdict> {
       const { stdout } = await execFileP("npx", ["tsx", PROBE], {
         env: {
           ...process.env,
-          STEPS: "16",
+          // 32, not 16 (task #96): the clip value chain now COMPILES (constFill
+          // + row-program fresh-ref provenance), so two more plans reach
+          // compiled replay and their one-time convergence settle (+9 byte-free
+          // view handles at the pruning rebuilds, livediff-attributed) completes
+          // by ~step 16. At STEPS=16 the late window [8..15] reads the settle
+          // as drift; at 32 the window [16..31] sits past it — a REAL ledger
+          // leak still climbs monotonically through it (equal detection power,
+          // longer window). Measured flat [435..435] through step 47.
+          STEPS: "32",
           TORCHLETTE_RC_TRACE: "verbose",
         },
         timeout: 300_000,
