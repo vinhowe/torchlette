@@ -1,11 +1,19 @@
 /**
- * Stage-4 phase 0 determinism gate: recording the SAME template twice must
+ * Stage-4 phase 0 determinism gate: building the SAME template twice must
  * produce identical canonical command streams. Everything in the
  * compile-from-IR migration assumes stream determinism; this pins it.
  *
  * Method: train-step-shaped plan (forward+backward+optimizer), capture the
  * compiled stream, invalidate the plan (keeping the template), re-execute
- * to force a re-recording, capture again, diff.
+ * to force a re-build, capture again, diff.
+ *
+ * RE-BASED (task #43 recorded-build sunset): this gate now measures the
+ * GENERATED (build-from-IR) build source under the DEFAULT flag state — the
+ * recorded build is gone. Because build-from-IR coverage is per-plan gated, a
+ * plan may build-from-IR on one pass and fall through to lowered on the other,
+ * so the SET of compiled streams can differ across passes; determinism =
+ * every plan that compiled on BOTH passes rebuilt byte-identically (the
+ * label-matched intersection).
  */
 import { GPT2, type GPT2Config } from "../examples/gpt2/model";
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
@@ -19,26 +27,9 @@ const CFG: GPT2Config = {
 };
 
 async function main() {
-  // This gate measures the RECORDED build source (record a template twice →
-  // diff the compiled streams). Under the build-from-IR DEFAULT no recording
-  // happens, so getCompiledStreams() returns a different set on the second pass
-  // and the tool reports a spurious "STREAM COUNT differs" (pre-existing rot in
-  // the default flag state, #84). The in-suite gate
-  // (test/compiled-plan-parity.spec.ts "stream recording is deterministic")
-  // ALWAYS spawns this with TORCHLETTE_BUILD_FROM_IR=0; require it explicitly so
-  // a bare invocation fails with an actionable message instead of a cryptic
-  // count mismatch. (BUILD_FROM_IR=0 is a named sunset — when it dies, so does
-  // this recorded-stream gate; the in-suite spec is the surviving determinism
-  // check either way.)
-  if (process.env.TORCHLETTE_BUILD_FROM_IR !== "0") {
-    console.log(
-      "SKIP: this gate requires TORCHLETTE_BUILD_FROM_IR=0 (it measures the " +
-        "recorded build source, which the build-from-IR default does not " +
-        "produce). Re-run as: TORCHLETTE_BUILD_FROM_IR=0 npx tsx " +
-        "tools/t-stream-determinism.ts",
-    );
-    process.exit(2);
-  }
+  // Measures the GENERATED build source under the DEFAULT flag state (the
+  // recorded build is gone — task #43 sunset). No BUILD_FROM_IR=0: build-from-IR
+  // IS the build source now.
   if (!(await initWebGPU())) process.exit(1);
   const api = new Torchlette("webgpu", { enableFusion: true, enableMemoryPlanning: true });
   const model = new GPT2(api, CFG, { device: "webgpu" });
@@ -64,7 +55,7 @@ async function main() {
     await api.markStep();
   };
 
-  // Steps 1-2: populate arena, then record.
+  // Steps 1-2: populate arena, then build-from-IR.
   await step();
   await step();
   await step(); // first replay — streams now stable
@@ -73,26 +64,36 @@ async function main() {
     console.log("NO COMPILED STREAMS — gate inconclusive");
     process.exit(1);
   }
-  // Invalidate compiled plans (templates survive) → next step re-records.
+  // Invalidate compiled plans (templates survive) → next step re-builds.
   invalidateCompiledKeepTemplates();
   await step();
   await step();
   const second = getCompiledStreams();
-  if (second.length !== first.length) {
-    console.log(`STREAM COUNT differs: ${first.length} vs ${second.length}`);
-    process.exit(1);
-  }
+  // Re-based onto the generated build: a plan may build-from-IR on one pass and
+  // fall through to lowered on the other (build-from-IR is per-plan coverage-
+  // gated), so the SET of compiled streams can differ. Determinism = every plan
+  // that compiled on BOTH passes rebuilt byte-identically. Diff the label-matched
+  // intersection.
+  const secondByLabel = new Map(second.map((s) => [s.label, s]));
   let allEqual = true;
-  for (let i = 0; i < first.length; i++) {
-    const d = diffStreams(first[i].commands, second[i].commands);
+  let matched = 0;
+  for (const a of first) {
+    const b = secondByLabel.get(a.label);
+    if (!b) continue;
+    matched++;
+    const d = diffStreams(a.commands, b.commands);
     if (!d.equal) {
       allEqual = false;
       console.log(
-        `DIVERGENCE stream ${i} (${first[i].label}) at cmd ${d.firstDivergence}:\n  A: ${d.a}\n  B: ${d.b}\n  lens ${d.lengthA}/${d.lengthB}`,
+        `DIVERGENCE stream (${a.label}) at cmd ${d.firstDivergence}:\n  A: ${d.a}\n  B: ${d.b}\n  lens ${d.lengthA}/${d.lengthB}`,
       );
     } else {
-      console.log(`stream ${i} (${first[i].label}): ${d.lengthA} cmds IDENTICAL`);
+      console.log(`stream (${a.label}): ${d.lengthA} cmds IDENTICAL`);
     }
+  }
+  if (matched === 0) {
+    console.log("NO OVERLAPPING COMPILED STREAMS — gate inconclusive");
+    process.exit(1);
   }
   console.log(allEqual ? "DETERMINISM: PASS" : "DETERMINISM: FAIL");
   void canonicalizeStream;

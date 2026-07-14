@@ -84,19 +84,22 @@ describe("observed cross-plan liveness — set-parity (gate 2)", () => {
     "build-from-IR-pruned agrees with the recorded cutover (trajectory + zero-miss + demonstrable pruning)",
     async () => {
       if (!(await canUseWebGPU())) return;
-      // Stage-2 flip: build-from-IR is the DEFAULT ({}); the recorded-cutover
-      // reference is the =0 opt-out.
+      // RE-BASED (task #43 recorded-build sunset): build-from-IR is the DEFAULT
+      // ({}); the recorded-cutover reference is GONE, so the trusted reference
+      // is now the LOWERED path (TORCHLETTE_COMPILED_PLAN=0) — the same reference
+      // the surviving compiled==lowered gate uses. A dropped-needed result under
+      // the pruned harvest still diverges/crashes against it.
       const bfir = await runProbe({});
-      const cutover = await runProbe({ TORCHLETTE_BUILD_FROM_IR: "0" });
+      const reference = await runProbe({ TORCHLETTE_COMPILED_PLAN: "0" });
 
       // (1) Bit-identical trajectory across the pruning-activation threshold —
       //     a dropped-needed result would diverge or crash. This IS the seam
-      //     agreement: the two harvest strategies compute the same values.
+      //     agreement: the pruned harvest computes the lowered path's values.
       expect(bfir.losses.length).toBe(16);
-      expect(cutover.losses.length).toBe(16);
+      expect(reference.losses.length).toBe(16);
       let maxDiff = 0;
       for (let i = 0; i < bfir.losses.length; i++) {
-        maxDiff = Math.max(maxDiff, Math.abs(bfir.losses[i] - cutover.losses[i]));
+        maxDiff = Math.max(maxDiff, Math.abs(bfir.losses[i] - reference.losses[i]));
       }
       expect(maxDiff).toBeLessThan(1e-5);
 

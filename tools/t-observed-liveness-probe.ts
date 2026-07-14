@@ -5,13 +5,13 @@
  * dumps, per recurring template (fingerprint hex), the SET of harvested result
  * identities ("nodeIndex:outputIndex") its compiled plan actually keeps.
  *
- * Run twice by test/observed-liveness.spec.ts (stage-2 flip: build-from-IR is
- * the default):
+ * Run twice by test/observed-liveness.spec.ts (build-from-IR is the default;
+ * task #43 recorded-build sunset re-based the reference onto the lowered path):
  *   - (unset)                     → build-from-IR with observed pruning
- *   - TORCHLETTE_BUILD_FROM_IR=0  → the recorded-cutover reference
- * The two result maps must agree on every recurring template: the pruned
- * build-from-IR result set == the cutover's live-result survivor set (single
- * source at the seam). Also prints the guard telemetry for diagnostics.
+ *   - TORCHLETTE_COMPILED_PLAN=0  → the lowered reference (trusted path)
+ * The build-from-IR trajectory must agree with the lowered reference to fp
+ * noise: the pruned harvest computes the lowered path's values (single source
+ * at the seam). Also prints the guard telemetry for diagnostics.
  *
  * process.exit(0) at end (Dawn holds threads).
  */

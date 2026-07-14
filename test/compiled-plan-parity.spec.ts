@@ -121,16 +121,15 @@ describe("compiled-plan correctness gates", () => {
   );
 
   it(
-    "stream recording is deterministic (record twice → identical)",
+    "stream build is deterministic (build twice → identical)",
     async () => {
       if (!webgpu) return;
-      // This gate verifies the RECORDED build source (record twice → diff), so
-      // it pins the stage-2 flip's opt-out: under the build-from-IR default no
-      // recording would occur and the gate would silently measure the wrong
-      // thing.
-      const { stdout, code } = await runTool(DETERMINISM, {
-        TORCHLETTE_BUILD_FROM_IR: "0",
-      });
+      // RE-BASED (task #43 recorded-build sunset): the recorded build is gone,
+      // so this gate now verifies the GENERATED (build-from-IR) build source
+      // under the DEFAULT flag state — build a template twice from IR and diff
+      // the label-matched intersection of compiled streams (every plan that
+      // compiled on both passes must be byte-identical).
+      const { stdout, code } = await runTool(DETERMINISM, {});
       expect(stdout, stdout.slice(-400)).toContain("DETERMINISM: PASS");
       expect(code).toBe(0);
     },
