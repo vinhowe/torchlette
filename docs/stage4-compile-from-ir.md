@@ -2972,6 +2972,21 @@ demotes to a should-never-fire loud assertion in stage 4.
 
 ### Stages 3–4 — BLOCKED: a SECOND, distinct prune-soundness class the harvest deletion exposes
 
+> **UNBLOCKED (task #98 phase 4, 2026-07-15) by execution-witnessed harvest.** The
+> "separate campaign" this STOP named ("a whole-step-graph or execution-witnessed
+> harvest") is `docs/step-object-design.md §4`, LANDED. The step-tape recorder observes
+> the LOWERED cross-plan read of the checkpoint-recompute `contiguous[512,768]` at
+> end-of-step time (AFTER backward + recompute ran — build-WITH-execution, the property
+> the recorded build had) and keeps it in the generated harvest via a per-producer K_w=2
+> witness set unioned into `prunedHarvest`'s keep set. With the harvest-deletion diff
+> applied, distil@512 + selective checkpointing (this exact config) now runs CLEAN where
+> it threw `Input not ready: contiguous[512,768]`; medium@512 and the 124M chunked-sum
+> class likewise. Gate: `test/witness-harvest.spec.ts` + `tools/t-witness-harvest-matrix.ts`.
+> The recorded build's harvest ROLE is not yet deleted (a later product decision, §4.3):
+> the full-deletion probe surfaces a distinct `shape=[]` GradScaler-scalar never-witnessed
+> class the recorded build still nets. The prune-soundness class named below is resolved;
+> stages 3–4 remain gated only on that never-witnessed remainder.
+
 Re-applying the harvest deletion (recorded build removed) with the stage-2 overlay
 oracle in place clears the ORIGINAL `releasedOverlay` throw on every config the
 #43 pass tested (small probes E=128, gate-2, parity-fullstack — all green,

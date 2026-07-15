@@ -316,6 +316,37 @@ The load-bearing new idea. Stated as one declaration: **a step object's harvest 
 is the union of the cross-plan reads physically observed during the two consecutive
 identical executed steps that make its tape eligible.**
 
+> **STATUS: LANDED (task #98 phase 4, 2026-07-15).** The mechanism ships across
+> commits `bdfa2e02` (failing-first gate + the harvest-keep SINK), `4dbfacd8` (the
+> witness recorder — the #97 unblock), `a498d319` (the config matrix + in-suite
+> gate). The #97 STOP is unblocked: distil@512 + selective checkpointing runs CLEAN
+> with the recorded build's harvest role removed, where the generated prune
+> deterministically threw `Input not ready: node contiguous[512,768]` before.
+>
+> **One refinement vs the §4.1 sketch, forced by the checkpoint config: the witness
+> window is PER PRODUCER, not per whole-step.** Selective checkpointing re-fingerprints
+> the recompute READER plans on every backward (fresh per-layer plans, `§3.5`), so no
+> two WHOLE steps are ever structurally identical — the whole-step tape-eligibility
+> gate (`step-tape.ts` compiled-only + `diffImages`) NEVER fires on the checkpoint
+> config, and a publish gated on it would never run. But the PRODUCER template of the
+> cross-plan activation (the checkpointed-MLP `contiguous[512,768]` producer) recurs
+> identically every step. So the recorder publishes a producer's witnessed harvest
+> once it has been read with the SAME pair set in two consecutive steps IT APPEARED IN
+> (`reconcileWitnessReads`, K_w=2 applied at the producer stratum — ruling 2 honored,
+> not widened). Publication is MONOTONE-SAFE: a set is only ever GROWN, never shrunk
+> (a superset keep is never a UAF — pruning too FEW never crashes), so a disagreement
+> republishes the UNION and counts `witnessVariances` rather than dropping a witnessed
+> pair. This is strictly SOUNDER than the whole-step gate would have been: it fires on
+> configs the whole-step gate structurally cannot cover.
+>
+> **Deferred to the FULL recorded-build sunset (§4.3, a later product decision):**
+> under the FULL harvest-deletion diff, a GradScaler inf-skip run surfaces a SEPARATE
+> never-witnessed class — a `shape=[]` live-scalar reclaimed at markStep (a `[lifetime]
+> reading RECLAIMED`, NOT an `Input not ready`), orthogonal to the checkpoint-recompute
+> harvest this phase covers. Phase 4 does NOT delete the recorded build (§4.3 keeps it
+> for never-witnessed classes), so this does not occur in the phase-4 config; it is a
+> STOP finding for the eventual full sunset, not for this phase.
+
 ### 4.1 Mechanism
 
 1. **Observation is already there.** The recorder is a faithful pure observer
@@ -519,6 +550,15 @@ deleted (ruling 3 + 5).
 
 ### Phase 4 — Witness-time harvest; recorded-build harvest role retires (for covered classes)
 
+**STATUS: the MECHANISM + GATE LANDED (2026-07-15, commits `bdfa2e02`→`a498d319`); the
+recorded-build harvest ROLE stays (deletion is a later product decision, §4.3).** The
+witnessed harvest set now keeps the checkpoint-recompute activation the generated prune
+dropped — the #97 STOP is unblocked (see §4 STATUS). The config matrix + the
+event-inclusive cells are green (below); the recorded build is NOT yet deleted — this
+phase EARNS the deletion for the covered classes, but the full sunset is gated on the
+never-witnessed remainder (§4.3) closing, including the `shape=[]` scaler-scalar class
+the full-deletion probe surfaced.
+
 **Goal:** §4's mechanism. The witnessed harvest set drives replay; the recorded
 build's harvest role retires FOR THE PLAN CLASSES witness coverage proves, config-
 matrix-proven with **checkpointing ON mandatory**.
@@ -531,6 +571,22 @@ matrix-proven with **checkpointing ON mandatory**.
   either changes structure (guard refuses, normal path runs) or flows through a
   declared slot (covered). Completeness is verified against actual variation, not
   assumed from the window size.
+- **Gate — MEASURED (`tools/t-witness-harvest-matrix.ts`, `test/witness-harvest.spec.ts`):**
+
+  | cell | witnessed (templates/pairs) | prunedPairsRemoved | cleanMisses | Input-not-ready | event |
+  |---|---|---|---|---|---|
+  | distil@512 + selective ckpt | 4 / 396 | 22 | 0 | 0 | — |
+  | medium@512 + ckpt | 4 / 1512 | 94 | 0 | 0 | — |
+  | 124M @256 (chunked-sum) | 4 / 768 | 46 | 0 | 0 | — |
+  | scaler-inf (autocast) | 7 / 460 | — | — | 0 | inf-skip fired (scale 1e40→1.5e38), no corruption |
+  | lr-milestone | 4 / 397 | — | — | 0 | LR 5e-4→5e-5 through declared slot, no corruption |
+
+  Operational §4.4 empty-diff = `cleanMisses==dirtyMisses==0` (no pruned-then-demanded
+  read; the witness set kept every read pair). STRONG oracle (recorded build DELETED via
+  the harvest-deletion diff): checkpoint / medium / chunked all run CLEAN — zero
+  `Input not ready` where the prune deterministically threw `contiguous[512,768]`.
+  `parity-fullstack` compiled==lowered 8.6e-6/30 on the default (non-tape) path (the
+  mechanism is inert without `STEP_TAPE` — one branch at the read seam).
 - **Deletes (staged):** the recorded build's harvest master for covered classes;
   full recorded-build sunset (`buildCompiledPlan` + ~80 `record*` refs,
   `stage4 §Task #43` B2/B3, ~−800–1200 SLOC) remains gated on FULL witness coverage
