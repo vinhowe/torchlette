@@ -2969,3 +2969,66 @@ continue`** — a saved-for-backward producer is never overlay-released.
 Gate: `test/derived-liveness-oracle.spec.ts` (the derivation the claim seam relies
 on) + the harvest-deleted parity/gate-2 trajectory (stage 3). guardMiss recovery
 demotes to a should-never-fire loud assertion in stage 4.
+
+### Stages 3–4 — BLOCKED: a SECOND, distinct prune-soundness class the harvest deletion exposes
+
+Re-applying the harvest deletion (recorded build removed) with the stage-2 overlay
+oracle in place clears the ORIGINAL `releasedOverlay` throw on every config the
+#43 pass tested (small probes E=128, gate-2, parity-fullstack — all green,
+compiled-vs-lowered ≤ 1e-5). But the profile A/B at **distilgpt2 @ seq-512 with
+selective checkpointing** (a config the #43 deletion pass never ran) surfaces a
+SECOND, structurally-different failure at step ~5 (pruning-activation):
+
+```
+Error: Input not ready: node id=5610 op=contiguous[0] shape=[512,768]
+```
+
+This is the PRUNE-THEN-DEMAND twin of the overlay throw, but its producer is NOT
+graph-held. Root-caused (deterministic; reproduces with the stage-2 overlay gate
+DISABLED too — orthogonal to it):
+- The `contiguous[512,768]` is a forward activation inside a **checkpointed MLP
+  segment recomputed in backward**. Its producing forward template
+  (`0x31292afa`/`0x72ada859`) PRUNES it from the harvest (observation never saw a
+  consumer — the backward/recompute reader resolves it LOWERED through
+  `getInputStorage`, invisible to `observeConsumed`). The recorded build harvested
+  it because it RECORDED the actual dispatch (build-WITH-execution). The generated
+  build reconstructs the harvest from IR (build-WITHOUT-execution) and the
+  observation prunes it.
+- **The derived fact is UNAVAILABLE at the seam.** Measured (`storageTracker.
+  graphHeldAt` on the executed result): the contiguous is `graphHeld=FALSE` — it is
+  NOT a saved-for-backward clone, so the stage-2 graph-retention oracle does not
+  cover it. The other graph-derived source, `computeLivenessOutputIds` (the SAME
+  liveness the harvest set is built from), also cannot reach it: at the PRODUCING
+  forward plan's build/harvest — which runs during `forward()` — the backward
+  consumer DOES NOT EXIST YET (backward's graph is built later, in `backward()`).
+  So no whole-step graph derivation is available at the forward-plan build seam.
+  A lowered post-execution graph-held observation (`observeGraphHeld`, source "h")
+  was built, proven to help the NON-checkpoint big-config case (ledger @ E768/seq256
+  passes, releasablePairs→0), and measured NULL against this checkpoint case (the
+  contiguous is graphHeld=false); it was reverted (unproven-necessary on the
+  recorded build, which handles graph-held via the guardMiss net). A
+  `computeLivenessOutputIds`→keepAlways extension was built, measured NULL (can't
+  reach the not-yet-existing backward consumer), and reverted.
+
+**This is the campaign's explicit STOP condition** ("derivation genuinely
+infeasible at the seam — planner scope structurally can't reach it → STOP and
+report; do not fall back to spreading recovery"). Consequences:
+- **Stage 3 (harvest deletion) does NOT land.** The recorded build stays as the
+  correctness net for the build-WITHOUT-execution prune of checkpoint-recompute
+  cross-plan forward reads — exactly the class it was already the net for. The #43
+  verdict is refined, not overturned: the recorded build is deletable once the
+  GENERATED harvest is sound for build-without-execution cross-plan forward→backward
+  reads (a whole-step-graph or execution-witnessed harvest — a separate campaign),
+  not merely once the overlay class is derived.
+- **Stage 4 (demote guardMiss) does NOT land.** guardMiss recovery is still
+  load-bearing for the compiled path's encounter with this prune class (the
+  recorded build present means the second consumer compiles and recovers). It can
+  only demote to a should-never-fire assertion once BOTH classes are unconstructible
+  — the prune class remains.
+
+**What DID land (the campaign's spine):** the stage-2 derived overlay-release oracle
+(`graphHeldAt` at the claim seam) — the ORIGINAL #97 bug (the `releasedOverlay`
+throw the #43(a) blocker named) is resolved by derivation, memory-neutral, gated,
+full-suite green on the recorded build. The over-prune of the OVERLAY class is now
+unconstructible; the recorded build's guardMiss is no longer load-bearing for THAT
+class. The remaining prune-soundness class is scoped above for the follow-on.
