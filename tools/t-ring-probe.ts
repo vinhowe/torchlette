@@ -1,12 +1,18 @@
 /**
  * inc-3 falsification probe: does the RUNAHEAD ring (deferred gen-scoped settle)
- * form a tape AND track the serial control at K=1 and K=2?
+ * form a tape AND track the serial control at K=1, K=2 AND K=3?
  *
  *   VULKAN_DEVICE_INDEX=2 LD_LIBRARY_PATH=tools/vk-shim \
  *   TORCHLETTE_STEP_TAPE=1 npx tsx tools/t-ring-probe.ts
  *
  * Small MSE-on-matmul step (no model load — fast, GPU-only). Prints, per arm,
  * the loss trajectory + capture hits + whether the body froze on hits.
+ *
+ * K=1 vs K=3 BIT-IDENTITY is the step-object §6 Phase 2 / phase2b §8 G-ring gate
+ * ("K=1 vs K=3 ring trajectory bit-identical"): runahead reorders only the CPU
+ * submission relative to the GPU fence, so the GPU trajectory MUST be byte-
+ * identical for every ring depth. The probe asserts serial == K1 == K2 == K3 to
+ * 0.0 — a deeper ring holding more in-flight steps must not perturb numerics.
  */
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
 import { Torchlette } from "../src/frontend/torchlette";
@@ -18,7 +24,7 @@ import { assertReferenceLossNonzero } from "./parity-sanity";
 const STEPS = 20;
 const log = (m: string) => console.error(`[t-ring] ${m}`);
 
-async function run(mode: "serial" | "ringNow" | "ringK1" | "ringK2"): Promise<{
+async function run(mode: "serial" | "ringNow" | "ringK1" | "ringK2" | "ringK3"): Promise<{
   losses: number[];
   hits: number;
   calls: number;
@@ -69,7 +75,7 @@ async function run(mode: "serial" | "ringNow" | "ringK1" | "ringK2"): Promise<{
     // step (K-behind=0). Isolates compute correctness from the deferred-readback
     // buffer-lifetime issue.
     const immediate = mode === "ringNow";
-    const K = mode === "ringK1" || immediate ? 1 : 2;
+    const K = immediate || mode === "ringK1" ? 1 : mode === "ringK3" ? 3 : 2;
     const step = api.capture(stepFn, { training: true, runahead: true, ringDepth: K });
     const handles: Tensor[] = [];
     const readVal = new Array<number | undefined>(STEPS).fill(undefined);
@@ -128,17 +134,26 @@ async function main() {
   const k2 = await run("ringK2");
   log(`ringK2   losses: ${k2.losses.map((l) => l.toFixed(5)).join(", ")}`);
   log(`ringK2   hits=${k2.hits} calls=${k2.calls} bodyRuns=${k2.bodyRuns}`);
+  const k3 = await run("ringK3");
+  log(`ringK3   losses: ${k3.losses.map((l) => l.toFixed(5)).join(", ")}`);
+  log(`ringK3   hits=${k3.hits} calls=${k3.calls} bodyRuns=${k3.bodyRuns}`);
 
-  const n = Math.min(serial.losses.length, k1.losses.length, k2.losses.length);
+  const n = Math.min(serial.losses.length, k1.losses.length, k2.losses.length, k3.losses.length);
   let dK1 = 0;
   let dK2 = 0;
+  let dK3 = 0;
   let dK1K2 = 0;
+  let dK1K3 = 0;
   for (let i = 0; i < n; i++) {
     dK1 = Math.max(dK1, Math.abs(serial.losses[i] - k1.losses[i]));
     dK2 = Math.max(dK2, Math.abs(serial.losses[i] - k2.losses[i]));
+    dK3 = Math.max(dK3, Math.abs(serial.losses[i] - k3.losses[i]));
     dK1K2 = Math.max(dK1K2, Math.abs(k1.losses[i] - k2.losses[i]));
+    dK1K3 = Math.max(dK1K3, Math.abs(k1.losses[i] - k3.losses[i]));
   }
-  log(`maxΔ serial-vs-K1=${dK1.toExponential(2)} serial-vs-K2=${dK2.toExponential(2)} K1-vs-K2=${dK1K2.toExponential(2)}`);
+  log(
+    `maxΔ serial-vs-K1=${dK1.toExponential(2)} serial-vs-K2=${dK2.toExponential(2)} serial-vs-K3=${dK3.toExponential(2)} K1-vs-K2=${dK1K2.toExponential(2)} K1-vs-K3=${dK1K3.toExponential(2)}`,
+  );
 
   // VALIDATED (inc-3): the ring — deferred gen-scoped boundary (recorder-
   // finalize synchronous + sweep-after-fence), per-settle ISOLATED fences, and
@@ -153,9 +168,15 @@ async function main() {
     k1.hits > 0 &&
     k1.bodyRuns < k1.calls;
   const k2Runahead = dK2 < 1e-9 && dK1K2 < 1e-9 && k2.hits > 0;
+  // G-ring (step-object §6 Phase 2): K=1 vs K=3 bit-identical — a deeper ring
+  // (more in-flight steps) reorders CPU submission only, never the GPU compute.
+  const k3Runahead = dK3 < 1e-9 && dK1K3 < 1e-9 && k3.hits > 0;
   log(`K1 mechanism ${k1Pass ? "PASS (bit-identical to serial, body frozen)" : "FAIL"}`);
   log(`K2 runahead ${k2Runahead ? "PASS (bit-identical: K is a pure knob)" : "FAIL"}`);
-  const pass = k1Pass && k2Runahead;
+  log(
+    `K3 runahead ${k3Runahead ? "PASS (K=1==K=3 bit-identical: ring depth is a pure knob)" : "FAIL"}`,
+  );
+  const pass = k1Pass && k2Runahead && k3Runahead;
   log(pass ? "PASS" : "FAIL");
   destroyWebGPU();
   process.exit(pass ? 0 : 1);
