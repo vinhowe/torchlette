@@ -112,6 +112,7 @@ import {
   buildCompiledPlan,
   buildCompiledPlanFromGenerated,
   type CompiledPlan,
+  checkpointBoundaryIndices,
   debugCompiledPlanEntryBytes,
   debugEntryBufferIndex,
   destroyCompiledPlanBuffers,
@@ -486,6 +487,53 @@ export function debugTemplatePlanMemory(): Record<
       pruned: cp?._prunedPairs?.length ?? 0,
       resultMB: mem.resultMB,
       tempMB: mem.tempMB,
+    };
+  }
+  return out;
+}
+
+/** [task #99 R1] The declared checkpoint-recompute segment DATA now reaching
+ *  the memory-planner input surface, per recompute-bearing template. For each
+ *  template whose compiled plan carries a checkpoint boundary (`_hasRecompute`),
+ *  reports the stamped `_recomputeSegments` — the checkpointed forward-activation
+ *  results (nodeIndex, outputIndex, slot, entryIdx) the planner today pins
+ *  whole-step and R2 will liveness-split. Visible/asserted-present surface for
+ *  the R1 gate; R1 stamps DATA only (no planning-decision change). Debug-only. */
+export function debugRecomputeSegments(): Record<
+  string,
+  {
+    hasRecompute: boolean;
+    segments: Array<{
+      nodeIndex: number;
+      outputIndex: number;
+      slot: number;
+      entryIdx?: number;
+    }>;
+  }
+> {
+  const out: Record<
+    string,
+    {
+      hasRecompute: boolean;
+      segments: Array<{
+        nodeIndex: number;
+        outputIndex: number;
+        slot: number;
+        entryIdx?: number;
+      }>;
+    }
+  > = {};
+  for (const [fp, template] of fusionAnalysisCache) {
+    const cp = template.loweredPlan?.compiledPlan;
+    if (!cp?._hasRecompute && !cp?._recomputeSegments) continue;
+    out[`0x${fp.toString(16)}`] = {
+      hasRecompute: !!cp?._hasRecompute,
+      segments: (cp?._recomputeSegments ?? []).map((s) => ({
+        nodeIndex: s.nodeIndex,
+        outputIndex: s.outputIndex,
+        slot: s.slot,
+        entryIdx: s.entryIdx,
+      })),
     };
   }
   return out;
@@ -2034,6 +2082,10 @@ export async function executeLoweredPlan(
           slots: gen.slots,
           nodeResults: genResults,
           externalReleases,
+          // [task #99 R1] Same boundary set the recorded path computes — the
+          // generated path lacks planNodes in its input, so supply it here for
+          // uniform recompute-segment stamping across both build paths.
+          recomputeBoundaryIndices: checkpointBoundaryIndices(planNodes),
         });
         if (built.valid) {
           built.templateFp = fp;
