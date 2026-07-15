@@ -149,6 +149,7 @@ import {
   setObservedLivenessEnabled,
   setTemplateCompiledInvalidator,
   setTemplateIdleRetirer,
+  setWitnessedHarvest,
 } from "./observed-liveness";
 
 /** [observed-liveness] Node ops that commit in-place mutations to persistent
@@ -163,6 +164,7 @@ const IN_PLACE_COMMIT_OPS: ReadonlySet<string> = new Set([
 import {
   STEP_TAPE_RECORD,
   STEP_TAPE_REPLAY,
+  setWitnessHarvestPublisher,
   stBeginPlan,
   stDeclareBatchCover,
   stEndPlan,
@@ -569,6 +571,12 @@ const buildReaches = new Map<number, number>();
 // build-from-IR is active (the over-harvest it fixes exists only there). Set
 // once at module load; the flag also gates every observation hook to a no-op.
 setObservedLivenessEnabled(buildFromIRActive());
+// [task #98 phase 4] Route the step-tape recorder's WITNESSED harvest set to
+// observed-liveness at tape eligibility. core (step-tape) stays a leaf: it holds
+// a publisher callback, wired here at the executor layer (same seam-inversion
+// pattern as the invalidator/retirer below). The witnessed set is what makes the
+// checkpoint-recompute activation survive the generated prune (#97 unblock).
+setWitnessHarvestPublisher((fp, pairs) => setWitnessedHarvest(fp, pairs));
 // The guard invalidates a producer template's compiled plan when a late
 // consumer misses its pruned output; route it through the cache here (the
 // module can't import this file — circular).

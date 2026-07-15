@@ -294,6 +294,18 @@ let cur: { entries: TapeEntry[]; plans: PlanExecRecord[] } = {
   plans: [],
 };
 let activePlan: PlanExecRecord | null = null;
+
+/**
+ * [task #98 phase 4 — WITNESS-TIME HARVEST] The cross-plan reads PHYSICALLY
+ * OBSERVED during THIS step, keyed by producer template fp → set of "ni:oi"
+ * pairs read. Populated by `stObserveWitnessRead` at the cross-plan read seam
+ * (`getInputStorage` on a stamped storage — the LOWERED read `observeConsumed`
+ * is blind to, §4.1). A step RUNS the whole program (forward + backward +
+ * checkpoint recompute), so this set includes the checkpoint-recompute
+ * activation read that the generated harvest prunes. At step end it is
+ * reconciled into the persistent per-producer `witnessProducer` tracker (K_w=2
+ * per producer), which publishes to observed-liveness. Cleared per step. */
+let curWitnessReads = new Map<number, Set<string>>();
 let prev: StepRecord | null = null;
 let stepOrdinal = 0;
 /** Set by the 1c replay layer for the duration of a REPLAY step: the recorder
@@ -329,10 +341,11 @@ let eligiblePairs = 0;
 let stepsObserved = 0;
 let boundaryResets = 0;
 let planInvalidations = 0;
-/** [task #98 phase 4] Witness-set disagreements between two consecutive
- *  producer observations (§4.1 rule 3). Populated by the phase-4 witness
- *  recorder (a later commit); the field exists here so the shadow-parity gate
- *  can read a stable stat surface. */
+/** [task #98 phase 4] Count of producer observations where THIS step's observed
+ *  cross-plan read set DISAGREED with the previous step's for the same producer
+ *  (§4.1 rule 3). Zero at steady state — a nonzero count is a nondeterministic-
+ *  reader signal (the conservative UNION is still published, so it never ships a
+ *  wrong prune; the counter makes the nondeterminism visible for shadow-parity). */
 let witnessVariances = 0;
 const refusalDiagnostics: string[] = [];
 const MAX_DIAGNOSTICS = 32;
@@ -340,6 +353,76 @@ const MAX_WARNINGS = 8;
 
 function hex(fp: number): string {
   return (fp >>> 0).toString(16);
+}
+
+/** [task #98 phase 4 — WITNESS-TIME HARVEST] Per PRODUCER-template `fp`, the
+ *  previous step's observed read set + how many CONSECUTIVE steps it has been
+ *  read with that exact set. Keyed by PRODUCER (not the whole-step structure):
+ *  under selective checkpointing the recompute READER plans are freshly-
+ *  fingerprinted every backward (so no two whole steps are structurally
+ *  identical, `stage4 §Task #97` — the reason the whole-step eligibility gate
+ *  can never fire on the checkpoint config), but the PRODUCER template of the
+ *  cross-plan activation (`0xc98a72f3`, the checkpointed-MLP `contiguous[512,768]`
+ *  producer) recurs identically every step. The witness window is therefore
+ *  PER PRODUCER: two consecutive steps in which THIS producer was read with the
+ *  SAME pair set (§10 ruling 2, K_w=2, applied at the producer stratum). */
+const witnessProducer = new Map<
+  number,
+  { reads: Set<string>; consecutive: number }
+>();
+
+/** [task #98 phase 4 — WITNESS-TIME HARVEST] Reconcile THIS step's observed
+ *  cross-plan reads (`curW`: producer fp → pair set) against the per-producer
+ *  witness tracker, and publish a producer's witnessed harvest once it has been
+ *  read with the SAME set in two consecutive steps (K_w=2). Called EVERY step
+ *  the recorder finalizes a NORMAL step (not gated on whole-step tape
+ *  eligibility — the checkpoint config never reaches that, see above).
+ *
+ *  Publication is monotone-safe: once a producer's set is published it is only
+ *  ever GROWN (a later step observing a new pair republishes the UNION), never
+ *  shrunk — a superset keep never causes a UAF (pruning too FEW never crashes),
+ *  so the tracker can trust the first two-consecutive agreement and extend it. A
+ *  DISAGREEMENT (the producer read a different set than last step) resets the
+ *  consecutive count AND, if a set was already published, republishes the UNION
+ *  (never drop a witnessed pair) and counts the variance (nondeterministic
+ *  reader diagnostic, §4.1 rule 3). */
+function reconcileWitnessReads(curW: Map<number, Set<string>>): void {
+  if (!witnessHarvestPublisher) return;
+  for (const [fp, reads] of curW) {
+    const tr = witnessProducer.get(fp);
+    if (!tr) {
+      // First observation of this producer: seed, not yet publishable (K_w=2).
+      witnessProducer.set(fp, { reads: new Set(reads), consecutive: 1 });
+      continue;
+    }
+    const same =
+      reads.size === tr.reads.size && [...reads].every((k) => tr.reads.has(k));
+    if (same) {
+      tr.consecutive++;
+      // Two (or more) consecutive identical observations → witnessed. Publish
+      // (idempotent — same set each time once stable).
+      if (tr.consecutive >= 2) witnessHarvestPublisher(fp, reads);
+    } else {
+      // The read set changed between two consecutive appearances. Grow the
+      // tracker to the UNION (monotone), reset the consecutive count, and — if
+      // already published — republish the union so no witnessed pair is dropped.
+      const union = new Set<string>(tr.reads);
+      for (const k of reads) union.add(k);
+      const wasPublished = tr.consecutive >= 2;
+      const grew = union.size !== tr.reads.size;
+      tr.reads = union;
+      tr.consecutive = 1;
+      if (grew) {
+        witnessVariances++;
+        if (refusalDiagnostics.length < MAX_DIAGNOSTICS) {
+          refusalDiagnostics.push(
+            `[step-tape] witness-variance fp=0x${hex(fp)} grew to ${union.size} pairs (conservative union${wasPublished ? " republished" : ""})`,
+          );
+        }
+      }
+      if (wasPublished && grew) witnessHarvestPublisher(fp, union);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +571,47 @@ export function stRecordReadback(
 /** The 1c replay layer marks a hit replay so the recorder ignores the step. */
 export function stMarkReplayStep(): void {
   replaying = true;
+}
+
+/**
+ * [task #98 phase 4 — WITNESS-TIME HARVEST] Record a cross-plan read of a
+ * STAMPED producer result during a recording step (§4.1 rule 2). Called from
+ * the cross-plan read seam (`getInputStorage`) for every stamped storage a plan
+ * reads — critically INCLUDING the LOWERED reads `observeConsumed` never sees
+ * (the backward pass re-reading a checkpoint-recompute forward activation, the
+ * #97 STOP class). The (producerFp, ni, oi) coordinate is exactly the harvest
+ * pair coordinate, so the witnessed set can be unioned into the generated
+ * harvest's keep set verbatim.
+ *
+ * Blind during a REPLAY step (a replay executes the tape, not the observed
+ * normal path — its reads must not corrupt the witness set the next NORMAL step
+ * builds). Cheap: one Map/Set insert, gated by `activePlan` (a read outside a
+ * recorded plan — warmup, readback — is not a cross-plan harvest read here). */
+export function stObserveWitnessRead(fp: number, ni: number, oi: number): void {
+  if (replaying) return;
+  if (!activePlan) return;
+  let s = curWitnessReads.get(fp);
+  if (!s) curWitnessReads.set(fp, (s = new Set()));
+  s.add(`${ni}:${oi}`);
+}
+
+/** Publisher callback (wired by the executor layer at load — core stays a leaf,
+ *  same pattern as observed-liveness's own invalidator callbacks). Delivers a
+ *  producer template's WITNESSED harvest set to observed-liveness on eligibility.
+ *
+ *  The witnessed set PERSISTS across a template's build-from-IR rebuild (an
+ *  intrinsic property of the workload, exactly like observed-liveness's own
+ *  needed-set — the `templates` map is never cleared on invalidation): only a
+ *  fresh eligibility REPLACES it. So there is deliberately no clear-on-invalidate
+ *  callback — clearing on rebuild would starve the rebuilt template of its
+ *  witnessed keep set until it re-witnessed, re-opening the prune window. */
+let witnessHarvestPublisher:
+  | ((fp: number, pairs: Set<string>) => void)
+  | undefined;
+export function setWitnessHarvestPublisher(
+  fn: (fp: number, pairs: Set<string>) => void,
+): void {
+  witnessHarvestPublisher = fn;
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +848,7 @@ export function stEndStep(info: {
     // (the last real recorded step) intact for the next normal step.
     replaying = false;
     cur = { entries: [], plans: [] };
+    curWitnessReads = new Map();
     activePlan = null;
     return;
   }
@@ -741,6 +866,22 @@ export function stEndStep(info: {
   cur = { entries: [], plans: [] };
   const p = prev;
   prev = rec;
+  // [task #98 phase 4 — WITNESS-TIME HARVEST] Reconcile THIS step's observed
+  // cross-plan reads into the per-producer witness tracker and publish any
+  // producer witnessed with a stable read set (§4.1). Done for EVERY finalized
+  // NORMAL step, keyed by PRODUCER template — NOT gated on whole-step structural
+  // identity or tape-replay eligibility. This is load-bearing for the #97
+  // checkpoint config: selective-checkpointing steps run recompute segments
+  // LOWERED and re-fingerprint the READER plans every backward, so no two whole
+  // steps are structurally identical and the whole-step eligibility gate below
+  // NEVER fires — yet the PRODUCER template of the cross-plan activation recurs
+  // identically every step, and those steps DID run the whole program (forward +
+  // backward + recompute), so their reads (incl. the lowered backward read of a
+  // checkpoint-recompute activation) are the witnessed harvest the generated
+  // prune needs. Rolling the accumulator here empties it for the next step.
+  const curWitness = curWitnessReads;
+  curWitnessReads = new Map();
+  reconcileWitnessReads(curWitness);
   if (!p) return;
   if (
     p.structKey !== rec.structKey ||
@@ -944,6 +1085,8 @@ export function stResetAll(): void {
   declaredScalarSlots.clear();
   declaredBatchCover.clear();
   cur = { entries: [], plans: [] };
+  curWitnessReads = new Map();
+  witnessProducer.clear();
   activePlan = null;
   prev = null;
   stepOrdinal = 0;
