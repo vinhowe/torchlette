@@ -398,10 +398,30 @@ StepEditChannel = {
   requestSplit(region, at): RegionUid[]   // partition: split (islands I4 split policy)
   requestRecompute(segment, mode): void   // recompute-vs-retain toggle (ruling 3)
   requestRingDepth(k): void               // ring K edit (phase2b §2, a memory knob)
-  requestSlotRebind?(slot, source): void   // slot source rebind (open — §7 Q)
   rollback(handle): void                   // discard → re-record under prior decl
 }
 ```
+
+**Slot sources are FIXED at declaration in v1 (RULED 2026-07-15, §10 Q1).**
+`requestSlotRebind` is NOT in the v1 surface: changing a knob's VALUE is already
+hitchless forever (declared slots re-dress every replay); changing its PLUMBING
+(source: upload → scalar-table → tensor) is a rare once-per-knob structural act, and
+a re-declare + two-step re-witness (§5.3) prices it correctly. Two doors held open at
+zero cost: (a) **slots get STABLE NAMES** — a slot survives re-witnessing as "the α
+slot", not "slot #7 of tape 43" — so rebind-as-edit can be added later as a pure
+mechanism change with no schema break; (b) the escape hatch: if implementation finds
+the rebind path LOWER-complexity than re-declare (Vin's proviso), take it — the
+ruling fixes the v1 surface, not the mechanism underneath.
+
+**RESERVED (not v1): `pauseAtBoundary(segment): PauseHandle`** — the
+breakpoint-and-poke channel (the model-editor charter's live-vs-static Q4). The step
+program's plan/segment boundaries are natural cut points; edits at a pause are slot
+WRITES taking effect for the remainder of the step; guards refuse the tape for a
+breakpointed step (it runs the normal path — debugging steps are rare by nature, so
+tape non-coverage costs nothing). Standing RULES (e.g. "clamp feature when it
+fires") are NOT pokes — they compile into the program as conditional seams (the
+scoreMod/maskMod pattern, #64) and stay tape-covered. The interface slot is reserved
+here so the v1 channel shape doesn't have to break to admit it.
 
 Every method RECORDS a requested decision and returns a handle; nothing mutates a
 live partition or plan directly (the `fuse.ts` discipline — "we do NOT build a
@@ -505,7 +525,12 @@ matrix-proven with **checkpointing ON mandatory**.
 - **Gate:** §4.4 — shadow set-parity empty (checkpointing ON), trajectory parity
   ≤ 1e-5, zero `Input not ready`. The config matrix MUST include distil@512+selective
   checkpointing, medium@512, 124M chunked-sum — the third-time-is-not-fooled matrix
-  (§7 risk 1).
+  (§7 risk 1). **The matrix is also EVENT-INCLUSIVE (RULED 2026-07-15, §10 Q2):** it
+  must interpose the known data-dependent variation sources — a GradScaler
+  inf-skip (overflow-inducing) step and an LR-scheduler milestone — and show each
+  either changes structure (guard refuses, normal path runs) or flows through a
+  declared slot (covered). Completeness is verified against actual variation, not
+  assumed from the window size.
 - **Deletes (staged):** the recorded build's harvest master for covered classes;
   full recorded-build sunset (`buildCompiledPlan` + ~80 `record*` refs,
   `stage4 §Task #43` B2/B3, ~−800–1200 SLOC) remains gated on FULL witness coverage
@@ -688,22 +713,22 @@ not shrink, for several phases before any deletion lands."**
 
 ---
 
-## 10. Genuinely open questions for Vin (only where they materially fork the design)
+## 10. Open questions — BOTH RESOLVED (Vin, 2026-07-15)
 
-1. **Slot rebind in the edit channel (§5.1 `requestSlotRebind?`).** Should the P3
-   editor be able to REBIND a slot's source (e.g. promote a plain-value arg to a
-   tensor slot, or change an upload to a scalar-table slot) as an edit, or is slot
-   source fixed at declaration time (only merge/split/recompute/ring are editable)?
-   This forks §5's surface: if slots are editable, the channel needs a slot-source
-   legality predicate and a re-witness on rebind; if fixed, the surface is smaller and
-   slots are purely a `capture()`-time concern. It does not block phases 0–5.
+1. **Slot rebind: FIXED AT DECLARATION in v1** (ruling stamped into §5.1). Rationale:
+   value changes are already hitchless; source changes are once-per-knob structural
+   acts correctly priced at a two-step re-witness; the only regime where rebind-as-edit
+   earns its machinery (slow steps × frequent plumbing changes) matches no sketched
+   workflow. Doors held open: stable slot NAMES now (schema-level, zero cost), and
+   Vin's proviso — if implementation finds the rebind path lower-complexity than
+   re-declare, take it. Also reserved in §5.1: the `pauseAtBoundary` breakpoint hook
+   (the strongest mid-step case — closed-loop intervention within one forward — is
+   pause-at-declared-boundaries + slot writes, not arbitrary mutation).
 
-2. **Witness count K_w for harvest eligibility.** §4 uses TWO consecutive identical
-   executed steps (matching the tape's existing eligibility, `step-tape.ts:730`). For
-   the #97 checkpoint class, is two witnesses ENOUGH confidence that the harvest set is
-   complete, or does the mandatory-checkpointing risk (§7 risk 1) argue for a larger
-   witness window (K_w=3) specifically when a `RecomputeSegment` is declared — trading
-   one extra warmup step for a stronger cross-plan-read completeness guarantee? This
-   forks phase 4's eligibility rule. My default recommendation: K_w=2 everywhere, with
-   `TAPE_VERIFY` as the completeness backstop — but the checkpoint history makes K_w=3-
-   under-checkpointing a defensible conservative default worth your call.
+2. **K_w = 2 everywhere** (ruling stamped into phase 4's gate). The field's consensus
+   (JAX refusal / Dynamo guards / CUDA-graph contract / V8 deopt) is that warmup count
+   is a performance parameter, never a correctness parameter: two structurally
+   identical steps carry all structural information, and data-dependent variation
+   (scaler inf-skip, scheduler milestones) is invisible to ANY small window — it is
+   handled by guards + the armed strict-lifetime detector + the phase-4 shadow
+   set-parity gate, whose config matrix is now required to be event-inclusive.
