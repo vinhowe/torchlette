@@ -1,6 +1,8 @@
 > **SUPERSEDED (2026-07-06).** The Dawn-level tape described here shipped as the
 > generated-plan replay (stage-4 phases 2-4). The successor campaign — program-level
-> replay one layer above plans — is `staged-execution-phase1.md`.
+> replay one layer above plans — is `staged-execution-phase1.md`. Its whole-step
+> unification (the program-level tape and `api.capture()` as ONE object in two
+> phases) is `docs/step-object-design.md`.
 
 # Dispatch Tape Replay System
 

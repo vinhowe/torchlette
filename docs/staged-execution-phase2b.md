@@ -376,6 +376,12 @@ The frozen-scalar family's kill-zone. Composition, stated precisely:
 
 ### 5. THE DECLARED-LIFETIME DIVIDEND (extension point — DO NOT BUILD)
 
+> **Step-object update (task #98, 2026-07-15):** this dividend is now the
+> DESTINATION of the step-object campaign (`docs/step-object-design.md`, ruling 2
+> + phase 7), not a speculative maybe. It stays "DO NOT BUILD" here — the step
+> object sequences it LAST, gated on its own re-open condition (captured path warm
+> + observation-layer watcher cost measured). The design aims at it explicitly.
+
 Inside a captured training region, the step's dataflow is known at capture time
 — which buffers a plan writes, which are read cross-plan, which die at the
 boundary. This is strictly MORE information than the observation layer

@@ -1,7 +1,13 @@
-# The Islands IR — Record-Time Kernel Partitioning (PROPOSED)
+# The Islands IR — Record-Time Kernel Partitioning
 
-**Status:** DESIGN ONLY (task #78, stage-1/3 protocol). No implementation this
-campaign. Reviewed against: the schedule-record spike
+**Status:** PARTIALLY IMPLEMENTED (task #78). I0 (reify), I1 (partition token in
+the fingerprint), and I2a (detector as a merge-proposing policy) LANDED
+null-clean; I2b (gap-spanning) was built-measured-null-reverted — see
+`## I2 IMPLEMENTATION FINDINGS` below for what shipped and the corrected roadmap
+target (the residual is matmul-adjacent singleton casts at CLAIM altitude, not
+detector generality). The `(G, P, device)` partition is lifted to a per-STEP
+facet by the step object — `docs/step-object-design.md §3.3` (ruling 4);
+I3/I4's deletions are earned there. Reviewed against: the schedule-record spike
 (`docs/spike-schedule-record-findings.md`), the kernel-editor validity/
 completeness and WGSL⊂CUDA analyses (scratchpad), `docs/architecture-debt.md`
 (sin taxonomy + stage plan), `docs/stage4-compile-from-ir.md` (the four
