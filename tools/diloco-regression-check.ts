@@ -26,6 +26,11 @@ const ROUNDS = parseInt(process.env.REG_ROUNDS ?? "10", 10);
 const TOKENS_PATH =
   process.env.LOCAL_TOKENS ??
   "/mnt/pccfs2/backed_up/vin/dev/torchlette/ckpts/tinystories-tokens.bin";
+// The baseline trajectory is a function of the input blob: the canonical
+// tinystories-tokens.bin has exactly this many tokens. Any other blob (or a
+// REG_* override) silently shifts round-0 loss and every baseline after it —
+// a non-canonical input must be LOUD, not a mysterious "regression".
+const CANONICAL_TOKEN_COUNT = 473_992_236;
 
 // Baseline trajectory re-verified 2026-05-29 on V100 (sivri), AC ON + scaler +
 // AdamW + plain GPT2 (no LoRA wrapper) + no-accumGrads path + selective
@@ -92,7 +97,17 @@ async function main() {
 
   const tokenSource = new FullCacheTokenSource(TOKENS_PATH);
   tokenSource.load();
-  log(`Tokens loaded: ${tokenSource.load().length.toLocaleString()}`);
+  const tokenCount = tokenSource.load().length;
+  log(`Tokens loaded: ${tokenCount.toLocaleString()} (${TOKENS_PATH})`);
+  if (tokenCount !== CANONICAL_TOKEN_COUNT) {
+    log(
+      `FATAL: non-canonical token blob (${tokenCount.toLocaleString()} tokens, ` +
+        `expected ${CANONICAL_TOKEN_COUNT.toLocaleString()}). The baselines are ` +
+        `only valid against the canonical blob — fix LOCAL_TOKENS before ` +
+        `interpreting any loss delta as a regression.`,
+    );
+    process.exit(2);
+  }
 
   const trainer = new WebGPUGPT2Trainer({
     api,
