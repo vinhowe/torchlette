@@ -46,6 +46,11 @@
  */
 
 import { ENV } from "./env";
+import {
+  deriveStepObject,
+  type StepObject,
+  type StepReceipts,
+} from "./step-object";
 
 /**
  * `TORCHLETTE_STEP_TAPE`:
@@ -161,7 +166,10 @@ function hashValue(h: number, v: unknown, depth: number): number {
     h = mixString(mix(h, u8.byteLength), v.constructor.name);
     let i = 0;
     for (; i + 4 <= u8.length; i += 4) {
-      h = mix(h, u8[i] | (u8[i + 1] << 8) | (u8[i + 2] << 16) | (u8[i + 3] << 24));
+      h = mix(
+        h,
+        u8[i] | (u8[i + 1] << 8) | (u8[i + 2] << 16) | (u8[i + 3] << 24),
+      );
     }
     for (; i < u8.length; i++) {
       h ^= u8[i];
@@ -499,7 +507,14 @@ function structuralKey(rec: {
       if (!e.slot.startsWith("sc:")) parts.push(e.slot);
     } else {
       parts.push(
-        `r:${e.which}:${e.params ? Object.keys(e.params).sort().map((k) => `${k}=${e.params![k]}`).join(",") : ""}`,
+        `r:${e.which}:${
+          e.params
+            ? Object.keys(e.params)
+                .sort()
+                .map((k) => `${k}=${e.params![k]}`)
+                .join(",")
+            : ""
+        }`,
       );
     }
   }
@@ -508,7 +523,8 @@ function structuralKey(rec: {
 
 function refuse(diag: string): void {
   refusals++;
-  if (refusalDiagnostics.length < MAX_DIAGNOSTICS) refusalDiagnostics.push(diag);
+  if (refusalDiagnostics.length < MAX_DIAGNOSTICS)
+    refusalDiagnostics.push(diag);
   if (refusals <= MAX_WARNINGS) {
     console.warn(`[step-tape] REFUSED: ${diag}`);
   }
@@ -534,7 +550,14 @@ function imageAt(p: PlanExecRecord, pos: number): NodeImage | undefined {
 function diffImages(
   prevPlans: PlanExecRecord[],
   curPlans: PlanExecRecord[],
-): { scalarVarying: Array<{ fp: number; pos: number; inputIndex: number; op: string }> } | null {
+): {
+  scalarVarying: Array<{
+    fp: number;
+    pos: number;
+    inputIndex: number;
+    op: string;
+  }>;
+} | null {
   const scalarVarying: Array<{
     fp: number;
     pos: number;
@@ -632,7 +655,12 @@ function diffImages(
 
 function buildSlots(
   rec: { plans: PlanExecRecord[] },
-  scalarVarying: Array<{ fp: number; pos: number; inputIndex: number; op: string }>,
+  scalarVarying: Array<{
+    fp: number;
+    pos: number;
+    inputIndex: number;
+    op: string;
+  }>,
 ): DynamicSlot[] {
   const slots: DynamicSlot[] = [];
   const seen = new Set<string>();
@@ -831,6 +859,47 @@ export function stNoteBoundary(reason: string): void {
 
 export function stGetTapes(): ReadonlyMap<string, StepTape> {
   return tapes;
+}
+
+/**
+ * [step-object phase 1] DERIVE the StepObject for each witnessed tape (task #98
+ * §2.1). This is the single-source read-over the design mandates: the StepObject
+ * is a PROJECTION over the recorder's tape store + the live receipt counters —
+ * NO second owner (docs/step-object-design.md §2, ruling 1). Reifies, changes
+ * NOTHING (the recorder still owns the tapes; this is a read-only view).
+ *
+ * Receipts hash into NEITHER identity (§2.5); they are the SAME live counters
+ * `stStats()` exposes — one source, two shapes.
+ */
+export function stDeriveStepObjects(): StepObject[] {
+  const receipts: StepReceipts = {
+    refusals,
+    eligiblePairs,
+    structureMisses,
+    planInvalidations,
+    boundaryResets,
+  };
+  const objs: StepObject[] = [];
+  for (const tape of tapes.values())
+    objs.push(deriveStepObject(tape, receipts));
+  return objs;
+}
+
+/**
+ * [step-object phase 1] DERIVE the StepObject for ONE tape by bucketKey — the
+ * per-step identity lookup (the digest IS the bucketKey, §2.2). Returns null if
+ * no tape is witnessed under that key.
+ */
+export function stDeriveStepObject(bucketKey: string): StepObject | null {
+  const tape = tapes.get(bucketKey);
+  if (!tape) return null;
+  return deriveStepObject(tape, {
+    refusals,
+    eligiblePairs,
+    structureMisses,
+    planInvalidations,
+    boundaryResets,
+  });
 }
 
 export function stStats(): {

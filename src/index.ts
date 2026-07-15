@@ -56,9 +56,29 @@ export {
   type StorageFormat,
   type WeightFormatName,
 } from "./backend/types";
-export { STEP_TAPE_RECORD, STEP_TAPE_REPLAY, stStats } from "./core/step-tape";
+export {
+  STEP_TAPE_RECORD,
+  STEP_TAPE_REPLAY,
+  stStats,
+  stDeriveStepObject,
+  stDeriveStepObjects,
+} from "./core/step-tape";
 // Step-tape observability (§6): guard-miss/hit counters for apps.
 export { stReplayStats } from "./executor/step-tape-replay";
+// The Step Object (task #98 phase 1): a whole step as first-class data — the
+// DERIVED union of the tape/skeleton facets (docs/step-object-design.md §2).
+export {
+  type StepObject,
+  type StepDeclaration,
+  type StepSkeletonRef,
+  type StepSlotDecl,
+  type StepReceipts,
+  type StepRefusalReason,
+  REFUSAL_GUARD,
+  stepObjectDigest,
+  stepObjectDigestMatchesBucket,
+  deriveStepObject,
+} from "./core/step-object";
 export {
   type DeviceKind,
   DisposedTensorError,
