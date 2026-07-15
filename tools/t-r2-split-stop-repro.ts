@@ -83,22 +83,40 @@ async function main() {
   const { GPT2 } = await import("../examples/gpt2/model.ts");
   const model = new GPT2(
     api,
-    { vocabSize: VOCAB, blockSize: 1024, numLayers: L, numHeads: H, embedDim: E, dropoutRate: 0 },
+    {
+      vocabSize: VOCAB,
+      blockSize: 1024,
+      numLayers: L,
+      numHeads: H,
+      embedDim: E,
+      dropoutRate: 0,
+    },
     { device: "webgpu" },
   );
   await api.beginStep();
   api.endStep();
   await api.markStep();
   model.train(true);
-  const opt = new Adam(model.parameters(), { lr: 5e-4, weightDecay: 0.01, adamW: true }, api);
+  const opt = new Adam(
+    model.parameters(),
+    { lr: 5e-4, weightDecay: 0.01, adamW: true },
+    api,
+  );
   const losses: number[] = [];
   for (let step = 0; step < STEPS; step++) {
     const { inp, tgt } = randInput(SEQ);
     await api.beginStep();
-    const input = api.tensorFromArray(Array.from(inp), [BATCH, SEQ], { device: "webgpu" });
-    const target = api.tensorFromArray(Array.from(tgt), [BATCH, SEQ], { device: "webgpu" });
+    const input = api.tensorFromArray(Array.from(inp), [BATCH, SEQ], {
+      device: "webgpu",
+    });
+    const target = api.tensorFromArray(Array.from(tgt), [BATCH, SEQ], {
+      device: "webgpu",
+    });
     const loss = api.tidy(() => {
-      const l = model.forwardWithLoss(input, target, { useCheckpoint: true, selectiveCheckpoint: true }).loss;
+      const l = model.forwardWithLoss(input, target, {
+        useCheckpoint: true,
+        selectiveCheckpoint: true,
+      }).loss;
       api.keep(l);
       return l;
     });
@@ -147,7 +165,9 @@ async function main() {
     destroyWebGPU();
     process.exit(1);
   }
-  log("split probe OFF — baseline run (no corruption expected). Set the probe to reproduce the STOP.");
+  log(
+    "split probe OFF — baseline run (no corruption expected). Set the probe to reproduce the STOP.",
+  );
   destroyWebGPU();
   process.exit(0);
 }

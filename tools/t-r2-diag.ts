@@ -7,20 +7,20 @@
  */
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
 import {
-  debugConvergenceState,
-  debugReleasableSummary,
-  debugTopHeldPairs,
-  getAllWitnessedHarvest,
-} from "../src/executor/observed-liveness";
+  debugPlannerRegistryStats,
+  debugResultBytesByTemplate,
+} from "../src/executor/compiled-plan";
 import {
   debugTemplateCount,
   debugTemplatePlanMemory,
   getPayloadThrashStats,
 } from "../src/executor/executor";
 import {
-  debugPlannerRegistryStats,
-  debugResultBytesByTemplate,
-} from "../src/executor/compiled-plan";
+  debugConvergenceState,
+  debugReleasableSummary,
+  debugTopHeldPairs,
+  getAllWitnessedHarvest,
+} from "../src/executor/observed-liveness";
 import { Torchlette } from "../src/frontend/torchlette";
 import { Adam } from "../src/optim/index.ts";
 
@@ -112,14 +112,22 @@ async function main() {
   );
   log(`=== RESULT BYTES BY OWNING TEMPLATE ===`);
   const byT = debugResultBytesByTemplate();
-  const sorted = Object.entries(byT).sort((a, b) => b[1].resultMB - a[1].resultMB);
+  const sorted = Object.entries(byT).sort(
+    (a, b) => b[1].resultMB - a[1].resultMB,
+  );
   for (const [fp, s] of sorted)
-    log(`  ${fp}: result=${s.resultMB}MB entries=${s.entries} hasRecompute=${s.hasRecompute}`);
+    log(
+      `  ${fp}: result=${s.resultMB}MB entries=${s.entries} hasRecompute=${s.hasRecompute}`,
+    );
   log(`=== TEMPLATE PLAN MEMORY (sorted by resultMB) ===`);
   const tpm = debugTemplatePlanMemory();
-  const tpmSorted = Object.entries(tpm).sort((a, b) => b[1].resultMB - a[1].resultMB);
+  const tpmSorted = Object.entries(tpm).sort(
+    (a, b) => b[1].resultMB - a[1].resultMB,
+  );
   for (const [fp, s] of tpmSorted.slice(0, 12))
-    log(`  ${fp}: nodes=${s.nodes} valid=${s.valid} results=${s.results} pruned=${s.pruned} resultMB=${s.resultMB} tempMB=${s.tempMB}`);
+    log(
+      `  ${fp}: nodes=${s.nodes} valid=${s.valid} results=${s.results} pruned=${s.pruned} resultMB=${s.resultMB} tempMB=${s.tempMB}`,
+    );
   log(`=== CONVERGENCE STATE ===`);
   for (const [fp, s] of Object.entries(debugConvergenceState()))
     log(
@@ -128,7 +136,9 @@ async function main() {
   const wit = getAllWitnessedHarvest();
   log(`=== WITNESSED HARVEST (${wit.size} producer templates) ===`);
   for (const [fp, pairs] of wit) {
-    log(`  producer 0x${fp.toString(16)}: ${pairs.length} pairs: ${pairs.join(" ")}`);
+    log(
+      `  producer 0x${fp.toString(16)}: ${pairs.length} pairs: ${pairs.join(" ")}`,
+    );
   }
   log(`=== RELEASABLE SUMMARY (per producer template, ALL) ===`);
   const rel = debugReleasableSummary();

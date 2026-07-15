@@ -960,7 +960,10 @@ export function debugResultBytesByTemplate(): Record<
     }
     const key = fp ?? -1;
     let a = acc.get(key);
-    if (!a) acc.set(key, (a = { bytes: 0, entries: 0, hasRecompute }));
+    if (!a) {
+      a = { bytes: 0, entries: 0, hasRecompute };
+      acc.set(key, a);
+    }
     a.bytes += e.bytes;
     a.entries++;
     a.hasRecompute ||= hasRecompute;
