@@ -52,18 +52,6 @@ export interface ResultStamp {
   oi: number;
 }
 
-/** Thrown by the bind-time guard when a pruned producer's value is missing but
- *  recoverable (no in-place op committed since its replay). Caught by
- *  executePlanOptimized → evict the consumer template + re-collect lowered. */
-export class RecoverableGuardMiss extends Error {
-  constructor(readonly stamp: ResultStamp) {
-    super(
-      `[observed-liveness] pruned producer template=0x${stamp.fp.toString(16)} node=${stamp.ni} oi=${stamp.oi} missing at a late consumer; recovering via lowered re-collection`,
-    );
-    this.name = "RecoverableGuardMiss";
-  }
-}
-
 const K_HYSTERESIS = 3;
 const REBUILD_GROWTH_LIMIT = 2;
 /** Steps a template may sit idle (not executed) before its compiled plan is
@@ -489,38 +477,45 @@ export function registerPrunedExecution(
 }
 
 /**
- * Bind-time guard: a late consumer's external input (producer nodeId, oi) is
- * missing. If it was a pruned producer, decide recovery vs loud failure.
- * Returns true if the miss was ours (handled by throwing); false if unrelated
- * (the caller rethrows the original "Input not ready").
+ * Bind-time guard (task #98 phase 5 — DEMOTED to a should-never-fire assertion).
+ * A late consumer's external input (producer nodeId, oi) is missing. If it was a
+ * pruned producer, this is a pruned-then-demanded read the harvest should have
+ * kept — it MUST NOT happen: both prune-soundness classes are covered upstream
+ * (the overlay class by `graphHeldAt` at the claim seam, task #97 stage 2; the
+ * checkpoint-recompute + shape=[] scaler-scalar classes by the recorded build's
+ * harvest / the witness-time harvest, step-object §4). A zero-fire soak across
+ * the full config matrix (docs/step-object-design.md §6 Phase 5) confirmed the
+ * old `RecoverableGuardMiss` clean-recovery never fired on any path. So the
+ * recovery net (grow-needed-set → invalidate → re-collect lowered next step) is
+ * deleted and a match here throws LOUDLY with full context.
+ *
+ * Returns false (unrelated miss → caller rethrows the original "Input not
+ * ready") ONLY when the missing input is NOT a pruned producer. A matched
+ * pruned-producer miss throws — it never returns.
  */
 export function guardMiss(nodeId: number, oi: number): boolean {
   if (!enabled) return false;
   const hit = prunedExecuted.get(nodeId);
   if (!hit || hit.stamp.oi !== oi) return false;
   const { stamp, mark } = hit;
-  // [stage-3 B] Attribution: a miss on a RELEASED pair means the claim's
-  // last-reader observation was wrong once — revoke pins it (below), and the
-  // counter makes claim churn visible.
+  // Counters retained as the observable "never fired" signal (gated at 0 by
+  // test/observed-liveness.spec.ts + witness-harvest.spec.ts). A fire here is a
+  // hard bug: a covered class regressed, or a NEW pruned-read class exists that
+  // the harvest coverage (graphHeldAt + recorded/witness harvest) does not net.
   if (hit.released) claimMisses++;
-  // Grow the producer's needed-set and invalidate its pruned build so next
-  // step re-harvests the value (conservative-then-re-pruned).
-  addNeeded(stamp.fp, stamp.ni, stamp.oi, "g");
-  // [stage-3] A miss proves a consumer observation didn't see — the pair's
-  // observed last-reader is untrustworthy forever. Idempotent for pruned-pair
-  // misses (which were never releasable).
-  revokeRelease(stamp.fp, stamp.ni, stamp.oi);
-  invalidateTemplateCompiled?.(stamp.fp);
-  // Soundness boundary: recompute reads CURRENT storages. If any in-place op
-  // committed since the producer's replay, the recompute would silently differ.
-  if (inPlaceCommits > mark) {
-    dirtyMisses++;
-    throw new Error(
-      `[observed-liveness] UNRECOVERABLE pruned-producer miss: template=0x${stamp.fp.toString(16)} node=${stamp.ni} oi=${stamp.oi} — ${inPlaceCommits - mark} in-place op(s) committed since its pruned replay, so recompute-on-demand would read mutated storages and produce a DIFFERENT value. Failing loudly rather than silently training on stale data. The value is added to the producer's needed-set; next step will harvest it. (stage-3 rematerialization would recover this in-step.)`,
-    );
-  }
-  cleanMisses++;
-  throw new RecoverableGuardMiss(stamp);
+  const dirty = inPlaceCommits > mark;
+  if (dirty) dirtyMisses++;
+  else cleanMisses++;
+  throw new Error(
+    `[observed-liveness] guardMiss ASSERTION FIRED (should never happen, task #98 phase 5): ` +
+      `a pruned producer's value was demanded at a late consumer's external slot. ` +
+      `template=0x${stamp.fp.toString(16)} node=${stamp.ni} oi=${stamp.oi} nodeId=${nodeId} ` +
+      `released=${hit.released ?? false} ${dirty ? `dirty(${inPlaceCommits - mark} in-place op(s) committed since replay)` : "clean"}. ` +
+      `Both prune-soundness classes are supposed to be unconstructible: the overlay class via graphHeldAt ` +
+      `(task #97 stage 2) and the checkpoint-recompute / shape=[] scaler-scalar classes via the recorded/witness harvest ` +
+      `(step-object §4). A fire means one of those nets regressed or a new pruned-read class exists — investigate the ` +
+      `producer template's harvest set, do NOT re-add lowered re-collection recovery.`,
+  );
 }
 
 // ── Step boundary: survival scan + convergence ───────────────────────────────

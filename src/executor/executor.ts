@@ -210,13 +210,6 @@ interface OptimizedExecutionOptions {
    * the engine for checkpointed training (see RuntimeEngine.setBufferArenaDisabled).
    */
   arenaDisabled?: boolean;
-  /**
-   * [observed-liveness] Guard recovery: force the whole execution LOWERED (no
-   * compiled fast-path, no build-from-IR) so a fresh collection recomputes a
-   * pruned producer's value against surviving storages. Set by forceAllMerged's
-   * one-shot retry after a RecoverableGuardMiss.
-   */
-  forceLowered?: boolean;
 }
 
 /**
@@ -1712,10 +1705,6 @@ export async function executeLoweredPlan(
      *  belongs to. Stamped on any compiled plan built here so the harvest can
      *  tag results with their cross-plan identity. */
     templateFp?: number;
-    /** [observed-liveness] Guard recovery: run this execution LOWERED (no
-     *  compiled fast-path, no build-from-IR, no cutover) so a fresh collection
-     *  recomputes a pruned producer's value against surviving storages. */
-    forceLowered?: boolean;
   } = {},
 ): Promise<OptimizedExecutionResult> {
   // Validate plan node count matches
@@ -1818,7 +1807,6 @@ export async function executeLoweredPlan(
   // copy, write, barrier) with abstract slot indices instead of concrete buffers.
   // Compiled plan: enabled by default. Disable with TORCHLETTE_COMPILED_PLAN=0.
   if (
-    !options.forceLowered &&
     loweredPlan.compiledPlan?.valid &&
     useTopLevelSharedEncoder &&
     options.bufferArena &&
@@ -1887,7 +1875,6 @@ export async function executeLoweredPlan(
   // are byte-identical to the unmodified normal path, and an uncovered plan
   // simply records on its next execution (the census-driven fallback).
   if (
-    !options.forceLowered &&
     !scalarAdaptPending &&
     buildFromIRActive() &&
     backend.name === "webgpu" &&
@@ -3655,7 +3642,6 @@ export async function executePlanOptimized(
     const r = await executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
       bufferArena,
       templateFp: fingerprint.primary,
-      forceLowered: options.forceLowered,
     });
     // [observed-liveness] Tag any compiled plan built this call with its
     // template fp so future replays stamp harvested results with their
@@ -3673,7 +3659,6 @@ export async function executePlanOptimized(
     const r = await executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
       bufferArena,
       templateFp: fingerprint.primary,
-      forceLowered: options.forceLowered,
     });
     if (loweredPlan.compiledPlan) {
       loweredPlan.compiledPlan.tapeFp = fingerprint.primary;

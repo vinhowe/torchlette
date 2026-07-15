@@ -21,11 +21,15 @@
  *  GATE 3 — late-consumer guard (deterministic, CPU). A plan built AFTER the
  *    observation window that reads a PRUNED producer output misses at the
  *    consumer's bind-time external-slot resolution (before any side effect).
- *    With the in-place-committed counter CLEAN the miss is recoverable
- *    (RecoverableGuardMiss → the executor evicts + re-collects lowered); with it
- *    DIRTY (an in-place op committed since the producer's pruned replay) the
- *    miss is unrecoverable and FAILS LOUDLY with a diagnostic naming
- *    template/node/oi. This test drives the exact decision logic the bind-time
+ *    Task #98 phase 5 DEMOTED the guardMiss recovery to a should-never-fire
+ *    assertion: a matched pruned-producer miss (clean OR dirty) now throws a
+ *    LOUD Error naming template/node/oi/stamp state — the old clean-recovery
+ *    (RecoverableGuardMiss → evict + re-collect lowered) is DELETED because a
+ *    zero-fire soak across the full config matrix proved it never fired (both
+ *    prune-soundness classes are covered upstream: graphHeldAt + the
+ *    recorded/witness harvest). An UNMATCHED miss (unregistered node / wrong
+ *    output index) still returns false so the caller rethrows the original
+ *    "Input not ready". This test drives the exact decision logic the bind-time
  *    seam (compiled-plan.ts phase 1) invokes.
  */
 import { execFile } from "node:child_process";
@@ -36,11 +40,9 @@ import { canUseWebGPU } from "./helpers/webgpu";
 import {
   guardMiss,
   noteInPlaceCommit,
-  RecoverableGuardMiss,
   registerPrunedExecution,
   resetObservedLiveness,
   setObservedLivenessEnabled,
-  setTemplateCompiledInvalidator,
 } from "../src/executor/observed-liveness";
 
 const execFileP = promisify(execFile);
@@ -134,11 +136,11 @@ describe("observed cross-plan liveness — late-consumer guard (gate 3)", () => 
     setObservedLivenessEnabled(false);
   });
 
-  it("CLEAN miss → RecoverableGuardMiss + producer template invalidated", () => {
-    let invalidated: number | undefined;
-    setTemplateCompiledInvalidator((fp) => (invalidated = fp));
+  it("CLEAN miss → loud should-never-fire assertion naming template/node/oi (recovery DELETED)", () => {
     // Producer's pruned replay registered at in-place-commit count 0; nothing
-    // mutated since.
+    // mutated since. Pre-phase-5 this was the "recoverable" clean case
+    // (RecoverableGuardMiss → re-collect lowered). Phase 5: it is a hard
+    // assertion — a matched pruned-producer miss must never happen.
     registerPrunedExecution(FP, NI, OI, PRODUCER_NODE_ID);
 
     let caught: unknown;
@@ -147,19 +149,17 @@ describe("observed cross-plan liveness — late-consumer guard (gate 3)", () => 
     } catch (e) {
       caught = e;
     }
-    expect(caught).toBeInstanceOf(RecoverableGuardMiss);
-    expect((caught as RecoverableGuardMiss).stamp).toEqual({
-      fp: FP,
-      ni: NI,
-      oi: OI,
-    });
-    // The producer template's compiled plan is invalidated (grows needed-set,
-    // rebuilds conservative-then-re-pruned next step).
-    expect(invalidated).toBe(FP);
+    expect(caught).toBeInstanceOf(Error);
+    const msg = (caught as Error).message;
+    // Full-context diagnostic: template (hex), node, output index, clean state.
+    expect(msg).toContain("guardMiss ASSERTION FIRED");
+    expect(msg).toContain(`0x${FP.toString(16)}`);
+    expect(msg).toContain(`node=${NI}`);
+    expect(msg).toContain(`oi=${OI}`);
+    expect(msg).toContain("clean");
   });
 
-  it("DIRTY miss (in-place op committed since) → loud failure naming template/node/oi", () => {
-    setTemplateCompiledInvalidator(() => {});
+  it("DIRTY miss (in-place op committed since) → loud assertion naming template/node/oi + in-place count", () => {
     registerPrunedExecution(FP, NI, OI, PRODUCER_NODE_ID);
     // An in-place op (adam / copy_) committed between the producer's pruned
     // replay and the miss → recompute would read mutated storages → unsound.
@@ -172,9 +172,10 @@ describe("observed cross-plan liveness — late-consumer guard (gate 3)", () => 
       caught = e;
     }
     expect(caught).toBeInstanceOf(Error);
-    expect(caught).not.toBeInstanceOf(RecoverableGuardMiss);
     const msg = (caught as Error).message;
-    // Diagnostic must name the template (hex), node, and output index.
+    // Diagnostic must name the template (hex), node, output index, and the
+    // dirty (in-place-committed) classification.
+    expect(msg).toContain("guardMiss ASSERTION FIRED");
     expect(msg).toContain(`0x${FP.toString(16)}`);
     expect(msg).toContain(`node=${NI}`);
     expect(msg).toContain(`oi=${OI}`);
@@ -182,13 +183,11 @@ describe("observed cross-plan liveness — late-consumer guard (gate 3)", () => 
   });
 
   it("miss on an UNREGISTERED node is not ours (returns false → caller rethrows original)", () => {
-    setTemplateCompiledInvalidator(() => {});
     // No registerPrunedExecution for this node id.
     expect(guardMiss(9999, 0)).toBe(false);
   });
 
   it("miss on the wrong output index of a registered node is not ours", () => {
-    setTemplateCompiledInvalidator(() => {});
     registerPrunedExecution(FP, NI, 0, PRODUCER_NODE_ID);
     expect(guardMiss(PRODUCER_NODE_ID, 1)).toBe(false);
   });

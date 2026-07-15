@@ -1406,8 +1406,11 @@ export async function executeCompiledPlan(
         // [observed-liveness] Bind-time guard: this external LEAF is a later
         // plan's view of a producer result. If pruning dropped that result the
         // resolution misses HERE — before any of this plan's side effects
-        // commit. guardMiss decides clean-recover (throws RecoverableGuardMiss)
-        // vs loud-fail; a miss it doesn't recognise rethrows the original.
+        // commit. guardMiss (task #98 phase 5) THROWS a should-never-fire
+        // assertion for a matched pruned-producer miss (both prune-soundness
+        // classes are covered upstream — graphHeldAt + the recorded/witness
+        // harvest); a miss it doesn't recognise returns and the original
+        // "Input not ready" is rethrown.
         let storage: StorageHandle;
         try {
           storage = getInputStorage(ref, backend);
@@ -1425,13 +1428,14 @@ export async function executeCompiledPlan(
         // clipCoef external is per-step correct here). The consumer's own
         // template-fp match fixes the input's semantic role; a resolution
         // that isn't materialized/live fails LOUDLY here (getInputStorage's
-        // [lifetime] guards + the guardMiss recovery above) — never a silent
+        // [lifetime] guards + the guardMiss assertion above) — never a silent
         // stale bind. NOTE a recorded producer-stamp equality assertion was
         // tried at this seam and reverted: the producer TEMPLATE legitimately
         // changes across warmup/steady graph variants while the value's role
-        // is unchanged (same-ni different-fp false positives on grads, and
-        // the mid-step RecoverableGuardMiss recovery is unsound from
-        // non-initial plans — "Input not ready" on released intermediates).
+        // is unchanged (same-ni different-fp false positives on grads; and a
+        // mid-step re-collection from non-initial plans was unsound anyway —
+        // "Input not ready" on released intermediates — which is why the
+        // guardMiss recovery it would have depended on is now an assertion).
         observeConsumed(storage, compiled.templateFp);
         slots[i] = gpuBuffer(storage.backendTensor);
         if (dbgSlots?.includes(i)) {

@@ -291,11 +291,12 @@ async function main() {
   );
 
   // Observed-liveness guardMiss telemetry (task #97 stage-1 baseline symptom):
-  // cleanMisses = RecoverableGuardMiss recoveries at the compiled external-slot
-  // seam (the count the recorded build's guardMiss net was silently absorbing);
-  // claimMisses = misses on a stage-3 B RELEASED pair (a wrong last-reader
-  // observation). Both must fall to ZERO once the lowered seam is governed by
-  // derived liveness rather than the empirical last-reader guess.
+  // cleanMisses/dirtyMisses = a pruned producer demanded at the compiled
+  // external-slot seam; claimMisses = a miss on a stage-3 B RELEASED pair (a
+  // wrong last-reader observation). Task #98 phase 5 DEMOTED guardMiss recovery
+  // to a should-never-fire assertion (a match now THROWS, not recovers), so any
+  // non-zero here is a hard bug — a prune-soundness class regressed. They must
+  // stay ZERO (the derived liveness / recorded-witness harvest cover the reads).
   const { getObservedLivenessStats } = await import(
     "../src/executor/observed-liveness"
   );

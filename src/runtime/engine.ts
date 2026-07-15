@@ -40,7 +40,6 @@ import { isDataSourceOp } from "../executor/lowered-plan";
 import {
   observeReadback as obsReadback,
   readbackMiss as obsReadbackMiss,
-  RecoverableGuardMiss,
 } from "../executor/observed-liveness";
 import { buildMergedPlan, tagPlanOutputs } from "../executor/plan-builder";
 import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
@@ -797,71 +796,53 @@ export class RuntimeEngine {
     const pendingRoots = collectPendingRoots(tensors);
     if (pendingRoots.length === 0) return;
 
-    // [observed-liveness] Guard recovery loop: a late consumer reading a PRUNED
-    // build-from-IR producer output misses at bind time (RecoverableGuardMiss,
-    // thrown before any side effect). The sound recovery is a FRESH plan
-    // re-collection run lowered: buildMergedPlan now walks the resultless
-    // producer's .inputs chain and pulls the whole recompute slice down to
-    // surviving storages. One retry suffices (a fresh lowered plan never prunes).
-    let plan!: ReturnType<typeof buildMergedPlan>;
-    let forceLowered = false;
-    for (let attempt = 0; ; attempt++) {
-      plan = buildMergedPlan(pendingRoots);
-      if (plan.nodes.length === 0) return;
-      if (TAPE_PROFILE && attempt === 0)
-        tpAdd("plan-collect", performance.now() - tpC0);
+    // [observed-liveness] The bind-time guard's clean-recovery loop was DELETED
+    // (task #98 phase 5): a pruned build-from-IR producer output demanded at a
+    // late consumer is now a should-never-fire assertion in `guardMiss` (both
+    // prune-soundness classes are covered upstream — see observed-liveness.ts).
+    // A zero-fire soak across the full config matrix (docs/step-object-design.md
+    // §6 Phase 5) confirmed the recovery never fired, so the FRESH-lowered
+    // re-collection retry is gone; the plan executes exactly once.
+    const plan = buildMergedPlan(pendingRoots);
+    if (plan.nodes.length === 0) return;
+    if (TAPE_PROFILE) tpAdd("plan-collect", performance.now() - tpC0);
 
-      // Apply DSL rewrites (node-insertion rules) before the template cache
-      // sees the plan. Runs every step but is cheap (few patterns, <1ms).
-      const pendingIds = getPendingNodeIds();
-      const tpR0 = TAPE_PROFILE ? performance.now() : 0;
-      rewritePlan(plan, DSL_RULES, pendingIds);
-      if (TAPE_PROFILE) tpAdd("dsl-rewrite", performance.now() - tpR0);
+    // Apply DSL rewrites (node-insertion rules) before the template cache
+    // sees the plan. Runs every step but is cheap (few patterns, <1ms).
+    const pendingIds = getPendingNodeIds();
+    const tpR0 = TAPE_PROFILE ? performance.now() : 0;
+    rewritePlan(plan, DSL_RULES, pendingIds);
+    if (TAPE_PROFILE) tpAdd("dsl-rewrite", performance.now() - tpR0);
 
-      // Tag plan outputs: nodes with LIVE pending RuntimeTensors only.
-      // The disposed pending IDs (kept for fusion analysis) must NOT be
-      // protected here — their tensors are gone and their buffers should be
-      // releasable. Including them inflates outputIndices and pins memory.
-      tagPlanOutputs(plan, getLivePendingNodeIds());
+    // Tag plan outputs: nodes with LIVE pending RuntimeTensors only.
+    // The disposed pending IDs (kept for fusion analysis) must NOT be
+    // protected here — their tensors are gone and their buffers should be
+    // releasable. Including them inflates outputIndices and pins memory.
+    tagPlanOutputs(plan, getLivePendingNodeIds());
 
-      // Scheduler audit (no-op unless TORCHLETTE_SCHEDULER_AUDIT=1).
-      auditPlan(plan, pendingIds);
+    // Scheduler audit (no-op unless TORCHLETTE_SCHEDULER_AUDIT=1).
+    auditPlan(plan, pendingIds);
 
-      // Retain rc on all materialized inputs used by the plan. Keeps storages
-      // alive through execution even if owning tensors are disposed mid-step.
-      retainPlanInputRefs(plan.nodes);
+    // Retain rc on all materialized inputs used by the plan. Keeps storages
+    // alive through execution even if owning tensors are disposed mid-step.
+    retainPlanInputRefs(plan.nodes);
 
-      const device = resolveDeviceFromTensors(tensors);
+    const device = resolveDeviceFromTensors(tensors);
 
-      // Data-source-only plans skip the template/arena/lowered-plan path.
-      const allDataSource = plan.nodes.every((n) => isDataSourceOp(n.op));
+    // Data-source-only plans skip the template/arena/lowered-plan path.
+    const allDataSource = plan.nodes.every((n) => isDataSourceOp(n.op));
 
-      const backend = this.getBackend(device);
+    const backend = this.getBackend(device);
 
-      // Check if plan has checkpoint boundaries - only segment if checkpointing is used
-      const hasCheckpointBoundaries = plan.nodes.some(
-        (n) => n.isCheckpointBoundary,
-      );
+    // Check if plan has checkpoint boundaries - only segment if checkpointing is used
+    const hasCheckpointBoundaries = plan.nodes.some(
+      (n) => n.isCheckpointBoundary,
+    );
 
-      try {
-        await this._dispatchForcePlan(plan, backend, device, {
-          allDataSource,
-          hasCheckpointBoundaries,
-          forceLowered,
-        });
-        break;
-      } catch (e) {
-        if (e instanceof RecoverableGuardMiss && attempt === 0) {
-          // Release this failed attempt's input-ref retains before rebuilding —
-          // the fresh plan retains its own (the miss threw before any side
-          // effect, so nothing else needs unwinding).
-          for (const node of plan.nodes) releaseNodeInputRefs(node);
-          forceLowered = true;
-          continue;
-        }
-        throw e;
-      }
-    }
+    await this._dispatchForcePlan(plan, backend, device, {
+      allDataSource,
+      hasCheckpointBoundaries,
+    });
     // Materialize ALL tensors that were pending on executed nodes.
     // This ensures all user-held tensors get their storages marked as externally reachable.
     const { materializePendingTensors, clearDisposedPendingNodeIds } =
@@ -892,9 +873,7 @@ export class RuntimeEngine {
     }
   }
 
-  /** Dispatch a collected force plan through the appropriate execution path.
-   *  Extracted so forceAllMerged can retry it under forceLowered after an
-   *  observed-liveness guard miss (see the recovery loop). */
+  /** Dispatch a collected force plan through the appropriate execution path. */
   private async _dispatchForcePlan(
     plan: ReturnType<typeof buildMergedPlan>,
     backend: ReturnType<RuntimeEngine["getBackend"]>,
@@ -902,7 +881,6 @@ export class RuntimeEngine {
     opts: {
       allDataSource: boolean;
       hasCheckpointBoundaries: boolean;
-      forceLowered: boolean;
     },
   ): Promise<void> {
     // Execution hook: replace local execution with a custom path (e.g., remote).
@@ -914,7 +892,6 @@ export class RuntimeEngine {
         enableVectorization: this.vectorizationEnabled,
         enableEarlyRelease: this.earlyReleaseEnabled,
         arenaDisabled: this.bufferArenaDisabled,
-        forceLowered: opts.forceLowered,
       });
       this.lastFusionStats = optimizedResult.stats;
       this.accumulateFusionStats(optimizedResult.stats);

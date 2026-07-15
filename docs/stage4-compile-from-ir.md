@@ -2968,7 +2968,8 @@ continue`** — a saved-for-backward producer is never overlay-released.
 
 Gate: `test/derived-liveness-oracle.spec.ts` (the derivation the claim seam relies
 on) + the harvest-deleted parity/gate-2 trajectory (stage 3). guardMiss recovery
-demotes to a should-never-fire loud assertion in stage 4.
+**DEMOTED to a should-never-fire loud assertion (task #98 phase 5, 2026-07-15)** — see
+the stage-4 update in the STOP block below.
 
 ### Stages 3–4 — BLOCKED: a SECOND, distinct prune-soundness class the harvest deletion exposes
 
@@ -3035,11 +3036,22 @@ report; do not fall back to spreading recovery"). Consequences:
   GENERATED harvest is sound for build-without-execution cross-plan forward→backward
   reads (a whole-step-graph or execution-witnessed harvest — a separate campaign),
   not merely once the overlay class is derived.
-- **Stage 4 (demote guardMiss) does NOT land.** guardMiss recovery is still
-  load-bearing for the compiled path's encounter with this prune class (the
-  recorded build present means the second consumer compiles and recovers). It can
-  only demote to a should-never-fire assertion once BOTH classes are unconstructible
-  — the prune class remains.
+- **Stage 4 (demote guardMiss) — LANDED as task #98 phase 5 (2026-07-15).** This
+  STOP's premise ("guardMiss recovery is still load-bearing… the second consumer
+  compiles and recovers") was FALSIFIED empirically: a zero-fire soak across the full
+  config matrix (default recorded-build path, `STEP_TAPE=record` witness/tape path,
+  `STEP_TAPE=1` replay, stream-generate — 20 configs, all build-from-IR-observed) shows
+  guardMiss NEVER fires. The recovery is not load-bearing because the recorded build
+  HARVESTS the checkpoint-recompute + `shape=[]` scaler-scalar values (they are never
+  pruned-then-demanded → the guardMiss seam is never reached), and the overlay class is
+  unconstructible via `graphHeldAt` (stage 2). guardMiss was a REDUNDANT secondary net.
+  So the clean-recovery is now a loud should-never-fire assertion and the recovery
+  machinery is DELETED (`RecoverableGuardMiss`, the `forceAllMerged` re-collect-lowered
+  retry, the `forceLowered` threading). Net −28 SLOC. See
+  `docs/step-object-design.md §6 Phase 5` for the soak table and the demotion boundary.
+  NOTE the prune-CLASS itself is not deleted — the recorded build's harvest still nets
+  it; phase 5 removes only the redundant guardMiss recovery, not the recorded-build
+  correctness net (its full sunset remains the §4.3 product decision).
 
 **What DID land (the campaign's spine):** the stage-2 derived overlay-release oracle
 (`graphHeldAt` at the claim seam) — the ORIGINAL #97 bug (the `releasedOverlay`

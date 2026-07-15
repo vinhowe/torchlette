@@ -644,14 +644,53 @@ matrix-proven with **checkpointing ON mandatory**.
 
 ### Phase 5 — guardMiss recovery → should-never-fire assert (after a zero-fire soak)
 
-**Goal:** ruling 5. Once phase 4 makes BOTH prune-soundness classes (overlay +
-checkpoint-recompute) unconstructible under the witnessed harvest, `guardMiss`
-recovery demotes to a loud should-never-fire assertion (`stage4 §Task #97 stage 4`
-— "guardMiss recovery is still load-bearing… It can only demote… once BOTH classes
-are unconstructible").
-- **Gate:** a long soak with guard-miss counters 0 across the matrix; `TAPE_VERIFY=16`
-  zero diffs over an LR-knee + scaler-backoff + checkpoint-save session.
-- **Deletes:** the guardMiss recovery path (→ assert).
+**STATUS: LANDED (2026-07-15).** `guardMiss`'s clean-recovery is now a loud
+should-never-fire assertion. The zero-fire soak (below) confirmed the recovery net
+never fires on ANY path — both prune-soundness classes are covered upstream (the
+overlay class by `graphHeldAt` at the claim seam, task #97 stage 2; the
+checkpoint-recompute + `shape=[]` scaler-scalar classes by the recorded build's
+harvest on the default path / the witness-time harvest on the tape path, §4). So the
+recovery machinery is DELETED (the `RecoverableGuardMiss` class, the `forceAllMerged`
+re-collect-lowered retry loop, and the `forceLowered` threading through
+`executeLoweredPlan` → the compiled/build-from-IR gates) and a matched
+pruned-producer miss throws with full context (template fp, node, oi, stamp state,
+clean/dirty classification). Net **−28 SLOC** (code-only). The `!hit` (unrelated
+miss → return false → caller rethrows original "Input not ready") path is unchanged.
+
+**Boundary (which seam got the assert, which kept recovery):** the demotion is
+TOTAL — there is exactly ONE recovery seam (`guardMiss`'s clean branch at the
+compiled external-slot bind, `compiled-plan.ts` phase 1) and it is now an assertion.
+No seam kept recovery, because there is no class where recovery is the DESIGNED net
+today: the `shape=[]` GradScaler-scalar never-witnessed class (the phase-4 STOP
+finding) is netted by the RECORDED BUILD's harvest (which keeps the value so it is
+never pruned-then-demanded — it never reaches the guardMiss seam), NOT by guardMiss
+recovery; the soak's `scaler-inf` cell fires zero. Demoting guardMiss does not remove
+that net — the recorded build's harvest is a separate, still-present mechanism.
+guardMiss was a redundant secondary net.
+
+**Zero-fire SOAK (device 10, build-from-IR default active; the deliverable):** 20
+configs across the default (recorded-build) path, the `STEP_TAPE=record` witness/tape
+path, the `STEP_TAPE=1` replay path, and stream-generate — **0 guardMiss fires
+everywhere**, every cell PASS.
+
+  | config | path | guardMiss fires | verdict |
+  |---|---|---|---|
+  | ledger-attack (STEPS=24, 48) | default | 0 | PASS, cleanMisses=claimMisses=dirtyMisses=0 |
+  | compiled-parity (+ STREAM_GENERATE) | default / stream-gen | 0 | PASS / 129/129 generated |
+  | parity-fullstack (compiled vs COMPILED_PLAN=0) | default / lowered | 0 | ≤1e-5/30 (max 7e-6 @ step 29) |
+  | stream-generate | stream-gen | 0 | PASS |
+  | witness-harvest {checkpoint, medium, chunked124m, scaler-inf, lr-milestone, base} | STEP_TAPE=record | 0 | PASS (396/1512/768/460/397/396 pairs, 0 Input-not-ready) |
+  | train-tape-matrix {fused,foreach}×{no-sched,cosine-lr} | STEP_TAPE=record | 0 | PASS (eligible tape, 0 refusals) |
+  | step-object-null | STEP_TAPE=record | 0 | null-clean |
+  | ring-probe, train-capture | STEP_TAPE=1 | 0 | PASS |
+
+- **Gate:** the zero-fire soak above; the gate-3 unit test rewritten to expect the
+  assertion (`test/observed-liveness.spec.ts` — CLEAN and DIRTY both throw a loud
+  should-never-fire Error naming template/node/oi; UNMATCHED still returns false);
+  `test:gates` 6/6; witness-harvest / derived-liveness-oracle / stale-external-rebind
+  green.
+- **Deletes:** the guardMiss recovery path (→ assert); `RecoverableGuardMiss`; the
+  `forceAllMerged` retry loop; the `forceLowered` option and its threading.
 
 ### Phase 6 — Partition as a step facet; edit channel generalized (islands I3/I4 co-sequenced)
 
