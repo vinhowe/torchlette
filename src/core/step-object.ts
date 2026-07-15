@@ -345,18 +345,6 @@ export function stepPartitionReproducesPerPlan(
 // ---------------------------------------------------------------------------
 
 /**
- * DERIVE a StepObject from a witnessed `StepTape` (the recorder's stored tape)
- * plus the live receipt counters. This is the ONLY constructor — there is no
- * authored path (ruling 1: no second owner). Every field is read from the tape;
- * nothing is recomputed independently of it (the digest, when recomputed, MUST
- * equal `tape.bucketKey` — the pure-projection invariant).
- *
- * The tape's `bucketKey` is `b:<structHashHex>:<fp+fp+…>`. We split it back into
- * the (structHash, orderedFps) pair the StepObject's declaration + witnessed
- * phase carry — the exact inverse of `stEndStep`'s construction, so the
- * round-trip is byte-identical.
- */
-/**
  * Project the `StepPartition` from the ordered plan fps + the per-plan islands
  * tokens the recorder captured (`tape.partitionHashes`, from the executor's
  * `PlanPartition.boundaryHash`). The two lists are aligned by plan order; if a
@@ -376,6 +364,18 @@ function derivePartition(
   return { plans, boundaryDigest: stepPartitionDigest(plans), device };
 }
 
+/**
+ * DERIVE a StepObject from a witnessed `StepTape` (the recorder's stored tape)
+ * plus the live receipt counters. This is the ONLY constructor — there is no
+ * authored path (ruling 1: no second owner). Every field is read from the tape;
+ * nothing is recomputed independently of it (the digest, when recomputed, MUST
+ * equal `tape.bucketKey` — the pure-projection invariant).
+ *
+ * The tape's `bucketKey` is `b:<structHashHex>:<fp+fp+…>`. We split it back into
+ * the (structHash, orderedFps) pair the StepObject's declaration + witnessed
+ * phase carry — the exact inverse of `stEndStep`'s construction, so the
+ * round-trip is byte-identical.
+ */
 export function deriveStepObject(
   tape: StepTape,
   receipts: StepReceipts,

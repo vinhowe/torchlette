@@ -228,6 +228,17 @@ export function makeStepEditChannel(
     };
   }
 
+  // Handles are tracked in PARALLEL with `pending` (same index) so rollback
+  // matches on the RETURNED handle uniformly across all facets — not per-facet
+  // string reconstruction. This keeps the public `StepEditRequest` shape clean.
+  const handles: RegionUid[] = [];
+  /** Record an accepted request + its handle in lockstep. */
+  const record = (request: StepEditRequest, handle: RegionUid): StepEditOutcome => {
+    pending.push(request);
+    handles.push(handle);
+    return { kind: "accepted", handle, request };
+  };
+
   return {
     get pending() {
       return pending;
@@ -242,6 +253,7 @@ export function makeStepEditChannel(
       const region = reRecord.requestMerge(a, b) as unknown as RegionUid;
       const request: StepEditRequest = { kind: "merge", a, b, region };
       pending.push(request);
+      handles.push(region);
       // S3 LIVE WIRING (optional): when bound, apply the detector's own merge so
       // the caller can assert channel-merge == detector-merge (the agreement
       // seam). Absent → the request is recorded only (STOP before live exec).
@@ -252,6 +264,7 @@ export function makeStepEditChannel(
           // Live realization refused → roll back the recorded request atomically.
           reRecord.rollback(region as never);
           pending.pop();
+          handles.pop();
           return {
             kind: "refused",
             code: "MERGE_REFUSED",
@@ -276,12 +289,7 @@ export function makeStepEditChannel(
         region as unknown as IslandId,
         `split@${at}` as unknown as IslandId,
       ) as unknown as RegionUid;
-      pending.push({ kind: "split", region, at });
-      return {
-        kind: "accepted",
-        handle,
-        request: { kind: "split", region, at },
-      };
+      return record({ kind: "split", region, at }, handle);
     },
 
     requestRecompute(segmentFp, mode): StepEditOutcome {
@@ -294,12 +302,10 @@ export function makeStepEditChannel(
           code: "RECOMPUTE_ILLEGAL",
           reason: `segment ${segmentFp} is not a valid checkpoint boundary (0 = no recompute segment).`,
         };
-      pending.push({ kind: "recompute", segmentFp: segmentFp >>> 0, mode });
-      return {
-        kind: "accepted",
-        handle: `recompute:${(segmentFp >>> 0).toString(16)}:${mode}`,
-        request: { kind: "recompute", segmentFp: segmentFp >>> 0, mode },
-      };
+      return record(
+        { kind: "recompute", segmentFp: segmentFp >>> 0, mode },
+        `recompute:${(segmentFp >>> 0).toString(16)}:${mode}`,
+      );
     },
 
     requestRingDepth(k): StepEditOutcome {
@@ -324,33 +330,21 @@ export function makeStepEditChannel(
           code: "RING_OUT_OF_BUDGET",
           reason: `ring depth K=${k} exceeds the budget cap ${cap} (§5.2 / risk 4).`,
         };
-      pending.push({ kind: "ringDepth", k });
-      return {
-        kind: "accepted",
-        handle: `ring:${k}`,
-        request: { kind: "ringDepth", k },
-      };
+      return record({ kind: "ringDepth", k }, `ring:${k}`);
     },
 
     rollback(handle): void {
       // §5.2: rollback is the identity — discard the recorded request so the
-      // declaration re-records under the prior one. Drive the underlying
-      // re-record rollback for a merge region; drop the pending entry.
-      const idx = pending.findIndex((r) => {
-        if (r.kind === "merge") return r.region === handle;
-        if (r.kind === "split")
-          return `split:${r.region}:${r.at}` === handle || false;
-        return false;
-      });
-      // Merge regions round-trip through the re-record channel; other facets are
-      // channel-local. Roll the re-record channel back for a merge handle.
-      for (const r of pending) {
-        if (r.kind === "merge" && r.region === handle) {
-          reRecord.rollback(r.region as never);
-          break;
-        }
-      }
-      if (idx >= 0) pending.splice(idx, 1);
+      // declaration re-records under the prior one. Match on the RETURNED handle
+      // (tracked in `handles` parallel to `pending`) so rollback works uniformly
+      // across ALL facets, not just merge.
+      const idx = handles.indexOf(handle);
+      if (idx < 0) return; // unknown handle → no-op
+      const r = pending[idx];
+      // Merge regions round-trip through the re-record channel; roll it back too.
+      if (r.kind === "merge") reRecord.rollback(r.region as never);
+      pending.splice(idx, 1);
+      handles.splice(idx, 1);
     },
 
     pauseAtBoundary(_segmentFp): PauseHandle {

@@ -74,6 +74,23 @@ describe("StepEditChannel — §5.1 surface, §5.2 refusals (task #98 phase 6)",
     expect(ch.pending).toEqual([]);
   });
 
+  it("rollback works uniformly across facets (split/recompute/ring, not just merge)", () => {
+    const ch = makeStepEditChannel();
+    const sp = ch.requestSplit("region:fused(1+2)", 2);
+    const rc = ch.requestRecompute(0xabc, "retain");
+    const rg = ch.requestRingDepth(3);
+    expect(ch.pending.length).toBe(3);
+    if (rc.kind === "accepted") ch.rollback(rc.handle); // roll the middle one
+    expect(ch.pending.map((r) => r.kind)).toEqual(["split", "ringDepth"]);
+    if (sp.kind === "accepted") ch.rollback(sp.handle);
+    if (rg.kind === "accepted") ch.rollback(rg.handle);
+    expect(ch.pending).toEqual([]);
+    // An unknown handle is a no-op (does not throw, does not drop anything).
+    ch.requestRingDepth(2);
+    ch.rollback("bogus-handle");
+    expect(ch.pending.length).toBe(1);
+  });
+
   it("requestSplit: a member-boundary cut is legal; a negative cut is refused", () => {
     const ch = makeStepEditChannel();
     expect(ch.requestSplit("region:fused(1+2)", 3).kind).toBe("accepted");
