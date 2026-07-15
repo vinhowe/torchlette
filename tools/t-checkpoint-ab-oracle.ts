@@ -43,8 +43,7 @@
  */
 import { execFileSync } from "node:child_process";
 
-const ROOT =
-  "/mnt/pccfs2/backed_up/vin/dev/torchlette/.claude/worktrees/agent-ae9d847494addfd48";
+const ROOT = process.cwd();
 const log = (m: string) => console.error(`[ckpt-ab] ${m}`);
 
 function run(

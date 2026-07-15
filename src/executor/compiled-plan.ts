@@ -391,6 +391,11 @@ export function buildCompiledPlan(input: {
   slotSources: SlotSource[];
   /** Node results to harvest after execution. */
   nodeResults: NodeResult[];
+  /** [task #99 R2 PROBE] Witness-sourced recompute-boundary "ni:oi" pairs for
+   *  this template (from observed-liveness.getWitnessedHarvest). Feeds the
+   *  recompute-segment stamping + (under TORCHLETTE_R2_SPLIT_PROBE=1) the
+   *  liveness split. */
+  witnessedRecomputePairs?: Set<string>;
 }): CompiledPlan {
   const { commandLog, bufferToSlot, slotSources, nodeResults, planNodes } =
     input;
@@ -554,13 +559,45 @@ export function buildCompiledPlan(input: {
     }
   }
 
+  // [task #99 R2] The recompute-boundary node set is sourced from the LIVE
+  // witness signal (getWitnessedHarvest) when present — the inert
+  // isCheckpointBoundary flag never fires on the real path (R1 finding). A
+  // node result whose (ni:oi) is in the witnessed set is a cross-plan read
+  // that resolved LOWERED (the checkpoint-recompute reader class). Fall back
+  // to the declared flag set when no witness data is supplied.
+  const witnessedBoundaries = witnessSourcedBoundaryIndices(
+    nodeResults,
+    input.witnessedRecomputePairs,
+  );
   return finalizeCompiledPlan(
     commands,
     slotSources,
     nodeResults,
     undefined,
-    checkpointBoundaryIndices(planNodes),
+    witnessedBoundaries ?? checkpointBoundaryIndices(planNodes),
+    input.witnessedRecomputePairs,
   );
+}
+
+/**
+ * [task #99 R2] Recompute-boundary node indices sourced from the LIVE witness
+ * signal: the plan-node indices whose harvested result (ni:oi) is in the
+ * witnessed-harvest set (getWitnessedHarvest) — the checkpoint-recompute reads
+ * observeConsumed is blind to (they resolved lowered). Returns undefined when
+ * no witness data supplied (caller falls back to the declared flag set).
+ */
+export function witnessSourcedBoundaryIndices(
+  nodeResults: NodeResult[],
+  witnessedPairs?: Set<string>,
+): Set<number> | undefined {
+  if (!witnessedPairs || witnessedPairs.size === 0) return undefined;
+  let boundaries: Set<number> | undefined;
+  for (const r of nodeResults) {
+    if (witnessedPairs.has(`${r.nodeIndex}:${r.outputIndex}`)) {
+      (boundaries ??= new Set<number>()).add(r.nodeIndex);
+    }
+  }
+  return boundaries;
 }
 
 /**
@@ -637,12 +674,19 @@ function finalizeCompiledPlan(
   slotSources: SlotSource[],
   nodeResults: NodeResult[],
   externalReleases?: Array<{ slot: number; entryIdx: number }>,
-  /** [task #99 R1] Declared checkpoint-boundary plan-node indices. Used ONLY to
-   *  stamp _recomputeSegments (visible DATA on the plan) — NOT passed to
-   *  planMemory, so no allocation/liveness decision changes. R2 will consume it. */
+  /** [task #99 R1] Declared checkpoint-boundary plan-node indices. Stamps
+   *  _recomputeSegments (visible DATA on the plan). Under the R2 split probe it
+   *  also drives which RESULT slots demote to packable temps. */
   recomputeBoundaryIndices?: Set<number>,
+  /** [task #99 R2 PROBE] The witnessed recompute pairs (ni:oi). Under
+   *  TORCHLETTE_R2_SPLIT_PROBE=1 the matching RESULT slots are DEMOTED to temps
+   *  (the mandated witness-sourced liveness split) — the deterministic repro of
+   *  the STOP: for selective checkpointing these are GENUINE saved-for-backward
+   *  activations, so demoting them is a UAF the [lifetime] guard catches. */
+  witnessedRecomputePairs?: Set<string>,
 ): CompiledPlan {
   const usePlanner = compiledPlannedEnabled();
+  const r2SplitProbe = ENV.TORCHLETTE_R2_SPLIT_PROBE === "1";
 
   if (ENV.TORCHLETTE_DEBUG_COMPILED) {
     const dispatchCount = commands.filter((c) => c.tag === TAG_DISPATCH).length;
@@ -666,6 +710,28 @@ function finalizeCompiledPlan(
   let claimedEntries: number[] | undefined;
   if (usePlanner) {
     const resultSlots = new Set<number>(nodeResults.map((r) => r.slot));
+    // [task #99 R2 PROBE] The mandated witness-sourced liveness split: a
+    // node result whose (ni:oi) is a witnessed recompute pair is DEMOTED from a
+    // whole-step RESULT to a packable temp (the design's "split the RESULT
+    // interval at the recompute boundary"). Under selective checkpointing this
+    // is UNSOUND — the witnessed pairs are genuine saved-for-backward
+    // activations (backward binds them directly, not a recompute copy), so the
+    // demotion strands the backward read → the [lifetime] guard throws. This is
+    // the deterministic STOP repro (docs/arena-recompute-design.md R2 finding).
+    if (r2SplitProbe && witnessedRecomputePairs) {
+      let demoted = 0;
+      for (const r of nodeResults) {
+        if (witnessedRecomputePairs.has(`${r.nodeIndex}:${r.outputIndex}`)) {
+          resultSlots.delete(r.slot);
+          demoted++;
+        }
+      }
+      if (demoted > 0) {
+        console.error(
+          `[recompute-segment R2-PROBE] demoted ${demoted} witnessed RESULT slot(s) to temp (liveness split)`,
+        );
+      }
+    }
     const memPlan = planMemory(
       commands,
       plannerRegistry,
@@ -866,6 +932,51 @@ export function debugPlannerRegistryStats(): {
     orphanResultMB: mb(orphanResult),
     deadOwnerResultMB: mb(deadOwnerResult),
   };
+}
+
+/** Debug (R2 scouting): per-owning-template RESULT registry bytes. Groups every
+ *  RESULT entry by the templateFp of its (first valid) owning plan, so we can see
+ *  WHICH producer templates the 1919 MB of pinned RESULT entries belong to — the
+ *  split targets. Temp entries excluded (shared, not per-template). */
+export function debugResultBytesByTemplate(): Record<
+  string,
+  { resultMB: number; entries: number; hasRecompute: boolean }
+> {
+  const acc = new Map<
+    number,
+    { bytes: number; entries: number; hasRecompute: boolean }
+  >();
+  for (const e of plannerRegistry.entries) {
+    if (!e.resultHolder) continue;
+    let fp: number | undefined;
+    let hasRecompute = false;
+    for (const o of e.owners) {
+      const cp = o as CompiledPlan;
+      if (cp.valid && cp.templateFp !== undefined) {
+        fp = cp.templateFp;
+        hasRecompute = !!cp._hasRecompute;
+        break;
+      }
+    }
+    const key = fp ?? -1;
+    let a = acc.get(key);
+    if (!a) acc.set(key, (a = { bytes: 0, entries: 0, hasRecompute }));
+    a.bytes += e.bytes;
+    a.entries++;
+    a.hasRecompute ||= hasRecompute;
+  }
+  const out: Record<
+    string,
+    { resultMB: number; entries: number; hasRecompute: boolean }
+  > = {};
+  for (const [fp, a] of acc) {
+    out[fp === -1 ? "unknown" : `0x${fp.toString(16)}`] = {
+      resultMB: +(a.bytes / 1e6).toFixed(1),
+      entries: a.entries,
+      hasRecompute: a.hasRecompute,
+    };
+  }
+  return out;
 }
 
 /** Test/debug: per-compiled-plan registry footprint (bytes of co-owned entries,

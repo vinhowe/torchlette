@@ -391,6 +391,99 @@ subgraph) is emitted before backward-first-read; the dead span packs.
 - **Deletes:** nothing yet (the bypass stays until R3 proves the memory + witness
   gates hold in the PRODUCTION trainer path).
 
+### Phase R2 — STOP (2026-07-15): the witness-sourced split is UNSOUND on the real config
+
+**Both R2 oracles CANNOT flip via the mandated mechanism.** The failing-first
+oracles were built on §1's attribution premise — "the +155% is the planner
+*pinning provably-dead* checkpoint-recompute activations whole-step". A read-wiring
+trace on the actual distil@512 + **selective**-checkpointing config
+FALSIFIES the "provably-dead" half of that premise. The pin is genuinely-LIVE.
+
+**The measured pin (deterministic, this campaign's device 10):** the 1919 MB RESULT
+pin is NOT on the small MLP-recompute producer (`0xc98a72f3`, 4.2 MB, converged +
+pruned) that §1/Risk-2 named. It is on two RECORDED-path templates:
+- `0xbd0dd584` — the FORWARD plan (223 nodes), **432 MB**, 172 result entries.
+- `0x19e72088` — the BACKWARD plan (507 nodes), **1483 MB**, 153 result entries.
+
+Both fall through to the recorded compiled-plan path (each has exactly ONE
+build-from-IR-uncovered op — `fusedCrossEntropyForward` / `fusedCrossEntropyBackward`),
+so they never reach `registerResultEntries` and observed-liveness's stage-3B
+release machinery is structurally BLIND to them (their `resultEntries` map is empty).
+
+**The read-wiring ruling (the load-bearing fact §1/§3 got wrong).** Selective
+checkpointing SAVES attention activations and recomputes ONLY the MLP:
+- Backward (`0x19e72088`) reads the forward plan's (`0xbd0dd584`) saved activations
+  **DIRECTLY** — 47 cross-plan reads, 39 `graphHeld=true`, shapes `[1,512,768]`
+  (residual hidden), `[1,12,512,64]` (per-head Q/K/V), `[512,50257]` (logits).
+  There is NO recompute-copy indirection: backward binds the forward entry itself.
+- The MLP recompute (6 layers, one per checkpointed block) produces
+  backward-INTERNAL temps that NEVER become a stamped cross-plan producer — the
+  genuinely dead-between-spans value is already a temp and is NOT in the pin.
+
+**Why the witness signal cannot drive the split.** `witnessedHarvest` = producer
+pairs read cross-plan LOWERED (the reads `observeConsumed` is blind to). This set
+includes the forward plan's genuine saves (backward reads them lowered), NOT only
+recompute-fed reads. "Witnessed lowered read" does **NOT** imply "recompute-fed /
+dead-after-producer." For this config, NO witnessed pair is recompute-fed: attention
+is saved by design, and the MLP recompute never becomes a witnessed producer.
+
+**The deterministic STOP repro** (`tools/t-r2-split-stop-repro.ts`,
+`TORCHLETTE_R2_SPLIT_PROBE=1`): running the EXACT mandated mechanism — source the
+recompute boundary from the LIVE witness (`getWitnessedHarvest`) and SPLIT it by
+demoting the witnessed RESULT slots to packable temps — demotes 76–77 slots and
+immediately raises WebGPU uncaptured errors ("usage includes writable usage and
+another usage in the same synchronization scope" → the enclosing submit is DROPPED
+→ downstream reads see stale data). The registry does drop (result 1919→1166 MB) but
+at the cost of a silent-corruption UAF: the demoted saved-for-backward activations
+are packed/overlaid, and the backward read strands on the aliased buffer. The
+`[lifetime]` / GPU-error guard (the campaign's ally) catches it. The trajectory
+diverges from the arena-free control while staying finite — the worst,
+"correct-looking-but-wrong" class.
+
+**What §1's +155% actually is.** Not a whole-step pin of dead activations, but the
+planner registry's **cross-STEP retention of the genuinely-live working set**
+(saved activations + gradients) for deterministic reuse — vs the arena-free path
+RETURNING those buffers to the pool between steps. PEAKS are ~equal (arena-ON
+4756 MB vs arena-free 4789 MB on distil@512); only steady CURRENT differs (registry
+retains 4584 MB vs pool-returns 2654 MB). The memory gate compares steady CURRENT,
+which is a retention-vs-return accounting difference, not an over-allocation the
+lowered path avoids by cross-plan interval splitting. The arena-free path frees
+these via WITHIN-plan action-indexed liveness (`executor.ts` livenessReleaseSchedule)
++ pool return, not a cross-plan RESULT-interval split.
+
+**Why the design's full mechanism doesn't rescue it.** §3's "emit a `generateStream`
+recompute sub-stream before backward-first-read" would make the demoted value safe
+by RE-CREATING it. But for the ACTUAL pin (attention saves) there IS no recompute
+by design — selective checkpointing deliberately does NOT recompute attention
+(it's expensive). Splitting those saves means ADDING attention recomputation — a
+checkpointing-POLICY change (the compute/memory tradeoff the user chose), not a
+memory-planner interval split. And the MLP, which IS recomputed, is already a temp
+with nothing to split. So the witness-sourced RESULT-interval split has no sound
+target on this config.
+
+**Disposition (honored, not swept):**
+- The witness-sourced boundary FEED lands (stage a, `witnessSourcedBoundaryIndices`
+  in `buildCompiledPlan`): R1's INERT `isCheckpointBoundary` source is replaced by
+  the LIVE `getWitnessedHarvest` signal, so `_recomputeSegments` now stamps from a
+  firing source (the R1 finding's requested fix). NULL-CLEAN: metadata only, no
+  planning-decision change with the probe off; the default path is byte-identical
+  to pre-R2 (registry 2833.8 MB, current 4584.7 MB — verified).
+- The SPLIT (stage b) does NOT land. It is gated behind `TORCHLETTE_R2_SPLIT_PROBE`
+  purely as the committed deterministic STOP repro; the default is unchanged.
+- The oracles stay FAILING-FIRST (they document the pin that the mandated mechanism
+  cannot soundly collapse). R3 (bypass deletion) is BLOCKED on R2 and does not land.
+
+**What a sound R2 would need (for a future campaign, NOT attempted here):** either
+(a) a recorded-path over-harvest reduction that gives the recorded compiled path the
+same within-plan liveness the arena-free path has (the 1919 MB is the working set,
+so the win is the registry-retention-vs-pool-return delta — a different mechanism
+than cross-plan interval split, and it must not regress the deterministic-reuse
+speed the registry buys); or (b) a checkpointing-policy change (recompute attention
+too), which is out of scope for a memory-planner campaign. Neither is the
+witness-sourced RESULT-interval split this phase mandated. Per the campaign
+discipline (STOP rather than improvise; do not force, do not widen K_w, do not
+weaken strict/`[lifetime]`), R2 STOPS here with this repro.
+
 ### Phase R3 — the bypass dies (ruling 3 + 5 of the step-object campaign)
 **Goal:** with R2's compiled+low-memory checkpointing proven, delete
 `setBufferArenaDisabled(true)` + `TORCHLETTE_CHECKPOINT_ARENA`

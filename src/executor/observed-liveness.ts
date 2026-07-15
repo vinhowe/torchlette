@@ -115,6 +115,9 @@ interface TemplateObs {
    *  harvest (via needed) and permanently excluded from step-global release
    *  (a future readback could land after any within-step release point). */
   everReadback: Set<string>;
+  /** pairs whose harvested VIEW aliases a stamped base (the base is readable
+   *  through the view — permanently excluded from step-global release). */
+  everAliased: Set<string>;
   /** pair → planner registry entry backing the harvested result in the
    *  CURRENT build (bytes for telemetry; mandatory pairs are terminal/declared
    *  outputs — never releasable). `op` is the producing node's op label
@@ -1011,6 +1014,49 @@ export function debugAllNeededSets(): Record<
       srcCounts,
     };
   }
+  return out;
+}
+
+/** Debug (R2 scouting): per-template convergence-blocking state — why a template
+ *  hasn't converged (needed-set size, grewThisStep, stableSteps) + survived/
+ *  everAliased counts (the pins that keep results unreleasable). */
+export function debugConvergenceState(): Record<
+  string,
+  {
+    neededSize: number;
+    converged: boolean;
+    pinned: boolean;
+    grewThisStep: boolean;
+    stableSteps: number;
+    everSurvived: number;
+    everReadback: number;
+    everAliased: number;
+    srcC: number;
+    srcS: number;
+  }
+> {
+  const out: Record<string, ReturnType<typeof mk>> = {};
+  function mk(t: TemplateObs) {
+    let srcC = 0;
+    let srcS = 0;
+    for (const s of t.neededSrc.values()) {
+      if (s === "c") srcC++;
+      else if (s === "s") srcS++;
+    }
+    return {
+      neededSize: t.needed.size,
+      converged: t.converged,
+      pinned: t.pinned,
+      grewThisStep: t.grewThisStep,
+      stableSteps: t.stableSteps,
+      everSurvived: t.everSurvived.size,
+      everReadback: t.everReadback.size,
+      everAliased: t.everAliased.size,
+      srcC,
+      srcS,
+    };
+  }
+  for (const [fp, t] of templates) out[`0x${fp.toString(16)}`] = mk(t);
   return out;
 }
 

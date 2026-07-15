@@ -137,6 +137,7 @@ import {
 import {
   clearResultEntries,
   getObservedLivenessStats,
+  getWitnessedHarvest,
   isObservedLivenessEnabled,
   noteInPlaceCommit,
   noteNewTemplate,
@@ -3061,6 +3062,15 @@ export async function executeLoweredPlan(
           }
         }
       }
+      // [task #99 R2] The LIVE witness signal for this template (the
+      // checkpoint-recompute cross-plan reads observeConsumed is blind to) —
+      // sourced from the recorder's per-producer witnessed harvest, not the
+      // inert isCheckpointBoundary flag (the R1 finding). Empty unless the
+      // template has been witnessed (K_w=2 consecutive identical reads).
+      const witnessedRecomputePairs =
+        options.templateFp !== undefined
+          ? new Set(getWitnessedHarvest(options.templateFp))
+          : undefined;
       const compiled = buildCompiledPlan({
         commandLog: compilationRecording.commandLog,
         arena: options.bufferArena!,
@@ -3068,6 +3078,7 @@ export async function executeLoweredPlan(
         bufferToSlot: compilationRecording.bufferToSlot,
         slotSources: compilationRecording.slotSources,
         nodeResults,
+        witnessedRecomputePairs,
       });
       if (unrecordedNodes.length > 0) {
         // A backend op returned a cached buffer that wasn't tracked during
