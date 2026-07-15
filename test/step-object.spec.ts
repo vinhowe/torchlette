@@ -26,6 +26,8 @@ import {
   type StepRefusalReason,
   stepObjectDigest,
   stepObjectDigestMatchesBucket,
+  stepPartitionDigest,
+  stepPartitionReproducesPerPlan,
 } from "../src/core/step-object";
 import type { StepTape } from "../src/core/step-tape";
 
@@ -62,6 +64,7 @@ function fakeTape(over: Partial<StepTape> = {}): StepTape {
     regime: { stepScopedCleanup: false },
     templateIds: new Set([0x2e67bb41, 0x16e9a591]),
     recomputeFps: [],
+    partitionHashes: [0x1111, 0x2222],
     recordedAtStep: 12,
     ...over,
   };
@@ -180,6 +183,74 @@ describe("StepObject — reify, null-clean (task #98 phase 1)", () => {
     );
     expect(obj.epoch).toBe(11);
     expect(obj.regime.stepScopedCleanup).toBe(true);
+  });
+
+  it("the partition FACET (task #98 phase 6) projects the per-plan islands tokens, aligned + device-keyed", () => {
+    const obj = deriveStepObject(fakeTape(), NO_RECEIPTS);
+    // Per-plan tokens aligned with the ordered fps (fakeTape: 0x1111, 0x2222).
+    expect(obj.declaration.partition.plans).toEqual([
+      { fp: 0x2e67bb41, boundaryHash: 0x1111 },
+      { fp: 0x16e9a591, boundaryHash: 0x2222 },
+    ]);
+    // Device key present (§2.4 — a device change is a BucketMiss).
+    expect(obj.declaration.partition.device).toBe("webgpu");
+    // The step-level partition digest is a pure function of the pairs.
+    expect(obj.declaration.partition.boundaryDigest).toBe(
+      stepPartitionDigest(obj.declaration.partition.plans),
+    );
+  });
+
+  it("the partition facet's boundaryDigest is null-stable + partition-discriminating", () => {
+    const a = deriveStepObject(fakeTape(), NO_RECEIPTS);
+    const b = deriveStepObject(fakeTape(), NO_RECEIPTS);
+    // Null-stable: same partition → same digest.
+    expect(a.declaration.partition.boundaryDigest).toBe(
+      b.declaration.partition.boundaryDigest,
+    );
+    // Discriminating: a different per-plan token → a different digest.
+    const c = deriveStepObject(
+      fakeTape({ partitionHashes: [0x1111, 0x9999] }),
+      NO_RECEIPTS,
+    );
+    expect(c.declaration.partition.boundaryDigest).not.toBe(
+      a.declaration.partition.boundaryDigest,
+    );
+  });
+
+  it("the I1 agreement seam at step altitude: the projection reproduces the per-plan boundaryHashes byte-identically (§3.3)", () => {
+    const obj = deriveStepObject(fakeTape(), NO_RECEIPTS);
+    // The step partition reproduces the detector's per-plan tokens exactly.
+    expect(
+      stepPartitionReproducesPerPlan(
+        obj.declaration.partition,
+        [0x1111, 0x2222],
+      ),
+    ).toBe(true);
+    // A byte-off projection is refused (a projection bug, never benign).
+    expect(
+      stepPartitionReproducesPerPlan(
+        obj.declaration.partition,
+        [0x1111, 0x2223],
+      ),
+    ).toBe(false);
+    // A length mismatch is refused.
+    expect(
+      stepPartitionReproducesPerPlan(obj.declaration.partition, [0x1111]),
+    ).toBe(false);
+  });
+
+  it("missing per-plan tokens project to 0 (sound null the seam still reproduces)", () => {
+    // An older tape / a plan with no reified partition: partitionHashes short.
+    const obj = deriveStepObject(
+      fakeTape({ partitionHashes: [] }),
+      NO_RECEIPTS,
+    );
+    expect(obj.declaration.partition.plans.map((p) => p.boundaryHash)).toEqual([
+      0, 0,
+    ]);
+    expect(
+      stepPartitionReproducesPerPlan(obj.declaration.partition, [0, 0]),
+    ).toBe(true);
   });
 
   it("the typed-refusal enumeration maps onto the 6 tape guard classes (§2.3)", () => {

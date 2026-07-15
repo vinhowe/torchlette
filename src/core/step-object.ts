@@ -109,6 +109,42 @@ export interface StepSlotDecl {
 }
 
 /**
+ * The `partition` facet (task #98 PHASE 6, ruling 4 — `docs/step-object-design.md
+ * §3.3`). `(G, P, device)` per STEP: the step's ONE partition of its whole
+ * semantic graph, of which the per-plan islands boundaryHashes are a PROJECTION
+ * (Objection B's answer — "the per-plan boundaryHashes are a DERIVED PROJECTION
+ * of it"). SINGLE SOURCE: the detector still OWNS membership (`fusion-detect.ts`
+ * `reifyPartition`); this facet is a read-only VIEW keyed to it — the same
+ * "loop-nest VIEW derived by a canonical ordering rule" pattern one stratum up.
+ *
+ * The `plans` entries are ALIGNED with the witnessed skeleton's ordered fps (a
+ * plan may repeat — its partition token repeats too, never deduped). Phase 6's
+ * I1 null test (`§3.3` agreement seam) is: this projection must reproduce the
+ * per-plan boundaryHashes byte-identically — asserted by
+ * `stepPartitionReproducesPerPlan`. `boundaryDigest` is the step-level partition
+ * identity (FNV-1a over the ordered `(fp, boundaryHash)` pairs); it is what the
+ * `StepEditChannel` (`step-edit-channel.ts`) mutates a REQUEST against.
+ */
+export interface StepPartition {
+  /** Per-plan islands partition tokens, ALIGNED with the ordered plan fps. */
+  readonly plans: readonly {
+    /** The plan's execution fingerprint (already carries boundaryHash, I1). */
+    readonly fp: number;
+    /** The plan's islands partition-identity token (`PlanPartition.boundaryHash`,
+     *  I1). 0 for a plan with no reified partition (lowered/arena-free). */
+    readonly boundaryHash: number;
+  }[];
+  /** Step-level partition identity: FNV-1a over the ordered (fp, boundaryHash)
+   *  pairs. Null-stable (a static graph's partition hashes identically every
+   *  step) and discriminating (any per-plan boundary change changes it). */
+  readonly boundaryDigest: number;
+  /** Device class the partition's legality is keyed to (islands R2 — a merge
+   *  legal on A100 may be illegal on V100; §2.4 device key). Reified from the
+   *  engine's backend kind; a device change is a BucketMiss. */
+  readonly device: string;
+}
+
+/**
  * The DECLARED phase (§2.1). Every field is a PROJECTION of tape state — none
  * is new machinery (§2.5 NOT-fields discipline). The recompute + partition
  * facets are REFERENCES reified from what exists TODAY (checkpoint segments
@@ -129,12 +165,16 @@ export interface StepDeclaration {
    *  (checkpoint segments are plan-builder barriers between these plans). Phase
    *  1 reifies the reference, not the recompute knob. */
   readonly recomputeRef: readonly number[];
-  /** Partition facet REFERENCE (ruling 4; NOT a mechanism here). The per-plan
-   *  boundaryHash projection — reified from the ordered plan fps (each plan's
-   *  I1 boundaryHash mixes into its fp already, `executor.ts:259`). Phase 6
-   *  lifts this to a per-step `StepPartition`; phase 1 records the projection
-   *  reference so the null test can assert it reproduces byte-identically. */
+  /** Partition facet REFERENCE (ruling 4). The per-plan boundaryHash projection —
+   *  reified from the ordered plan fps (each plan's I1 boundaryHash mixes into
+   *  its fp already, `executor.ts:259`). Kept as the ordered-fps reference the
+   *  phase-1 null test pins; `partition` (below) is the phase-6 typed lift. */
   readonly partitionRef: readonly number[];
+  /** The `partition` FACET (task #98 phase 6, ruling 4): `StepPartition` — the
+   *  per-step partition of which `partitionRef` is the fp projection. A read-only
+   *  view keyed to the detector's membership (single source, no second owner).
+   *  The `StepEditChannel` records edit REQUESTS against its `boundaryDigest`. */
+  readonly partition: StepPartition;
   /** Ring config REFERENCE (§2.1). Phase 1 has no ring knob to reify from a
    *  recorded tape (the ring lives on the capture handle, not the tape); the
    *  witnessed phase carries no K. Reified as `null` — a reference placeholder,
@@ -243,6 +283,64 @@ export function stepObjectDigestMatchesBucket(
 }
 
 // ---------------------------------------------------------------------------
+// §3.3 — The partition facet: step-level identity + the I1 agreement seam.
+// ---------------------------------------------------------------------------
+
+/**
+ * FNV-1a over the ordered `(fp, boundaryHash)` pairs — the step-level partition
+ * identity token (task #98 phase 6). Null-stable + partition-discriminating, the
+ * same shape islands' `partitionBoundaryHash` uses one stratum down. Pure;
+ * order-sensitive (a repeated plan's token repeats, never deduped).
+ */
+export function stepPartitionDigest(
+  plans: readonly { readonly fp: number; readonly boundaryHash: number }[],
+): number {
+  let h = 0x811c9dc5;
+  const prime = 0x01000193;
+  const mix = (v: number) => {
+    h ^= v & 0xff;
+    h = Math.imul(h, prime);
+    h ^= (v >>> 8) & 0xff;
+    h = Math.imul(h, prime);
+    h ^= (v >>> 16) & 0xff;
+    h = Math.imul(h, prime);
+    h ^= (v >>> 24) & 0xff;
+    h = Math.imul(h, prime);
+  };
+  mix(plans.length);
+  for (const p of plans) {
+    mix(p.fp >>> 0);
+    mix(p.boundaryHash >>> 0);
+  }
+  return h >>> 0;
+}
+
+/**
+ * The I1 AGREEMENT SEAM at step altitude (§3.3 / Objection B). The step
+ * partition is the DECLARED facet; the per-plan boundaryHashes are its DERIVED
+ * projection. This assert is the phase-6 null test: the projection must
+ * reproduce the per-plan boundaryHashes byte-identically against the source
+ * (the executor's already-computed per-plan tokens). Returns true iff the
+ * partition's per-plan `boundaryHash` list equals `perPlanBoundaryHashes`
+ * position-for-position — a false is a projection bug (the step facet and the
+ * detector's per-plan membership diverged), NEVER a benign difference.
+ */
+export function stepPartitionReproducesPerPlan(
+  partition: StepPartition,
+  perPlanBoundaryHashes: readonly number[],
+): boolean {
+  if (partition.plans.length !== perPlanBoundaryHashes.length) return false;
+  for (let i = 0; i < partition.plans.length; i++) {
+    if (
+      partition.plans[i].boundaryHash >>> 0 !==
+      perPlanBoundaryHashes[i] >>> 0
+    )
+      return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Derivation (the single-source read-over).
 // ---------------------------------------------------------------------------
 
@@ -258,9 +356,33 @@ export function stepObjectDigestMatchesBucket(
  * phase carry — the exact inverse of `stEndStep`'s construction, so the
  * round-trip is byte-identical.
  */
+/**
+ * Project the `StepPartition` from the ordered plan fps + the per-plan islands
+ * tokens the recorder captured (`tape.partitionHashes`, from the executor's
+ * `PlanPartition.boundaryHash`). The two lists are aligned by plan order; if a
+ * token list is missing/short (older tapes, or a plan with no reified partition),
+ * the missing token is 0 — a sound null that the phase-6 null test still
+ * reproduces (0 == 0). SINGLE SOURCE: no membership is computed here.
+ */
+function derivePartition(
+  orderedFps: readonly number[],
+  partitionHashes: readonly number[],
+  device: string,
+): StepPartition {
+  const plans = orderedFps.map((fp, i) => ({
+    fp: fp >>> 0,
+    boundaryHash: (partitionHashes[i] ?? 0) >>> 0,
+  }));
+  return { plans, boundaryDigest: stepPartitionDigest(plans), device };
+}
+
 export function deriveStepObject(
   tape: StepTape,
   receipts: StepReceipts,
+  /** Device class the partition's legality is keyed to (§2.4 device key;
+   *  islands R2). Defaults to "webgpu" — the recorder only witnesses on the GPU
+   *  path; the field exists so a device change is a BucketMiss (phase-6 §2.4). */
+  device = "webgpu",
 ): StepObject {
   // Split the canonical bucketKey `b:<structHash>:<fps>` — the recorder's own
   // construction (`step-tape.ts stEndStep`). The struct hash is the second
@@ -297,8 +419,13 @@ export function deriveStepObject(
     recomputeRef: tape.recomputeFps,
     // Partition reference: the per-plan boundaryHash projection is ALREADY mixed
     // into each plan's fp (islands I1); the ordered fps ARE that projection's
-    // reference at step altitude. Phase 6 lifts it to a StepPartition.
+    // reference at step altitude. Phase 6 lifts it to a StepPartition (below).
     partitionRef: orderedFps,
+    // The `partition` FACET (task #98 phase 6, ruling 4): a read-only view over
+    // the detector's per-plan islands tokens (`tape.partitionHashes`, recorded
+    // from `PlanPartition.boundaryHash`), ALIGNED with the ordered fps. Single
+    // source — the detector owns membership; this projects it per step.
+    partition: derivePartition(orderedFps, tape.partitionHashes ?? [], device),
     ringRef: null,
   };
 

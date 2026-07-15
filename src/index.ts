@@ -1,10 +1,23 @@
 // Tile-IR custom kernel API + WebGPU init
 
+// Weight-only quantization (docs/quantization-design.md): the operand-format
+// axis + host quantizer. api.createQuantizedWeight is on the Torchlette class.
+export {
+  dequantizeToF32,
+  type QuantizedWeight,
+  quantizeLinearWeight,
+} from "./backend/quantize";
 // Attention score/mask modifiers (#64 — declarations, as data)
 export type {
   AttnMaskModSpec,
   AttnModifierSpec,
   AttnScoreModSpec,
+} from "./backend/types";
+export {
+  type QuantPacking,
+  resolveWeightFormat,
+  type StorageFormat,
+  type WeightFormatName,
 } from "./backend/types";
 export {
   type BindingSpec,
@@ -43,42 +56,32 @@ export {
   webgpuDeviceRequirements,
 } from "./backend/webgpu";
 export { attnModifierKey } from "./backend/webgpu/attention-kernel";
-// Weight-only quantization (docs/quantization-design.md): the operand-format
-// axis + host quantizer. api.createQuantizedWeight is on the Torchlette class.
-export {
-  dequantizeToF32,
-  type QuantizedWeight,
-  quantizeLinearWeight,
-} from "./backend/quantize";
-export {
-  type QuantPacking,
-  resolveWeightFormat,
-  type StorageFormat,
-  type WeightFormatName,
-} from "./backend/types";
-export {
-  STEP_TAPE_RECORD,
-  STEP_TAPE_REPLAY,
-  stStats,
-  stDeriveStepObject,
-  stDeriveStepObjects,
-} from "./core/step-tape";
-// Step-tape observability (§6): guard-miss/hit counters for apps.
-export { stReplayStats } from "./executor/step-tape-replay";
 // The Step Object (task #98 phase 1): a whole step as first-class data — the
 // DERIVED union of the tape/skeleton facets (docs/step-object-design.md §2).
 export {
-  type StepObject,
+  deriveStepObject,
+  REFUSAL_GUARD,
   type StepDeclaration,
-  type StepSkeletonRef,
-  type StepSlotDecl,
+  type StepObject,
+  type StepPartition,
   type StepReceipts,
   type StepRefusalReason,
-  REFUSAL_GUARD,
+  type StepSkeletonRef,
+  type StepSlotDecl,
   stepObjectDigest,
   stepObjectDigestMatchesBucket,
-  deriveStepObject,
+  stepPartitionDigest,
+  stepPartitionReproducesPerPlan,
 } from "./core/step-object";
+export {
+  STEP_TAPE_RECORD,
+  STEP_TAPE_REPLAY,
+  stDeriveStepObject,
+  stDeriveStepObjects,
+  stStats,
+} from "./core/step-tape";
+// Step-tape observability (§6): guard-miss/hit counters for apps.
+export { stReplayStats } from "./executor/step-tape-replay";
 export {
   type DeviceKind,
   DisposedTensorError,
@@ -113,3 +116,11 @@ export {
   resetTensorDebugStats,
   setDebugTracking,
 } from "./runtime/tensor";
+export {
+  makeStepEditChannel,
+  type RegionUid,
+  type StepEditChannel,
+  type StepEditOutcome,
+  type StepEditRefusalCode,
+  type StepEditRequest,
+} from "./schedule/moves/step-edit-channel";
