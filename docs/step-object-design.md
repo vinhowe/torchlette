@@ -536,17 +536,67 @@ plus the runahead ring (K=2 default).
 
 ### Phase 3 — Checkpointing first-class; the bypass dies
 
-**Goal:** `RecomputeSegment[]` declared on the step object; the arena+tape serve the
-recompute segments; `setBufferArenaDisabled(true)` + `TORCHLETTE_CHECKPOINT_ARENA`
-deleted (ruling 3 + 5).
+**STATUS: STOPPED at the bypass deletion (2026-07-15). The `RecomputeSegment`-
+as-declared-data reification LANDED; the bypass deletion is BLOCKED by a hard
+two-gate conflict and remains in place with a WHY comment.** What landed: the
+step object's `recomputeRef` is now a REAL recompute fact — the fps of the plans
+that carried a checkpoint boundary this step (`StepTape.recomputeFps`, recorded
+per-plan from `isCheckpointBoundary` at `stBeginPlan`), no longer a placeholder
+alias of the all-fps `partitionRef`. Gate: `test/step-object.spec.ts` (recompute
+= only the recompute-bearing plan fps; distinct from partition; null-clean).
+
+**The bypass did NOT die — the STOP, with a deterministic repro.** The Goal was
+to kill `setBufferArenaDisabled(true)` + `TORCHLETTE_CHECKPOINT_ARENA` and run the
+full arena+compiled stack under checkpointing. Two required gates are CONTRADICTORY
+under the current arena mechanism:
+
+- **MEMORY gate (b66ead78 A/B, distil@512 + selective checkpointing, V100):**
+  arena-OFF (bypass-alive) peak **4893 MB** / current-settled **1695 MB**;
+  arena-ON (full stack) peak **5397 MB** / current **5233 MB** — **+10.3% peak,
+  +209% current**. The per-position arena pins one buffer per dispatch position
+  across steps, INCLUDING the forward activations checkpointing drops for
+  recompute (the arena pins by position, blind to tensor liveness). So arena-ON =
+  the original b66ead78 bug returns (the arena holds activations again). The gate
+  (peak ≤ arena-free +5%) is met ONLY by running arena-free.
+- **PHASE-4 WITNESS gate (`t-witness-harvest-matrix CELL=checkpoint`):** the
+  witness-harvest prune/witness mechanism (observed-liveness) only engages on the
+  COMPILED path. Arena-free checkpointing runs LOWERED, so the mechanism goes
+  inert: **witnessedTemplates 4→0, prunedPairsRemoved 22→0 = FAIL(B)** ("witnessed
+  harvest set EMPTY"). Note `inputNotReady=0` throughout — arena-free/lowered is
+  SOUND (it materializes everything; nothing is pruned, so nothing to witness) —
+  the FAIL is purely "the phase-4 mechanism didn't fire", not a correctness bug.
+
+  **Deterministic repro of the conflict** (V100, `VULKAN_DEVICE_INDEX=10`):
+  1. With checkpointed steps forced arena-free (the phase-3 change: `checkpoint()`
+     declares recompute → executor derives arena-free), rebuild and run
+     `TORCHLETTE_STEP_TAPE=record CELL=checkpoint npx tsx
+     tools/t-witness-harvest-matrix.ts` → **FAIL(B)**, witnessedTemplates=0.
+  2. Neutralize the arena-free-under-checkpoint change (arena ON) and re-run →
+     **PASS**, witnessedTemplates=4 / 396 pairs / 22 pruned. Same tool, same
+     config, opposite verdict — the two gates cannot both hold.
+
+  No config gives compiled + low-memory for checkpointed steps: that IS the "arena
+  SERVES the recompute segments" endpoint (§3.5 — the arena must FREE
+  recompute-scoped activations while STAYING compiled, e.g. per-position liveness
+  keyed to the recompute boundary + planner packing that doesn't pin dropped
+  forward positions). That is a SEPARATE campaign (arena mechanism surgery), not a
+  fold-into-one-gate. Per the STOP-rather-than-force rule, the bypass stays.
+
+**Goal (UNMET — the target, restated):** `RecomputeSegment[]` declared on the step
+object; **the arena+tape SERVE the recompute segments**; `setBufferArenaDisabled(true)`
++ `TORCHLETTE_CHECKPOINT_ARENA` deleted (ruling 3 + 5).
 - **Gate:** bypass-OFF path baseline-EXACT loss + peak within budget vs bypass-ON,
   at 124M/batch1/seq256 (the b66ead78 A/B) AND distil@512 selective-checkpointing
-  (the #97 config); `Input not ready` zero occurrences; test:gates 4/4.
-- **Deletes:** `setBufferArenaDisabled`, `TORCHLETTE_CHECKPOINT_ARENA`.
-- **PRECONDITION:** phase 4's witness harvest must be sound for the checkpoint
-  config FIRST (the #97 lesson — the bypass exists because the fast stack couldn't
-  serve checkpointing). Sequenced: phase 4 lands its checkpoint-config witness gate,
-  then phase 3 deletes the bypass.
+  (the #97 config); `Input not ready` zero occurrences; test:gates 4/4; AND the
+  phase-4 witness gate must still fire (the new constraint this STOP surfaced —
+  arena-free defeats it).
+- **Deletes (DEFERRED to the arena-serves-recompute campaign):**
+  `setBufferArenaDisabled`, `TORCHLETTE_CHECKPOINT_ARENA`.
+- **PRECONDITION (was thought met, now refined):** phase 4's witness harvest is
+  sound for the checkpoint config ON THE ARENA-ON/COMPILED path — but that path
+  fails the MEMORY gate. The true precondition for the bypass death is an arena
+  that frees recompute activations WHILE staying compiled (so both the memory gate
+  and the phase-4 witness gate hold at once). That arena does not exist yet.
 
 ### Phase 4 — Witness-time harvest; recorded-build harvest role retires (for covered classes)
 

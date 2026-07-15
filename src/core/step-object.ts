@@ -287,10 +287,14 @@ export function deriveStepObject(
   const declaration: StepDeclaration = {
     boundaryStructHash: structHash,
     slots,
-    // Recompute-segment reference: the ordered plan sequence the step touches
-    // (phase-3 derives per-segment recompute knobs from the barriers BETWEEN
-    // these plans). Reified as the ordered fps — the reference, not a knob.
-    recomputeRef: orderedFps,
+    // Recompute-segment fact (task #98 phase 3, ruling 3): the fps of the plans
+    // that carried a checkpoint boundary this step — the DECLARED recompute
+    // segments, in plan order. Empty when the step is not checkpointed. This is
+    // now a REAL recompute fact derived from the observed boundaries, no longer
+    // a placeholder alias of the all-fps partitionRef. The executor's arena-free
+    // decision for these plans is the functional half of the same declaration
+    // (driven at run time by checkpoint() via RuntimeEngine.declareRecomputeSegments).
+    recomputeRef: tape.recomputeFps,
     // Partition reference: the per-plan boundaryHash projection is ALREADY mixed
     // into each plan's fp (islands I1); the ordered fps ARE that projection's
     // reference at step altitude. Phase 6 lifts it to a StepPartition.

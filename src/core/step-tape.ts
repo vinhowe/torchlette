@@ -118,6 +118,12 @@ export interface StepTape {
   regime: { stepScopedCleanup: boolean };
   /** Template fingerprints referenced (guard-4 invalidation index). */
   templateIds: Set<number>;
+  /** Fingerprints of the plans that carried a checkpoint boundary this step
+   *  (task #98 phase 3): the DECLARED recompute segments, in plan order. The
+   *  step object's `recomputeRef` is derived from this — a real recompute fact,
+   *  distinct from the all-fps `partitionRef`. Empty when the step is not
+   *  checkpointed. */
+  recomputeFps: number[];
   /** Step ordinal (recorder-local) at which this tape was recorded. */
   recordedAtStep: number;
 }
@@ -213,6 +219,9 @@ interface NodeLike {
   /** Primary result (derived view of results[0]); defined ⇒ the node's value
    *  pre-exists this plan's execution (produced by an earlier plan). */
   result?: unknown;
+  /** Checkpoint-segment boundary marker (task #98 phase 3, ruling 3). A plan
+   *  carrying any is a recompute-bearing plan — a declared recompute segment. */
+  isCheckpointBoundary?: boolean;
 }
 
 /** One node's payload/scalar image (only nodes with payload or scalar refs). */
@@ -262,6 +271,11 @@ interface PlanExecRecord {
    *  template run lowered, so the warmup pair is counted as such, never
    *  refused). */
   compiled: boolean;
+  /** True iff this plan carries a checkpoint boundary (task #98 phase 3): it is
+   *  a recompute-bearing plan — a DECLARED recompute segment of the step. The
+   *  step object's `recomputeRef` is derived from the fps of such plans, making
+   *  the recompute facet a real declared fact, not a placeholder over all fps. */
+  hasRecompute: boolean;
 }
 
 interface StepRecord {
@@ -455,6 +469,13 @@ export function stBeginPlan(fp: number, planNodes: readonly NodeLike[]): void {
       hadResult: n.result !== undefined,
     });
   }
+  let hasRecompute = false;
+  for (let i = 0; i < planNodes.length; i++) {
+    if (planNodes[i].isCheckpointBoundary) {
+      hasRecompute = true;
+      break;
+    }
+  }
   const rec: PlanExecRecord = {
     fp,
     image,
@@ -464,6 +485,7 @@ export function stBeginPlan(fp: number, planNodes: readonly NodeLike[]): void {
     uniformPos: new Set(),
     scalarWrites: [],
     compiled: false,
+    hasRecompute,
   };
   cur.plans.push(rec);
   cur.entries.push({ kind: "plan", templateId: fp });
@@ -908,6 +930,11 @@ export function stEndStep(info: {
   const bucketKey = `b:${fnvStr(rec.structKey).toString(16)}:${rec.plans.map((pl) => hex(pl.fp)).join("+")}`;
   const templateIds = new Set<number>();
   for (const pl of rec.plans) templateIds.add(pl.fp);
+  // Recompute segments (task #98 phase 3): the fps of plans that carried a
+  // checkpoint boundary, in plan order — the DECLARED recompute facet.
+  const recomputeFps = rec.plans
+    .filter((pl) => pl.hasRecompute)
+    .map((pl) => pl.fp);
   tapes.set(bucketKey, {
     bucketKey,
     entries: rec.entries,
@@ -916,6 +943,7 @@ export function stEndStep(info: {
     structGen: rec.opSeqEnd - p.opSeqEnd,
     regime: { stepScopedCleanup: rec.stepScopedCleanup },
     templateIds,
+    recomputeFps,
     recordedAtStep: stepOrdinal,
   });
   lastEligible = {

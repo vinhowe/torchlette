@@ -61,6 +61,7 @@ function fakeTape(over: Partial<StepTape> = {}): StepTape {
     structGen: 3,
     regime: { stepScopedCleanup: false },
     templateIds: new Set([0x2e67bb41, 0x16e9a591]),
+    recomputeFps: [],
     recordedAtStep: 12,
     ...over,
   };
@@ -145,15 +146,31 @@ describe("StepObject — reify, null-clean (task #98 phase 1)", () => {
     ]);
   });
 
-  it("declaration facet references reify from the ordered fps (recompute + partition), ring is a placeholder (§2.5)", () => {
+  it("partition reifies from the ordered fps; recompute is the DECLARED recompute segments (task #98 phase 3), ring is a placeholder (§2.5)", () => {
+    // Not checkpointed: no recompute segments declared → empty recomputeRef,
+    // while partition is still the full ordered-fps projection (phase 6 knob).
     const obj = deriveStepObject(fakeTape(), NO_RECEIPTS);
-    // Recompute-segment + partition are REFERENCES to the ordered plan sequence
-    // (phases 3/6 derive knobs from them) — NOT new state.
-    expect(obj.declaration.recomputeRef).toEqual([0x2e67bb41, 0x16e9a591]);
+    expect(obj.declaration.recomputeRef).toEqual([]);
     expect(obj.declaration.partitionRef).toEqual([0x2e67bb41, 0x16e9a591]);
     // Ring config is not derivable from a tape alone → null placeholder (the
     // §2.5 discipline: no field the doc lacks, no value the source can't give).
     expect(obj.declaration.ringRef).toBeNull();
+  });
+
+  it("recomputeRef carries ONLY the recompute-bearing plan fps (a real declared fact, not the all-fps partition alias)", () => {
+    // A checkpointed step: the second plan carried a checkpoint boundary. The
+    // recompute facet declares exactly that plan; the partition still spans all.
+    const obj = deriveStepObject(
+      fakeTape({ recomputeFps: [0x16e9a591] }),
+      NO_RECEIPTS,
+    );
+    expect(obj.declaration.recomputeRef).toEqual([0x16e9a591]);
+    expect(obj.declaration.partitionRef).toEqual([0x2e67bb41, 0x16e9a591]);
+    // Distinct facets — recompute is a strict subset when checkpointing is
+    // selective (the two are no longer the same reference).
+    expect(obj.declaration.recomputeRef).not.toEqual(
+      obj.declaration.partitionRef,
+    );
   });
 
   it("epoch is reified as the scoped-memory epoch, regime as guard-5 data", () => {

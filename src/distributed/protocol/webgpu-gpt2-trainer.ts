@@ -153,6 +153,29 @@ export class WebGPUGPT2Trainer implements Trainer {
     // (measured 124M/seq256: steady 6.6GB->2.6GB, peak 7.8->7.66GB; loss
     // identical — checkpointing is numerically transparent). Opt back into the
     // arena (e.g. to compare) with TORCHLETTE_CHECKPOINT_ARENA=1.
+    //
+    // WHY THIS BYPASS STILL EXISTS (task #98 phase 3 STOP, 2026-07-15):
+    // Phase 3 attempted to make checkpointing first-class — kill this bypass and
+    // run the full arena+compiled stack. It hit a HARD CONFLICT between two
+    // required gates, unsolvable within the current arena mechanism:
+    //   (1) MEMORY gate — the arena pins one buffer per dispatch position across
+    //       steps, INCLUDING the forward activations checkpointing drops for
+    //       recompute. Arena-ON checkpointing therefore holds them resident:
+    //       distil@512+ckpt peak 5397MB / current 5233MB vs arena-free 4893MB /
+    //       1695MB (+10.3% peak, +209% current — the original bug returns).
+    //   (2) PHASE-4 WITNESS gate — the witness-harvest prune/witness mechanism
+    //       (observed-liveness) only engages on the COMPILED path. Running
+    //       checkpointed steps arena-free reverts them to LOWERED, so the
+    //       mechanism goes inert (t-witness-harvest-matrix CELL=checkpoint:
+    //       witnessedTemplates 4->0, prunedPairsRemoved 22->0 = FAIL(B)).
+    // No config gives compiled+low-memory for checkpointed steps: that IS the
+    // "arena serves recompute segments with per-segment liveness" full
+    // unification (step-object-design §3.5), which is its own campaign — the
+    // arena must learn to FREE recompute-scoped activations while STAYING
+    // compiled. Until then the bypass is the correct behaviour: checkpointing
+    // runs arena-free/lowered (sound: the lowered path materializes everything,
+    // zero Input-not-ready), meeting the memory gate. See
+    // docs/step-object-design.md §6 Phase 3 STOP note for the repro.
     if (this.opts.checkpointing && ENV.TORCHLETTE_CHECKPOINT_ARENA !== "1") {
       this.api._runtime().setBufferArenaDisabled(true);
       this.opts.log(
