@@ -124,6 +124,18 @@ export interface StepTape {
    *  distinct from the all-fps `partitionRef`. Empty when the step is not
    *  checkpointed. */
   recomputeFps: number[];
+  /** Per-plan islands partition-identity token (task #98 phase 6, ruling 4),
+   *  ALIGNED with the ordered plan fps. Each entry is the executor's already-
+   *  computed `PlanPartition.boundaryHash` (islands I1, `executor.ts:259`) for
+   *  that plan — the detector OWNS membership; this is a read-only PROJECTION,
+   *  no second owner. The step object's `partition` facet (`StepPartition`) is
+   *  derived from this + the ordered fps. It hashes into NEITHER identity: the
+   *  boundaryHash is ALREADY mixed into each plan's fp (I1), so the fp sequence
+   *  already carries the partition; this field just surfaces the per-plan token
+   *  so the phase-6 null test can assert the projection reproduces it
+   *  byte-identically. 0 for a plan with no reified partition (arena-free /
+   *  lowered checkpoint plans). */
+  partitionHashes: number[];
   /** Step ordinal (recorder-local) at which this tape was recorded. */
   recordedAtStep: number;
 }
@@ -276,6 +288,11 @@ interface PlanExecRecord {
    *  step object's `recomputeRef` is derived from the fps of such plans, making
    *  the recompute facet a real declared fact, not a placeholder over all fps. */
   hasRecompute: boolean;
+  /** The executor's already-computed islands partition-identity token for this
+   *  plan (task #98 phase 6, ruling 4): `PlanPartition.boundaryHash` (I1). A
+   *  read-only PROJECTION of the detector's membership — recorded, never
+   *  recomputed here. 0 when no partition was reified (lowered/arena-free plan). */
+  partitionHash: number;
 }
 
 interface StepRecord {
@@ -445,7 +462,11 @@ function reconcileWitnessReads(curW: Map<number, Set<string>>): void {
 
 /** Plan execution begins (executor, after fingerprinting, permuted order).
  *  Captures the full payload/scalar byte-image for the guard-3 diff. */
-export function stBeginPlan(fp: number, planNodes: readonly NodeLike[]): void {
+export function stBeginPlan(
+  fp: number,
+  planNodes: readonly NodeLike[],
+  partitionHash = 0,
+): void {
   const image: NodeImage[] = [];
   for (let i = 0; i < planNodes.length; i++) {
     const n = planNodes[i];
@@ -486,6 +507,7 @@ export function stBeginPlan(fp: number, planNodes: readonly NodeLike[]): void {
     scalarWrites: [],
     compiled: false,
     hasRecompute,
+    partitionHash: partitionHash >>> 0,
   };
   cur.plans.push(rec);
   cur.entries.push({ kind: "plan", templateId: fp });
@@ -935,6 +957,9 @@ export function stEndStep(info: {
   const recomputeFps = rec.plans
     .filter((pl) => pl.hasRecompute)
     .map((pl) => pl.fp);
+  // Per-plan islands partition tokens (task #98 phase 6), aligned with the
+  // ordered plan fps — the read-only projection of the detector's membership.
+  const partitionHashes = rec.plans.map((pl) => pl.partitionHash);
   tapes.set(bucketKey, {
     bucketKey,
     entries: rec.entries,
@@ -944,6 +969,7 @@ export function stEndStep(info: {
     regime: { stepScopedCleanup: rec.stepScopedCleanup },
     templateIds,
     recomputeFps,
+    partitionHashes,
     recordedAtStep: stepOrdinal,
   });
   lastEligible = {

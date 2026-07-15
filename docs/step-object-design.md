@@ -246,6 +246,19 @@ For each mechanism: what it is TODAY, what FACET it becomes, what gets DELETED
   into the master key (I1 null-test-clean). The step-partition's per-plan
   projection must reproduce the per-plan boundaryHashes byte-identically — the I1
   null test, run at step altitude.
+- **STATUS: the FACET LANDED (task #98 phase 6, commit `b0d9fc91`).**
+  `StepPartition` (`src/core/step-object.ts`) is the per-step `(G, P, device)`
+  facet: a `plans[]` of `(fp, boundaryHash)` ALIGNED with the ordered fps, a
+  step-level `boundaryDigest` (FNV-1a over the pairs, null-stable +
+  discriminating), and the device key (§2.4). SINGLE SOURCE: the executor surfaces
+  each plan's already-computed `PlanPartition.boundaryHash` (I1) to `stBeginPlan`;
+  the recorder stores the aligned per-plan tokens (`tape.partitionHashes`) — a
+  read-only projection that hashes into NEITHER identity (the token is already in
+  each plan's fp via I1, so the bucketKey is unchanged). The detector still OWNS
+  membership. The I1 agreement seam at step altitude is `stepPartitionReproducesPerPlan`
+  (asserted green in `t-step-edit-null` — the per-plan boundaryHashes reproduce
+  byte-identically). The four-mechanism collapse (I3/I4 deletions) is NOT this
+  phase — it stays staged behind `islands-design.md §7`.
 
 ### 3.4 Harvest → witness-time finalization (the #97 resolution)
 
@@ -414,6 +427,40 @@ plan — whichever lands first (`stage4 §Task #43` verdict, refined).
 Ruling 4: `ReRecordChannel` (`src/schedule/moves/fuse.ts:65`) generalizes into THE
 step-object edit channel; the P3 editor binds to one seam. Kept at INTERFACE
 altitude — the editor itself is out of scope.
+
+> **STATUS: the CHANNEL + REQUEST PLUMBING LANDED (task #98 phase 6, 2026-07-15,
+> commit `b0d9fc91`); STOPPED at the S3 live-execution boundary.** `StepEditChannel`
+> (`src/schedule/moves/step-edit-channel.ts`, `makeStepEditChannel`) is the §5.1
+> surface EXACTLY — `requestMerge` / `requestSplit` / `requestRecompute` /
+> `requestRingDepth` / `rollback`, typed `StepEditRefusalCode` refusals (the
+> `FuseRefusalCode` shape, never a throw), record-request-not-mutate (requests are
+> QUEUED on `pending`; nothing mutates a live facet). `pauseAtBoundary` is the
+> RESERVED interface shape (returns a `NOT_IMPLEMENTED` typed refusal; zero
+> behavioral surface). No `requestSlotRebind` in v1 (§10 Q1). It GENERALIZES
+> `ReRecordChannel` — the ONE seam, no second owner of membership.
+>
+> **What EXECUTES vs what STOPPED (the S3 wiring boundary).** This phase lands the
+> channel-to-partition REQUEST plumbing + refusal/rollback. It does NOT execute a
+> live merge end-to-end against the detector's partition: the live membership WRITE
+> is the `fuseGesture` S3 wiring the schedule-state docs name (`fuse.ts` "THE HONEST
+> SCOPING STATEMENT" — the editor channel is not yet built). Per the
+> STOP-rather-than-force rule (§6), the phase stops before live execution. The
+> optional `applyMerge` hook is the seam a future `fuseGesture` binding fills; absent
+> it (the default), a legal merge is RECORDED (queued) — its eventual effect is the
+> re-witness (§5.3), not an in-place mutation this phase performs. The `applyMerge`
+> path is proven by unit test (the channel drives the bound merge exactly once and
+> rolls back atomically on a throw), so the socket the S3 wiring plugs into is real
+> and tested; the S3 wiring itself remains the named remaining work.
+>
+> **Gates (device 11):** `tools/t-step-edit-null.ts` — the phase-6 NULL-EDIT gate:
+> the partition projection reproduces the per-plan boundaryHashes byte-identically,
+> the step-level `boundaryDigest` is steady-stable (`2928133286` on distil@512),
+> routing an IDENTITY edit (a refused merge + a rollback) changes NOTHING
+> (`eligiblePairs=7`, `refusals=0`, digest untouched). `tools/t-step-edit-binding-
+> probe.ts` — the examples-first admission proof (the P3 socket is REAL): the channel
+> binds a LIVE witnessed StepObject partition (5 plans), refuses an illegal merge with
+> typed `MERGE_REFUSED`, rolls back to empty, pause reserved. `test/step-object.spec.ts`
+> + `test/step-edit-channel.spec.ts` pin the surface + refusals in the cpu project.
 
 ### 5.1 The typed request surface
 
@@ -694,14 +741,37 @@ everywhere**, every cell PASS.
 
 ### Phase 6 — Partition as a step facet; edit channel generalized (islands I3/I4 co-sequenced)
 
-**Goal:** `StepPartition` per step; `StepEditChannel` (§5) as the one edit seam; the
-islands I3 (epilogue-as-atom-merge) / I4 (chunking as split) deletions land here
+**STATUS: the FACET + CHANNEL LANDED (2026-07-15, commit `b0d9fc91`); STOPPED at the
+S3 live-wiring boundary; the islands I3/I4 DELETIONS DEFERRED (a separate campaign,
+`islands-design.md §7`).** What landed: (a) `StepPartition` per step — the
+`(fp, boundaryHash)` projection of the detector's per-plan membership + a step-level
+`boundaryDigest` + the device key (§3.3 STATUS). (b) `StepEditChannel` — the §5.1
+surface EXACTLY, typed refusals, record-request-not-mutate, `pauseAtBoundary`
+reserved (§5 STATUS). The I1 null-test at step altitude PASSES: the per-plan
+boundaryHashes reproduce byte-identically (`stepPartitionReproducesPerPlan`, green in
+`t-step-edit-null`); routing an identity edit changes nothing.
+
+**What STOPPED (S3):** the live membership WRITE (a legal merge executed end-to-end
+against the detector's partition) is the `fuseGesture` S3 wiring the schedule-state
+docs name — implemented as the REQUEST plumbing + the `applyMerge` socket + refusal/
+rollback, but NOT wired to live partition execution (per the STOP-rather-than-force
+rule). **The precise remaining wiring:** bind `fuseGesture` (`fuse.ts`) to the
+channel's `applyMerge` so an accepted `requestMerge` drives `Partition.merge` on the
+detector's live per-plan partition, then re-fingerprint (BucketMiss → re-witness,
+§5.3). The islands I3 (epilogue-as-atom-merge) / I4 (chunking as split) deletions
+depend on that live wiring AND the four-mechanism collapse — they stay staged behind
+`islands-design.md §7`, NOT folded into this phase.
+
+**Goal (partial — the facet + channel; the deletions DEFERRED):** `StepPartition`
+per step; `StepEditChannel` (§5) as the one edit seam; the islands I3/I4 deletions
 (`islands-design.md §7` — the four bespoke mechanisms collapse to one object + three
 policies).
-- **Gate:** I1 null-test at step altitude (per-plan boundaryHashes reproduce
-  byte-identically); the islands cross-path numeric gate; the P3 editor binds
-  `StepEditChannel` in `examples/schedule-editor` FIRST (admission pressure — earns
-  generality in examples/ before src/).
+- **Gate (MET for the facet + channel):** I1 null-test at step altitude (per-plan
+  boundaryHashes reproduce byte-identically) — `t-step-edit-null` PASS; the P3 editor
+  binding proven in a live-engine probe FIRST (`t-step-edit-binding-probe`, the
+  admission-pressure proof — earns generality against a live recording engine before
+  the UI binds it). The islands cross-path numeric gate + the four-mechanism deletion
+  gate are the SEPARATE campaign's (deferred with I3/I4).
 
 ### Phase 7 — The declared-lifetime dividend (LAST; its own re-open condition)
 

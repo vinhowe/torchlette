@@ -3654,7 +3654,14 @@ export async function executePlanOptimized(
   // [step-tape 1b] pure observation: record the plan execution (template id +
   // payload/scalar image for the guard-3 diff), and stamp the template fp on
   // the compiled plan so its invalidation cascades to tapes (guard 4).
-  stBeginPlan(fingerprint.primary, planNodes);
+  // [step-object phase 6] surface the plan's islands partition-identity token
+  // (I1 boundaryHash — already the detector's, `:259`) so the step object's
+  // partition facet is a read-only projection (no second owner of membership).
+  stBeginPlan(
+    fingerprint.primary,
+    planNodes,
+    cachedTemplate?.partition?.boundaryHash ?? 0,
+  );
   try {
     const r = await executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
       bufferArena,
