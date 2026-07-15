@@ -6,8 +6,17 @@ null-clean; I2b (gap-spanning) was built-measured-null-reverted — see
 `## I2 IMPLEMENTATION FINDINGS` below for what shipped and the corrected roadmap
 target (the residual is matmul-adjacent singleton casts at CLAIM altitude, not
 detector generality). The `(G, P, device)` partition is lifted to a per-STEP
-facet by the step object — `docs/step-object-design.md §3.3` (ruling 4);
-I3/I4's deletions are earned there. Reviewed against: the schedule-record spike
+facet by the step object — `docs/step-object-design.md §3.3` (ruling 4). **That
+lift LANDED (task #98 phase 6, commit `b0d9fc91`):** `StepPartition`
+(`src/core/step-object.ts`) is the per-step `(fp, boundaryHash)` projection of the
+per-plan `PlanPartition.boundaryHash` (I1) surfaced through `tape.partitionHashes`;
+the detector still OWNS membership (this is a read-only projection, no second
+owner); `stepPartitionReproducesPerPlan` is the I1 null test at step altitude
+(green). `StepEditChannel` (`src/schedule/moves/step-edit-channel.ts`) generalizes
+`ReRecordChannel` (`fuse.ts:65`) into the one edit seam. **I3/I4's deletions are
+NOT earned by that phase** — the live `fuseGesture` merge wiring + the
+four-mechanism collapse (§7) remain a SEPARATE campaign (the phase-6 STOP boundary,
+`step-object-design.md §6 Phase 6 STATUS`). Reviewed against: the schedule-record spike
 (`docs/spike-schedule-record-findings.md`), the kernel-editor validity/
 completeness and WGSL⊂CUDA analyses (scratchpad), `docs/architecture-debt.md`
 (sin taxonomy + stage plan), `docs/stage4-compile-from-ir.md` (the four
