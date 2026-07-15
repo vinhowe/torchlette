@@ -41,8 +41,9 @@
  * The dirty-miss counter is THE measurement deciding whether stage-3 remat ever
  * needs to serve this path; surfaced on getPayloadThrashStats().
  */
-import type { StorageHandle } from "../graph/types";
+
 import { storageTracker } from "../graph/storage-tracker";
+import type { StorageHandle } from "../graph/types";
 
 /** Cross-plan identity of a harvested VALUE, independent of any live buffer. */
 export interface ResultStamp {
@@ -148,6 +149,66 @@ const key = (ni: number, oi: number): string => `${ni}:${oi}`;
 // ── Module state (step-scoped structures cleared at observeStepBoundary) ──────
 let enabled = false;
 const templates = new Map<number, TemplateObs>();
+
+/**
+ * [task #98 phase 4 — WITNESS-TIME HARVEST] Per producer-template `fp`, the set
+ * of "ni:oi" pairs the step-tape recorder physically OBSERVED read across the
+ * two consecutive identical executed steps that made its tape eligible (§4.1).
+ *
+ * This is the #97 resolution: the observation seam (`observeConsumed`) is fed
+ * ONLY by the compiled external-slot bind, so a cross-plan read that resolves
+ * LOWERED through `getInputStorage` — the canonical case being the BACKWARD
+ * pass re-reading a checkpoint-RECOMPUTED forward activation — is structurally
+ * invisible to it, and its producer template PRUNES the activation from the
+ * generated harvest (the `contiguous[512,768]` STOP). The tape witnesses at
+ * END-OF-STEP time, AFTER backward + recompute ran, so every such read was
+ * physically observed; the recorder records it (`stObserveWitnessRead`) and,
+ * on eligibility, publishes the union here. `prunedHarvest` unions these pairs
+ * into `keepAlways` so the pruned build keeps them — the build-WITH-execution
+ * guarantee the recorded build had, promoted to the tape stratum.
+ *
+ * SINGLE SOURCE / NO SECOND OWNER (ruling 1): the ONLY producer of this map is
+ * the step-tape recorder's eligibility path (`stEndStep` → `setWitnessedHarvest`).
+ * observed-liveness merely CONSULTS it — it never authors it. Gen-independent
+ * (keyed by template fp + ni:oi, the same coordinate the needed-set uses).
+ */
+const witnessedHarvest = new Map<number, Set<string>>();
+
+/**
+ * Publish (or replace) the witnessed harvest set for a producer template. Called
+ * by the step-tape recorder at tape eligibility (`step-tape.ts stEndStep`). A
+ * fresh eligibility for the same fp REPLACES the set (re-witnessing under a
+ * changed declaration re-establishes it). Passing an empty set clears the entry
+ * (a witness step that observed no cross-plan lowered read of this fp).
+ */
+export function setWitnessedHarvest(fp: number, pairs: Set<string>): void {
+  if (pairs.size === 0) {
+    witnessedHarvest.delete(fp);
+    return;
+  }
+  witnessedHarvest.set(fp, new Set(pairs));
+}
+
+/** Drop a template's witnessed harvest (guard-4 invalidation: a re-witness must
+ *  re-establish it). Called from `stInvalidateTemplate` via the recorder. */
+export function clearWitnessedHarvest(fp: number): void {
+  witnessedHarvest.delete(fp);
+}
+
+/** Test/telemetry: the witnessed harvest set for a template (sorted "ni:oi"). */
+export function getWitnessedHarvest(fp: number): string[] {
+  const s = witnessedHarvest.get(fp);
+  return s ? [...s].sort() : [];
+}
+
+/** Test/telemetry: every template's witnessed harvest set (fp → sorted "ni:oi").
+ *  The shadow-parity gate reads this to assert coverage of the pruned classes. */
+export function getAllWitnessedHarvest(): Map<number, string[]> {
+  const out = new Map<number, string[]>();
+  for (const [fp, s] of witnessedHarvest) out.set(fp, [...s].sort());
+  return out;
+}
+
 let stepStamped: Array<{ shId: number; checkId: number; stamp: ResultStamp }> =
   [];
 let newTemplateThisStep = 0;
@@ -188,9 +249,7 @@ export function setTemplateCompiledInvalidator(fn: (fp: number) => void): void {
  *  (retry at a later boundary). */
 export type RetireResult = "retired" | "none" | "live";
 let retireIdleTemplate: ((fp: number) => RetireResult) | undefined;
-export function setTemplateIdleRetirer(
-  fn: (fp: number) => RetireResult,
-): void {
+export function setTemplateIdleRetirer(fn: (fp: number) => RetireResult): void {
   retireIdleTemplate = fn;
 }
 
@@ -386,7 +445,10 @@ export function observeReadback(storage: StorageHandle): void {
  * (caller throws a descriptive error naming the recovery); undefined if
  * unrelated (caller falls through to its normal not-materialized error).
  */
-export function readbackMiss(nodeId: number, oi: number): ResultStamp | undefined {
+export function readbackMiss(
+  nodeId: number,
+  oi: number,
+): ResultStamp | undefined {
   if (!enabled) return undefined;
   const hit = prunedExecuted.get(nodeId);
   if (!hit || hit.stamp.oi !== oi) return undefined;
@@ -537,7 +599,10 @@ export function observeStepBoundary(): void {
     if (t.converged) {
       // Post-convergence growth is guard-driven (a late consumer). Cap churn:
       // a needed-set that grows past 2× its converged size pins conservative.
-      if (t.grewThisStep && t.needed.size > REBUILD_GROWTH_LIMIT * t.convergedSize) {
+      if (
+        t.grewThisStep &&
+        t.needed.size > REBUILD_GROWTH_LIMIT * t.convergedSize
+      ) {
         t.pinned = true;
         pinnedTemplates++;
       }
@@ -575,23 +640,35 @@ export function observeStepBoundary(): void {
  * disabled). [stage-3 A] `keepAlways` is the TERMINAL node only — declared
  * outputs are pruned when observation (plan reads + survival + readbacks)
  * proves them dead; see the executor call site for the rationale.
+ *
+ * [task #98 phase 4] The WITNESSED harvest set (§4.1) is unioned into the keep
+ * set: a pair the step-tape recorder observed read across two identical executed
+ * steps is kept, EVEN THOUGH `observeConsumed` (the needed-set's only feed) never
+ * saw the read. This is the #97 unblock — the checkpoint-recompute `contiguous`
+ * is witnessed (backward read it lowered) and therefore never pruned. The
+ * witnessed set is DERIVED data with one producer (the recorder's eligibility
+ * path); consulting it here is the single-source-at-the-seam pattern, not a
+ * second harvest owner.
  */
 export function prunedHarvest(
   fp: number,
   actionPairs: Array<{ i: number; oi: number }>,
   keepAlways: Set<string>,
-): {
-  kept: Array<{ i: number; oi: number }>;
-  excluded: Array<{ i: number; oi: number }>;
-} | undefined {
+):
+  | {
+      kept: Array<{ i: number; oi: number }>;
+      excluded: Array<{ i: number; oi: number }>;
+    }
+  | undefined {
   if (!enabled) return undefined;
   const t = templates.get(fp);
   if (!t || t.pinned || !t.converged) return undefined;
+  const witnessed = witnessedHarvest.get(fp);
   const kept: Array<{ i: number; oi: number }> = [];
   const excluded: Array<{ i: number; oi: number }> = [];
   for (const p of actionPairs) {
     const k = key(p.i, p.oi);
-    if (t.needed.has(k) || keepAlways.has(k)) kept.push(p);
+    if (t.needed.has(k) || keepAlways.has(k) || witnessed?.has(k)) kept.push(p);
     else excluded.push(p);
   }
   prunedPairsRemoved += excluded.length;

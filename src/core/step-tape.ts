@@ -329,6 +329,11 @@ let eligiblePairs = 0;
 let stepsObserved = 0;
 let boundaryResets = 0;
 let planInvalidations = 0;
+/** [task #98 phase 4] Witness-set disagreements between two consecutive
+ *  producer observations (§4.1 rule 3). Populated by the phase-4 witness
+ *  recorder (a later commit); the field exists here so the shadow-parity gate
+ *  can read a stable stat surface. */
+let witnessVariances = 0;
 const refusalDiagnostics: string[] = [];
 const MAX_DIAGNOSTICS = 32;
 const MAX_WARNINGS = 8;
@@ -914,6 +919,8 @@ export function stStats(): {
   tapeCount: number;
   /** [#81] ceremony resets that hit a WARM tape store (starvation trigger). */
   ceremonyResetsWhileWarm: number;
+  /** [task #98 phase 4] witness-set disagreements between paired witness steps. */
+  witnessVariances: number;
   refusalDiagnostics: string[];
 } {
   return {
@@ -927,6 +934,7 @@ export function stStats(): {
     planInvalidations,
     tapeCount: tapes.size,
     ceremonyResetsWhileWarm,
+    witnessVariances,
     refusalDiagnostics: refusalDiagnostics.slice(),
   };
 }
@@ -946,6 +954,7 @@ export function stResetAll(): void {
   stepsObserved = 0;
   boundaryResets = 0;
   planInvalidations = 0;
+  witnessVariances = 0;
   refusalDiagnostics.length = 0;
   lastEligible = null;
   replaying = false;
