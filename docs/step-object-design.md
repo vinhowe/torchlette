@@ -303,6 +303,15 @@ For each mechanism: what it is TODAY, what FACET it becomes, what gets DELETED
 
 ### 3.5 The checkpoint bypass → the `recompute` facet (the bypass dies)
 
+> **CROSS-REF (task #99, `docs/arena-recompute-design.md`):** the bypass-death
+> mechanism — how the planner SERVES recompute segments so checkpointed steps run
+> compiled AND low-memory — is designed there. MEASURED attribution of §6 Phase
+> 3's +209%: it lives in the PLANNER REGISTRY (checkpoint activations pinned as
+> whole-step RESULT slots), NOT the position-indexed arena (which arena-reclaim
+> already empties at cutover — 1.8 MB steady). So the fix is planner-side
+> multi-segment RESULT liveness (stage4 §(d) remat), not a segment-scoped arena.
+> That doc's Phase R3 is the deletion this facet awaits.
+
 - **Today:** `WebGPUGPT2Trainer.initialize()` calls `setBufferArenaDisabled(true)`
   when checkpointing (`webgpu-gpt2-trainer.ts:157`, commit b66ead78) — the whole
   compiled/tape/arena stack is DORMANT there; plans run lowered. Selective
@@ -582,6 +591,13 @@ plus the runahead ring (K=2 default).
 - **Deletes:** nothing (the fallback stays; deletions are later dividends).
 
 ### Phase 3 — Checkpointing first-class; the bypass dies
+
+> **CROSS-REF (task #99):** the two-gate conflict below is RESOLVED in design by
+> `docs/arena-recompute-design.md` (the "arena serves recompute segments"
+> campaign this STOP named as a separate campaign). Its measured attribution
+> proves the +209% is PLANNER-registry-resident, not arena-resident, so the fix
+> is the stage-4 §(d) rematerialization (multi-segment RESULT liveness), and this
+> phase's bypass deletion is that doc's Phase R3.
 
 **STATUS: STOPPED at the bypass deletion (2026-07-15). The `RecomputeSegment`-
 as-declared-data reification LANDED; the bypass deletion is BLOCKED by a hard

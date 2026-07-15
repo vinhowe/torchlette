@@ -1392,6 +1392,14 @@ and deterministic node indexing, so step N's observation predicts step N+1.
 
 ### (d) Extension point: rematerialization (stage 3 — designed for, NOT built)
 
+> **CROSS-REF (task #99, `docs/arena-recompute-design.md`):** the checkpoint-
+> recompute slice of this extension point is now designed. It uses reuse #1
+> below (multi-segment RESULT liveness split at the declared `recomputeRef`
+> boundary + a `generateStream` recompute sub-stream) and reuse #3 (b66ead78's
+> arena-free mode dies by unification). MEASURED confirmation that the fix belongs
+> HERE and not in the arena: distil@512 + checkpointing arena-ON steady-state has
+> the whole +155% delta in the PLANNER REGISTRY (2833 MB), arena 1.8 MB.
+
 The stamped identity `(templateFp, nodeIndex, oi)` is the cross-plan name of a
 VALUE, independent of any live buffer — exactly what a remat edge must name.
 Three planned reuses, zero speculative code now:
