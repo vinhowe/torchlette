@@ -42,6 +42,7 @@ const GPU_TEST_FILES = [
   "test/quant-compiled-plan-parity.spec.ts",
   "test/topk-kernel.spec.ts",
   "test/true-segmentation-benchmark.spec.ts",
+  "test/witness-harvest.spec.ts",
 ];
 
 // Heavyweight training tests excluded from default `npm run test`.
