@@ -26,6 +26,29 @@ existing machinery refers to code in-tree at commit ed779c6.*
 > "materialized value → compiled-replay slot, per-step, no over-harvest"
 > primitive; (b) was attempted via generation and reverted on the ledger gate
 > (the generate-more-plans path entangles with the fundamental over-harvest).
+>
+> **UPDATE 2026-07-16 (D4 attempt #5, the finiteness-argument pass): STOPPED — a
+> FIFTH class.** With D0–D2 landed (route-as-data + derived `crossPlanEdges` +
+> observers→derivation collapse), the reconciled −1186 deletion was applied clean
+> (3-way, 6 rejects hand-resolved; build exit 0; tsc zero net-new; CPU 1426/0;
+> `test:gates` 5/5). The `scaler-inf` crux cell then THREW on the deleted tree with
+> the attempt-#4 `[1,512,768]` overlay-release signature, and distilgpt2@512
+> selective-ckpt threw `Input not ready: contiguous[32,128]` — BOTH pass on main.
+> Root cause (measured, `t-witness-harvest-matrix.ts` census, main vs deleted,
+> same device/config): the recorded build's recording pass is itself a
+> `noteWitnessRead` WITNESSING DRIVER (an extra lowered execution per template).
+> Deleting it shrinks the derived `crossPlanEdges` from **6 producers / 943 edges**
+> (main, PASS) to **4 / 734** (deleted, THREW) — two producers vanish, every
+> survivor loses edges — leaving a `forwardToForce` `[1,512,768]` activation
+> unwitnessed and unprotected → stage-3B overlay-release → UAF throw. This
+> FALSIFIES finiteness assumption 3 ("the recorded build's build-WITH-execution
+> property, promoted to the tape"): the promotion is incomplete — the recorded
+> build was silently supplying part of the witnessing completeness the theorem
+> assumes. The deletion is REVERTED and preserved uncommitted as
+> `.claude/D4-deletion-attempt5-STOPPED.diff` (net −1209 on the current tree).
+> Re-open: a witness-to-CONVERGENCE cutover gate (drive `K_w=2` cross-plan
+> witnessing to a fixed point before compiled-replay cutover) — net-new mechanism,
+> attempt #6. Full analysis: `docs/step-data-dependence-design.md §D4 STATUS`.
 
 ## Why (tied to the ledger)
 

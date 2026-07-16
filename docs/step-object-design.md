@@ -81,6 +81,17 @@ intent; the doc's job is to make them structural, never to re-litigate them.
    build (via witness-time harvest — only AFTER proven on the CHECKPOINT config),
    `guardMiss` recovery → a should-never-fire assert (after a zero-fire soak), the
    observation predicates inside boundaries, the checkpoint bypass, the stale docs.
+   - **Recorded build — NOT EXECUTED (STOPPED 2026-07-16, D4 attempt #5).** Proving
+     on the CHECKPOINT config is exactly where it failed: on the deleted tree the
+     `scaler-inf` crux cell threw the attempt-#4 `[1,512,768]` overlay-release, and
+     distilgpt2@512 selective-ckpt threw `Input not ready: contiguous[32,128]` —
+     both pass on main. The recorded build's RECORDING PASS is itself a
+     `noteWitnessRead` witnessing driver; deleting it shrinks the derived
+     `crossPlanEdges` 6→4 producers / 943→734 edges (`t-witness-harvest-matrix.ts`
+     census), so a `forwardToForce` activation goes unwitnessed → stage-3B releases
+     it → UAF. Falsifies finiteness assumption 3. Deletion reverted, preserved as
+     `.claude/D4-deletion-attempt5-STOPPED.diff`. See
+     `step-data-dependence-design.md §D4 STATUS`.
 
 ---
 

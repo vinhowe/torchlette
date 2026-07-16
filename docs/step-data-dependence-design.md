@@ -580,6 +580,68 @@ Transient/cold classes keep it (§7).
 - **Deletes:** the recorded build's harvest role + `buildCompiledPlan` + the `record*` family for
   covered classes (net −1186); the recorded build stays ONLY for the never-witnessed remainder (§7).
 
+**STATUS 2026-07-16 — D4 STOPPED at attempt #5 (Stage 2); a FIFTH class named; the deletion is
+REVERTED, preserved uncommitted as `.claude/D4-deletion-attempt5-STOPPED.diff` (net −1209 = the
+reconciled −1186 plus D0–D2's now-vanished additions inside the deleted machinery).** The
+reconciliation itself was clean: the diff applied 3-way with 6 rejects (all D0–D2 context drift in
+`compiled-plan.ts`/`executor.ts`), resolved by hand; `npm run build` exit 0; `tsc --noEmit` ZERO
+net-new errors vs main (the two orphaned imports `crossPlanEdgeKeepSet`/`currentVariantSelection`
+were removed — D2a `75d873d4` had rewritten the deleted `compilationRecording` block to call
+`crossPlanEdgeKeepSet(templateFp, currentVariantSelection())`, so their only executor use died with
+the block; the derived keep-set's REAL consumer, `observed-liveness.ts:627`, is retained). The CPU
+project passed 1426/0. `test:gates` passed 5/5 after one tool-timing fix (`t-stream-determinism.ts`
+sampled the post-invalidation rebuild after 2 steps; the recorded build re-populated
+`getCompiledStreams()` one step sooner, so build-from-IR-only needs the same 3-step settle the FIRST
+phase already uses — the property held byte-identically, PASS with 3 steps; that fix rides in the
+preserved diff).
+
+**THE FIFTH CLASS — the recorded build is itself a witnessing driver; assumption 3's "promoted to
+the tape" is FALSE.** On the deleted tree, `CELL=scaler-inf` (the crux, `t-witness-harvest-matrix.ts`,
+device 1 clean) THREW at step 9: `[lifetime] reading step-globally RELEASED storage id=11068
+(shape=[1,512,768])… overlaid by the last observed reader's temps (stage-3 B)… invisible to
+observation` — the EXACT attempt-#4 `[1,512,768]` overlay-release signature. Root cause is measured
+directly by the same tool's `crossPlanEdges` census, main vs deleted, like-for-like (same config,
+same device, D0–D2 present in BOTH — the only difference is the recorded-build deletion):
+
+| tree | producers | pairs | edges | positions | threw | converged | result |
+|------|-----------|-------|-------|-----------|-------|-----------|--------|
+| main (recorded build present) | **6** | 459 | **943** | 2552 | false | 7 | PASS |
+| deleted (recorded build gone) | **4** | 369 | **734** | 1742 | **true** @step9 | 6 | FAIL |
+
+Two entire cross-plan producers VANISH without the recorded build — `0xafe3da58` (76 edges) and
+`0x77663cc5` (14 edges, the settled-state plan of `[E-3]`) — and every surviving producer loses
+edges (`0xde879f15` 550→484 edges / 6→5 consumers; `0xa442983c` 286→233 / 4→3). The derivation code
+is UNTOUCHED and `SHADOW DIFF: EMPTY (green)` in both (shadow is derived-vs-derived, so it is BLIND
+to a producer the witness never saw) — the edge set is not mis-derived, it is UNDER-WITNESSED. The
+recorded build's recording pass (`startCompilationRecording` → lowered execution →
+`buildCompiledPlan`) is an EXTRA lowered execution per template, and `noteWitnessRead` fires during
+it; deleting it removes that witnessing source, so some cross-plan edges never reach the `K_w=2`
+threshold to enter `crossPlanEdges`, leaving a `[1,512,768]` `forwardToForce` activation unprotected
+→ stage-3B overlay-releases it → the UAF guard throws. Second manifestation, same root: distilgpt2
+`@512` selective-ckpt Memory-Stability throws `Input not ready: contiguous[32,128]` (the class-#2
+checkpoint-recompute symptom) on the deleted tree; PASSES on main. Both cells pass on main, fail on
+the deleted tree, isolated on one clean device with zero `vkCreateDevice` contention.
+
+**Assumption-3 cross-check (§6.2).** Assumption 3 states every cross-plan read "is physically
+observed by end-of-step in the witness executions… This is the recorded build's property
+(build-WITH-execution) promoted to the tape." Measured FALSE: the promotion is INCOMPLETE. The
+recorded build's own build-WITH-execution pass is still a live witnessing DRIVER (an extra lowered
+execution the compiled-replay path elides), not merely a property the tape already carries. The
+finiteness theorem holds GIVEN complete witnessing; the recorded build was silently supplying part
+of that completeness. Assumptions 1, 2, 4 were NOT stretched (route-as-data made the scaler window
+fp-stable — `witnessVariances` 2–3, no structural fork; the derived set is monotone and shadow-green
+where witnessed). Only assumption 3 failed, and precisely at its stated content.
+
+**Re-open condition (attempt #6's charter):** a mechanism that reproduces the recorded build's
+witnessing coverage WITHOUT the recorded build — i.e. drive the `K_w=2` cross-plan witnessing to
+CONVERGENCE (producers/edges stable across two consecutive lowered passes) BEFORE a template cuts
+over to compiled replay, so no cross-plan edge is only-ever-witnessed by the recording pass. Gate:
+`CELL=scaler-inf` derives ≥6 producers / ≥943 edges (main's count) on the deleted tree with
+`threw=false`, AND distilgpt2 `@512` selective-ckpt Memory-Stability is green. This is net-new
+mechanism (a witness-to-convergence cutover gate), NOT a diff reconciliation — hence a STOP, not a
+forced deletion. The preserved diff re-applies 3-way clean; re-run this §D4 Stage-2 matrix once the
+re-open mechanism lands.
+
 ### Phase D5 — The declared-lifetime dividend (LAST; step-object phase 7)
 
 **Goal:** the observation predicates RETIRE on the captured path (they are now queries of
