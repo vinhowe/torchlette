@@ -89,6 +89,7 @@ import {
   TAG_UNIFORM,
   TAG_WRITE,
 } from "./compiled-plan";
+import { operandRequiresContiguous } from "./contiguous-operands";
 import type { AttnInputContig, LoweredPlan } from "./lowered-plan";
 import { getInputStorage } from "./op-dispatch";
 import { lookupScalarStorage } from "./scalar-table";
@@ -1304,16 +1305,24 @@ function generateFullReduction(
       : (ref.outputIndex ?? 0) === 0
         ? ref.node.result
         : ref.node.results?.[ref.outputIndex ?? 0];
-  const inSlot = resolveRefSlot(ref);
-  if (inSlot === undefined) return "untracked-producer";
+  const prologue: GpuCommand[] = [];
+  let inSlot: Slot;
   let size: number;
   let bytesPerElement = 4;
   if (storage) {
     const t = storage.backendTensor as WebGPUTensor;
-    if (!t.isContiguous || (t.offset ?? 0) !== 0) return "non-contiguous";
-    size = t.size;
+    // Contiguity-forcing resolve (declared input(0)); a live strided input gets
+    // a synthesized contiguous-copy prologue, then the reduction binds the copy.
+    const r = resolveContiguousOperand(node.op, 0, ref, resolveRefSlot, slots);
+    if (typeof r === "string") return r;
+    prologue.push(...r.prologue);
+    inSlot = r.slot;
+    size = t.size; // logical element count is copy-invariant
     bytesPerElement = dtypeBytes(t.dtype);
   } else if (ref.kind !== "materialized" && !VIEW_OPS.has(ref.node.op)) {
+    const s = resolveRefSlot(ref);
+    if (s === undefined) return "untracked-producer";
+    inSlot = s;
     size = sizeOf(ref.node.shape);
     const sd = refShapeDtype(ref);
     if (sd) bytesPerElement = dtypeBytes(sd.dtype);
@@ -1322,8 +1331,18 @@ function generateFullReduction(
   }
   // Input exceeds maxStorageBufferBindingSize → chunked partials path (the
   // generated commands mirror sumFullReductionChunked, sharing its plan).
-  if (fullReductionNeedsChunking(size, bytesPerElement))
-    return generateChunkedFullReduction(size, bytesPerElement, inSlot, slots);
+  if (fullReductionNeedsChunking(size, bytesPerElement)) {
+    const chunked = generateChunkedFullReduction(
+      size,
+      bytesPerElement,
+      inSlot,
+      slots,
+    );
+    return {
+      commands: [...prologue, ...chunked.commands],
+      outSlot: chunked.outSlot,
+    };
+  }
   const plan = planFullReductionDispatch(reduceOp, size);
   const outSlot = slots.length;
   slots.push({ kind: "arena" });
@@ -1335,6 +1354,7 @@ function generateFullReduction(
   if (!bindings) return "config-missing";
   return {
     commands: [
+      ...prologue,
       {
         tag: TAG_ALLOC,
         slot: outSlot,
@@ -1453,23 +1473,29 @@ function generateDimReduction(
   if (payload?.dim == null) return "no-dim";
   const ref = node.inputs[0];
   if (ref.kind === "scalar") return "scalar-operand";
-  const inSlot = resolveRefSlot(ref);
-  if (inSlot === undefined) return "untracked-producer";
-  // The dim-reduction kernel reads its input as a contiguous buffer. If the
-  // input is live and non-contiguous the real dispatch inserts a contiguous
-  // copy we don't capture here, so bail.
+  // The dim-reduction kernel reads its input as a contiguous buffer. A live
+  // strided input gets a synthesized contiguous-copy prologue (declared
+  // input(0)); the reduction then binds the copy.
   const storage =
     ref.kind === "materialized"
       ? ref.storage
       : (ref.outputIndex ?? 0) === 0
         ? ref.node.result
         : ref.node.results?.[ref.outputIndex ?? 0];
+  const prologue: GpuCommand[] = [];
+  let inSlot: Slot;
   let inShape: number[];
   if (storage) {
     const t = storage.backendTensor as WebGPUTensor;
-    if (!t.isContiguous || (t.offset ?? 0) !== 0) return "non-contiguous";
+    const r = resolveContiguousOperand(node.op, 0, ref, resolveRefSlot, slots);
+    if (typeof r === "string") return r;
+    prologue.push(...r.prologue);
+    inSlot = r.slot;
     inShape = t.shape;
   } else {
+    const s = resolveRefSlot(ref);
+    if (s === undefined) return "untracked-producer";
+    inSlot = s;
     const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
     if (!sd) return "no-shape";
     inShape = sd.shape;
@@ -1493,6 +1519,7 @@ function generateDimReduction(
   if (!bindings) return "config-missing";
   return {
     commands: [
+      ...prologue,
       {
         tag: TAG_ALLOC,
         slot: outSlot,
@@ -1531,20 +1558,28 @@ function generateMean(
     | undefined;
   const ref = node.inputs[0];
   if (ref.kind === "scalar") return "scalar-operand";
-  const inSlot = resolveRefSlot(ref);
-  if (inSlot === undefined) return "untracked-producer";
   const storage =
     ref.kind === "materialized"
       ? ref.storage
       : (ref.outputIndex ?? 0) === 0
         ? ref.node.result
         : ref.node.results?.[ref.outputIndex ?? 0];
+  const prologue: GpuCommand[] = [];
+  let inSlot: Slot;
   let inShape: number[];
   if (storage) {
     const t = storage.backendTensor as WebGPUTensor;
-    if (!t.isContiguous || (t.offset ?? 0) !== 0) return "non-contiguous";
+    // The sum reads its input contiguous; a live strided input gets a
+    // synthesized copy prologue (declared input(0)), then binds the copy.
+    const r = resolveContiguousOperand(node.op, 0, ref, resolveRefSlot, slots);
+    if (typeof r === "string") return r;
+    prologue.push(...r.prologue);
+    inSlot = r.slot;
     inShape = t.shape;
   } else {
+    const s = resolveRefSlot(ref);
+    if (s === undefined) return "untracked-producer";
+    inSlot = s;
     const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
     if (!sd) return "no-shape";
     inShape = sd.shape;
@@ -1602,6 +1637,7 @@ function generateMean(
 
   return {
     commands: [
+      ...prologue,
       {
         tag: TAG_ALLOC,
         slot: sumSlot,
@@ -1675,20 +1711,33 @@ function generateBatchedReduction(
     if (node.inputs.length !== 1) return "arity";
     const ref = node.inputs[0];
     if (ref.kind === "scalar") return "scalar-operand";
-    const inSlot = resolveRefSlot(ref);
-    if (inSlot === undefined) return "untracked-input";
     const storage =
       ref.kind === "materialized"
         ? ref.storage
         : (ref.outputIndex ?? 0) === 0
           ? ref.node.result
           : ref.node.results?.[ref.outputIndex ?? 0];
+    let inSlot: Slot;
     let inShape: number[];
     if (storage) {
       const t = storage.backendTensor as WebGPUTensor;
-      if (!t.isContiguous || (t.offset ?? 0) !== 0) return "non-contiguous";
+      // Each reduction reads its input contiguous; a live strided input gets a
+      // synthesized copy prologue, then this node binds the copy.
+      const r = resolveContiguousOperand(
+        node.op,
+        0,
+        ref,
+        resolveRefSlot,
+        slots,
+      );
+      if (typeof r === "string") return r;
+      commands.push(...r.prologue);
+      inSlot = r.slot;
       inShape = t.shape;
     } else {
+      const s = resolveRefSlot(ref);
+      if (s === undefined) return "untracked-input";
+      inSlot = s;
       const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
       if (!sd) return "no-shape";
       inShape = sd.shape;
@@ -1897,14 +1946,37 @@ function generateGather(
   };
 }
 
-/** Resolve an input that the kernel reads as a CONTIGUOUS buffer. Bails when
- *  the input is live-but-non-contiguous (the op would insert an uncaptured
- *  asContiguous copy) or a released non-derivable view; a released non-view /
- *  contiguous-view producer is contiguous by construction. Returns the slot. */
-function resolveContiguousInputSlot(
+/**
+ * Resolve an input that the kernel reads as a raw-bindable (contiguous strides,
+ * element offset 0) buffer, SYNTHESIZING the contiguous-copy prologue the
+ * dispatch layer would insert (`asContiguous`/`ensureContiguous`) whenever the
+ * operand resolves to LIVE strided storage.
+ *
+ * This is the single generic mechanism that closes the `[non-contiguous]`
+ * uncovered class (docs/operand-layout-metadata-design.md): the per-generator
+ * bail is replaced by a call here, driven by the CONTIGUOUS_OPERANDS
+ * declaration — the caller passes `(op, operandIndex)` and the table (not the
+ * generator's own hardcoded knowledge) decides whether the operand is
+ * contiguity-required. The synthesized prologue is byte-identical to the
+ * recorded copy (same `planContigCopy` → `planContiguousDirectCore` → shared
+ * getPipeline cache), so the t-stream-generate differential ASSERTS agreement
+ * with the dispatcher at the recording seam.
+ *
+ * Returns { slot, prologue } (prologue may be empty when already contiguous),
+ * or a bail string. A RELEASED strided view with no live layout stays bailed —
+ * its stride-bearing layout isn't recoverable post-hoc (unchanged; not the #99
+ * case, whose operand is live). A LIVE strided operand at a position the table
+ * does NOT declare contiguity-required bails `undeclared-contiguous`: the
+ * declaration is load-bearing, so an undeclared-but-forced operand is a
+ * coverage gap the differential surfaces rather than a silent wrong copy.
+ */
+function resolveContiguousOperand(
+  op: string,
+  operandIndex: number,
   ref: LazyIRNode["inputs"][number],
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
-): Slot | string {
+  slots: SlotSource[],
+): { slot: Slot; prologue: GpuCommand[] } | string {
   if (ref.kind === "scalar") return "scalar-operand";
   const slot = resolveRefSlot(ref);
   if (slot === undefined) return "untracked-input";
@@ -1916,11 +1988,58 @@ function resolveContiguousInputSlot(
         : ref.node.results?.[ref.outputIndex ?? 0];
   if (storage) {
     const sbt = storage.backendTensor as WebGPUTensor;
-    if (!sbt.isContiguous || (sbt.offset ?? 0) !== 0) return "non-contiguous";
+    if (!sbt.isContiguous || (sbt.offset ?? 0) !== 0) {
+      // The declaration is the single source: only synthesize the copy for a
+      // position the table names contiguity-required. Undeclared-but-strided =
+      // coverage gap (bail loudly), never a guessed copy.
+      if (!operandRequiresContiguous(op, operandIndex))
+        return "undeclared-contiguous";
+      // LIVE strided operand: synthesize the contiguous copy from the live
+      // layout (shape/strides/offset/dtype/bufferSize), exactly as the
+      // attention prologue does from a lowering capture. The copy's output
+      // slot replaces the operand's slot in the kernel binding.
+      const cc = planContigCopy(
+        {
+          contiguous: false,
+          shape: sbt.shape,
+          strides: sbt.strides,
+          offset: sbt.offset ?? 0,
+          dtype: sbt.dtype,
+          bufferSize: sbt.buffer.size,
+        },
+        slot,
+        slots,
+      );
+      if (typeof cc === "string") return cc;
+      return { slot: cc.outSlot, prologue: cc.commands };
+    }
   } else if (!(refShapeDtype(ref) ?? contiguousViewShapeDtype(ref))) {
     return "no-storage";
   }
-  return slot;
+  return { slot, prologue: [] };
+}
+
+/** Contiguity-forcing variant that returns only the slot, appending any
+ *  synthesized copy prologue to `out`. Thin adapter for the many generators
+ *  that emit their commands into a single array in operand order. */
+function resolveContiguousInto(
+  op: string,
+  operandIndex: number,
+  ref: LazyIRNode["inputs"][number],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  slots: SlotSource[],
+  out: GpuCommand[],
+): Slot | string {
+  const r = resolveContiguousOperand(
+    op,
+    operandIndex,
+    ref,
+    resolveRefSlot,
+    slots,
+  );
+  if (typeof r === "string") return r;
+  out.push(...r.prologue);
+  return r.slot;
 }
 
 /** fusedCrossEntropyForward: ALLOC(loss [B], kind 0) + one tile dispatch
@@ -1940,7 +2059,15 @@ function generateCrossEntropyForward(
     | { batchSize?: number; vocabSize?: number; ignoreIndex?: number }
     | undefined;
   if (!cfg || cfg.batchSize == null || cfg.vocabSize == null) return "payload";
-  const logitsSlot = resolveContiguousInputSlot(node.inputs[0], resolveRefSlot);
+  const prologue: GpuCommand[] = [];
+  const logitsSlot = resolveContiguousInto(
+    node.op,
+    0,
+    node.inputs[0],
+    resolveRefSlot,
+    slots,
+    prologue,
+  );
   if (typeof logitsSlot === "string") return logitsSlot;
   const targetsSlot = resolveRefSlot(node.inputs[1]);
   if (targetsSlot === undefined) return "untracked-input";
@@ -1962,6 +2089,7 @@ function generateCrossEntropyForward(
   if (!bindings) return "config-missing";
   return {
     commands: [
+      ...prologue,
       {
         tag: TAG_ALLOC,
         slot: outSlot,
@@ -1996,14 +2124,29 @@ function generateCrossEntropyBackward(
     | { batchSize?: number; vocabSize?: number; ignoreIndex?: number }
     | undefined;
   if (!cfg || cfg.batchSize == null || cfg.vocabSize == null) return "payload";
-  const logitsSlot = resolveContiguousInputSlot(node.inputs[0], resolveRefSlot);
+  const prologue: GpuCommand[] = [];
+  const logitsSlot = resolveContiguousInto(
+    node.op,
+    0,
+    node.inputs[0],
+    resolveRefSlot,
+    slots,
+    prologue,
+  );
   if (typeof logitsSlot === "string") return logitsSlot;
   const targetsSlot = resolveRefSlot(node.inputs[1]);
   if (targetsSlot === undefined) return "untracked-input";
   const tgt = refShapeDtype(node.inputs[1]);
   if (!tgt) return "no-shape";
   if (tgt.dtype !== "i32" && tgt.dtype !== "u32") return "targets-not-i32";
-  const gradSlot = resolveContiguousInputSlot(node.inputs[2], resolveRefSlot);
+  const gradSlot = resolveContiguousInto(
+    node.op,
+    2,
+    node.inputs[2],
+    resolveRefSlot,
+    slots,
+    prologue,
+  );
   if (typeof gradSlot === "string") return gradSlot;
   const plan = planCrossEntropyBackwardDispatch(
     cfg.batchSize,
@@ -2025,6 +2168,7 @@ function generateCrossEntropyBackward(
   if (!bindings) return "config-missing";
   return {
     commands: [
+      ...prologue,
       {
         tag: TAG_ALLOC,
         slot: outSlot,
@@ -2626,14 +2770,22 @@ function generateUnscaleGrad(
       : (ref.outputIndex ?? 0) === 0
         ? ref.node.result
         : ref.node.results?.[ref.outputIndex ?? 0];
-  const inSlot = resolveRefSlot(ref);
-  if (inSlot === undefined) return "untracked-producer";
+  const prologue: GpuCommand[] = [];
+  let inSlot: Slot;
   let size: number;
   if (storage) {
     const t = storage.backendTensor as WebGPUTensor;
-    if (!t.isContiguous || (t.offset ?? 0) !== 0) return "non-contiguous";
+    // grad_in is raw-bound (declared input(0)); a live strided grad gets a
+    // synthesized contiguous-copy prologue, then unscale binds the copy.
+    const r = resolveContiguousOperand(node.op, 0, ref, resolveRefSlot, slots);
+    if (typeof r === "string") return r;
+    prologue.push(...r.prologue);
+    inSlot = r.slot;
     size = t.size;
   } else if (ref.kind !== "materialized" && !VIEW_OPS.has(ref.node.op)) {
+    const s = resolveRefSlot(ref);
+    if (s === undefined) return "untracked-producer";
+    inSlot = s;
     size = sizeOf(ref.node.shape);
   } else {
     return "no-storage";
@@ -2652,6 +2804,7 @@ function generateUnscaleGrad(
   if (!bindings) return "config-missing";
   return {
     commands: [
+      ...prologue,
       {
         tag: TAG_ALLOC,
         slot: outSlot,
