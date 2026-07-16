@@ -43,11 +43,56 @@
  *     CELL=checkpoint npx tsx tools/t-witness-harvest-matrix.ts
  */
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
+import {
+  crossPlanEdgePerProducer,
+  crossPlanEdgeStats,
+  crossPlanEdges,
+  getAllCrossPlanEdgeKeepSets,
+} from "../src/core/cross-plan-edges";
 import { STEP_TAPE_RECORD, stStats } from "../src/core/step-tape";
+import { currentVariantSelection } from "../src/core/step-variant";
 import { getPayloadThrashStats } from "../src/executor/executor";
 import { getAllWitnessedHarvest } from "../src/executor/observed-liveness";
 import { Torchlette } from "../src/frontend/torchlette";
 import { Adam, GradScaler, StepLR } from "../src/optim/index.ts";
+
+/**
+ * [D1] SHADOW DIFF (docs/step-data-dependence-design.md §4.2 / campaign D1 gate).
+ * Compare, per producer template, the DERIVED crossPlanEdges keep-set against
+ * the per-producer witnessed-harvest oracle. D1 deletes nothing: both run, and
+ * this diff MUST soak empty (D2's precondition). A `derivedMissing` pair (the
+ * derived set dropped a pair the oracle keeps) is the DANGEROUS direction
+ * (under-keep → UAF) → FAIL. A `derivedExtra` pair (derived keeps more than the
+ * oracle) is the monotone-safe direction — categorized, reported, non-fatal (it
+ * should be zero in D1 by construction, but a strict superset is never a UAF).
+ */
+function shadowDiff(): {
+  producers: number;
+  derivedMissing: Array<{ fp: string; pairs: string[] }>;
+  derivedExtra: Array<{ fp: string; pairs: string[] }>;
+  empty: boolean;
+} {
+  const oracle = getAllWitnessedHarvest(); // fp -> sorted "ni:oi"
+  const derived = getAllCrossPlanEdgeKeepSets(); // fp -> sorted "ni:oi"
+  const fps = new Set<number>([...oracle.keys(), ...derived.keys()]);
+  const derivedMissing: Array<{ fp: string; pairs: string[] }> = [];
+  const derivedExtra: Array<{ fp: string; pairs: string[] }> = [];
+  for (const fp of fps) {
+    const o = new Set(oracle.get(fp) ?? []);
+    const d = new Set(derived.get(fp) ?? []);
+    const missing = [...o].filter((k) => !d.has(k)).sort();
+    const extra = [...d].filter((k) => !o.has(k)).sort();
+    const hex = (fp >>> 0).toString(16);
+    if (missing.length) derivedMissing.push({ fp: hex, pairs: missing });
+    if (extra.length) derivedExtra.push({ fp: hex, pairs: extra });
+  }
+  return {
+    producers: fps.size,
+    derivedMissing,
+    derivedExtra,
+    empty: derivedMissing.length === 0 && derivedExtra.length === 0,
+  };
+}
 
 type Cell = {
   L: number;
@@ -299,10 +344,46 @@ async function main() {
   let witnessedPairs = 0;
   for (const s of witnessed.values()) witnessedPairs += s.length;
 
+  // [D1] The derived cross-plan edge set + the shadow diff vs the oracle.
+  const edgeStats = crossPlanEdgeStats();
+  const perProducer = crossPlanEdgePerProducer();
+  const diff = shadowDiff();
+  // Reify discipline: the derived object is non-null once witnessed, null when
+  // absent (the "null on non-witness paths" clause — here it must be present).
+  const derivedObj = crossPlanEdges(currentVariantSelection());
+
   log("=== VERDICT ===");
   log(
     `witnessedTemplates=${witnessed.size} witnessedPairs=${witnessedPairs} witnessVariances=${st.witnessVariances}`,
   );
+  log(
+    `crossPlanEdges: variants=${edgeStats.variants} producers=${edgeStats.producers} ` +
+      `pairs=${edgeStats.pairs} edges=${edgeStats.edges} positions=${edgeStats.positions} ` +
+      `derivedObjNull=${derivedObj === null}`,
+  );
+  // Per-producer edge-set sizes (the D1 report: sizes measured per cell), top by
+  // pairs — the ~47-edge forwardToForce checkpoint class surfaces here.
+  {
+    const rows = [...perProducer.entries()].sort(
+      (a, b) => b[1].pairs - a[1].pairs,
+    );
+    for (const [fp, r] of rows.slice(0, 6))
+      log(
+        `  producer 0x${(fp >>> 0).toString(16)}: pairs=${r.pairs} edges=${r.edges} consumers=${r.consumers}`,
+      );
+  }
+  log(
+    `SHADOW DIFF: ${diff.empty ? "EMPTY (green)" : "NON-EMPTY"} — producers=${diff.producers} ` +
+      `derivedMissing=${diff.derivedMissing.length} derivedExtra=${diff.derivedExtra.length}`,
+  );
+  for (const m of diff.derivedMissing)
+    log(
+      `  DERIVED-MISSING (UNDER-KEEP, UAF risk) fp=0x${m.fp}: ${m.pairs.join(",")}`,
+    );
+  for (const x of diff.derivedExtra)
+    log(
+      `  derived-extra (safe superset) fp=0x${x.fp}: ${x.pairs.slice(0, 8).join(",")}${x.pairs.length > 8 ? "…" : ""}`,
+    );
   log(`inputNotReady=${inputNotReady} threw=${threw}`);
   log(
     `cleanMisses=${thrash.cleanMisses} dirtyMisses=${thrash.dirtyMisses} prunedPairsRemoved=${thrash.prunedPairsRemoved} converged=${thrash.convergedTemplates}`,
@@ -333,6 +414,26 @@ async function main() {
   if (losses.some((l) => !Number.isFinite(l))) {
     log("FAIL(D): non-finite loss (corruption)");
     fail = true;
+  }
+  // E. [D1] shadow diff — the derived keep-set must NOT under-keep vs the oracle
+  // (the dangerous direction). A derived-extra (safe superset) is reported but
+  // does not fail. The derived object must be non-null when witnessed.
+  if (diff.derivedMissing.length > 0) {
+    log(
+      `FAIL(E): shadow diff DERIVED-MISSING on ${diff.derivedMissing.length} producer(s) — derived keep-set dropped a pair the oracle keeps (UAF risk)`,
+    );
+    fail = true;
+  }
+  if (witnessed.size > 0 && derivedObj === null) {
+    log(
+      "FAIL(E): crossPlanEdges null despite a witnessed producer (reify bug)",
+    );
+    fail = true;
+  }
+  if (diff.derivedExtra.length > 0) {
+    log(
+      `WARN(E): shadow diff has ${diff.derivedExtra.length} derived-extra producer(s) — safe superset, but non-empty (D2 precondition not yet met)`,
+    );
   }
 
   if (!fail) {
@@ -368,6 +469,14 @@ async function main() {
       scalerInfObserved: cfg.scaler ? scalerInfObserved : null,
       lrDropped: cfg.scheduler ? lrBefore > lrAfter : null,
       steps: losses.length,
+      // [D1] derived edge set + shadow diff (empty = green).
+      edgeProducers: edgeStats.producers,
+      edgePairs: edgeStats.pairs,
+      edges: edgeStats.edges,
+      shadowEmpty: diff.empty,
+      shadowDerivedMissing: diff.derivedMissing.length,
+      shadowDerivedExtra: diff.derivedExtra.length,
+      derivedObjNull: derivedObj === null,
     })}\n`,
   );
   destroyWebGPU();

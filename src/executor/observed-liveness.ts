@@ -42,6 +42,8 @@
  * needs to serve this path; surfaced on getPayloadThrashStats().
  */
 
+import { crossPlanEdgeKeepSet } from "../core/cross-plan-edges";
+import { currentVariantSelection } from "../core/step-variant";
 import { storageTracker } from "../graph/storage-tracker";
 import type { StorageHandle } from "../graph/types";
 
@@ -662,11 +664,24 @@ export function prunedHarvest(
   const t = templates.get(fp);
   if (!t || t.pinned || !t.converged) return undefined;
   const witnessed = witnessedHarvest.get(fp);
+  // [D1] The DERIVED cross-plan edge set is consulted IN ADDITION to the
+  // per-producer witnessed harvest (both run; the shadow diff gates the D2
+  // collapse). Its keep-set projection EQUALS `witnessed` by construction (both
+  // published from one witness stream at one K_w=2 moment), so unioning it is
+  // null-clean here; the harvest becomes a QUERY of crossPlanEdges without
+  // deleting the oracle this phase (§4.2 / campaign D1).
+  const derived = crossPlanEdgeKeepSet(fp, currentVariantSelection());
   const kept: Array<{ i: number; oi: number }> = [];
   const excluded: Array<{ i: number; oi: number }> = [];
   for (const p of actionPairs) {
     const k = key(p.i, p.oi);
-    if (t.needed.has(k) || keepAlways.has(k) || witnessed?.has(k)) kept.push(p);
+    if (
+      t.needed.has(k) ||
+      keepAlways.has(k) ||
+      witnessed?.has(k) ||
+      derived.has(k)
+    )
+      kept.push(p);
     else excluded.push(p);
   }
   prunedPairsRemoved += excluded.length;

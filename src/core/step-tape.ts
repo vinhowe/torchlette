@@ -45,13 +45,21 @@
  * (phase 2+, its own soak per §2.5).
  */
 
+import {
+  type ProducerEdgePayload,
+  publishCrossPlanEdges,
+  resetCrossPlanEdges,
+} from "./cross-plan-edges";
 import { ENV } from "./env";
 import {
   deriveStepObject,
   type StepObject,
   type StepReceipts,
 } from "./step-object";
-import { currentVariantSelection } from "./step-variant";
+import {
+  currentVariantSelection,
+  type StepVariant,
+} from "./step-variant";
 
 /**
  * `TORCHLETTE_STEP_TAPE`:
@@ -294,6 +302,11 @@ interface PlanExecRecord {
    *  read-only PROJECTION of the detector's membership — recorded, never
    *  recomputed here. 0 when no partition was reified (lowered/arena-free plan). */
   partitionHash: number;
+  /** [D1] Running cross-plan READ ORDINAL for this consumer plan execution: the
+   *  position of each witnessed cross-plan read in this plan's read stream (the
+   *  "position" of the crossPlanEdges schema). Deterministic replay ⇒ stable
+   *  across steps. Incremented in `stObserveWitnessRead`. */
+  xreads: number;
 }
 
 interface StepRecord {
@@ -338,6 +351,12 @@ let activePlan: PlanExecRecord | null = null;
  * reconciled into the persistent per-producer `witnessProducer` tracker (K_w=2
  * per producer), which publishes to observed-liveness. Cleared per step. */
 let curWitnessReads = new Map<number, Set<string>>();
+/** [D1] THIS step's observed cross-plan CONSUMER edges (for the derived
+ *  crossPlanEdges object): producerFp → pairKey("ni:oi") → consumerFp → the read
+ *  positions in that consumer plan's stream. Populated alongside
+ *  `curWitnessReads` in `stObserveWitnessRead`; reconciled into
+ *  `witnessProducerEdges` (the monotone union) at step end. Cleared per step. */
+let curWitnessEdges = new Map<number, Map<string, Map<number, Set<number>>>>();
 let prev: StepRecord | null = null;
 let stepOrdinal = 0;
 /** Set by the 1c replay layer for the duration of a REPLAY step: the recorder
@@ -403,6 +422,19 @@ const witnessProducer = new Map<
   { reads: Set<string>; consecutive: number }
 >();
 
+/** [D1] The PERSISTENT monotone union of observed cross-plan CONSUMER edges per
+ *  producer template — the accumulator the derived crossPlanEdges object is
+ *  published FROM. Keyed producerFp → pairKey("ni:oi") → consumerFp → edge
+ *  (positions + step watermarks). Grown every step from `curWitnessEdges` (never
+ *  shrunk — the same monotone-safe discipline as `witnessProducer.reads`); a
+ *  producer's edges for the PUBLISHED pair set are handed to
+ *  `publishCrossPlanEdges` at the SAME K_w=2 moment `witnessHarvestPublisher`
+ *  fires, so the edge set's keep-set projection equals the per-producer oracle. */
+const witnessProducerEdges = new Map<
+  number,
+  Map<string, Map<number, { positions: Set<number>; firstStep: number; lastStep: number }>>
+>();
+
 /** [task #98 phase 4 — WITNESS-TIME HARVEST] Reconcile THIS step's observed
  *  cross-plan reads (`curW`: producer fp → pair set) against the per-producer
  *  witness tracker, and publish a producer's witnessed harvest once it has been
@@ -418,8 +450,19 @@ const witnessProducer = new Map<
  *  consecutive count AND, if a set was already published, republishes the UNION
  *  (never drop a witnessed pair) and counts the variance (nondeterministic
  *  reader diagnostic, §4.1 rule 3). */
-function reconcileWitnessReads(curW: Map<number, Set<string>>): void {
+function reconcileWitnessReads(
+  curW: Map<number, Set<string>>,
+  curE: Map<number, Map<string, Map<number, Set<number>>>>,
+): void {
   if (!witnessHarvestPublisher) return;
+  // [D1] Grow the persistent monotone edge union FIRST, so the edges published
+  // below reflect this step's observations. Every producer in `curE` (incl.
+  // not-yet-eligible seeds) accumulates; only PUBLISHED producers surface.
+  accumulateEdges(curE);
+  // [D1] The variant this witness belongs to (§3.3): the derived edge set is
+  // keyed by it. A singleton `"train"` in v1 (open-Q1 verdict: route-as-data),
+  // but the key is built right, not speculatively general.
+  const variant = currentVariantSelection();
   for (const [fp, reads] of curW) {
     const tr = witnessProducer.get(fp);
     if (!tr) {
@@ -432,8 +475,13 @@ function reconcileWitnessReads(curW: Map<number, Set<string>>): void {
     if (same) {
       tr.consecutive++;
       // Two (or more) consecutive identical observations → witnessed. Publish
-      // (idempotent — same set each time once stable).
-      if (tr.consecutive >= 2) witnessHarvestPublisher(fp, reads);
+      // (idempotent — same set each time once stable). The derived edge set is
+      // published for the SAME pair set, so its keep-set projection equals the
+      // per-producer oracle's set by construction (the D1 shadow-diff invariant).
+      if (tr.consecutive >= 2) {
+        witnessHarvestPublisher(fp, reads);
+        publishProducerEdges(variant, fp, reads);
+      }
     } else {
       // The read set changed between two consecutive appearances. Grow the
       // tracker to the UNION (monotone), reset the consecutive count, and — if
@@ -452,9 +500,65 @@ function reconcileWitnessReads(curW: Map<number, Set<string>>): void {
           );
         }
       }
-      if (wasPublished && grew) witnessHarvestPublisher(fp, union);
+      if (wasPublished && grew) {
+        witnessHarvestPublisher(fp, union);
+        publishProducerEdges(variant, fp, union);
+      }
     }
   }
+}
+
+/** [D1] Grow the persistent monotone edge union from THIS step's observed
+ *  consumer edges (never shrink — assumption 4). Watermarks: firstStep at first
+ *  observation, lastStep advanced each step the edge recurs (the generation
+ *  watermark D2 reads). */
+function accumulateEdges(
+  curE: Map<number, Map<string, Map<number, Set<number>>>>,
+): void {
+  for (const [fp, byPair] of curE) {
+    let acc = witnessProducerEdges.get(fp);
+    if (!acc) witnessProducerEdges.set(fp, (acc = new Map()));
+    for (const [pk, byConsumer] of byPair) {
+      let accPair = acc.get(pk);
+      if (!accPair) acc.set(pk, (accPair = new Map()));
+      for (const [cfp, positions] of byConsumer) {
+        let e = accPair.get(cfp);
+        if (!e)
+          accPair.set(
+            cfp,
+            (e = {
+              positions: new Set(),
+              firstStep: stepOrdinal,
+              lastStep: stepOrdinal,
+            }),
+          );
+        for (const p of positions) e.positions.add(p);
+        e.lastStep = stepOrdinal;
+      }
+    }
+  }
+}
+
+/** [D1] Publish the derived cross-plan edges for a producer, restricted to the
+ *  PUBLISHED pair set (the same set handed to `witnessHarvestPublisher`) — so
+ *  `crossPlanEdgeKeepSet(fp) === witnessedHarvest[fp]`. */
+function publishProducerEdges(
+  variant: StepVariant,
+  fp: number,
+  pairs: Set<string>,
+): void {
+  const acc = witnessProducerEdges.get(fp);
+  const payload: Map<
+    string,
+    Map<number, { positions: Set<number>; firstStep: number; lastStep: number }>
+  > = new Map();
+  if (acc) {
+    for (const pk of pairs) {
+      const byConsumer = acc.get(pk);
+      if (byConsumer) payload.set(pk, byConsumer);
+    }
+  }
+  publishCrossPlanEdges(variant, fp, payload as ProducerEdgePayload);
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +613,7 @@ export function stBeginPlan(
     compiled: false,
     hasRecompute,
     partitionHash: partitionHash >>> 0,
+    xreads: 0,
   };
   cur.plans.push(rec);
   cur.entries.push({ kind: "plan", templateId: fp });
@@ -634,10 +739,25 @@ export function stMarkReplayStep(): void {
  * recorded plan — warmup, readback — is not a cross-plan harvest read here). */
 export function stObserveWitnessRead(fp: number, ni: number, oi: number): void {
   if (replaying) return;
-  if (!activePlan) return;
+  const consumer = activePlan;
+  if (!consumer) return;
+  const pairKey = `${ni}:${oi}`;
   let s = curWitnessReads.get(fp);
   if (!s) curWitnessReads.set(fp, (s = new Set()));
-  s.add(`${ni}:${oi}`);
+  s.add(pairKey);
+  // [D1] Record the CONSUMER edge for the derived crossPlanEdges object: which
+  // plan (consumer.fp — the template-generation discriminator) read the producer
+  // value, at which position in this consumer plan's cross-plan read stream. The
+  // producer's value identity is (fp, ni, oi); the consumer edge is (consumerFp,
+  // position). Same seam, same gating — one extra Map/Set insert at witness time.
+  const position = consumer.xreads++;
+  let byPair = curWitnessEdges.get(fp);
+  if (!byPair) curWitnessEdges.set(fp, (byPair = new Map()));
+  let byConsumer = byPair.get(pairKey);
+  if (!byConsumer) byPair.set(pairKey, (byConsumer = new Map()));
+  let positions = byConsumer.get(consumer.fp);
+  if (!positions) byConsumer.set(consumer.fp, (positions = new Set()));
+  positions.add(position);
 }
 
 /** Publisher callback (wired by the executor layer at load — core stays a leaf,
@@ -894,6 +1014,7 @@ export function stEndStep(info: {
     replaying = false;
     cur = { entries: [], plans: [] };
     curWitnessReads = new Map();
+    curWitnessEdges = new Map();
     activePlan = null;
     return;
   }
@@ -925,8 +1046,10 @@ export function stEndStep(info: {
   // checkpoint-recompute activation) are the witnessed harvest the generated
   // prune needs. Rolling the accumulator here empties it for the next step.
   const curWitness = curWitnessReads;
+  const curWitnessE = curWitnessEdges;
   curWitnessReads = new Map();
-  reconcileWitnessReads(curWitness);
+  curWitnessEdges = new Map();
+  reconcileWitnessReads(curWitness, curWitnessE);
   if (!p) return;
   if (
     p.structKey !== rec.structKey ||
@@ -1143,7 +1266,10 @@ export function stResetAll(): void {
   declaredBatchCover.clear();
   cur = { entries: [], plans: [] };
   curWitnessReads = new Map();
+  curWitnessEdges = new Map();
   witnessProducer.clear();
+  witnessProducerEdges.clear();
+  resetCrossPlanEdges();
   activePlan = null;
   prev = null;
   stepOrdinal = 0;

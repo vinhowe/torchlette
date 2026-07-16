@@ -1,0 +1,283 @@
+/**
+ * crossPlanEdges — THE ONE DERIVED CROSS-PLAN EDGE SET (campaign phase D1,
+ * docs/step-data-dependence-design.md §2 / §4).
+ *
+ * WHAT THIS IS. Element B of the step's data-dependence: by witness time the
+ * step object knows the ordered plan sequence per variant; the cross-plan edge
+ * set — producer plan → consumer plan, per VALUE — is DERIVABLE from the
+ * witnessed streams (§4.1). This module is that ONE derived object. It is keyed
+ * by variant (§3.3); within a variant it holds, per PRODUCER value identity
+ * `(producer plan fp, ni:oi)`, the set of consumer edges `(consumer plan fp,
+ * position)` the witness physically observed reading that value across a plan
+ * boundary (§4.1 "autograd cross-plan reads" — the ~47 measured `forwardToForce`
+ * edges, `[E-1]`).
+ *
+ * SINGLE SOURCE — ONE PRODUCER, CONSUMERS QUERY (ruling 1, §4.2). The ONLY
+ * writer is the step-tape recorder's witness-eligibility path (`step-tape.ts`
+ * `reconcileWitnessReads`), which publishes at the SAME K_w=2 moment it
+ * publishes the per-producer witnessed harvest set — so the edge set's
+ * per-producer keep-set PROJECTION is byte-EQUAL to that shadow oracle by
+ * construction (the D1 null gate). The harvest, the planner's result retention,
+ * and the observed-liveness predicates become CALLERS of this one query (§4.2);
+ * D1 wires the harvest as an ADDITIONAL consumer (both run, shadow-diff gated),
+ * deleting nothing until D2's diff has soaked empty.
+ *
+ * TEMPLATE-GENERATION KEYING (D0 refinement — the campaign's ground truth). A
+ * producer's cross-plan read set GROWS as the main plan settles across template
+ * transitions (measured: producer `0xa442983c` 97→123→125 pairs as the reader
+ * template transitioned `0x991b475f → 0xaded5357 + 0x77663cc5`). The edge set is
+ * keyed per (variant, settled template-generation): the CONSUMER PLAN FP is the
+ * generation discriminator (a reader-template transition writes edges under a
+ * NEW `consumerFp`), and each edge carries a `lastStep` watermark so a later
+ * phase (D2 "derive-through") can drop edges whose consumer fp has fallen out of
+ * the current generation. D1 KEEPS the full monotone union (assumption 4 —
+ * over-keep is memory, under-keep is a UAF), so the projection matches the
+ * monotone-growing shadow oracle exactly; the generation metadata is recorded,
+ * not yet used to prune.
+ *
+ * NULL ON NON-WITNESS PATHS (reify discipline). Nothing is written until a
+ * producer reaches K_w=2 witness eligibility; `crossPlanEdges(v)` returns `null`
+ * for a variant with no witnessed producer, and every query returns empty. The
+ * module owns no GPU memory, references only fingerprints + `ni:oi` coordinates,
+ * and adds NO env flag (it rides `TORCHLETTE_STEP_TAPE` with the campaign).
+ *
+ * A leaf core module: it imports nothing from `step-tape`/executor (both import
+ * IT), so there is no cycle.
+ */
+
+import type { StepVariant } from "./step-variant";
+
+/** A cross-plan CONSUMER edge of one producer value: which consumer plan read it
+ *  (the generation discriminator) and where in that plan's cross-plan read
+ *  stream, with the observation watermarks the D2 derive-through will consult. */
+export interface CrossPlanEdge {
+  /** The consumer plan's execution fingerprint (the template-generation key). */
+  readonly consumerFp: number;
+  /** Read ordinals within the consumer plan's cross-plan read stream (the
+   *  "position" of the schema; sorted, deduped). Multiple ⇒ the consumer read
+   *  the value at more than one node position. */
+  readonly positions: readonly number[];
+  /** Recorder step ordinal at which this edge was FIRST witnessed. */
+  readonly firstStep: number;
+  /** Recorder step ordinal at which this edge was LAST witnessed (the generation
+   *  watermark — D2 drops edges whose consumer has fallen out of the current
+   *  generation; unused for pruning in D1). */
+  readonly lastStep: number;
+}
+
+/** The derived edge set for ONE variant: producer plan fp → value pair "ni:oi"
+ *  → its consumer edges. */
+export interface CrossPlanEdgeSet {
+  readonly variant: StepVariant;
+  /** producerFp → ("ni:oi" → edges). */
+  readonly producers: ReadonlyMap<
+    number,
+    ReadonlyMap<string, readonly CrossPlanEdge[]>
+  >;
+}
+
+/** Mutable edge accumulator (module-internal; the published object exposes the
+ *  read-only projection above). */
+interface EdgeAccum {
+  positions: Set<number>;
+  firstStep: number;
+  lastStep: number;
+}
+
+/** The store: variant → producerFp → pairKey("ni:oi") → consumerFp → EdgeAccum.
+ *  Written ONLY by `publishCrossPlanEdges` (the witness); read by the harvest +
+ *  the shadow-diff instrument. */
+const store = new Map<
+  StepVariant,
+  Map<number, Map<string, Map<number, EdgeAccum>>>
+>();
+
+/** The producer-edge payload the witness hands to `publishCrossPlanEdges`:
+ *  pairKey → (consumerFp → observed positions + watermarks). */
+export type ProducerEdgePayload = ReadonlyMap<
+  string,
+  ReadonlyMap<
+    number,
+    { positions: ReadonlySet<number>; firstStep: number; lastStep: number }
+  >
+>;
+
+/**
+ * Publish (REPLACE) the derived cross-plan edges for ONE producer template under
+ * a variant. Called by the step-tape recorder at witness eligibility (K_w=2),
+ * for exactly the pair set it publishes to the per-producer harvest oracle — so
+ * `crossPlanEdgeKeepSet(producerFp)` equals that oracle's set by construction.
+ * A fresh publication REPLACES the producer's prior edges (re-witnessing under a
+ * changed declaration re-establishes them), mirroring `setWitnessedHarvest`.
+ */
+export function publishCrossPlanEdges(
+  variant: StepVariant,
+  producerFp: number,
+  edges: ProducerEdgePayload,
+): void {
+  let byProducer = store.get(variant);
+  if (!byProducer) {
+    byProducer = new Map();
+    store.set(variant, byProducer);
+  }
+  if (edges.size === 0) {
+    byProducer.delete(producerFp);
+    if (byProducer.size === 0) store.delete(variant);
+    return;
+  }
+  const byPair = new Map<string, Map<number, EdgeAccum>>();
+  for (const [pairKey, byConsumer] of edges) {
+    const consumers = new Map<number, EdgeAccum>();
+    for (const [consumerFp, e] of byConsumer) {
+      consumers.set(consumerFp, {
+        positions: new Set(e.positions),
+        firstStep: e.firstStep,
+        lastStep: e.lastStep,
+      });
+    }
+    byPair.set(pairKey, consumers);
+  }
+  byProducer.set(producerFp, byPair);
+}
+
+/**
+ * THE HARVEST QUERY (§4.2): the keep-set for a producer = the set of value pairs
+ * "ni:oi" that have AT LEAST ONE cross-plan consumer edge under the variant.
+ * This is the projection observed-liveness consults; it EQUALS the per-producer
+ * witnessed harvest set (the D1 shadow-diff invariant). Empty when the producer
+ * is not (yet) witnessed under the variant.
+ */
+export function crossPlanEdgeKeepSet(
+  producerFp: number,
+  variant: StepVariant,
+): Set<string> {
+  const out = new Set<string>();
+  const byPair = store.get(variant)?.get(producerFp);
+  if (!byPair) return out;
+  for (const [pairKey, consumers] of byPair) {
+    if (consumers.size > 0) out.add(pairKey);
+  }
+  return out;
+}
+
+/**
+ * The derived edge set for a variant — the object the doc's schema names. Returns
+ * `null` for a variant with no witnessed producer (the reify-discipline null on
+ * non-witness paths). A read-only PROJECTION of the store.
+ */
+export function crossPlanEdges(variant: StepVariant): CrossPlanEdgeSet | null {
+  const byProducer = store.get(variant);
+  if (!byProducer || byProducer.size === 0) return null;
+  const producers = new Map<number, Map<string, CrossPlanEdge[]>>();
+  for (const [producerFp, byPair] of byProducer) {
+    const pairs = new Map<string, CrossPlanEdge[]>();
+    for (const [pairKey, byConsumer] of byPair) {
+      const edges: CrossPlanEdge[] = [];
+      for (const [consumerFp, e] of byConsumer) {
+        edges.push({
+          consumerFp,
+          positions: [...e.positions].sort((a, b) => a - b),
+          firstStep: e.firstStep,
+          lastStep: e.lastStep,
+        });
+      }
+      edges.sort((a, b) => a.consumerFp - b.consumerFp);
+      pairs.set(pairKey, edges);
+    }
+    producers.set(producerFp, pairs);
+  }
+  return { variant, producers };
+}
+
+/**
+ * SHADOW-DIFF SUPPORT: every witnessed producer's keep-set projection, unioned
+ * across ALL variants (the per-producer harvest oracle is variant-blind, so the
+ * comparison must be too). producerFp → sorted "ni:oi" pairs.
+ */
+export function getAllCrossPlanEdgeKeepSets(): Map<number, string[]> {
+  const out = new Map<number, Set<string>>();
+  for (const byProducer of store.values()) {
+    for (const [producerFp, byPair] of byProducer) {
+      let s = out.get(producerFp);
+      if (!s) {
+        s = new Set();
+        out.set(producerFp, s);
+      }
+      for (const [pairKey, consumers] of byPair) {
+        if (consumers.size > 0) s.add(pairKey);
+      }
+    }
+  }
+  const sorted = new Map<number, string[]>();
+  for (const [fp, s] of out) sorted.set(fp, [...s].sort());
+  return sorted;
+}
+
+/** Telemetry: sizes of the derived object (for the D1 gate's edge-set report). */
+export function crossPlanEdgeStats(): {
+  variants: number;
+  producers: number;
+  pairs: number;
+  edges: number;
+  positions: number;
+} {
+  let pairs = 0;
+  let edges = 0;
+  let positions = 0;
+  const producerSet = new Set<number>();
+  for (const byProducer of store.values()) {
+    for (const [producerFp, byPair] of byProducer) {
+      producerSet.add(producerFp);
+      for (const consumers of byPair.values()) {
+        pairs++;
+        for (const e of consumers.values()) {
+          edges++;
+          positions += e.positions.size;
+        }
+      }
+    }
+  }
+  return {
+    variants: store.size,
+    producers: producerSet.size,
+    pairs,
+    edges,
+    positions,
+  };
+}
+
+/** Per-producer edge-set sizes (for the D1 gate: "the edge-set sizes measured
+ *  per cell"). producerFp → { pairs, edges, consumers }. */
+export function crossPlanEdgePerProducer(): Map<
+  number,
+  { pairs: number; edges: number; consumers: number }
+> {
+  const out = new Map<
+    number,
+    { pairs: number; edges: number; consumers: number }
+  >();
+  for (const byProducer of store.values()) {
+    for (const [producerFp, byPair] of byProducer) {
+      let rec = out.get(producerFp);
+      if (!rec) {
+        rec = { pairs: 0, edges: 0, consumers: 0 };
+        out.set(producerFp, rec);
+      }
+      const consumerSet = new Set<number>();
+      for (const consumers of byPair.values()) {
+        rec.pairs++;
+        for (const cfp of consumers.keys()) {
+          rec.edges++;
+          consumerSet.add(cfp);
+        }
+      }
+      rec.consumers = consumerSet.size;
+    }
+  }
+  return out;
+}
+
+/** Clear all derived edges (test/telemetry reset; mirrors `stResetAll`). */
+export function resetCrossPlanEdges(): void {
+  store.clear();
+}
