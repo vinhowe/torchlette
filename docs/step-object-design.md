@@ -383,6 +383,16 @@ identical executed steps that make its tape eligible.**
 > BLOCKED by the broader `forwardToForce` cross-plan class — see `stage4-compile-from-ir.md
 > §"Task #43 recorded-build DELETION PASS (2026-07-16)"`. The `shape=[]` named blocker is
 > closed; the deletion is not.
+>
+> **DEEP-UNIFICATION CROSS-REF (`docs/step-data-dependence-design.md`, 2026-07-16):** the
+> `forwardToForce` cross-plan class that blocks the full sunset is one face of a single root
+> (cross-plan values invisible to per-plan knowledge under data-dependent variation) shared
+> with #99 R2 and the checkpoint bypass. That doc's finiteness argument replaces this
+> per-producer witness compromise with a route-as-data + declared-variant + derived cross-plan
+> EDGE SET (three observers → one derivation). Empirically it REVISES the "inf-skip
+> re-fingerprints" premise: the scaler window's fork is a VALUE-level scale-change op
+> (`[E-3]`, `witnessVariances=3`; the optimizer never host-skips, `[E-2]`) → route-as-data,
+> not a structural variant. The recorded-build sunset is that doc's phase D4.
 
 ### 4.1 Mechanism
 

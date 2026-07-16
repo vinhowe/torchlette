@@ -3070,6 +3070,16 @@ class. The remaining prune-soundness class is scoped above for the follow-on.
 
 ## Task #43 recorded-build DELETION PASS (2026-07-16): the shape=[] class FIXED; full deletion STILL BLOCKED by the broader `forwardToForce` cross-plan class
 
+> **DEEP-UNIFICATION CROSS-REF (`docs/step-data-dependence-design.md`, 2026-07-16):** this fourth
+> blocked attempt is face 1 of a single root shared with #99 R2 and the checkpoint bypass. The
+> `forwardToForce` cross-plan class is designed away there by a derived cross-plan EDGE SET (the ~47
+> reads, `[E-1]`) whose `graphHeld=false` members are carried as genuine-save edges — superseding the
+> `graphHeldAt` heuristic (that doc §5, the STOP's own proposed unblock made principled). EMPIRICAL
+> CORRECTION to the "GradScaler inf-skip re-fingerprints" attribution here: `[E-2]` the optimizer
+> never host-skips (grads zeroed as data); `[E-3]` the scaler window's fp instability is a VALUE-level
+> scale-change op (`witnessVariances=3`) → route-as-data, NOT a structural variant. The sunset is that
+> doc's phase D4 (the finiteness argument).
+
 The authorized full-sunset pass root-caused and FIXED the last NAMED blocker — the
 `shape=[]` GradScaler-scalar `[lifetime] reading RECLAIMED` — then, on the deleted
 tree, found it is the SMALLEST instance of a broader class the witness/generated

@@ -393,6 +393,15 @@ subgraph) is emitted before backward-first-read; the dead span packs.
 
 ### Phase R2 — STOP (2026-07-15): the witness-sourced split is UNSOUND on the real config
 
+> **DEEP-UNIFICATION CROSS-REF (`docs/step-data-dependence-design.md §4.3`, 2026-07-16):** this
+> STOP is face 2 of one root. The +155% is genuinely-live retention (this STOP proved it), and
+> "witnessed lowered read" does NOT imply "recompute-fed/dead" — TRUE, and exactly the confusion a
+> derived cross-plan EDGE SET removes: an edge is recompute-fed iff its producer is in a declared
+> `RecomputeSegment` (splittable), else a genuine save (retained until last consumer). The design
+> does NOT resurrect the unsound split this STOP killed; it makes retention-vs-return a DERIVED
+> per-edge quantity so the return point (last cross-plan consumer) is known. R3 is that doc's phase
+> D3.
+
 **Both R2 oracles CANNOT flip via the mandated mechanism.** The failing-first
 oracles were built on §1's attribution premise — "the +155% is the planner
 *pinning provably-dead* checkpoint-recompute activations whole-step". A read-wiring
