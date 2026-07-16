@@ -170,10 +170,15 @@ export interface StepEditChannelOpts {
    *  membership write the detector owns). Defaults to an in-memory stub — the
    *  request plumbing without live execution (the S3 boundary this phase stops at). */
   readonly reRecord?: ReRecordChannel;
-  /** LIVE wiring hook (S3): apply an accepted merge to the detector's partition
-   *  and return the resulting per-plan boundaryHashes. When provided, the caller
-   *  can assert the channel merge == the detector's own merge (the I1 agreement
-   *  seam). Absent = the request is recorded only (STOP before live execution). */
+  /** LIVE wiring hook (S3 — NOW BOUND). Apply an accepted merge to the detector's
+   *  partition on the live executor. The executor binds this to `applyPartitionMerge`
+   *  (`src/executor/executor.ts`), which records the merge as a request keyed by the
+   *  plan's default fingerprint and lets the detector's own `mergeIslands` realize it
+   *  on the next run (re-fingerprint → re-witness under the merged partition, §5.3).
+   *  It THROWS a typed refusal for a structurally-illegal / not-yet-cached merge; this
+   *  channel catches the throw and returns `MERGE_REFUSED` with atomic rollback. Absent
+   *  = the request is recorded only (the STOP-before-live-execution surface). See
+   *  `tools/t-step-edit-binding-probe.ts` (phase 5) for the end-to-end binding. */
   readonly applyMerge?: (a: IslandId, b: IslandId, region: RegionUid) => void;
 }
 

@@ -461,6 +461,21 @@ altitude — the editor itself is out of scope.
 > rolls back atomically on a throw), so the socket the S3 wiring plugs into is real
 > and tested; the S3 wiring itself remains the named remaining work.
 >
+> **UPDATE — S3 FUSE LIVE WIRING LANDED (2026-07-16).** The `applyMerge` seam is now
+> BOUND to the live executor: `applyPartitionMerge` (`src/executor/executor.ts`) records
+> an accepted merge as a REQUEST keyed by the plan's default fingerprint (no second owner
+> — membership stays the detector's; `mergeIslands` in `fusion-detect.ts` is the only new
+> mutator, in the owner's file). On the next run, `resolveEditedFingerprint` mixes the
+> merged partition's `boundaryHash` into the fingerprint (the I1 token) → the template
+> re-keys → the bucketKey changes → BucketMiss → the tape re-witnesses under the merged
+> partition (§5.3, executed end-to-end). Execution is BYTE-IDENTICAL: the edited template
+> ALIASES the default's lowered plan (a grouping-only merge changes island boundaries,
+> not math). Gates: `tools/t-step-edit-binding-probe.ts` (§5 phase 5 — accepted merge →
+> re-witness island 17→16 → rollback to 17), `tools/t-step-edit-numerics-null.ts` (edited
+> trajectory == control, maxΔ=0 over 24 steps), `test/island-merge.spec.ts` (the I1
+> agreement + convexity refusals). What remains: the INTERIOR kernel-fusion that turns a
+> merged island's N dispatches into 1 (I3), and the four-mechanism collapse (§7).
+>
 > **Gates (device 11):** `tools/t-step-edit-null.ts` — the phase-6 NULL-EDIT gate:
 > the partition projection reproduces the per-plan boundaryHashes byte-identically,
 > the step-level `boundaryDigest` is steady-stable (`2928133286` on distil@512),

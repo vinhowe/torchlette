@@ -566,8 +566,13 @@ The `make*Spec` / `makeAdamStepSpec` factories that were the second owner of the
 body are DELETED — the schedule module is the sole WGSL writer at the dispatch seam.
 The skeletons stay `visibility:"opaque"` because their INTERNALS are still authored
 (the online-softmax composite; the locked per-element Adam formula), and the
-AUTOMATED internal `opaque→derived` flip waits on the S3 merge/fuse transaction (the
-one remaining engine deliverable). **The authored set is now, on the LIVE path,
+AUTOMATED internal `opaque→derived` flip waited on the S3 merge/fuse transaction —
+**whose live wiring has now LANDED** (`src/executor/executor.ts` `applyPartitionMerge`
+/ `resolveEditedFingerprint`; an accepted `StepEditChannel.requestMerge` drives the
+detector's own `mergeIslands`, re-fingerprints the plan, and re-witnesses the tape
+under the merged partition — `t-step-edit-binding-probe.ts` end-to-end, byte-identical
+trajectory `t-step-edit-numerics-null.ts`). The S3 gate is thus OPEN; the internals
+flip itself is the remaining follow-on (it consumes this seam, it is not blocked by it). **The authored set is now, on the LIVE path,
 atoms-only in the sense that matters here: no un-re-derived whole KERNEL BODY owns
 its own second copy — every attention/Adam/matmul/reduction/elementwise body lowers
 from the schedule. The irreducible base is `{atomicAdd<f32>, the enumerated subgroup
