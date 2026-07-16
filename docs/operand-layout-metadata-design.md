@@ -130,9 +130,43 @@ not each generator's hardcoded knowledge — is the single source deciding which
 operands are forced. The generator DERIVES from it; the dispatcher is ASSERTED
 against it by t-stream-generate.
 
-## The #99 re-test (headline)
+## The #99 re-test (headline — MEASURED, device 10, distil@512 + selective ckpt)
 
-With the class closed, the two checkpoint templates go GENERATED →
-`registerResultEntries` + stage-3B release fire. Measured payoff recorded here after
-the fix: attribution collapse (`t-planner-pin-attribution --assert`), A/B oracle
-(`t-checkpoint-ab-oracle`), and the peak re-measurement.
+With the class closed, the two checkpoint templates go GENERATED (t-stream-generate:
+both FULLY GENERATED, 0 diverged, uncovered set EMPTY for CE — the +4/+5 cmds are the
+synthesized copy prologue) → `registerResultEntries` fires (entry count 602→699) →
+stage-3B release engages.
+
+| metric | pre-campaign (doc §R2) | post-campaign |
+|---|---|---|
+| planner-registry **result** | 1919.4 MB | **1260.9 MB** (−658.5, −34%) |
+| planner-registry materialized | 2833.8 MB | 2355.7 MB (−478) |
+| arena-ON current | 4584.7 MB | 4106.5 MB (−478) |
+| arena-ON peak | 4756.6 MB | 4278.5 MB (−478) |
+| arena-free current / peak | 1798.3 / 3933.5 MB | 1798.3 / 3933.5 MB (unchanged) |
+| registry entries | 602 | 699 |
+| witness pruned pairs (ckpt cell) | 22 | **211** |
+
+- **`t-planner-pin-attribution --assert` FLIPS to PASS** ("planner-registry 2355.7MB
+  collapsed" — below the 2500MB threshold; pre-campaign it FAILED at 2833.8MB). This
+  is the #99 headline: the attribution oracle resolved by GENERALITY.
+- **`t-checkpoint-ab-oracle` MEMORY side still FAILs** (arena-ON current 4106.5MB >
+  arena-free+5% = 1888.2MB). This is EXPECTED and honest: per doc/arena-recompute-
+  design.md phase R2, the residual arena-ON−arena-free delta is the registry's
+  cross-STEP retention of the genuinely-LIVE working set (a retention-vs-return
+  accounting difference), NOT the over-allocation the pin-attribution threshold
+  targets. Closing the uncovered CLASS collapsed the dead-pin share (result −658MB);
+  the live working-set retention the +5% budget measures is a separate (out-of-scope)
+  mechanism. The WITNESS side PASSes both before and after (arena-ON engaged).
+- **Peak re-measurement**: arena-ON peak 4278.5 vs arena-free 3933.5 MB (+8.8%). The
+  task's phase-3 (+10.3%, 5397 vs 4893) and R2 (~parity, 4756 vs 4789) readings were
+  the profiler config (which shows peak 5397MB, unchanged by this campaign — it is not
+  the A/B arena comparison); the pin-attribution A/B above is the controlled arena vs
+  arena-free peak. profile-training distil@512 checkpoint: flat 5233MB current steps
+  9-12 (zero leak, LEAK STATUS OK).
+
+**What remains pinned:** the 1260.9 MB registry result IS the genuinely-live saved
+activations + gradients the compiled path retains cross-step for deterministic reuse
+(doc §R2's "working set"). It is not a dead pin and this campaign does not target it —
+the #99 uncovered-CLASS pin (the ~658MB the CE templates held on the recorded path) is
+gone.
