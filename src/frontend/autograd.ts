@@ -316,7 +316,22 @@ export async function backwardImpl(
           // contain recomputed nodes — mixing in unmaterialized forward nodes
           // causes DSL rewrites to produce invalid reshape operations.
           const forwardToForce: RuntimeTensor[] = [];
-          if (!seed.isMaterialized()) forwardToForce.push(seed);
+          // Do NOT force-materialize the grad seed (`full([],1.0)`) in this
+          // separate forward-tensors plan. The seed is a LEAF CONSTANT (no
+          // inputs); forcing it here makes it a CROSS-PLAN value — produced in
+          // this plan, consumed by the main backward plan (e.g. a GradScaler's
+          // `mul(seed, scale)` backward). When the recorded build is retired and
+          // the compiled plan is built from the generated stream, the
+          // observed-liveness harvest cannot witness that later cross-plan read
+          // (data-dependent — a GradScaler inf-skip re-fingerprints the plans),
+          // so it prunes the seed's harvested `full` result; its rc hits 0 and
+          // `destroyUnreachable` reaps it mid-backward, before the consumer reads
+          // it (`[lifetime] reading RECLAIMED (shape=[])`). Leaving the seed lazy
+          // materializes it INSIDE the main backward plan alongside its consumer
+          // (intra-plan) — no cross-plan harvest, no prune, no reap. Backward
+          // functions only build lazy nodes, so the recompute plan never needs
+          // the seed's value early. Null on the recorded build (the harvest pins
+          // the seed either way); the fix is for the recorded-build sunset.
           for (const node of ordered) {
             for (const input of node.inputs) {
               const rt = input._unwrap();
