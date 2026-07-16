@@ -567,6 +567,7 @@ export function buildCompiledPlan(input: {
   // to the declared flag set when no witness data is supplied.
   const witnessedBoundaries = witnessSourcedBoundaryIndices(
     nodeResults,
+    slotSources,
     input.witnessedRecomputePairs,
   );
   return finalizeCompiledPlan(
@@ -585,17 +586,38 @@ export function buildCompiledPlan(input: {
  * witnessed-harvest set (getWitnessedHarvest) — the checkpoint-recompute reads
  * observeConsumed is blind to (they resolved lowered). Returns undefined when
  * no witness data supplied (caller falls back to the declared flag set).
+ *
+ * ELIGIBILITY IS DERIVED, NOT ASSUMED (regression fix, landed 42ae55c5): the
+ * witness read (`noteWitnessRead`) fires for ANY cross-plan read of a stamped
+ * storage — which by its own doc includes "a persistent-slot bind" and other
+ * pre-existing-buffer binds (params/optimizer-state read every step, external
+ * scalar carries), not only the checkpoint-recompute RESULT reads this feed is
+ * for. Those pairs are NOT planner-tracked RESULTs, so stamping them as
+ * recompute boundaries trips the identity-seam assertion in finalizeCompiledPlan
+ * (the boundary result has no planner entry). A recompute boundary is a
+ * checkpoint-recomputed forward activation — always a PLAN-PRODUCED tensor
+ * (an `arena`/`write` slot, the same class the planner allocates entries for).
+ * Pre-existing binds (`external`/`params`/`persistent`/`constFill`) are filtered
+ * out here at the single classification source (the slot kind), so the assertion
+ * downstream stays a true seam check, not a filter. This was masked by device-10
+ * contention OOM in two prior verification passes (the cells OOM'd before
+ * reaching the assertion).
  */
 export function witnessSourcedBoundaryIndices(
   nodeResults: NodeResult[],
+  slotSources: SlotSource[],
   witnessedPairs?: Set<string>,
 ): Set<number> | undefined {
   if (!witnessedPairs || witnessedPairs.size === 0) return undefined;
   let boundaries: Set<number> | undefined;
   for (const r of nodeResults) {
-    if (witnessedPairs.has(`${r.nodeIndex}:${r.outputIndex}`)) {
-      (boundaries ??= new Set<number>()).add(r.nodeIndex);
-    }
+    if (!witnessedPairs.has(`${r.nodeIndex}:${r.outputIndex}`)) continue;
+    // Only PLAN-PRODUCED slots (alloc/write commands populate them) can be a
+    // recompute RESULT; the planner tracks exactly these. A witnessed read of a
+    // pre-existing bind is a persistent/external cross-plan read, not a boundary.
+    const kind = slotSources[r.slot]?.kind;
+    if (kind !== "arena" && kind !== "write") continue;
+    (boundaries ??= new Set<number>()).add(r.nodeIndex);
   }
   return boundaries;
 }
