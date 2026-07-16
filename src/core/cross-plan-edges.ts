@@ -161,6 +161,29 @@ export function crossPlanEdgeKeepSet(
 }
 
 /**
+ * THE OVERLAY-RELEASE QUERY (§5): does this producer VALUE pair have a witnessed
+ * cross-plan consumer edge to a template OTHER than `excludeFp`? The stage-3 B
+ * overlay-release consults this to DECLINE a claim whose value a lowered consumer
+ * still re-reads — the derived edge set superseding the `graphHeldAt` heuristic
+ * (a graphHeld=false forwardToForce activation with a witnessed later reader).
+ * A cheap targeted probe (no projection allocation), the single-source seam the
+ * claim reads instead of independently reconstructing liveness.
+ */
+export function crossPlanEdgeHasOtherConsumer(
+  producerFp: number,
+  pairKey: string,
+  variant: StepVariant,
+  excludeFp: number,
+): boolean {
+  const consumers = store.get(variant)?.get(producerFp)?.get(pairKey);
+  if (!consumers) return false;
+  for (const consumerFp of consumers.keys()) {
+    if (consumerFp !== excludeFp) return true;
+  }
+  return false;
+}
+
+/**
  * The derived edge set for a variant — the object the doc's schema names. Returns
  * `null` for a variant with no witnessed producer (the reify-discipline null on
  * non-witness paths). A read-only PROJECTION of the store.

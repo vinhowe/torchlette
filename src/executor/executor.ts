@@ -152,6 +152,7 @@ import {
   setObservedLivenessEnabled,
   setTemplateCompiledInvalidator,
   setTemplateIdleRetirer,
+  stampResult,
 } from "./observed-liveness";
 
 /** [observed-liveness] Node ops that commit in-place mutations to persistent
@@ -163,7 +164,10 @@ const IN_PLACE_COMMIT_OPS: ReadonlySet<string> = new Set([
   "stridedScatterAdd",
 ]);
 
-import { crossPlanEdgeKeepSet } from "../core/cross-plan-edges";
+import {
+  crossPlanEdgeHasOtherConsumer,
+  crossPlanEdgeKeepSet,
+} from "../core/cross-plan-edges";
 import {
   STEP_TAPE_RECORD,
   STEP_TAPE_REPLAY,
@@ -780,6 +784,24 @@ function buildFromIRActive(): boolean {
 // variants (reach 1). Gates constFill coverage so a transient plan's `full`
 // never triggers a compile that leaks its plan-owned buffer.
 const buildReaches = new Map<number, number>();
+
+// Per-fp count of CONSECUTIVE executions that ran LOWERED with no valid compiled
+// plan (the "converged-to-lowered" witness criterion,
+// docs/step-data-dependence-design.md §D4 attempt #6). A build-from-IR-UNCOVERED
+// recurring producer (the forward+loss plan whose full-reduction sum has no
+// generator) can only be compiled — hence STAMPED, hence witnessed — by the
+// recorded build; once that build is gone it stays lowered forever and its
+// cross-plan outputs are never stamped, so its consumers can never witness its
+// edges (the D4 attempt-#5 hole: the recorded build was the STAMPING compiler,
+// not merely a witnessing driver). Reproduce its witnessing coverage WITHOUT the
+// recorded build: after a template has run lowered for K_w consecutive executions
+// with no compiled plan, it has converged to lowered — stamp its harvest outputs
+// on the lowered path so its edges are witnessed. The counter RESETS whenever the
+// template holds a valid compiled plan, so a warmup-lowered-then-compiled plan
+// never reaches the threshold — the mechanism is DORMANT wherever any compiler
+// (build-from-IR or the recorded build) exists, and only fires for genuinely
+// uncovered plans stranded lowered. Reuses the K_w=2 witness constant.
+const loweredWitnessRuns = new Map<number, number>();
 
 // [observed-liveness] The module observes cross-plan liveness only when
 // build-from-IR is active (the over-harvest it fixes exists only there). Set
@@ -2229,6 +2251,30 @@ export async function executeLoweredPlan(
           // This makes the over-prune UNCONSTRUCTIBLE, so the recorded build's
           // compiled-only guardMiss net is no longer load-bearing for soundness.
           if (storageTracker.graphHeldAt(storage.id)) continue;
+          // The DERIVED cross-plan edge set SUPERSEDES the graphHeldAt heuristic
+          // (docs/step-data-dependence-design.md §5). graphHeldAt only exonerates
+          // saved-for-backward values with a LIVE _graphRetained clone; a
+          // graphHeld=false activation that a LOWERED consumer still re-reads
+          // (the [1,512,768] forwardToForce class) is invisible to it, so the
+          // claim would overlay a value with a genuine later reader → the
+          // stage-3 B released-read UAF. The witness observed that reader
+          // directly (noteWitnessRead fires on the lowered getInputStorage read),
+          // so a cross-plan consumer edge to a template OTHER than this claimant
+          // means the value is still live: decline the claim. This is the
+          // witnessed-cross-plan-reader unblock the #97 STOP named, made
+          // principled by DERIVING the consumer edge rather than guessing from a
+          // graph-retention flag. Sound only because the witnessing has converged
+          // by claim time (this template did not cut over until its edge set
+          // reached a fixed point — see the converged-to-lowered witness stamp).
+          if (
+            crossPlanEdgeHasOtherConsumer(
+              stamp.fp,
+              `${stamp.ni}:${stamp.oi}`,
+              currentVariantSelection(),
+              fp,
+            )
+          )
+            continue;
           const entry = resultEntryFor(stamp.fp, stamp.ni, stamp.oi);
           if (!entry || !plannerEntryClaimable(entry.entryIdx, entry.gen))
             continue;
@@ -3442,8 +3488,81 @@ export async function executeLoweredPlan(
   // Cache stats on the lowered plan so the compiled path can return them
   loweredPlan.cachedStats = stats;
 
+  // Converged-to-lowered WITNESS STAMP (docs/step-data-dependence-design.md §D4
+  // attempt #6). A template holding a valid compiled plan resets its counter
+  // (any compiler, so DORMANT on the main tree); one that has run lowered for
+  // K_w consecutive executions with no compiled plan has converged to lowered —
+  // an uncovered recurring producer stranded without the recorded build. Stamp
+  // its PRIMARY action outputs (derivable from loweredPlan.actions, the same set
+  // actionOutputHarvestPairs uses for oi=0) so its cross-plan edges are witnessed
+  // without compilation, reproducing the recorded build's witnessing coverage.
+  // The stamp is metadata only; a lowered plan owns no planner registry entry, so
+  // its stamped outputs are never claimable/releasable (releasableLastReader
+  // requires a converged observed-liveness template + a registry entry) — the
+  // stamp purely feeds the cross-plan witness the harvest and the overlay-release
+  // now consult.
+  if (isObservedLivenessEnabled() && options.templateFp !== undefined) {
+    if (loweredPlan.compiledPlan?.valid) {
+      loweredWitnessRuns.set(options.templateFp, 0);
+    } else {
+      const runs = (loweredWitnessRuns.get(options.templateFp) ?? 0) + 1;
+      loweredWitnessRuns.set(options.templateFp, runs);
+      if (runs >= 2) stampLoweredActionOutputs(loweredPlan, planNodes, options.templateFp);
+    }
+  }
+
   if (TAPE_PROFILE) tpAdd("lowered-exec", performance.now() - tpL0);
   return { result: lastNode.result, stats };
+}
+
+/** Stamp the PRIMARY (oi=0) action-output results of a lowered plan with its
+ *  cross-plan value identity (templateFp, nodeIndex, 0) — the same coordinate
+ *  the compiled-replay harvest stamps (compiled-plan.ts stampResult) and the
+ *  same output set actionOutputHarvestPairs enumerates for oi=0. Lets an
+ *  uncovered lowered-forever producer participate in cross-plan witnessing. */
+function stampLoweredActionOutputs(
+  loweredPlan: LoweredPlan,
+  planNodes: LazyIRNode[],
+  templateFp: number,
+): void {
+  const isOutput = new Set<number>();
+  for (const action of loweredPlan.actions) {
+    switch (action.kind) {
+      case "sequential":
+      case "view":
+      case "data-source":
+        isOutput.add(action.nodeIndex);
+        break;
+      case "fused":
+        isOutput.add(action.outputNodeIndex);
+        for (const ni of action.additionalOutputNodeIndices) isOutput.add(ni);
+        break;
+      case "matmul-epilogue":
+      case "row-program":
+        isOutput.add(action.outputNodeIndex);
+        break;
+      case "adam-batch":
+      case "batched-reduction":
+        for (const ni of action.nodeIndices) isOutput.add(ni);
+        break;
+      case "reclaim":
+        break;
+    }
+  }
+  for (const i of isOutput) {
+    const n = planNodes[i];
+    if (!n) continue;
+    if (n.result) stampResult(n.result, templateFp, i, 0);
+    // Multi-output extras (oi>0): the recorded-build harvest stamps them too
+    // (SDPA / packed optimizer side outputs), so match its coverage — the D4
+    // crux's afe3da58 recovers its full 76-pair set only with the extras.
+    if (n.results) {
+      for (let oi = 1; oi < n.results.length; oi++) {
+        const ro = n.results[oi];
+        if (ro) stampResult(ro, templateFp, i, oi);
+      }
+    }
+  }
 }
 
 // ============================================================================
