@@ -536,6 +536,36 @@ deterministic evidence recorded here so the next attempt doesn't re-walk it:
   `TORCHLETTE_CHECKPOINT_ARENA`; the step-object §6 Phase 3 STOP narrative; (named follow-on) the
   dead segmented executor.
 
+**STATUS 2026-07-16 — D3 STOPPED at Stage 1; the peak-parity precondition FAILED; bypass RETAINED.**
+The ratified ruling gated bypass-deletion on a re-framed memory oracle: arena-ON PEAK ≤ arena-free
+PEAK + 5% (steady CURRENT reported-not-gated), justified by a cited inversion "arena-ON peak
+4278.5 < arena-free 4790." Stage 1 re-measured the peak matrix fresh, like-for-like, on ONE clean
+device (VULKAN 0, commit 112c9fa4, 3 repeats each, perfectly reproducible; the memory tracker is
+LOGICAL bytes so arena-ON steady 4278.5 reproduces the ruling's number exactly):
+
+| config | mode | current | steadyPeak | globalPeak (FIT, warmup-incl) |
+|--------|------|---------|-----------|-------------------------------|
+| distil@512 | arena-ON   | 4106.5  | 4278.5  | 5824.6–6680.3 |
+| distil@512 | arena-free | 1798.3  | 3933.5  | 4414.5–4789.9 |
+| medium@512 | arena-ON   | 11084.4 | 11306.7 | 18011.4 |
+| medium@512 | arena-free | 6027.2  | 12789.6 | 15690.8 |
+
+Gate (arena-ON peak ≤ arena-free peak +5%): **distil steady +8.8% FAIL, distil global +21.6% FAIL,
+medium steady −11.6% PASS, medium global +14.8% FAIL.** The ruling's inversion was a **methodology
+mismatch** — 4278.5 is arena-ON *steady* peak, 4790 is arena-free *global* (warmup-inclusive) peak.
+Measured like-for-like the inversion is NOT robust: distil FAILS on the durable steady peak, and
+BOTH configs FAIL on the FIT-honest global peak (the quantity the "FIT = peak" rationale actually
+names). Deleting the bypass would **regress** distil peak +8.8% and both configs' FIT peak +15–22%
+— the opposite of what the checkpoint bypass exists to protect. Per Stage 1's own STOP clause the
+campaign HALTED after the measurement; the checkpoint bypass (`setBufferArenaDisabled`) is RETAINED.
+The oracle (`tools/t-checkpoint-ab-oracle.ts`) is re-framed to gate on like-for-like steady peak and
+now returns FAIL for the RIGHT reason (honest peak, not the old current-parity). `globalPeakMB`
+(never-reset FIT watermark) + `MODEL={distil,medium}` were added to
+`tools/t-planner-pin-attribution.ts` to make these numbers durable. **Re-open condition:** a future
+mechanism that lowers arena-ON steady peak below arena-free steady peak +5% on distil (e.g. the D2b
+post-witness re-planning that collapses the planner-registry RESULT pin, §4.3 / D2b STOP note) would
+re-establish the precondition and re-enable D3.
+
 ### Phase D4 — Recorded-build sunset (the finiteness argument cashed; subsumes #43)
 
 **Goal:** with the edge set covering every recurring plan's cross-plan reads across the

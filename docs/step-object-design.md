@@ -685,6 +685,18 @@ under the current arena mechanism:
   forward positions). That is a SEPARATE campaign (arena mechanism surgery), not a
   fold-into-one-gate. Per the STOP-rather-than-force rule, the bypass stays.
 
+**D3 UPDATE (2026-07-16) — the peak-parity re-frame did NOT rescue the bypass deletion;
+this STOP is RECONFIRMED.** The step-data-dependence D3 campaign re-framed the MEMORY gate
+from current-parity to PEAK-parity (arena-ON peak ≤ arena-free peak +5%), on a ratified ruling
+that cited a fresh inversion "arena-ON peak 4278.5 < arena-free 4790." Stage-1 re-measurement
+(like-for-like, VULKAN 0, commit 112c9fa4, 3 repeats, reproducible) showed the inversion was a
+methodology mismatch (arena-ON *steady* peak vs arena-free *global* peak): like-for-like, distil
+arena-ON steady peak 4278.5MB is **+8.8%** over arena-free 3933.5MB — the SAME direction as this
+STOP's original +10.3%. medium arena-ON steady peak IS below arena-free (−11.6%), but distil fails,
+and BOTH fail on the FIT-honest global peak (+21.6% / +14.8%). Bypass RETAINED; the true
+precondition (an arena that frees recompute activations while staying compiled) is still unmet.
+See `docs/step-data-dependence-design.md §D3` STATUS.
+
 **Goal (UNMET — the target, restated):** `RecomputeSegment[]` declared on the step
 object; **the arena+tape SERVE the recompute segments**; `setBufferArenaDisabled(true)`
 + `TORCHLETTE_CHECKPOINT_ARENA` deleted (ruling 3 + 5).

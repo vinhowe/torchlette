@@ -494,6 +494,18 @@ discipline (STOP rather than improvise; do not force, do not widen K_w, do not
 weaken strict/`[lifetime]`), R2 STOPS here with this repro.
 
 ### Phase R3 — the bypass dies (ruling 3 + 5 of the step-object campaign)
+
+**STATUS 2026-07-16 — R3 STILL BLOCKED; D3's peak-parity re-frame did NOT unblock it.**
+The step-data-dependence D3 campaign re-framed the memory gate from steady-current-parity to
+PEAK-parity (arena-ON peak ≤ arena-free peak + 5%) to unblock this deletion. Stage-1 fresh
+like-for-like measurement (see `docs/step-data-dependence-design.md §D3` STATUS table and
+`tools/t-planner-pin-attribution.ts` D3 header) FALSIFIED the precondition: distil@512 arena-ON
+steady peak 4278.5MB is +8.8% over arena-free 3933.5MB (FAIL), and BOTH distil and medium FAIL on
+the FIT-honest global peak (+21.6% / +14.8%). The ruling's cited inversion was arena-ON *steady*
+vs arena-free *global* peak (methodology mismatch). The bypass REMAINS — deleting it regresses peak.
+R3 stays BLOCKED behind a mechanism that lowers arena-ON steady peak (the D2b post-witness
+re-planning / planner-registry RESULT-pin collapse). Nothing below is deleted this pass.
+
 **Goal:** with R2's compiled+low-memory checkpointing proven, delete
 `setBufferArenaDisabled(true)` + `TORCHLETTE_CHECKPOINT_ARENA`
 (`webgpu-gpt2-trainer.ts:179-180`) and the b66ead78 workaround narrative;

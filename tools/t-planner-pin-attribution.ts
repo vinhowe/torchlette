@@ -29,6 +29,20 @@
  *   delta = 2786.4MB (+154.9%) — ENTIRELY the planner registry (matches §1).
  *   ASSERT verdict: FAIL (registry 2833.8MB > 2500MB AND arena 1.8MB < 5MB) — failing-first, as designed.
  *
+ * === D3 PEAK MATRIX (2026-07-16, device VULKAN 0, commit 112c9fa4, 3 repeats, reproducible) ===
+ * Added MODEL={distil,medium} + globalPeakMB (the true FIT watermark, warmup-inclusive,
+ * never-reset). The D3 ruling gates the A/B on PEAK-parity; measured like-for-like:
+ *   | config | mode       | current | steadyPeak | globalPeak(FIT) |
+ *   | distil | arena-ON   | 4106.5  | 4278.5     | 5824.6–6680.3   |
+ *   | distil | arena-free | 1798.3  | 3933.5     | 4414.5–4789.9   |
+ *   | medium | arena-ON   | 11084.4 | 11306.7    | 18011.4         |
+ *   | medium | arena-free | 6027.2  | 12789.6    | 15690.8         |
+ * GATE (arena-ON peak ≤ arena-free peak +5%): distil steady +8.8% FAIL, global +21.6% FAIL;
+ * medium steady −11.6% PASS, global +14.8% FAIL. The inversion is NOT robust — the ruling's
+ * "arena-ON 4278.5 < arena-free 4790" compared arena-ON STEADY vs arena-free GLOBAL peak
+ * (methodology mismatch). D3 STOPPED; the checkpoint bypass is RETAINED. steadyPeak is
+ * rock-stable; globalPeak is warmup-arena noise.
+ *
  * ASSERT MODE (--assert, run after both modes captured; reads /tmp result files):
  *   FAILS while the planner-registry materialized share exceeds the doc threshold
  *   (registry > 2500 MB AND arena-resident < 5 MB) — the deterministic negative the
@@ -55,10 +69,16 @@ const RESULT_DIR = "/tmp/t-planner-pin-attribution";
 const REGISTRY_FAIL_MB = 2500; // §1 threshold: registry > 2.5 GB = FAIL
 const ARENA_MAX_MB = 5; // §1 threshold: arena-resident < 5 MB (already reclaimed)
 
-// distil@512 dims + selective checkpointing (the #97 / witness-harvest CELL=checkpoint config).
-const L = 6;
-const H = 12;
-const E = 768;
+// Model dims. Default distil@512 (the #97 / witness-harvest CELL=checkpoint config);
+// MODEL=medium selects gpt2-medium@512 for the D3 peak-parity robustness matrix.
+// Both run with selective checkpointing. Result files are namespaced by model so the
+// distil `--assert` gate (reads arena.json/free.json) is unaffected by medium runs.
+const MODEL = process.env.MODEL === "medium" ? "medium" : "distil";
+const DIMS =
+  MODEL === "medium" ? { L: 24, H: 16, E: 1024 } : { L: 6, H: 12, E: 768 };
+const L = DIMS.L;
+const H = DIMS.H;
+const E = DIMS.E;
 const SEQ = 512;
 const STEPS = 14;
 const RESET_AT = 9; // reset the peak watermark once pool reuse settles (late-step steady state)
@@ -134,6 +154,7 @@ async function runMode(arenaFree: boolean) {
 
   let steadyCurrent = 0;
   let steadyPeak = 0;
+  let globalPeak = 0; // true FIT watermark: max resident over ALL steps incl. warmup
   let arenaResMB = 0;
   let registryMB = 0;
   const losses: number[] = [];
@@ -165,6 +186,9 @@ async function runMode(arenaFree: boolean) {
     api.endStep();
     await api.markStep();
 
+    // Track the true FIT watermark (never reset) — the max resident over the whole
+    // run, warmup included. This is the "peak = FIT" quantity the D3 ruling gates on.
+    globalPeak = Math.max(globalPeak, gpuMemoryTracker.getPeakUsageBytes());
     if (step === RESET_AT) {
       // @ts-expect-error test-only reset of the peak watermark
       gpuMemoryTracker.peakUsageBytes =
@@ -184,14 +208,17 @@ async function runMode(arenaFree: boolean) {
 
   const currentMB = +(steadyCurrent / 1e6).toFixed(1);
   const peakMB = +(steadyPeak / 1e6).toFixed(1);
+  const globalPeakMB = +(globalPeak / 1e6).toFixed(1);
   const otherMB = +(currentMB - arenaResMB - registryMB).toFixed(1);
   const reg = debugPlannerRegistryStats();
 
   const result = {
     mode,
+    model: MODEL,
     arenaFree,
     currentMB,
     peakMB,
+    globalPeakMB,
     arenaResidentMB: arenaResMB,
     plannerRegistryMaterializedMB: registryMB,
     plannerRegistryTotalMB: reg.totalMB,
@@ -205,13 +232,14 @@ async function runMode(arenaFree: boolean) {
 
   log("=== ATTRIBUTION ===");
   log(
-    `current=${currentMB}MB peak=${peakMB}MB | arena-resident=${arenaResMB}MB ` +
+    `current=${currentMB}MB steadyPeak=${peakMB}MB globalPeak=${globalPeakMB}MB | arena-resident=${arenaResMB}MB ` +
       `planner-registry(materialized)=${registryMB}MB (total ${reg.totalMB}, result ${reg.resultMB}, ${reg.entries} entries) | other=${otherMB}MB`,
   );
 
   fs.mkdirSync(RESULT_DIR, { recursive: true });
+  const suffix = MODEL === "distil" ? "" : `-${MODEL}`;
   fs.writeFileSync(
-    `${RESULT_DIR}/${mode}.json`,
+    `${RESULT_DIR}/${mode}${suffix}.json`,
     JSON.stringify(result, null, 2),
   );
   process.stdout.write(`${JSON.stringify(result)}\n`);
