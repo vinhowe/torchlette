@@ -1152,6 +1152,71 @@ export function reifyPartition(
   return { islands, boundaryHash: partitionBoundaryHash(islands) };
 }
 
+/** Typed refusal codes for `mergeIslands` — the T0 well-formedness rules
+ *  (islands-design §2 "Legality of merge"). Device-budget refusal is priced
+ *  ABOVE this pure altitude (the caller has node/binding access); here we
+ *  enforce only the partition-structural rules. */
+export type IslandMergeRefusal = "MERGE_OUT_OF_RANGE" | "MERGE_NONCONVEX";
+
+/**
+ * THE detector's own `merge(P, a, b)` (islands-design §2 — the ONLY partition
+ * mutator besides `split`). A PURE derivation on the reified `PlanPartition`:
+ * it fuses the two islands at indices `aIdx`, `bIdx` into ONE island (kind
+ * `fused` — the merged-island kind) whose members are the union, in plan
+ * order, and recomputes the `boundaryHash` via the same `partitionBoundaryHash`
+ * the reification uses. This lives in the detector's file because MEMBERSHIP IS
+ * DETECTOR-OWNED (fuse.ts §1.6 — no second owner); the editor channel EXPRESSES
+ * a merge as an input to THIS function, it never mutates membership itself.
+ *
+ * CONVEXITY (§2 rule 1) is witnessed by ADJACENCY in emission order: the reified
+ * islands are ordered by dataflow/plan position, so two adjacent islands have no
+ * external op between them — their union is convex by construction. A non-adjacent
+ * request is `MERGE_NONCONVEX` (an external island would fall inside the merged
+ * region → a cycle). This is the I1-agreement target: a channel-driven merge MUST
+ * produce a partition byte-identical to a direct call here.
+ *
+ * The inverse is `split` (islands-design §2.1 — merge/split are inverse up to
+ * island-id renaming); rollback re-derives the DEFAULT partition, which is the
+ * split back to the original cut (the move-algebra law at this altitude).
+ */
+export function mergeIslands(
+  p: PlanPartition,
+  aIdx: number,
+  bIdx: number,
+): { ok: true; partition: PlanPartition } | { ok: false; code: IslandMergeRefusal } {
+  const n = p.islands.length;
+  if (
+    !Number.isInteger(aIdx) ||
+    !Number.isInteger(bIdx) ||
+    aIdx < 0 ||
+    bIdx < 0 ||
+    aIdx >= n ||
+    bIdx >= n ||
+    aIdx === bIdx
+  )
+    return { ok: false, code: "MERGE_OUT_OF_RANGE" };
+  const lo = Math.min(aIdx, bIdx);
+  const hi = Math.max(aIdx, bIdx);
+  // Convexity witness: adjacent islands in emission order (no external op
+  // between them). Non-adjacent → the merged region would enclose a foreign
+  // island (§2 rule 1: "no external node lies between them").
+  if (hi - lo !== 1) return { ok: false, code: "MERGE_NONCONVEX" };
+  const merged: Island = {
+    kind: "fused",
+    // Union of both islands' members, kept in plan order (positions are the
+    // canonical ordering the boundaryHash mixes — same as reifyPartition).
+    members: [...p.islands[lo].members, ...p.islands[hi].members].sort(
+      (x, y) => x - y,
+    ),
+  };
+  const islands: Island[] = [
+    ...p.islands.slice(0, lo),
+    merged,
+    ...p.islands.slice(hi + 1),
+  ];
+  return { ok: true, partition: { islands, boundaryHash: partitionBoundaryHash(islands) } };
+}
+
 /**
  * Segment a lazy plan into fusible and sequential parts.
  *

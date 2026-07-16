@@ -46,6 +46,8 @@ import {
   groupToRecipe,
   inlinedConstantValue,
   isFusibleOp,
+  mergeIslands,
+  type PlanFingerprint,
   type PlanPartition,
   reifyPartition,
 } from "../compiler/fusion-detect";
@@ -300,6 +302,16 @@ export interface FusionAnalysisTemplate {
   replayedGeneration?: number;
   /** Secondary fingerprint hash — used for collision detection on cache hit. */
   fingerprintSecondary: number;
+
+  /** [S3 FUSE LIVE WIRING] When set, this template is an ALIAS of the template
+   *  keyed by `aliasOf` (the DEFAULT fingerprint): it SHARES that template's
+   *  `loweredPlan` + `bufferArena` (the execution artifact) and differs only in
+   *  `partition` (merged) + `fingerprintSecondary`. This makes a grouping-only
+   *  partition merge byte-identical in execution to the default (the numerics
+   *  null) while re-keying the template + re-witnessing the tape. Its shared
+   *  resources are OWNED by the default template — teardown/eviction of an alias
+   *  MUST NOT destroy them (guarded below). */
+  aliasOf?: number;
 }
 
 type CachedSegmentDesc =
@@ -350,6 +362,163 @@ type CachedSegmentDesc =
  * Typically holds <10 entries (one per unique plan structure).
  */
 const fusionAnalysisCache = new Map<number, FusionAnalysisTemplate>();
+
+// ============================================================================
+// [S3 FUSE LIVE WIRING] The editor's accepted-merge REQUEST store.
+//
+// The `StepEditChannel.applyMerge` hook (docs/step-object-design.md §5.3) binds
+// to `applyPartitionMerge` below: an ACCEPTED requestMerge records a directive
+// here, keyed by the plan's DEFAULT execution fingerprint (the token-free
+// `computePlanFingerprint` primary — a pure, per-step-stable function of the
+// static graph). NOTHING here owns membership: the store holds the WHAT (fuse
+// islands a,b of the plan whose default fp is F); the DETECTOR'S OWN merge
+// (`mergeIslands`, fusion-detect.ts) computes the merged partition when the
+// executor next runs plan F. This is the fuse.ts §1.6 discipline lifted live:
+// record-request-not-mutate, one owner of membership (the detector).
+//
+// Effect chain (§5.3): a directive changes the plan's fingerprint (its merged
+// boundaryHash mixes in via `computePlanFingerprint`'s I1 `partitionToken`) →
+// the template re-fingerprints (cache MISS) → the tape's bucketKey (built from
+// the ordered plan fps) changes → the StepObject's BucketMiss fires → the next
+// executed steps re-witness a fresh skeleton under the merged partition.
+//
+// The NON-edited path is BYTE-IDENTICAL: with an empty store, `edit === undefined`
+// and the executor computes the default fingerprint exactly as before (no token,
+// no re-key, no reification change) — zero behavioral delta by construction.
+// ---------------------------------------------------------------------------
+interface PartitionMergeRequest {
+  /** Island indices (emission order) to fuse — the detector's merge input. */
+  readonly aIdx: number;
+  readonly bIdx: number;
+  /** The merged partition's boundaryHash, cached after the first realization so
+   *  the edited fingerprint reproduces byte-stably every subsequent step without
+   *  re-deriving the default partition. Undefined until the first edited run. */
+  token?: number;
+  /** The edited primary fingerprint (the plan's re-keyed template id), stored when
+   *  the edited fp first goes active — the read-only handle a probe uses to inspect
+   *  the merged template's partition (island count −1). Undefined until active. */
+  editedFp?: number;
+}
+
+/** default-primary-fp → the accepted merge for that plan (at most one merge per
+ *  plan in v1 — binary fuse, fuse.ts §5 ruling 1). Empty ⇒ zero behavior change. */
+const editedPartitions = new Map<number, PartitionMergeRequest>();
+
+/**
+ * [S3] Read-only accessor: the DETECTOR'S reified partition for the plan whose
+ * default fingerprint is `fp` (from the executor's own template cache). The
+ * editor binding reads island structure through this — it does NOT own or copy
+ * membership; the detector remains the single owner. Undefined until the plan
+ * has executed once (been lowered + cached).
+ */
+export function getCachedPlanPartition(fp: number): PlanPartition | undefined {
+  return fusionAnalysisCache.get(fp >>> 0)?.partition;
+}
+
+/**
+ * [S3] Read-only: the MERGED partition realized for the plan whose default fp is
+ * `defaultFp` (the edited template's reified partition — island count one fewer
+ * than the default). Undefined until the edit is active + witnessed. Probes/tests
+ * use this to assert the merged partition actually runs.
+ */
+export function getEditedPlanPartition(
+  defaultFp: number,
+): PlanPartition | undefined {
+  const edit = editedPartitions.get(defaultFp >>> 0);
+  if (!edit || edit.editedFp === undefined) return undefined;
+  return fusionAnalysisCache.get(edit.editedFp)?.partition;
+}
+
+/**
+ * [S3] The live wiring seam the `StepEditChannel.applyMerge` hook binds to.
+ * Records an accepted merge of islands (aIdx, bIdx) for the plan whose DEFAULT
+ * fingerprint is `defaultFp`. The DETECTOR'S OWN merge (`mergeIslands`) validates
+ * it against the executor's reified partition; a structurally-illegal merge
+ * (non-convex / out of range) or a plan not yet cached THROWS a typed refusal —
+ * the channel catches the throw and returns `MERGE_REFUSED` with atomic rollback
+ * (step-edit-channel.ts). Membership is untouched here; the detector realizes the
+ * merge on the next run of plan `defaultFp`.
+ */
+export function applyPartitionMerge(
+  defaultFp: number,
+  aIdx: number,
+  bIdx: number,
+): void {
+  const partition = fusionAnalysisCache.get(defaultFp >>> 0)?.partition;
+  if (!partition) {
+    throw new Error(
+      `partition merge refused: no cached partition for plan fp 0x${(defaultFp >>> 0).toString(16)} (run the plan before editing).`,
+    );
+  }
+  const check = mergeIslands(partition, aIdx, bIdx);
+  if (!check.ok) {
+    throw new Error(
+      `partition merge(${aIdx},${bIdx}) is illegal: ${check.code}`,
+    );
+  }
+  // Record the DIRECTIVE (not the membership). Token is cached lazily on the
+  // first edited run (the detector re-derives the merged partition there).
+  editedPartitions.set(defaultFp >>> 0, { aIdx, bIdx });
+}
+
+/**
+ * [S3] Rollback: discard the recorded merge for `defaultFp` so the plan
+ * re-witnesses under the DEFAULT partition (the inverse `split` back to the
+ * original cut — apply∘inverse = identity at this altitude). No-op for an
+ * unrecorded fp.
+ */
+export function rollbackPartitionMerge(defaultFp: number): void {
+  editedPartitions.delete(defaultFp >>> 0);
+}
+
+/** Test/debug: the count of live partition-merge directives (0 ⇒ null path). */
+export function getEditedPartitionCount(): number {
+  return editedPartitions.size;
+}
+
+/**
+ * [S3] Resolve an edited fingerprint for a plan. Given the DEFAULT fingerprint
+ * (token-free), consult the merge store and, when a merge with a KNOWN token is
+ * recorded, recompute the fingerprint mixing the merged partition's boundaryHash
+ * as the I1 `partitionToken` — the plan re-fingerprints so its template re-keys
+ * and its tape re-witnesses (§5.3). Returns the (possibly re-computed) fingerprint
+ * plus the live request (or undefined). The token is UNKNOWN until the first
+ * edited run realizes the default partition (bootstrapped in the miss path), so
+ * the first post-accept step runs the default fp and the merge takes effect on
+ * the next — exactly "the next executed steps re-witness".
+ */
+function resolveEditedFingerprint(
+  nodes: LazyIRNode[],
+  externalNodeIds: Set<number> | undefined,
+  defaultFp: PlanFingerprint,
+): { fingerprint: PlanFingerprint; edit: PartitionMergeRequest | undefined; active: boolean } {
+  const edit = editedPartitions.get(defaultFp.primary >>> 0);
+  if (!edit) return { fingerprint: defaultFp, edit: undefined, active: false };
+  // Bootstrap the merged token from the DETECTOR'S cached default partition (the
+  // plan was lowered at least once — its partition is in the cache). This makes
+  // the edit take effect on the FIRST step after acceptance, whether that step
+  // hits or misses the template cache (the warmed-plan case: it hits, so the
+  // token can only come from the cached partition, not a fresh analysis).
+  if (edit.token === undefined) {
+    const defaultPartition = fusionAnalysisCache.get(
+      defaultFp.primary >>> 0,
+    )?.partition;
+    if (defaultPartition) {
+      const m = mergeIslands(defaultPartition, edit.aIdx, edit.bIdx);
+      if (m.ok) edit.token = m.partition.boundaryHash;
+    }
+  }
+  if (edit.token !== undefined) {
+    const fingerprint = computePlanFingerprint(
+      nodes,
+      externalNodeIds,
+      edit.token,
+    );
+    edit.editedFp = fingerprint.primary;
+    return { fingerprint, edit, active: true };
+  }
+  return { fingerprint: defaultFp, edit, active: false };
+}
 
 // ---------------------------------------------------------------------------
 // Payload-thrash detector: structural hash → how many DISTINCT full
@@ -700,6 +869,9 @@ export function clearTemplateCacheForNewEngine(): void {
 export function evictAllArenas(force = false): void {
   // Import is at top of file — destroyArena is already available
   for (const [, template] of fusionAnalysisCache) {
+    // [S3] Aliases SHARE the default's arena/loweredPlan — the owner (non-alias)
+    // entry tears them down; touching them here would double-destroy.
+    if (template.aliasOf !== undefined) continue;
     if (template.bufferArena) {
       destroyArena(template.bufferArena, force);
       template.bufferArena = undefined;
@@ -729,6 +901,7 @@ export function getCompiledStreams(): Array<{
     commands: import("./compiled-plan").GpuCommand[];
   }> = [];
   for (const [fp, template] of fusionAnalysisCache) {
+    if (template.aliasOf !== undefined) continue; // [S3] shared cp — count once
     const cp = template.loweredPlan?.compiledPlan;
     if (cp?.valid) {
       out.push({
@@ -746,6 +919,7 @@ export function getCompiledStreams(): Array<{
  *  execution re-records the same template (the determinism gate's lever). */
 export function invalidateCompiledKeepTemplates(): void {
   for (const [, template] of fusionAnalysisCache) {
+    if (template.aliasOf !== undefined) continue; // [S3] shared — owner handles it
     if (template.loweredPlan?.compiledPlan) {
       destroyCompiledPlanBuffers(template.loweredPlan.compiledPlan);
       template.loweredPlan.compiledPlan = undefined;
@@ -755,6 +929,7 @@ export function invalidateCompiledKeepTemplates(): void {
 
 export function invalidateCompiledPlans(): void {
   for (const [, template] of fusionAnalysisCache) {
+    if (template.aliasOf !== undefined) continue; // [S3] shared — owner handles it
     if (template.loweredPlan?.compiledPlan) {
       destroyCompiledPlanBuffers(template.loweredPlan.compiledPlan);
       template.loweredPlan.compiledPlan = undefined;
@@ -3355,7 +3530,17 @@ export async function executePlanOptimized(
   // to detect collisions (effective collision probability: 2^-64).
   // [tape-1a] G0 measurement seams (src/core/tape-profile.ts; sunset: 1c).
   const tpF0 = TAPE_PROFILE ? performance.now() : 0;
-  const fingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
+  const defaultFingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
+  // [S3 FUSE LIVE WIRING] Resolve a live partition-merge edit: with an empty
+  // store this returns the default fingerprint UNCHANGED (byte-identical null
+  // path); with a realized merge it re-fingerprints the plan (the merged
+  // boundaryHash mixed in as the I1 token) so the template re-keys + the tape
+  // re-witnesses under the merged partition (§5.3).
+  const { fingerprint, edit: partitionEdit } = resolveEditedFingerprint(
+    plan.nodes,
+    externalNodeIds,
+    defaultFingerprint,
+  );
   if (TAPE_PROFILE) tpAdd("fingerprint", performance.now() - tpF0);
   const cachedTemplate = fusionAnalysisCache.get(fingerprint.primary);
 
@@ -3370,11 +3555,15 @@ export async function executePlanOptimized(
     validatedTemplate &&
     validatedTemplate.fingerprintSecondary !== fingerprint.secondary
   ) {
-    if (validatedTemplate.loweredPlan?.compiledPlan) {
-      destroyCompiledPlanBuffers(validatedTemplate.loweredPlan.compiledPlan);
-    }
-    if (validatedTemplate.loweredPlan) {
-      destroyScalarTable(validatedTemplate.loweredPlan);
+    // [S3] An alias shares the default's loweredPlan — never destroy it here; the
+    // default (owner) tears it down. Just drop the alias entry (rebuilt on demand).
+    if (validatedTemplate.aliasOf === undefined) {
+      if (validatedTemplate.loweredPlan?.compiledPlan) {
+        destroyCompiledPlanBuffers(validatedTemplate.loweredPlan.compiledPlan);
+      }
+      if (validatedTemplate.loweredPlan) {
+        destroyScalarTable(validatedTemplate.loweredPlan);
+      }
     }
     validatedTemplate = undefined;
     fusionAnalysisCache.delete(fingerprint.primary);
@@ -3449,6 +3638,57 @@ export async function executePlanOptimized(
         `[template] HIT fp=0x${fingerprint.primary.toString(16)} nodes=${plan.nodes.length} ext=${extCount} compiled=${!!loweredPlan.compiledPlan?.valid} ${n0Info}`,
       );
     }
+  } else if (
+    partitionEdit &&
+    fingerprint.primary !== defaultFingerprint.primary &&
+    fusionAnalysisCache.get(defaultFingerprint.primary)?.loweredPlan
+  ) {
+    // ── [S3 FUSE LIVE WIRING] Edited-fp miss: ALIAS the default template ──
+    // A grouping-only partition merge changes island BOUNDARIES, never the
+    // lowered plan. Rather than build a fresh (numerically-perturbing) template,
+    // the edited fp SHARES the default template's execution artifact (loweredPlan
+    // + bufferArena) and overrides only the reified partition (merged, island
+    // count −1) + the secondary fingerprint. Execution is byte-identical → the
+    // trajectory is null; only the template key + recorded partitionHash change,
+    // which is exactly what re-fingerprints the plan and re-witnesses the tape.
+    const base = fusionAnalysisCache.get(defaultFingerprint.primary)!;
+    const dflt = base.partition;
+    const m = mergeIslands(dflt, partitionEdit.aIdx, partitionEdit.bIdx);
+    const mergedPartition = m.ok ? m.partition : dflt;
+    if (partitionEdit.token === undefined && m.ok)
+      partitionEdit.token = mergedPartition.boundaryHash;
+    const aliasTemplate: FusionAnalysisTemplate = {
+      ...base,
+      partition: mergedPartition,
+      fingerprintSecondary: fingerprint.secondary,
+      aliasOf: defaultFingerprint.primary,
+    };
+    fusionAnalysisCache.set(fingerprint.primary, aliasTemplate);
+    planNodes = base.finalPerm.map((i) => plan.nodes[i]);
+    // Re-apply the cheap simplification passes (same as the normal HIT path) so
+    // fresh nodes' input refs match the shared lowered plan's assumptions.
+    {
+      const consumers = new Map<number, LazyIRNode[]>();
+      const consumerCount = new Map<number, number>();
+      for (const node of planNodes) {
+        for (const inp of node.inputs) {
+          if (inp.kind === "pending") {
+            consumerCount.set(
+              inp.node.id,
+              (consumerCount.get(inp.node.id) ?? 0) + 1,
+            );
+            if (!consumers.has(inp.node.id)) consumers.set(inp.node.id, []);
+            consumers.get(inp.node.id)!.push(node);
+          }
+        }
+      }
+      runPasses(
+        { planNodes, consumers, consumerCount },
+        new Set(),
+        SIMPLIFICATION_PASSES,
+      );
+    }
+    loweredPlan = base.loweredPlan!;
   } else {
     // ── Cache miss: run full analysis + build lowered plan ──
 
@@ -3515,13 +3755,36 @@ export async function executePlanOptimized(
       };
     });
 
+    // [islands I0] Reify the partition from the positional segment descriptors —
+    // pure derivation, no decision change. All three CachedSegmentDesc kinds
+    // carry members as finalPoss. (This is the DEFAULT fp's template; an accepted
+    // merge is realized in the alias fast-path above, which SHARES this template's
+    // loweredPlan and overrides only the partition — so execution stays byte-
+    // identical. Here we only bootstrap the merged token so the NEXT step
+    // re-fingerprints to that alias.)
+    let reifiedPartition = reifyPartition(cachedSegments);
+    if (partitionEdit) {
+      const m = mergeIslands(
+        reifiedPartition,
+        partitionEdit.aIdx,
+        partitionEdit.bIdx,
+      );
+      if (m.ok) {
+        if (partitionEdit.token === undefined)
+          partitionEdit.token = m.partition.boundaryHash;
+        // Fallback: an edited fp reached the normal miss (the default template was
+        // evicted after the token bootstrapped, so the alias fast-path above could
+        // not fire). Reflect the merge here too, so the reified partition stays a
+        // true projection (island count −1) even in this rare eviction race.
+        if (fingerprint.primary !== defaultFingerprint.primary)
+          reifiedPartition = m.partition;
+      }
+    }
+
     const template: FusionAnalysisTemplate = {
       finalPerm,
       segments: cachedSegments,
-      // [islands I0] Reify the partition from the positional segment
-      // descriptors — pure derivation, no decision change. All three
-      // CachedSegmentDesc kinds carry members as finalPoss.
-      partition: reifyPartition(cachedSegments),
+      partition: reifiedPartition,
       fingerprintSecondary: fingerprint.secondary,
       epilogueClaimedOrigPoss: [...analysis.epilogueClaimedIds].map(
         (id) => origIdToPos.get(id) as number,
@@ -3587,16 +3850,26 @@ export async function executePlanOptimized(
       // Remove oldest entries (first in map insertion order)
       const toRemove = fusionAnalysisCache.size - MAX_CACHED_TEMPLATES;
       let removed = 0;
+      // [S3] A default template with a live alias must NOT be evicted (the alias
+      // borrows its loweredPlan/arena). Collect fps that are alias targets.
+      const aliasTargets = new Set<number>();
+      for (const [, t] of fusionAnalysisCache)
+        if (t.aliasOf !== undefined) aliasTargets.add(t.aliasOf >>> 0);
       for (const [fp, tmpl] of fusionAnalysisCache) {
         if (removed >= toRemove) break;
         if (fp === fingerprint.primary) continue; // don't evict the one we just added
-        if (tmpl.bufferArena) {
-          destroyArena(tmpl.bufferArena);
+        if (aliasTargets.has(fp >>> 0)) continue; // owner of a live alias — keep
+        if (tmpl.aliasOf === undefined) {
+          // Owner (or unaliased) template: it owns its resources — destroy them.
+          if (tmpl.bufferArena) {
+            destroyArena(tmpl.bufferArena);
+          }
+          if (tmpl.loweredPlan?.compiledPlan) {
+            destroyCompiledPlanBuffers(tmpl.loweredPlan.compiledPlan);
+          }
+          if (tmpl.loweredPlan) destroyScalarTable(tmpl.loweredPlan);
         }
-        if (tmpl.loweredPlan?.compiledPlan) {
-          destroyCompiledPlanBuffers(tmpl.loweredPlan.compiledPlan);
-        }
-        if (tmpl.loweredPlan) destroyScalarTable(tmpl.loweredPlan);
+        // Aliases: drop the map entry only (resources belong to the owner).
         fusionAnalysisCache.delete(fp);
         removed++;
       }
