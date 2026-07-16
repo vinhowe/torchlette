@@ -492,6 +492,39 @@ per-edge (retention-vs-return derived, §4.3).
   arena-free, because the whole-step pin is now per-edge return-at-last-consumer); test:gates green.
 - **Deletes:** the per-producer witness set; the whole-step RESULT pin's policy heuristic.
 
+**STATUS 2026-07-16 — D2a LANDED; D2b (per-edge planner return) attempted at the
+externalReleases seam, MEASURED NULL, REVERTED.** The harvest face is collapsed: the
+per-producer publication into observed-liveness is deleted; `prunedHarvest` and the
+executor's recompute-boundary feed consume only `crossPlanEdgeKeepSet`; the shadow diff
+inverted to a verification tool (`getWitnessProducerKeepSets`, diffed on demand — all 5
+matrix cells EMPTY post-collapse). The planner-retention face did NOT land, with the
+deterministic evidence recorded here so the next attempt doesn't re-walk it:
+- **Mechanism tried:** per-edge return through the EXISTING stage-3 B `externalReleases`
+  seam — a consumer plan claims a producer's registry entry when the derived
+  current-generation consumer set names it the LAST consumer to execute this step
+  (superseding `graphHeldAt` for witnessed pairs, §5), with the observed-fallback kept for
+  unwitnessed producers. Sound: 78 derived releases/run on distil@512+selective-ckpt,
+  zero `[lifetime]` throws, finite descending loss.
+- **Why NULL:** `planMemory` claimed ZERO of the released entries (claimedEntries=0;
+  registry byte-identical 2355.7 MB materialized / 1260.9 MB result / 699 entries).
+  Two structural reasons: (a) the releases fire at the CONSUMER's build, but the backward
+  plan reads the forward saves LATE in its stream (reverse-layer order) — few of its own
+  temps allocate after the release point, and the plans that could reuse the bytes (the
+  optimizer) never bind those saves, so a per-plan release-event cannot express the
+  cross-plan reuse; (b) the packing is baked at BUILD time (steps 0–1), before the edge
+  set exists (witnessed at step ≥2) — the derived signal arrives one lifecycle too late
+  for the build-time seam unless the build is re-planned post-witness (a REBUILD, not a
+  release event). The R2 memory oracle did not move (arena-ON 4106.5 MB vs budget
+  1888.2 MB) — the whole-step pin survives.
+- **What D2b needs instead (repriced):** post-witness RE-PLANNING — once a template's
+  edge set is witnessed, rebuild its consumer plans' memory plans with the producer's
+  RESULT intervals split at their derived last-read positions (the §4.3 "returned to the
+  pool after its last consumer" applied INSIDE planMemory as interval ends, not as
+  build-input release events). That is a planner-input change (resultSlots becomes
+  resultSlots-with-end-positions), staged behind its own differential. The whole-step
+  RESULT pin heuristic therefore STAYS until that lands; deleting it now would be a
+  deletion the gate has not earned.
+
 ### Phase D3 — Checkpoint bypass dies (subsumes #99 R2′ / R3, step-object phase 3)
 
 **Goal:** with D2's per-edge retention, checkpointed steps run compiled + low-memory. Delete
