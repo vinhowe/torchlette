@@ -139,7 +139,6 @@ import {
 import {
   clearResultEntries,
   getObservedLivenessStats,
-  getWitnessedHarvest,
   isObservedLivenessEnabled,
   noteInPlaceCommit,
   noteNewTemplate,
@@ -153,7 +152,6 @@ import {
   setObservedLivenessEnabled,
   setTemplateCompiledInvalidator,
   setTemplateIdleRetirer,
-  setWitnessedHarvest,
 } from "./observed-liveness";
 
 /** [observed-liveness] Node ops that commit in-place mutations to persistent
@@ -165,15 +163,15 @@ const IN_PLACE_COMMIT_OPS: ReadonlySet<string> = new Set([
   "stridedScatterAdd",
 ]);
 
+import { crossPlanEdgeKeepSet } from "../core/cross-plan-edges";
 import {
   STEP_TAPE_RECORD,
   STEP_TAPE_REPLAY,
-  setWitnessHarvestPublisher,
   stBeginPlan,
   stDeclareBatchCover,
   stEndPlan,
 } from "../core/step-tape";
-import { variantToken } from "../core/step-variant";
+import { currentVariantSelection, variantToken } from "../core/step-variant";
 import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
 import {
   assignNodeResult,
@@ -492,7 +490,11 @@ function resolveEditedFingerprint(
   nodes: LazyIRNode[],
   externalNodeIds: Set<number> | undefined,
   defaultFp: PlanFingerprint,
-): { fingerprint: PlanFingerprint; edit: PartitionMergeRequest | undefined; active: boolean } {
+): {
+  fingerprint: PlanFingerprint;
+  edit: PartitionMergeRequest | undefined;
+  active: boolean;
+} {
   const edit = editedPartitions.get(defaultFp.primary >>> 0);
   if (!edit) return { fingerprint: defaultFp, edit: undefined, active: false };
   // Bootstrap the merged token from the DETECTOR'S cached default partition (the
@@ -783,12 +785,10 @@ const buildReaches = new Map<number, number>();
 // build-from-IR is active (the over-harvest it fixes exists only there). Set
 // once at module load; the flag also gates every observation hook to a no-op.
 setObservedLivenessEnabled(buildFromIRActive());
-// [task #98 phase 4] Route the step-tape recorder's WITNESSED harvest set to
-// observed-liveness at tape eligibility. core (step-tape) stays a leaf: it holds
-// a publisher callback, wired here at the executor layer (same seam-inversion
-// pattern as the invalidator/retirer below). The witnessed set is what makes the
-// checkpoint-recompute activation survive the generated prune (#97 unblock).
-setWitnessHarvestPublisher((fp, pairs) => setWitnessedHarvest(fp, pairs));
+// [D2] The step-tape → observed-liveness witnessed-harvest publisher wiring was
+// DELETED. The derived crossPlanEdges object (published by the recorder at K_w=2)
+// is now the sole harvest owner; observed-liveness reads it directly via
+// `crossPlanEdgeKeepSet` (see prunedHarvest). No callback seam to wire.
 // The guard invalidates a producer template's compiled plan when a late
 // consumer misses its pruned output; route it through the cache here (the
 // module can't import this file — circular).
@@ -3238,14 +3238,15 @@ export async function executeLoweredPlan(
           }
         }
       }
-      // [task #99 R2] The LIVE witness signal for this template (the
+      // [task #99 R2 / D2] The LIVE witness signal for this template (the
       // checkpoint-recompute cross-plan reads observeConsumed is blind to) —
-      // sourced from the recorder's per-producer witnessed harvest, not the
-      // inert isCheckpointBoundary flag (the R1 finding). Empty unless the
-      // template has been witnessed (K_w=2 consecutive identical reads).
+      // sourced from the DERIVED crossPlanEdges keep-set (D2 collapse: the
+      // per-producer witnessed-harvest oracle it used to read is gone). The
+      // projection equals the retired oracle's set by construction (D1 gate).
+      // Empty unless the template has been witnessed (K_w=2 identical reads).
       const witnessedRecomputePairs =
         options.templateFp !== undefined
-          ? new Set(getWitnessedHarvest(options.templateFp))
+          ? crossPlanEdgeKeepSet(options.templateFp, currentVariantSelection())
           : undefined;
       const compiled = buildCompiledPlan({
         commandLog: compilationRecording.commandLog,

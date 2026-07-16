@@ -49,22 +49,28 @@ import {
   crossPlanEdges,
   getAllCrossPlanEdgeKeepSets,
 } from "../src/core/cross-plan-edges";
-import { STEP_TAPE_RECORD, stStats } from "../src/core/step-tape";
+import {
+  getWitnessProducerKeepSets,
+  STEP_TAPE_RECORD,
+  stStats,
+} from "../src/core/step-tape";
 import { currentVariantSelection } from "../src/core/step-variant";
 import { getPayloadThrashStats } from "../src/executor/executor";
-import { getAllWitnessedHarvest } from "../src/executor/observed-liveness";
 import { Torchlette } from "../src/frontend/torchlette";
 import { Adam, GradScaler, StepLR } from "../src/optim/index.ts";
 
 /**
- * [D1] SHADOW DIFF (docs/step-data-dependence-design.md §4.2 / campaign D1 gate).
- * Compare, per producer template, the DERIVED crossPlanEdges keep-set against
- * the per-producer witnessed-harvest oracle. D1 deletes nothing: both run, and
- * this diff MUST soak empty (D2's precondition). A `derivedMissing` pair (the
- * derived set dropped a pair the oracle keeps) is the DANGEROUS direction
- * (under-keep → UAF) → FAIL. A `derivedExtra` pair (derived keeps more than the
- * oracle) is the monotone-safe direction — categorized, reported, non-fatal (it
- * should be zero in D1 by construction, but a strict superset is never a UAF).
+ * [D2] INVERTED SHADOW DIFF (docs/step-data-dependence-design.md §4.2 / campaign
+ * D2 gate). The live harvest now consumes ONLY the derived crossPlanEdges
+ * keep-set; the per-producer witnessed-harvest oracle was RETIRED. This diff
+ * inverts to a VERIFICATION TOOL (not a live mechanism): it compares the retired
+ * oracle's WOULD-HAVE-BEEN keep set — recomputed on demand from the step-tape
+ * recorder's INDEPENDENT per-producer accumulator (`getWitnessProducerKeepSets`,
+ * distinct from the edge accumulator the derived set projects from) — against
+ * the derived keep-set. A `derivedMissing` pair (the derived set dropped a pair
+ * the oracle would keep) is the DANGEROUS direction (under-keep → UAF) → FAIL. A
+ * `derivedExtra` pair (derived keeps more than the oracle) is the monotone-safe
+ * direction — categorized, reported, non-fatal (a strict superset is never a UAF).
  */
 function shadowDiff(): {
   producers: number;
@@ -72,7 +78,7 @@ function shadowDiff(): {
   derivedExtra: Array<{ fp: string; pairs: string[] }>;
   empty: boolean;
 } {
-  const oracle = getAllWitnessedHarvest(); // fp -> sorted "ni:oi"
+  const oracle = getWitnessProducerKeepSets(); // fp -> sorted "ni:oi"
   const derived = getAllCrossPlanEdgeKeepSets(); // fp -> sorted "ni:oi"
   const fps = new Set<number>([...oracle.keys(), ...derived.keys()]);
   const derivedMissing: Array<{ fp: string; pairs: string[] }> = [];
@@ -340,7 +346,10 @@ async function main() {
 
   const st = stStats();
   const thrash = getPayloadThrashStats();
-  const witnessed = getAllWitnessedHarvest();
+  // [D2] The retired oracle's would-have-been keep set (from the recorder's
+  // independent per-producer accumulator) — reported as the witness-coverage
+  // signal (the mechanism fired) and diffed against the derived set above.
+  const witnessed = getWitnessProducerKeepSets();
   let witnessedPairs = 0;
   for (const s of witnessed.values()) witnessedPairs += s.length;
 

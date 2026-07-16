@@ -40,8 +40,11 @@
  *      BATCH_SIZE(=1)
  */
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
-import { STEP_TAPE_RECORD, stStats } from "../src/core/step-tape";
-import { getAllWitnessedHarvest } from "../src/executor/observed-liveness";
+import {
+  getWitnessProducerKeepSets,
+  STEP_TAPE_RECORD,
+  stStats,
+} from "../src/core/step-tape";
 import { Torchlette } from "../src/frontend/torchlette";
 import { Adam } from "../src/optim/index.ts";
 
@@ -166,7 +169,7 @@ async function main() {
   }
 
   const st = stStats();
-  const witnessed = getAllWitnessedHarvest();
+  const witnessed = getWitnessProducerKeepSets();
   const witnessedTemplates = witnessed.size;
   let witnessedPairs = 0;
   for (const s of witnessed.values()) witnessedPairs += s.length;

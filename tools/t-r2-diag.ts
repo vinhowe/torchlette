@@ -6,6 +6,7 @@
  * recompute boundary source. Not a gate; a scouting probe.
  */
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
+import { getWitnessProducerKeepSets } from "../src/core/step-tape";
 import {
   debugPlannerRegistryStats,
   debugResultBytesByTemplate,
@@ -19,7 +20,6 @@ import {
   debugConvergenceState,
   debugReleasableSummary,
   debugTopHeldPairs,
-  getAllWitnessedHarvest,
 } from "../src/executor/observed-liveness";
 import { Torchlette } from "../src/frontend/torchlette";
 import { Adam } from "../src/optim/index.ts";
@@ -133,7 +133,7 @@ async function main() {
     log(
       `  ${fp}: needed=${s.neededSize} conv=${s.converged} pin=${s.pinned} grew=${s.grewThisStep} stable=${s.stableSteps} survived=${s.everSurvived} readback=${s.everReadback} aliased=${s.everAliased} srcC=${s.srcC} srcS=${s.srcS}`,
     );
-  const wit = getAllWitnessedHarvest();
+  const wit = getWitnessProducerKeepSets();
   log(`=== WITNESSED HARVEST (${wit.size} producer templates) ===`);
   for (const [fp, pairs] of wit) {
     log(

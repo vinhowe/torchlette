@@ -56,10 +56,7 @@ import {
   type StepObject,
   type StepReceipts,
 } from "./step-object";
-import {
-  currentVariantSelection,
-  type StepVariant,
-} from "./step-variant";
+import { currentVariantSelection, type StepVariant } from "./step-variant";
 
 /**
  * `TORCHLETTE_STEP_TAPE`:
@@ -419,7 +416,7 @@ function hex(fp: number): string {
  *  SAME pair set (§10 ruling 2, K_w=2, applied at the producer stratum). */
 const witnessProducer = new Map<
   number,
-  { reads: Set<string>; consecutive: number }
+  { reads: Set<string>; consecutive: number; published: boolean }
 >();
 
 /** [D1] The PERSISTENT monotone union of observed cross-plan CONSUMER edges per
@@ -432,7 +429,10 @@ const witnessProducer = new Map<
  *  fires, so the edge set's keep-set projection equals the per-producer oracle. */
 const witnessProducerEdges = new Map<
   number,
-  Map<string, Map<number, { positions: Set<number>; firstStep: number; lastStep: number }>>
+  Map<
+    string,
+    Map<number, { positions: Set<number>; firstStep: number; lastStep: number }>
+  >
 >();
 
 /** [task #98 phase 4 — WITNESS-TIME HARVEST] Reconcile THIS step's observed
@@ -454,7 +454,13 @@ function reconcileWitnessReads(
   curW: Map<number, Set<string>>,
   curE: Map<number, Map<string, Map<number, Set<number>>>>,
 ): void {
-  if (!witnessHarvestPublisher) return;
+  // [D2] Gate on recording (was: `if (!witnessHarvestPublisher)`). The
+  // per-producer publication into observed-liveness DIED with D2 — the derived
+  // crossPlanEdges object is now the SOLE published harvest owner (§4.2). The
+  // witness still runs whenever the recorder is active; `curW`/`curE` are empty
+  // outside executor-driven plan contexts (stObserveWitnessRead needs an
+  // activePlan), so this is a no-op there.
+  if (!STEP_TAPE_RECORD) return;
   // [D1] Grow the persistent monotone edge union FIRST, so the edges published
   // below reflect this step's observations. Every producer in `curE` (incl.
   // not-yet-eligible seeds) accumulates; only PUBLISHED producers surface.
@@ -467,7 +473,11 @@ function reconcileWitnessReads(
     const tr = witnessProducer.get(fp);
     if (!tr) {
       // First observation of this producer: seed, not yet publishable (K_w=2).
-      witnessProducer.set(fp, { reads: new Set(reads), consecutive: 1 });
+      witnessProducer.set(fp, {
+        reads: new Set(reads),
+        consecutive: 1,
+        published: false,
+      });
       continue;
     }
     const same =
@@ -475,11 +485,15 @@ function reconcileWitnessReads(
     if (same) {
       tr.consecutive++;
       // Two (or more) consecutive identical observations → witnessed. Publish
-      // (idempotent — same set each time once stable). The derived edge set is
-      // published for the SAME pair set, so its keep-set projection equals the
-      // per-producer oracle's set by construction (the D1 shadow-diff invariant).
+      // (idempotent — same set each time once stable) the DERIVED edge set —
+      // the sole published harvest owner since D2. `published` records the
+      // eligibility for the inverted shadow diff (getWitnessProducerKeepSets):
+      // the RETIRED oracle's would-have-been keep set, cross-checked on demand
+      // against the derived projection (a genuine cross-check — the oracle
+      // accumulator `witnessProducer.reads` is independent of the edge
+      // accumulator `witnessProducerEdges`).
       if (tr.consecutive >= 2) {
-        witnessHarvestPublisher(fp, reads);
+        tr.published = true;
         publishProducerEdges(variant, fp, reads);
       }
     } else {
@@ -488,7 +502,7 @@ function reconcileWitnessReads(
       // already published — republish the union so no witnessed pair is dropped.
       const union = new Set<string>(tr.reads);
       for (const k of reads) union.add(k);
-      const wasPublished = tr.consecutive >= 2;
+      const wasPublished = tr.published;
       const grew = union.size !== tr.reads.size;
       tr.reads = union;
       tr.consecutive = 1;
@@ -501,7 +515,6 @@ function reconcileWitnessReads(
         }
       }
       if (wasPublished && grew) {
-        witnessHarvestPublisher(fp, union);
         publishProducerEdges(variant, fp, union);
       }
     }
@@ -760,23 +773,26 @@ export function stObserveWitnessRead(fp: number, ni: number, oi: number): void {
   positions.add(position);
 }
 
-/** Publisher callback (wired by the executor layer at load — core stays a leaf,
- *  same pattern as observed-liveness's own invalidator callbacks). Delivers a
- *  producer template's WITNESSED harvest set to observed-liveness on eligibility.
- *
- *  The witnessed set PERSISTS across a template's build-from-IR rebuild (an
- *  intrinsic property of the workload, exactly like observed-liveness's own
- *  needed-set — the `templates` map is never cleared on invalidation): only a
- *  fresh eligibility REPLACES it. So there is deliberately no clear-on-invalidate
- *  callback — clearing on rebuild would starve the rebuilt template of its
- *  witnessed keep set until it re-witnessed, re-opening the prune window. */
-let witnessHarvestPublisher:
-  | ((fp: number, pairs: Set<string>) => void)
-  | undefined;
-export function setWitnessHarvestPublisher(
-  fn: (fp: number, pairs: Set<string>) => void,
-): void {
-  witnessHarvestPublisher = fn;
+/**
+ * [D2] THE RETIRED ORACLE, exposed as a QUERY for the inverted shadow diff.
+ * The per-producer witnessed harvest set the old `witnessHarvestPublisher`
+ * pushed into observed-liveness DIED with D2 (the derived crossPlanEdges object
+ * is the sole published harvest owner, §4.2 / §7). But the per-producer
+ * accumulator `witnessProducer.reads` is still computed here — INDEPENDENTLY of
+ * the edge accumulator `witnessProducerEdges` — so it remains a genuine
+ * cross-check on the derivation. This returns the published producers' keep sets
+ * (fp → sorted "ni:oi"), i.e. what the retired per-producer oracle WOULD have
+ * kept; the shadow-diff instrument diffs it against the derived keep-set on
+ * demand (a verification tool, not a live mechanism). Empty until a producer
+ * reaches K_w=2 eligibility.
+ */
+export function getWitnessProducerKeepSets(): Map<number, string[]> {
+  const out = new Map<number, string[]>();
+  for (const [fp, tr] of witnessProducer) {
+    if (!tr.published) continue;
+    out.set(fp, [...tr.reads].sort());
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

@@ -11,15 +11,6 @@
  * inference (growing KV cache buffers).
  */
 
-import { ENV } from "../core/env";
-import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
-import {
-  STEP_TAPE_RECORD,
-  stInvalidateTemplate,
-  stMarkPlanCompiled,
-  stRecordUniform,
-  stRecordWrite,
-} from "../core/step-tape";
 import type { DType } from "../backend/types";
 import type {
   GPUBindGroup,
@@ -28,6 +19,15 @@ import type {
   GPUComputePipeline,
 } from "../backend/webgpu/gpu-types";
 import { setCompilationRecording } from "../backend/webgpu/webgpu-state";
+import { ENV } from "../core/env";
+import {
+  STEP_TAPE_RECORD,
+  stInvalidateTemplate,
+  stMarkPlanCompiled,
+  stRecordUniform,
+  stRecordWrite,
+} from "../core/step-tape";
+import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
 
 // ============================================================================
 // Slot table
@@ -315,13 +315,13 @@ export interface CompiledPlan {
 
 import {
   arenaLivenessEnabled,
-  compiledPlannedEnabled,
   type BufferArena,
+  compiledPlannedEnabled,
 } from "../backend/webgpu/buffer-arena";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
 import { gpuMemoryTracker } from "../backend/webgpu/memory-tracker";
-import { pinnedBufferSet } from "../backend/webgpu/webgpu-state";
 import { alignBufferSize, F32_BYTES } from "../backend/webgpu/shape-utils";
+import { pinnedBufferSet } from "../backend/webgpu/webgpu-state";
 /** Recorded dispatch entry — the subset of fields needed by the compiled plan. */
 export interface RecordedDispatch {
   pipeline: GPUComputePipeline;
@@ -346,8 +346,7 @@ export interface RecordedDispatch {
 }
 
 import type { LazyIRNode, StorageHandle } from "../graph/types";
-import { getInputStorage } from "./op-dispatch";
-import { planMemory, PlannerRegistry } from "./memory-planner";
+import { PlannerRegistry, planMemory } from "./memory-planner";
 import {
   guardMiss,
   isStepTapeReplayActive,
@@ -357,6 +356,7 @@ import {
   setSteadyBoundaryTrimmer,
   stampResult,
 } from "./observed-liveness";
+import { getInputStorage } from "./op-dispatch";
 
 /** Recorded buffer copy for compilation. */
 export interface RecordedCopy {
@@ -392,9 +392,10 @@ export function buildCompiledPlan(input: {
   /** Node results to harvest after execution. */
   nodeResults: NodeResult[];
   /** [task #99 R2 PROBE] Witness-sourced recompute-boundary "ni:oi" pairs for
-   *  this template (from observed-liveness.getWitnessedHarvest). Feeds the
-   *  recompute-segment stamping + (under TORCHLETTE_R2_SPLIT_PROBE=1) the
-   *  liveness split. */
+   *  this template (from the DERIVED crossPlanEdgeKeepSet since D2 — the
+   *  retired per-producer witnessed-harvest oracle it used to read is gone).
+   *  Feeds the recompute-segment stamping + (under TORCHLETTE_R2_SPLIT_PROBE=1)
+   *  the liveness split. */
   witnessedRecomputePairs?: Set<string>;
 }): CompiledPlan {
   const { commandLog, bufferToSlot, slotSources, nodeResults, planNodes } =
@@ -439,7 +440,9 @@ export function buildCompiledPlan(input: {
           continue;
         }
         const bindings: Slot[] = [];
-        let bindingRanges: Array<{ offset: number; size: number } | null> | undefined;
+        let bindingRanges:
+          | Array<{ offset: number; size: number } | null>
+          | undefined;
         for (let i = 0; i < d.buffers.length; i++) {
           const entry = d.buffers[i];
           const recorded = d.slots?.[i] ?? -1;
@@ -451,7 +454,9 @@ export function buildCompiledPlan(input: {
               );
             }
           }
-          bindings.push(recorded >= 0 ? recorded : persistentSlot(entry.buffer));
+          bindings.push(
+            recorded >= 0 ? recorded : persistentSlot(entry.buffer),
+          );
           if (entry.offset !== undefined || entry.size !== undefined) {
             bindingRanges ??= new Array(d.buffers.length).fill(null);
             bindingRanges[i] = {
@@ -560,8 +565,8 @@ export function buildCompiledPlan(input: {
   }
 
   // [task #99 R2] The recompute-boundary node set is sourced from the LIVE
-  // witness signal (getWitnessedHarvest) when present — the inert
-  // isCheckpointBoundary flag never fires on the real path (R1 finding). A
+  // witness signal (the derived crossPlanEdgeKeepSet since D2) when present — the
+  // inert isCheckpointBoundary flag never fires on the real path (R1 finding). A
   // node result whose (ni:oi) is in the witnessed set is a cross-plan read
   // that resolved LOWERED (the checkpoint-recompute reader class). Fall back
   // to the declared flag set when no witness data is supplied.
@@ -583,7 +588,7 @@ export function buildCompiledPlan(input: {
 /**
  * [task #99 R2] Recompute-boundary node indices sourced from the LIVE witness
  * signal: the plan-node indices whose harvested result (ni:oi) is in the
- * witnessed-harvest set (getWitnessedHarvest) — the checkpoint-recompute reads
+ * derived crossPlanEdgeKeepSet (D2; formerly the witnessed-harvest oracle) — the checkpoint-recompute reads
  * observeConsumed is blind to (they resolved lowered). Returns undefined when
  * no witness data supplied (caller falls back to the declared flag set).
  *
@@ -1174,9 +1179,21 @@ export type CommandLogEntry =
       inputSlots: Slot[];
       nodeIndex?: number;
     }
-  | { kind: "copy"; copy: RecordedCopy; srcSlot: Slot; dstSlot: Slot; nodeIndex?: number }
+  | {
+      kind: "copy";
+      copy: RecordedCopy;
+      srcSlot: Slot;
+      dstSlot: Slot;
+      nodeIndex?: number;
+    }
   | { kind: "write"; buffer: GPUBuffer; nodeIndex: number; slot: Slot }
-  | { kind: "clear"; buffer: GPUBuffer; bytes: number; slot: Slot; nodeIndex?: number }
+  | {
+      kind: "clear";
+      buffer: GPUBuffer;
+      bytes: number;
+      slot: Slot;
+      nodeIndex?: number;
+    }
   | {
       kind: "uniform";
       buffer: GPUBuffer;
@@ -1240,9 +1257,8 @@ export function setRecordingNodeIndex(nodeIndex: number): void {
  * offset-repack command the stream generator emits (the segment diff needs
  * both sides identical). Cleared right after the node executes.
  */
-let pendingParamsVolatilePack:
-  | ((node: LazyIRNode) => ArrayBufferView)
-  | null = null;
+let pendingParamsVolatilePack: ((node: LazyIRNode) => ArrayBufferView) | null =
+  null;
 export function setPendingParamsVolatilePack(
   pack: ((node: LazyIRNode) => ArrayBufferView) | null,
 ): void {
@@ -1332,9 +1348,10 @@ export function setLastBindGroupBuffers(
     return;
   }
   lastBindGroupBuffers = (bufs as Array<GPUBuffer | CapturedBindEntry>).map(
-    (b) => (b && typeof b === "object" && "buffer" in (b as object)
-      ? (b as CapturedBindEntry)
-      : { buffer: b as GPUBuffer }),
+    (b) =>
+      b && typeof b === "object" && "buffer" in (b as object)
+        ? (b as CapturedBindEntry)
+        : { buffer: b as GPUBuffer },
   );
 }
 
@@ -1366,7 +1383,11 @@ export function recordDispatch(dispatch: RecordedDispatch): void {
     }
     dispatch.slots = slots;
   }
-  activeCommandLog.push({ kind: "dispatch", dispatch, nodeIndex: recordingNodeIndex });
+  activeCommandLog.push({
+    kind: "dispatch",
+    dispatch,
+    nodeIndex: recordingNodeIndex,
+  });
 }
 
 /**
@@ -1523,7 +1544,6 @@ import {
   profiledCreateBindGroup,
   setDispatchSequenceCounters,
 } from "../backend/webgpu/bind-group-cache";
-import { setProfileModule } from "../backend/webgpu/profiler";
 import {
   allocateOutputBuffer,
   clearActiveArena,
@@ -1536,13 +1556,16 @@ import { flushBufferPool } from "../backend/webgpu/buffer-pool";
 import { dispatchComputePass } from "../backend/webgpu/dispatch";
 import { GPUBufferUsage, gpuBuffer } from "../backend/webgpu/gpu-types";
 import {
+  gpuTimestampsActive,
+  setProfileModule,
+} from "../backend/webgpu/profiler";
+import {
   beginSharedEncoder,
   endSharedEncoder,
   flushSharedEncoder,
   getSharedEncoderInstance,
   incrementSharedEncoderPassCount,
 } from "../backend/webgpu/shared-encoder";
-import { gpuTimestampsActive } from "../backend/webgpu/profiler";
 import { createTensor } from "../backend/webgpu/tensor";
 import {
   getSubmitCount,
@@ -1880,9 +1903,7 @@ export async function executeCompiledPlan(
           }
           if (
             ENV.TORCHLETTE_DEBUG_SLOT &&
-            cmd.bindings.includes(
-              parseInt(ENV.TORCHLETTE_DEBUG_SLOT, 10),
-            )
+            cmd.bindings.includes(parseInt(ENV.TORCHLETTE_DEBUG_SLOT, 10))
           ) {
             const s = parseInt(ENV.TORCHLETTE_DEBUG_SLOT, 10);
             console.log(
@@ -1924,7 +1945,11 @@ export async function executeCompiledPlan(
               entries.push({
                 binding: j,
                 resource: range
-                  ? { buffer: bufs[j], offset: range.offset, size: range.size || undefined }
+                  ? {
+                      buffer: bufs[j],
+                      offset: range.offset,
+                      size: range.size || undefined,
+                    }
                   : { buffer: bufs[j] },
               });
             }
@@ -1934,7 +1959,8 @@ export async function executeCompiledPlan(
             });
             cmd.cachedBindGroup = bg;
             cmd.cachedBuffers = bufs.slice();
-            if (TAPE_PROFILE) tpAdd("replay-bindgroup", performance.now() - tpB0);
+            if (TAPE_PROFILE)
+              tpAdd("replay-bindgroup", performance.now() - tpB0);
           }
           if (cmd.module !== undefined) setProfileModule(cmd.module);
           const enc = getSharedEncoderInstance();
@@ -2003,7 +2029,11 @@ export async function executeCompiledPlan(
               writeNode.op === "tensorFromArray"
                 ? (writeNode.payload as
                     | {
-                        values?: number[] | Float32Array | Int32Array | Uint32Array;
+                        values?:
+                          | number[]
+                          | Float32Array
+                          | Int32Array
+                          | Uint32Array;
                         dtype?: DType;
                       }
                     | undefined)
@@ -2373,7 +2403,8 @@ export async function executeCompiledPlan(
         if (!ref) continue;
         if (ref.kind === "pending") {
           const node = ref.node;
-          const sh = node.results?.[c.oi] ?? (c.oi === 0 ? node.result : undefined);
+          const sh =
+            node.results?.[c.oi] ?? (c.oi === 0 ? node.result : undefined);
           if (sh) sh.releasedOverlay = true;
           registerPrunedExecution(c.fp, c.ni, c.oi, node.id, true);
           if (node.results) {

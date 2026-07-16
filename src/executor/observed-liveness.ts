@@ -143,64 +143,17 @@ const key = (ni: number, oi: number): string => `${ni}:${oi}`;
 let enabled = false;
 const templates = new Map<number, TemplateObs>();
 
-/**
- * [task #98 phase 4 — WITNESS-TIME HARVEST] Per producer-template `fp`, the set
- * of "ni:oi" pairs the step-tape recorder physically OBSERVED read across the
- * two consecutive identical executed steps that made its tape eligible (§4.1).
- *
- * This is the #97 resolution: the observation seam (`observeConsumed`) is fed
- * ONLY by the compiled external-slot bind, so a cross-plan read that resolves
- * LOWERED through `getInputStorage` — the canonical case being the BACKWARD
- * pass re-reading a checkpoint-RECOMPUTED forward activation — is structurally
- * invisible to it, and its producer template PRUNES the activation from the
- * generated harvest (the `contiguous[512,768]` STOP). The tape witnesses at
- * END-OF-STEP time, AFTER backward + recompute ran, so every such read was
- * physically observed; the recorder records it (`stObserveWitnessRead`) and,
- * on eligibility, publishes the union here. `prunedHarvest` unions these pairs
- * into `keepAlways` so the pruned build keeps them — the build-WITH-execution
- * guarantee the recorded build had, promoted to the tape stratum.
- *
- * SINGLE SOURCE / NO SECOND OWNER (ruling 1): the ONLY producer of this map is
- * the step-tape recorder's eligibility path (`stEndStep` → `setWitnessedHarvest`).
- * observed-liveness merely CONSULTS it — it never authors it. Gen-independent
- * (keyed by template fp + ni:oi, the same coordinate the needed-set uses).
- */
-const witnessedHarvest = new Map<number, Set<string>>();
-
-/**
- * Publish (or replace) the witnessed harvest set for a producer template. Called
- * by the step-tape recorder at tape eligibility (`step-tape.ts stEndStep`). A
- * fresh eligibility for the same fp REPLACES the set (re-witnessing under a
- * changed declaration re-establishes it). Passing an empty set clears the entry
- * (a witness step that observed no cross-plan lowered read of this fp).
- */
-export function setWitnessedHarvest(fp: number, pairs: Set<string>): void {
-  if (pairs.size === 0) {
-    witnessedHarvest.delete(fp);
-    return;
-  }
-  witnessedHarvest.set(fp, new Set(pairs));
-}
-
-/** Drop a template's witnessed harvest (guard-4 invalidation: a re-witness must
- *  re-establish it). Called from `stInvalidateTemplate` via the recorder. */
-export function clearWitnessedHarvest(fp: number): void {
-  witnessedHarvest.delete(fp);
-}
-
-/** Test/telemetry: the witnessed harvest set for a template (sorted "ni:oi"). */
-export function getWitnessedHarvest(fp: number): string[] {
-  const s = witnessedHarvest.get(fp);
-  return s ? [...s].sort() : [];
-}
-
-/** Test/telemetry: every template's witnessed harvest set (fp → sorted "ni:oi").
- *  The shadow-parity gate reads this to assert coverage of the pruned classes. */
-export function getAllWitnessedHarvest(): Map<number, string[]> {
-  const out = new Map<number, string[]>();
-  for (const [fp, s] of witnessedHarvest) out.set(fp, [...s].sort());
-  return out;
-}
+// [D2] The per-producer WITNESSED-HARVEST oracle (task #98 phase 4) — the
+// `witnessedHarvest` map + `setWitnessedHarvest` / `clearWitnessedHarvest` /
+// `getWitnessedHarvest` / `getAllWitnessedHarvest` — was DELETED here. It was
+// the SHADOW ORACLE D1 kept alongside the derived crossPlanEdges keep-set; D2
+// collapses the two observers into one derivation (§4.2 / §7): `prunedHarvest`
+// now consults ONLY `crossPlanEdgeKeepSet` (the derived set), and the executor's
+// recompute-boundary feed sources the same derived query. The retired oracle's
+// would-have-been decisions remain computable on demand from the step-tape
+// recorder's independent per-producer accumulator (`getWitnessProducerKeepSets`)
+// for the inverted shadow-diff verification tool — but it is no longer a live
+// mechanism here (no second harvest owner).
 
 let stepStamped: Array<{ shId: number; checkId: number; stamp: ResultStamp }> =
   [];
@@ -663,25 +616,20 @@ export function prunedHarvest(
   if (!enabled) return undefined;
   const t = templates.get(fp);
   if (!t || t.pinned || !t.converged) return undefined;
-  const witnessed = witnessedHarvest.get(fp);
-  // [D1] The DERIVED cross-plan edge set is consulted IN ADDITION to the
-  // per-producer witnessed harvest (both run; the shadow diff gates the D2
-  // collapse). Its keep-set projection EQUALS `witnessed` by construction (both
-  // published from one witness stream at one K_w=2 moment), so unioning it is
-  // null-clean here; the harvest becomes a QUERY of crossPlanEdges without
-  // deleting the oracle this phase (§4.2 / campaign D1).
+  // [D2] THE HARVEST IS A QUERY OF crossPlanEdges — the collapse (§4.2 / §7).
+  // The per-producer witnessed-harvest oracle DIED; the derived cross-plan edge
+  // set's keep-set projection is now the SOLE cross-plan-read source consulted
+  // here. D1 proved (shadow diff EMPTY on all 5 matrix cells) that this
+  // projection equals the retired oracle's set by construction — both were
+  // published from one witness stream at one K_w=2 moment — so consuming only
+  // the derived set is behaviour-preserving, with the single-source guarantee
+  // now structural (one producer, one consumer) rather than two-run-and-diff.
   const derived = crossPlanEdgeKeepSet(fp, currentVariantSelection());
   const kept: Array<{ i: number; oi: number }> = [];
   const excluded: Array<{ i: number; oi: number }> = [];
   for (const p of actionPairs) {
     const k = key(p.i, p.oi);
-    if (
-      t.needed.has(k) ||
-      keepAlways.has(k) ||
-      witnessed?.has(k) ||
-      derived.has(k)
-    )
-      kept.push(p);
+    if (t.needed.has(k) || keepAlways.has(k) || derived.has(k)) kept.push(p);
     else excluded.push(p);
   }
   prunedPairsRemoved += excluded.length;
