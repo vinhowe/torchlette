@@ -173,6 +173,7 @@ import {
   stDeclareBatchCover,
   stEndPlan,
 } from "../core/step-tape";
+import { variantToken } from "../core/step-variant";
 import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
 import {
   assignNodeResult,
@@ -3530,7 +3531,20 @@ export async function executePlanOptimized(
   // to detect collisions (effective collision probability: 2^-64).
   // [tape-1a] G0 measurement seams (src/core/tape-profile.ts; sunset: 1c).
   const tpF0 = TAPE_PROFILE ? performance.now() : 0;
-  const defaultFingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
+  // [D0 variant seam] Mix the current step VARIANT's token into the fingerprint
+  // via the SAME token-mixing arg the islands I1 partition uses
+  // (docs/step-data-dependence-design.md §3.3/§3.4). The token is delivered from
+  // the step's per-step selection (NOT the S3 island-merge resolver, §3.4
+  // verdict). SINGLETON == ABSENT: `variantToken()` returns `undefined` for the
+  // base `"train"` variant, the exact value `computePlanFingerprint` treats as
+  // "no discriminator" — so this is BYTE-IDENTICAL to the pre-variant path on
+  // every plan today (null-clean). A future residual variant returns a nonzero
+  // token, re-keying its template + re-witnessing its tape through this one seam.
+  const defaultFingerprint = computePlanFingerprint(
+    plan.nodes,
+    externalNodeIds,
+    variantToken(),
+  );
   // [S3 FUSE LIVE WIRING] Resolve a live partition-merge edit: with an empty
   // store this returns the default fingerprint UNCHANGED (byte-identical null
   // path); with a realized merge it re-fingerprints the plan (the merged

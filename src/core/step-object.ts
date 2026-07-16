@@ -42,6 +42,11 @@
  */
 
 import type { DynamicSlotSource, StepTape } from "./step-tape";
+import {
+  DECLARED_VARIANTS,
+  type StepVariant,
+  type VariantSet,
+} from "./step-variant";
 
 // ---------------------------------------------------------------------------
 // §2.3 — Guard semantics as TYPED REFUSALS.
@@ -210,6 +215,11 @@ export interface StepReceipts {
   readonly structureMisses: number;
   readonly planInvalidations: number;
   readonly boundaryResets: number;
+  /** [D0] The per-step VARIANT SELECTION (docs/step-data-dependence-design.md
+   *  §3.3 point 2). The runtime selector record — hashes into NEITHER identity
+   *  (only the variant's structural TOKEN does, at the fingerprint seam). A
+   *  singleton `"train"` in v1 (open-Q1 verdict: route-as-data). */
+  readonly variant: StepVariant;
 }
 
 /**
@@ -219,6 +229,13 @@ export interface StepReceipts {
 export interface StepObject {
   /** DECLARED phase (the source form; hashes into STEP identity via §2.2). */
   readonly declaration: StepDeclaration;
+  /** [D0] The DECLARED variant set (docs/step-data-dependence-design.md §2,
+   *  §3.3): the residual structural forks after value-level variation is routed
+   *  as data. A singleton `["train"]` in v1. DATA on the object (ruling 1 — no
+   *  second whole-step mechanism); the per-step SELECTION lives on
+   *  `receipts.variant`. The singleton's variant token is ABSENT, so this facet
+   *  is null-clean against every existing identity. */
+  readonly variants: VariantSet;
   /** WITNESSED phase (the compiled form; DERIVED, not authored). null when the
    *  step has not yet witnessed a skeleton (no eligible tape exists). */
   readonly skeleton: StepSkeletonRef | null;
@@ -436,6 +453,9 @@ export function deriveStepObject(
 
   return {
     declaration,
+    // [D0] The declared variant set — a singleton in v1 (§3.3). Constant DATA on
+    // the object; the per-step selection is carried on `receipts.variant`.
+    variants: DECLARED_VARIANTS,
     skeleton,
     epoch: tape.epoch,
     regime: { stepScopedCleanup: tape.regime.stepScopedCleanup },

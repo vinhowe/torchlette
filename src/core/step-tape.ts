@@ -51,6 +51,7 @@ import {
   type StepObject,
   type StepReceipts,
 } from "./step-object";
+import { currentVariantSelection } from "./step-variant";
 
 /**
  * `TORCHLETTE_STEP_TAPE`:
@@ -1078,6 +1079,7 @@ export function stDeriveStepObjects(): StepObject[] {
     structureMisses,
     planInvalidations,
     boundaryResets,
+    variant: currentVariantSelection(),
   };
   const objs: StepObject[] = [];
   for (const tape of tapes.values())
@@ -1099,6 +1101,7 @@ export function stDeriveStepObject(bucketKey: string): StepObject | null {
     structureMisses,
     planInvalidations,
     boundaryResets,
+    variant: currentVariantSelection(),
   });
 }
 
