@@ -48,6 +48,16 @@ before/after application of a move whose schema is already in `types.ts §13`.
 
 ## 1. Deliverable 1 — the `merge`/`fuse` composite transaction (S3)
 
+> **STATUS UPDATE (2026-07-16): S3 FUSE LIVE WIRING LANDED.** The schedule-altitude
+> `fuseGesture` (this deliverable) is joined by the LIVE executor path: an accepted
+> `StepEditChannel.requestMerge` now drives a REAL per-plan partition merge
+> (`applyPartitionMerge` → the detector's `mergeIslands`, `src/executor/executor.ts` /
+> `fusion-detect.ts`), re-fingerprints the plan, and re-witnesses the tape under the merged
+> partition — byte-identical trajectory, rollback to identity. `ReRecordChannel` is no
+> longer a pure stub at the live seam. See `islands-design.md` header + `step-object-design.md
+> §5 STATUS`. The membership rule below is UPHELD: `mergeIslands` lives in the detector's file
+> (the sole owner); the channel only expresses the request.
+
 ### 1.1 The ruling this implements
 
 S3 (`design-amendment-round-1.md`, `schedule-state-design.md §3.5`): `fuse` is **NOT** a

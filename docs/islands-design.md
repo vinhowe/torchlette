@@ -13,10 +13,19 @@ per-plan `PlanPartition.boundaryHash` (I1) surfaced through `tape.partitionHashe
 the detector still OWNS membership (this is a read-only projection, no second
 owner); `stepPartitionReproducesPerPlan` is the I1 null test at step altitude
 (green). `StepEditChannel` (`src/schedule/moves/step-edit-channel.ts`) generalizes
-`ReRecordChannel` (`fuse.ts:65`) into the one edit seam. **I3/I4's deletions are
-NOT earned by that phase** — the live `fuseGesture` merge wiring + the
-four-mechanism collapse (§7) remain a SEPARATE campaign (the phase-6 STOP boundary,
-`step-object-design.md §6 Phase 6 STATUS`). Reviewed against: the schedule-record spike
+`ReRecordChannel` (`fuse.ts:65`) into the one edit seam. **S3 FUSE LIVE WIRING now
+LANDED** — an accepted `StepEditChannel.requestMerge`, bound to the executor via
+`applyMerge → applyPartitionMerge` (`src/executor/executor.ts`), drives the DETECTOR'S
+OWN merge (`mergeIslands`, `fusion-detect.ts` — the ONLY new partition mutator, in the
+membership owner's file, no second owner): the merged partition's `boundaryHash` mixes
+into the plan fingerprint (the I1 token), the template re-keys, and the tape
+re-witnesses under the merged partition (§5.3). The edit is BYTE-IDENTICAL in execution
+(the edited template ALIASES the default's lowered plan — a grouping-only merge changes
+island boundaries, never math; `t-step-edit-numerics-null.ts` maxΔ=0 over 24 steps) and
+rolls back to identity (`t-step-edit-binding-probe.ts`: island 17→16→17). **Interior
+kernel-fusion (fewer dispatches inside one merged island) + I3/I4's deletions are NOT
+earned by this** — the four-mechanism collapse (§7) remains a SEPARATE campaign; what
+LANDED is the live partition-edit transaction the editor socket drives. Reviewed against: the schedule-record spike
 (`docs/spike-schedule-record-findings.md`), the kernel-editor validity/
 completeness and WGSL⊂CUDA analyses (scratchpad), `docs/architecture-debt.md`
 (sin taxonomy + stage plan), `docs/stage4-compile-from-ir.md` (the four
