@@ -14,6 +14,7 @@ const GPU_TEST_FILES = [
   "test/checkpoint-autocast-parity.spec.ts",
   "test/checkpoint-memory-profile.spec.ts",
   "test/checkpoint-scale-analysis.spec.ts",
+  "test/checkpoint-scaler-seed-lifetime.spec.ts",
   "test/checkpoint-segmentation.spec.ts",
   "test/compiled-plan-parity.spec.ts",
   "test/distilgpt2-checkpoint-memory.spec.ts",
