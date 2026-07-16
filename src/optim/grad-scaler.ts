@@ -270,7 +270,6 @@ export class GradScaler {
 
   /** Adjust scale based on whether inf was found this step. */
   private _applyScaleAdjustment(): void {
-    const prev = this._scale;
     if (this._foundInfThisStep) {
       this._scale *= this.backoffFactor;
       this._growthTracker = 0;
@@ -281,21 +280,27 @@ export class GradScaler {
         this._growthTracker = 0;
       }
     }
-    // [scaler-as-tensor] Push the new scale into the LIVE tensor so the NEXT
+    // [D0 route-as-data] Push the scale into the LIVE tensor so the NEXT
     // replayed step reads it as DATA (growth/backoff flows through hits; invScale
     // is derived in-graph from it). The JS `_scale` is now a stats-only mirror.
     //
-    // Only write on an ACTUAL change. Every `.set()` mints a per-step scatter
-    // that CHAINS onto the scale tensor's ref (copy-on-write when the tensor is
-    // still pending) — during the lowered warmup that chain strands an earlier
-    // scatter's source, read after reclaim (STRICT_LIFETIME; the setLR
-    // driver-scalar KNOWN OPEN's warmup transient). Since the scale holds
-    // constant across the vast majority of steps (growthInterval apart), gating
-    // on change makes the write RARE — the scale tensor is materialized by the
-    // time the next change lands, so its scatter is a clean true-in-place DMA
-    // with a same-step source. The buffer already holds `prev` (the live tensor
-    // is the single source), so skipping an unchanged write is exact.
-    if (this._scaleLive && this._scale !== prev) this._scaleLive.set(this._scale);
+    // UNCONDITIONAL (docs/step-data-dependence-design.md §3.2, open-Q1): the
+    // write fires EVERY step — the same value on a no-change step — so the
+    // scale-change scatter is a PERMANENT part of the program, not a structural
+    // op present only while the scale moves. The old `_scale !== prev` gate made
+    // the write conditional, which minted a backoff-ONLY 2-node plan
+    // (`0xccadbdf5`) that appeared during the scale-backoff window and vanished
+    // once the scale settled — a value-level fork that perturbed the plan set and
+    // drove `witnessVariances` (E-3). Routing the write as data (the frozen-scalar
+    // discipline generalized from optimizer scalars to control-flow) DISSOLVES
+    // that conditional structural op: every step runs the same plan set, the new
+    // scale value flows through the existing LiveScalar scatter / re-dress
+    // channel, and the inf-skip zero-mask semantics are byte-preserved (untouched
+    // above). Same unconditional-per-step precedent as `Adam.setLR` (the
+    // scheduler-driven LR write, STRICT_LIFETIME-clean via LiveScalar's
+    // `_pinRing`). Writing the same value is an exact no-op on the buffer (the
+    // live tensor is the single source of the current scale).
+    if (this._scaleLive) this._scaleLive.set(this._scale);
   }
 
   /**
