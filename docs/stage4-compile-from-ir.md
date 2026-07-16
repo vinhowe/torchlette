@@ -3067,3 +3067,79 @@ throw the #43(a) blocker named) is resolved by derivation, memory-neutral, gated
 full-suite green on the recorded build. The over-prune of the OVERLAY class is now
 unconstructible; the recorded build's guardMiss is no longer load-bearing for THAT
 class. The remaining prune-soundness class is scoped above for the follow-on.
+
+## Task #43 recorded-build DELETION PASS (2026-07-16): the shape=[] class FIXED; full deletion STILL BLOCKED by the broader `forwardToForce` cross-plan class
+
+The authorized full-sunset pass root-caused and FIXED the last NAMED blocker — the
+`shape=[]` GradScaler-scalar `[lifetime] reading RECLAIMED` — then, on the deleted
+tree, found it is the SMALLEST instance of a broader class the witness/generated
+harvest cannot serve. **The harvest deletion was NOT performed** (campaign STOP
+rule). The reconciled harvest-deletion diff (adapted from the 6-merges-stale
+`.claude/harvest-deletion-43a.diff`, builds clean, −1280 lines) is preserved at
+`.claude/harvest-deletion-43a-reconciled.diff` for the next attempt.
+
+### The `shape=[]` class — ROOT-CAUSED + FIXED (LANDED)
+Deterministic repro (apply the reconciled harvest-deletion diff, then
+`VULKAN_DEVICE_INDEX=N LD_LIBRARY_PATH=tools/vk-shim TORCHLETTE_STEP_TAPE=record
+CELL=scaler-inf npx tsx tools/t-witness-harvest-matrix.ts`): PRE-FIX throws
+`[lifetime] reading RECLAIMED storage id=… (shape=[])` at step ~6.
+
+Root cause (traced storage id → producer/consumer/reaper): the reclaimed `shape=[]`
+storage is the **backward gradient seed `full([], 1.0)`** (`Torchlette._seedGrad`).
+Under selective checkpointing, `backward()` force-materializes the seed in a SEPARATE
+"forward tensors" plan (`autograd.ts`, `forwardToForce`). That makes the seed a
+CROSS-PLAN value: produced in that plan, consumed by the main backward plan. With a
+GradScaler the consumer is the extra `mul(seed, scale)` backward node (the derivative
+of `scale(loss) = mul(loss, scale)`), which runs in a LATER-forced segment. On the
+recorded build the harvest rc-pins every produced result, so the seed survives to
+that later read. When the recorded build is retired and the compiled plan is built
+from the generated stream, the observed-liveness harvest cannot WITNESS that later
+cross-plan read (it is data-dependent — the GradScaler inf-skip re-fingerprints the
+plans, so the producer never witnesses two consecutive identical steps), so it PRUNES
+the seed's harvested `full` result; its rc then hits 0 and `destroyUnreachable` reaps
+it mid-backward (`autograd.ts` post-force `destroyUnreachable`), before the consumer
+reads it → the RECLAIMED throw.
+
+Fix (`autograd.ts`, the checkpoint `forwardToForce` set): the grad seed is a LEAF
+CONSTANT (`full([],1.0)`, no inputs); do NOT force it in the separate forward-tensors
+plan. Leaving it lazy materializes it INSIDE the main backward plan alongside its
+consumer (intra-plan), so it is never a prunable cross-plan harvested result.
+NULL on the recorded build (the harvest pins the seed either way): `test:gates` 6/6,
+`parity-fullstack-tl` compiled-vs-lowered max |Δloss| 8e-6/30, all `t-witness-harvest-
+matrix` cells PASS (scaler-inf 6/459 templates/pairs vs the pre-fix 7/460 — the only
+delta is the seed no longer being a separately-forced template), full webgpu project
+green (run EXCLUSIVELY — `npm run test` runs cpu+webgpu concurrently and the webgpu
+project needs GPU-exclusive access; concurrent runs mass-fail on `vkCreateDevice`
+device-chain contention, NOT logic). Gate: `test/checkpoint-scaler-seed-lifetime.spec.ts`
+(checkpoint + GradScaler backward: finite grads, no lifetime throw, parity vs
+checkpoint-only reference).
+
+### The STOP — the broader `forwardToForce` cross-plan class (new, blocks the full deletion)
+With the seed fixed, the deleted-tree `scaler-inf` cell advances past the `shape=[]`
+throw and reveals that it was the SMALLEST member of a class: the checkpoint backward's
+`forwardToForce` plan force-materializes forward ACTIVATIONS as cross-plan values, and
+the generated/witness harvest cannot reliably keep them under `scaler-inf`'s
+data-dependent inf-skip. Two further instances, both non-`shape=[]`:
+- **`[512,50257]` (CE logits) RECLAIMED** — the next reclaim after the seed on the
+  no-fix tree (bypassing only the `shape=[]` throw surfaces it at step 6). The seed
+  fix's plan-fingerprint shift happens to resolve THIS one too, but that is
+  coincidental (a fingerprint side effect, not a principled keep).
+- **`[1,512,768]` (a transformer-layer activation, template `0xa444a1bc` node 272,
+  oi 0) OVERLAY-RELEASED (stage-3 B)** — recurs every step with the seed fix applied.
+  It is `graphHeldAt=FALSE`, so #97's `graphHeldAt` oracle explicitly does NOT protect
+  it: #97 assumed non-graph-held ⟹ boundary-dead, but here a non-graph-held cross-plan
+  activation IS read after the overlay-release (by the invisible checkpoint/scaler
+  cross-plan reader). Training stays finite in warn mode (the overlaid bytes may be
+  correct), but under STRICT lifetime it throws — and strict is never weakened.
+
+These are the SAME structural gap the #97/#98 campaign named (a build-WITHOUT-execution
+prune of checkpoint-recompute cross-plan forward reads that no build-time analysis can
+witness), now shown to extend BEYOND the single `shape=[]` scalar to the full
+`forwardToForce` activation set once the scaler's data-dependent inf-skip defeats the
+two-consecutive-step witness requirement. Closing it needs NET-NEW mechanism (a
+whole-step or execution-witnessed harvest robust to data-dependent re-fingerprinting,
+OR extending the overlay-release oracle past `graphHeldAt` to witnessed cross-plan
+readers) — out of a deletions-only pass's scope. **VERDICT: the recorded build is NOT
+deletable. The `shape=[]` named blocker is closed; the deletion is now gated on the
+broader `forwardToForce` cross-plan class under the scaler-inf (checkpoint + GradScaler
++ autocast + inf-skip) workload.** Fourth blocked attempt, one new named class.

@@ -368,6 +368,21 @@ identical executed steps that make its tape eligible.**
 > harvest this phase covers. Phase 4 does NOT delete the recorded build (§4.3 keeps it
 > for never-witnessed classes), so this does not occur in the phase-4 config; it is a
 > STOP finding for the eventual full sunset, not for this phase.
+>
+> **UPDATE (2026-07-16, the full-sunset pass): the `shape=[]` scalar was ROOT-CAUSED +
+> FIXED, and it turned out to be the SMALLEST instance of a broader class.** The
+> reclaimed `shape=[]` is the backward grad seed `full([],1.0)` (`_seedGrad`),
+> force-materialized by the checkpoint `forwardToForce` plan into a cross-plan value the
+> generated harvest can't witness under the inf-skip's data-dependent re-fingerprinting.
+> Fix: don't force the leaf-constant seed early (materialize it intra-plan); null on the
+> recorded build; gate `test/checkpoint-scaler-seed-lifetime.spec.ts`. But on the deleted
+> tree the same `forwardToForce` mechanism produces further cross-plan ACTIVATIONS
+> (`[512,50257]` CE logits reclaimed, `[1,512,768]` a `graphHeld=FALSE` layer activation
+> OVERLAY-RELEASED every step — the case #97's `graphHeldAt` explicitly does not protect)
+> that the witness/generated harvest still cannot serve. So the FULL sunset remains
+> BLOCKED by the broader `forwardToForce` cross-plan class — see `stage4-compile-from-ir.md
+> §"Task #43 recorded-build DELETION PASS (2026-07-16)"`. The `shape=[]` named blocker is
+> closed; the deletion is not.
 
 ### 4.1 Mechanism
 
