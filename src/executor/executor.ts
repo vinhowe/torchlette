@@ -127,8 +127,10 @@ import {
 } from "./lowered-plan";
 import {
   clearResultEntries,
+  diagnoseReleasable,
   getObservedLivenessStats,
   isObservedLivenessEnabled,
+  noteD5Candidate,
   noteInPlaceCommit,
   noteNewTemplate,
   noteTemplateExecuted,
@@ -2203,6 +2205,32 @@ export async function executeLoweredPlan(
           }
           const stamp = storage.stamp;
           if (!stamp) continue;
+          // [D5 stage-1] Watcher-cost probe: for each stamped external this
+          // template could claim, compare the predicate verdict against the
+          // DERIVED guards (graphHeldAt + crossPlanEdge). A structurally-
+          // releasable pair (this template its stable last reader) that a
+          // predicate BLOCKS but the derived guards would RELEASE is a "real
+          // prune" the derivation wouldn't make; if the derived guards also
+          // block it the predicate pruned nothing (a free dividend). Pure
+          // measurement, no behaviour change.
+          if (ENV.TORCHLETTE_MEASURE_D5) {
+            const diag = diagnoseReleasable(stamp.fp, stamp.ni, stamp.oi);
+            const structural = diag.reader === fp;
+            const derivedReleases =
+              !storageTracker.graphHeldAt(storage.id) &&
+              !crossPlanEdgeHasOtherConsumer(
+                stamp.fp,
+                `${stamp.ni}:${stamp.oi}`,
+                currentVariantSelection(),
+                fp,
+              );
+            noteD5Candidate(
+              diag.pred,
+              structural,
+              derivedReleases,
+              `producer=0x${stamp.fp.toString(16)} ${stamp.ni}:${stamp.oi} shape=${JSON.stringify(storage.backendTensor.shape)}`,
+            );
+          }
           if (releasableLastReader(stamp.fp, stamp.ni, stamp.oi) !== fp)
             continue;
           // [task #97] DERIVED cross-plan liveness governs the overlay-release,

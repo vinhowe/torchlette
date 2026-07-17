@@ -1137,7 +1137,7 @@ broadcast-into-fused class stays DELIBERATELY UNCOVERED.
   and `d4-12-foreach-closure.diff` are all now IN GIT HISTORY (`39debb7d` + `43272c47`); the
   untracked artifacts in the main checkout's `.claude/` are historical and safe to delete.
 
-### Phase D5 — The declared-lifetime dividend (LAST; step-object phase 7)
+### Phase D5 — The declared-lifetime dividend (DONE ✓ 2026-07-17; step-object phase 7)
 
 **Goal:** the observation predicates RETIRE on the captured path (they are now queries of
 `crossPlanEdges(v)`, §4.2). Gated on ruling 2's own re-open condition (captured path warm + watcher
@@ -1145,6 +1145,26 @@ cost measured).
 - **Gate:** set-parity of the derived liveness vs the observation layer on the captured path;
   measured watcher-cost delta > derivation cost; captured-path only (LOWERED keeps all three).
 - **Deletes:** `everReadback` / `everSurvived` / `everAliased` on the captured path.
+
+**EXECUTED — the measurement reshaped the deletion into a retirement.** The re-open condition was
+honored, not assumed: `tools/t-d5-watcher-cost.ts` + a `TORCHLETTE_MEASURE_D5` claim-seam probe
+measured what the three predicates prune that the derivation (`crossPlanEdges` + `graphHeldAt` +
+declared survivors) wouldn't, across distil{ckpt on/off} + gpt2-medium × captured/uncaptured.
+
+| id | finding | source |
+|---|---|---|
+| E-5 | On the CAPTURED path the predicates prune NOTHING: the convergence machinery they gate never activates under step-tape replay (a warm tape stops executing lowered, so no template reaches the `K_HYSTERESIS` stable *executed* steps convergence needs — convergedTemplates=0 / releasableMB=0 / 0 predicate prunes, even at 60 steps / 56 hits). The claim seam + read guards + overlay-release were already dormant/suppressed on replay. | `t-d5-watcher-cost.ts CAPTURE=1` |
+| E-6 | Off-capture the predicates DO converge (8 templates) and `everSurvived` carries exactly ONE real prune the derived guards miss: the `[1,S,vocab]` CE-logits boundary survivor (survives the step with no cross-plan consumer edge; declared-live under capture, observation-only without a declaration). `everReadback`/`everAliased` carry zero real prunes but stay uncaptured (unordered readback). | `t-d5-watcher-cost.ts CAPTURE=0` |
+| E-7 | The captured trajectory is BIT-IDENTICAL pre/post retirement (distil last-loss 11.0766, every per-step value unchanged); captured-vs-uncaptured tracks within the fp-noise floor (max Δ ~1e-3 nats). | `t-d5-watcher-cost.ts` A/B |
+
+**Consequence (assumption cross-check).** E-6 is why D5 is a captured-path RETIREMENT, not a global
+DELETION — a full deletion would drop a live edge the derived set cannot see on the uncaptured path
+(the same OUTSIDE-the-finiteness-frame shape as D4's sixth class: the derivation is complete only
+under a DECLARATION). So: the four observation-RECORDING hooks (`stampResult`/`observeConsumed`/
+`observeReadback`/`noteAliasedBase`) no-op under `isStepTapeReplayActive()`; the UNCAPTURED path
+keeps the full observation layer; strict-lifetime stays armed as the wrong-derivation detector.
+"Partial dividend beats wrong dividend." `t-d5-watcher-cost.ts` is the standing re-open-condition
+regression gate.
 
 **Subsumption:** D3 = `arena-recompute-design.md` R2′ + R3; D2/D5 = `step-object-design.md` phase 7
 convergence; D4 = the `stage4 §Task #43` sunset (the four-times-blocked deletion); D0–D1 are the

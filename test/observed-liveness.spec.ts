@@ -38,12 +38,18 @@ import { promisify } from "node:util";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { canUseWebGPU } from "./helpers/webgpu";
 import {
+  getCapturedRecordSkips,
   guardMiss,
   noteInPlaceCommit,
+  observeConsumed,
+  observeReadback,
   registerPrunedExecution,
   resetObservedLiveness,
   setObservedLivenessEnabled,
+  setStepTapeReplayActive,
+  stampResult,
 } from "../src/executor/observed-liveness";
+import type { StorageHandle } from "../src/graph/types";
 
 const execFileP = promisify(execFile);
 const PROBE = path.join(__dirname, "..", "tools", "t-observed-liveness-probe.ts");
@@ -190,5 +196,58 @@ describe("observed cross-plan liveness — late-consumer guard (gate 3)", () => 
   it("miss on the wrong output index of a registered node is not ours", () => {
     registerPrunedExecution(FP, NI, 0, PRODUCER_NODE_ID);
     expect(guardMiss(PRODUCER_NODE_ID, 1)).toBe(false);
+  });
+});
+
+// [D5 — THE DECLARED-LIFETIME DIVIDEND; step-object phase 7 / ruling 2]
+// CONTRACT CHANGE (named, like the lazy-execution precedent): the observation
+// RECORDING is RETIRED on the captured path. Inside a declared step-tape replay
+// (`setStepTapeReplayActive(true)`) liveness DERIVES from `crossPlanEdges` + the
+// declared boundary survivors, so the recording hooks (`stampResult`,
+// `observeConsumed`, `observeReadback`, `noteAliasedBase`) no-op — they change
+// no decision there (the stage-1 measurement proved the convergence machinery
+// they feed never activates under replay: `tools/t-d5-watcher-cost.ts`). The
+// UNCAPTURED path is unchanged (the measurement found `everSurvived`
+// load-bearing off-capture — the `[1,S,vocab]` CE-logits boundary survivor).
+describe("observed cross-plan liveness — captured-path retirement (D5)", () => {
+  const FP = 0x515151;
+  const fakeSh = (id: number): StorageHandle => ({ id }) as StorageHandle;
+
+  beforeEach(() => {
+    resetObservedLiveness();
+    setObservedLivenessEnabled(true);
+    setStepTapeReplayActive(false);
+  });
+  afterAll(() => {
+    resetObservedLiveness();
+    setObservedLivenessEnabled(false);
+    setStepTapeReplayActive(false);
+  });
+
+  it("UNCAPTURED: stampResult stamps + enrolls (observation records)", () => {
+    const sh = fakeSh(1);
+    stampResult(sh, FP, 7, 0);
+    expect(sh.stamp).toEqual({ fp: FP, ni: 7, oi: 0 });
+    expect(getCapturedRecordSkips()).toBe(0);
+  });
+
+  it("CAPTURED (replay active): stampResult no-ops — no stamp, skip counted", () => {
+    setStepTapeReplayActive(true);
+    const sh = fakeSh(2);
+    stampResult(sh, FP, 7, 0);
+    expect(sh.stamp).toBeUndefined();
+    expect(getCapturedRecordSkips()).toBe(1);
+  });
+
+  it("CAPTURED: observeConsumed / observeReadback are no-ops (no throw, no record)", () => {
+    // A value stamped OUTSIDE the replay (a build step) — then read DURING a
+    // replay. The captured-path retirement must not record its consumption or
+    // readback (derived from the edge set / declared ring outputs instead).
+    const sh = fakeSh(3);
+    stampResult(sh, FP, 9, 0); // build-step stamp (replay inactive)
+    expect(sh.stamp).toBeDefined();
+    setStepTapeReplayActive(true);
+    expect(() => observeConsumed(sh, FP)).not.toThrow();
+    expect(() => observeReadback(sh)).not.toThrow();
   });
 });

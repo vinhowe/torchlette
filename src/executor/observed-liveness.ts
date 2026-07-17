@@ -181,6 +181,11 @@ let claimMisses = 0;
 let pinnedTemplates = 0;
 let prunedPairsRemoved = 0;
 let retiredTemplates = 0;
+/** [D5] Observation-recording calls skipped on the captured (declared-boundary
+ *  replay) path — the retired watcher's per-replay bookkeeping, now reclaimed.
+ *  Telemetry only; a nonzero value means a warm capture is deriving, not
+ *  observing. */
+let capturedRecordSkips = 0;
 
 /** Executor callback: invalidate a template's compiled plan by fingerprint
  *  (the module can't import executor.ts — circular). */
@@ -235,6 +240,62 @@ export function isStepTapeReplayActive(): boolean {
   return stTapeReplayActive;
 }
 
+// ── [D5 stage-1] Watcher-cost measurement (the §5 re-open condition) ──────────
+// Tallies, at the executor claim seam, how the three observation predicates'
+// verdicts diverge from the DERIVED guards (graphHeldAt + crossPlanEdge). A
+// pure measurement surface — no behaviour change. `redundantPrune` = predicate
+// blocked a structurally-releasable pair the derived guards ALSO block (free to
+// retire); `realPrune` = predicate blocked but derived guards would ACCEPT (a
+// release the derivation wouldn't make — the honest cost of retiring). Keyed by
+// predicate so the report says WHICH predicate carries any real prune.
+interface D5Cost {
+  candidates: number; // stamped externals examined at the seam
+  structural: number; // structurally releasable (predicates ignored)
+  predBlocked: Record<"survived" | "readback" | "aliased", number>;
+  redundantPrune: Record<"survived" | "readback" | "aliased", number>;
+  realPrune: Record<"survived" | "readback" | "aliased", number>;
+  /** Sample of real-prune pairs (predicate blocked, derived would release) for
+   *  characterization: pred + shape/op string. Capped. */
+  realSamples: Array<{ pred: string; info: string }>;
+}
+let d5cost: D5Cost | undefined;
+export function resetD5Cost(): void {
+  d5cost = {
+    candidates: 0,
+    structural: 0,
+    predBlocked: { survived: 0, readback: 0, aliased: 0 },
+    redundantPrune: { survived: 0, readback: 0, aliased: 0 },
+    realPrune: { survived: 0, readback: 0, aliased: 0 },
+    realSamples: [],
+  };
+}
+export function getD5Cost(): D5Cost | undefined {
+  return d5cost;
+}
+/** Executor feeds one seam candidate's classification here (measurement flag
+ *  only). `derivedReleases` = the derived guards (graphHeldAt + crossPlanEdge)
+ *  would ACCEPT the release (i.e. neither declined). */
+export function noteD5Candidate(
+  pred: "survived" | "readback" | "aliased" | null,
+  structural: boolean,
+  derivedReleases: boolean,
+  info: string,
+): void {
+  if (!d5cost) return;
+  d5cost.candidates++;
+  if (structural) d5cost.structural++;
+  if (structural && pred) {
+    d5cost.predBlocked[pred]++;
+    if (derivedReleases) {
+      d5cost.realPrune[pred]++;
+      if (d5cost.realSamples.length < 40)
+        d5cost.realSamples.push({ pred, info });
+    } else {
+      d5cost.redundantPrune[pred]++;
+    }
+  }
+}
+
 export function resetObservedLiveness(): void {
   templates.clear();
   stepStamped = [];
@@ -250,6 +311,13 @@ export function resetObservedLiveness(): void {
   pinnedTemplates = 0;
   prunedPairsRemoved = 0;
   retiredTemplates = 0;
+  capturedRecordSkips = 0;
+}
+
+/** [D5] How many observation-recording calls were skipped on the captured path
+ *  (the reclaimed watcher cost). */
+export function getCapturedRecordSkips(): number {
+  return capturedRecordSkips;
 }
 
 function obs(fp: number): TemplateObs {
@@ -330,6 +398,40 @@ export function noteInPlaceCommit(): void {
 
 // ── Stamp / observe ──────────────────────────────────────────────────────────
 
+/**
+ * [D5 — THE DECLARED-LIFETIME DIVIDEND, step-object phase 7 / ruling 2]
+ * Watcher-cost reclaimed: the observation RECORDING is RETIRED on the captured
+ * path. Inside a declared step-tape replay the whole step's dataflow is DECLARED
+ * — cross-plan liveness DERIVES from `crossPlanEdges(v)` + the declared boundary
+ * survivors, so the per-step observation (stamp enrollment → survival scan →
+ * convergence feed → overlay-release) recovers nothing.
+ *
+ * The D5 stage-1 measurement (`tools/t-d5-watcher-cost.ts`) proved the dividend
+ * is FREE on the captured path: the convergence machinery the predicates gate
+ * NEVER activates under step-tape replay (a warm tape stops executing lowered,
+ * so no template reaches the K_HYSTERESIS stable executed steps convergence
+ * requires — measured convergedTemplates=0 / releasableMB=0 / zero predicate
+ * prunes across distil{ckpt on/off} and gpt2-medium, even over 60 steps / 56
+ * hits). The claim seam (`releasableLastReader`, `prunedHarvest`) is therefore
+ * dormant on the captured path by construction, and the overlay-release
+ * application + the read guards were already suppressed there
+ * (`compiled-plan.ts` / `op-dispatch.ts` `isStepTapeReplayActive()`). Retiring
+ * the recording changes NO decision — it only stops paying the per-replay
+ * bookkeeping (the survival scan's `storageTracker.isDestroyed` per stamped
+ * result, the growing `everSurvived`/`everReadback`/`everAliased`/`needed` sets).
+ *
+ * NOT a global deletion: the UNCAPTURED path keeps the full observation layer.
+ * There the same measurement found `everSurvived` LOAD-BEARING — it carries one
+ * real prune the derived guards (`graphHeldAt` + `crossPlanEdgeHasOtherConsumer`)
+ * miss: the `[1,S,vocab]` CE-logits boundary survivor, a value that survives the
+ * step with NO cross-plan consumer edge (declared-live under capture, but only
+ * observation-visible without a declaration). So the retirement is captured-path
+ * only. Strict-lifetime stays armed as the wrong-derivation detector.
+ */
+function capturedPathRetired(): boolean {
+  return stTapeReplayActive;
+}
+
 /** Stamp a harvested result and enroll it for the survival scan. checkId
  *  follows the view-base chain so an in-place param VIEW is judged by the
  *  persistent buffer owner, not the per-replay view handle (which dies at
@@ -341,6 +443,11 @@ export function stampResult(
   oi: number,
 ): void {
   if (!enabled) return;
+  // [D5] Captured-path retirement: derived, not observed (see above).
+  if (capturedPathRetired()) {
+    capturedRecordSkips++;
+    return;
+  }
   const stamp: ResultStamp = { fp, ni, oi };
   sh.stamp = stamp;
   stepStamped.push({ shId: sh.id, checkId: sh.baseStorageId ?? sh.id, stamp });
@@ -355,6 +462,9 @@ export function observeConsumed(
   consumerFp?: number,
 ): void {
   if (!enabled) return;
+  // [D5] Captured-path retirement: cross-plan consumption is a derived edge
+  // (crossPlanEdges), not an observed one, inside a declared boundary.
+  if (capturedPathRetired()) return;
   const stamp = storage.stamp;
   if (!stamp) return;
   addNeeded(stamp.fp, stamp.ni, stamp.oi, "c");
@@ -376,6 +486,9 @@ export function observeConsumed(
  */
 export function observeReadback(storage: StorageHandle): void {
   if (!enabled) return;
+  // [D5] Captured-path retirement: a captured step's readbacks are the DECLARED
+  // ring outputs (loss / diagnostics) — enumerated by the tape, not observed.
+  if (capturedPathRetired()) return;
   const stamp = storage.stamp;
   if (!stamp) return;
   addNeeded(stamp.fp, stamp.ni, stamp.oi, "r");
@@ -413,6 +526,9 @@ export function readbackMiss(
  *  replay-harvest chokepoint (every alias flows through it). */
 export function noteAliasedBase(stamp: ResultStamp): void {
   if (!enabled) return;
+  // [D5] Captured-path retirement: aliasing is STATICALLY VISIBLE in the
+  // recorded plan sequence inside a declared boundary — derived, not observed.
+  if (capturedPathRetired()) return;
   obs(stamp.fp).everAliased.add(key(stamp.ni, stamp.oi));
 }
 
@@ -802,6 +918,52 @@ export function releasableLastReader(
   return t.lastReader.get(k);
 }
 
+/**
+ * [D5 stage-1: watcher-cost measurement] Diagnose one producer pair's
+ * releasability WITHOUT consulting the three observation predicates
+ * (`everSurvived` / `everReadback` / `everAliased`) — the STRUCTURAL gates only
+ * (converged, !pinned, !revoked, consumed-only source, entry present, K-stable
+ * last reader). Returns:
+ *  - `reader`: the stable last-reader fp if structurally releasable (predicates
+ *    ignored), else undefined.
+ *  - `pred`: which of the three predicates WOULD block this pair (the first that
+ *    fires, in the shipping check order), or null if none block. Only meaningful
+ *    when `reader !== undefined` (a structurally-releasable pair the predicate
+ *    prunes is EXACTLY the watcher-cost quantity: what the predicate prunes that
+ *    the structural derivation wouldn't).
+ *
+ * This is the D5 re-open-condition instrument (`phase2b.md §5`): the divergence
+ * between this predicate-free verdict and `releasableLastReader` is the set the
+ * observation predicates prune; the executor cross-checks each such pair against
+ * the DERIVED guards (`graphHeldAt` + `crossPlanEdgeHasOtherConsumer`) to decide
+ * whether the prune is redundant (derivation covers it → free dividend) or real.
+ * Pure query — no state mutation, no behaviour change.
+ */
+export function diagnoseReleasable(
+  fp: number,
+  ni: number,
+  oi: number,
+): {
+  reader: number | undefined;
+  pred: "survived" | "readback" | "aliased" | null;
+} {
+  const t = templates.get(fp);
+  if (!t || !t.converged || t.pinned) return { reader: undefined, pred: null };
+  const k = key(ni, oi);
+  if (t.releaseRevoked.has(k)) return { reader: undefined, pred: null };
+  if (t.neededSrc.get(k) !== "c") return { reader: undefined, pred: null };
+  const entry = t.resultEntries.get(k);
+  if (!entry) return { reader: undefined, pred: null };
+  if ((t.lastReaderStable.get(k) ?? 0) < K_HYSTERESIS)
+    return { reader: undefined, pred: null };
+  // Structurally releasable. Which predicate (if any) blocks it?
+  let pred: "survived" | "readback" | "aliased" | null = null;
+  if (t.everSurvived.has(k)) pred = "survived";
+  else if (t.everReadback.has(k)) pred = "readback";
+  else if (t.everAliased.has(k)) pred = "aliased";
+  return { reader: t.lastReader.get(k), pred };
+}
+
 /** The registry entry registered for a pair (with the generation it is valid
  *  for) — the claim seam resolves stamps to entries through this. */
 export function resultEntryFor(
@@ -928,6 +1090,40 @@ export function debugReleasableSummary(): Record<
     }
   }
   return out;
+}
+
+/** [D5 stage-1] Aggregate bookkeeping footprint of the three observation
+ *  predicates across all templates — the memory side of the watcher cost. Each
+ *  predicate is a `Set<string>` of "ni:oi" keys; this sums their sizes plus the
+ *  needed-set and last-reader bookkeeping the predicates ride alongside. */
+export function getPredicateMemStats(): {
+  templates: number;
+  everSurvived: number;
+  everReadback: number;
+  everAliased: number;
+  neededPairs: number;
+  lastReaderPairs: number;
+} {
+  let everSurvived = 0;
+  let everReadback = 0;
+  let everAliased = 0;
+  let neededPairs = 0;
+  let lastReaderPairs = 0;
+  for (const t of templates.values()) {
+    everSurvived += t.everSurvived.size;
+    everReadback += t.everReadback.size;
+    everAliased += t.everAliased.size;
+    neededPairs += t.needed.size;
+    lastReaderPairs += t.lastReader.size;
+  }
+  return {
+    templates: templates.size,
+    everSurvived,
+    everReadback,
+    everAliased,
+    neededPairs,
+    lastReaderPairs,
+  };
 }
 
 /** Test/telemetry: per-template observed needed-set (sorted "ni:oi"). */
