@@ -769,6 +769,78 @@ coverage before running. With a VALID tree the two named-gap cells go green and 
 alone. Re-open for #8: cover the batch>1 true-batched reduction + the released-input scatterAdd/CE class,
 or make the mixed-coverage fall-through zero-residue so a lowered consumer can read a generated producer.
 
+**STATUS 2026-07-17 — D4 attempt #8: TARGET A (zero-residue fall-through) RESOLVED — the third-class
+materialization residue is CLOSED BY CONSTRUCTION, coverage-independent; TARGET B (foreach
+lowered-convergence OOM) ROOT-CAUSED as a PRE-EXISTING lowered-path memory bug the charter's assumed
+fix does NOT reach — STOP-and-report; the deletion is NOT landed (the foreach OOM keeps the full green
+matrix out of reach).** Both on the AUTHORITATIVE deleted tree (base `71655ea8` + deletion diff + #7
+coverage + Target A, sivri V100 device 0, serial/whole-node-exclusive).
+
+**TARGET A — the residue was the stage-3 B overlay-release stranding a LOWERED consumer, not a coverage
+gap (measured, not the #7 narrative's guess).** The `distilgpt2-full-finetuning` Memory-Stability twin
+throws `Input not ready: contiguous[32,128]` feeding the embedding-grad scatterAdd. Traced the node's
+full lifecycle: it is a saved-for-backward value (token ids: read by the forward `gather` @action5 and
+the backward `scatterAdd` @action158, in a SEPARATE force's plan). A build-from-IR-compiled plan that
+reads it as an external runs the stage-3 B overlay-release (`compiled-plan.ts:1823`), claims its registry
+entry as boundary-dead and CLEARS `node.result` — sound for a COMPILED consumer (its bind-time guard
+recovers) but the reader here is a LOWERED plan, whose read lands in `getInputStorage` and throws. Both
+claim guards miss it: `graphHeldAt` is FALSE (the retention clone is not minted until backward runs) and
+the witnessed cross-plan-consumer edge is never recorded (the lowered read throws BEFORE `noteWitnessRead`
+can fire — a chicken-and-egg). The recorded build masked this by keeping the value in its harvest;
+`guardMiss` was demoted to a should-never-fire assertion on exactly the "overlay claims are always sound"
+premise the recorded build silently guaranteed. Confirmed: pure-lowered (`COMPILED_PLAN=0`, the semantic
+reference) PASSES the same test — it re-produces the value in a middle plan and protects it — so the bug
+is the compiled overlay-release, not liveness. FIX (`op-dispatch.ts` `getInputStorage`, commit
+`f2256fe2`): when a pending producer's result is missing, RECOMPUTE it from its still-live inputs —
+exactly the value a pure-lowered run materialises — declining async/stateful producers (adamStep/transfer
+are never overlay-claimed, so a miss there stays loud). This is the lowered analog of the compiled
+bind-time recovery: refusal-to-compile is now correct-and-slow, never corrupting. The fall-through
+materialises what pure-lowered would, so the sunset no longer depends on ANY op's coverage — the
+batched-reduction / no-storage / untracked-input ops stay UNCOVERED on purpose and are read correctly.
+Gates: deleted-tree distil-ft **6/6** (was 1 fail — the #7 twin), #7 profiler distil@512 exit 0,
+witness crux scaler-inf **6 producers / threw=false / inputNotReady=0 / shadowEmpty**, checkpoint
+threw=false; NULL on main: distil-ft 6/6, test:gates 6/6, parity-fullstack compiled-vs-lowered worst
+|Δ|=**5.72e-6/30** (recompute never fires — the harvest keeps the value; op-dispatch.ts survives the
+deletion unchanged). `d4-deleted-tree-gate.sh` extended: `op-dispatch.ts` added to COVER_FILES + a
+`recomputeMissingResult` sentinel.
+
+**TARGET B — the foreach lowered-convergence OOM is a PRE-EXISTING pool-churn bug, NOT the unbudgeted
+per-position arena the charter assumed; STOP.** The `t-train-tape-matrix` FOREACH cells (FUSED=0) OOM a
+32 GB V100 by ~step 9 (~3 GB/step); the FUSED cells PASS (their adamStep compiles build-from-IR → tape
+forms, `eligiblePairs=6 tapeCount=1`). The charter's prescribed fix — "reuse arena-reclaim / ARENA_LIVENESS
+at the converged-to-lowered K_w point (`destroyArena`)" — was implemented and measured NULL: the converged
+branch fires (fp=0xfa7c442, 354 resolve buffers) but `destroyArena` is a no-op there because at
+end-of-plan the buffers are still live (`canRecycle=false`), so it only FORGETS them (leak) instead of
+freeing. `TORCHLETTE_DEBUG_BIGALLOC` named the real growth: **10× 328 MB fused-kernel outputs per step**
+(the foreach optimizer's m/v-class buffers) allocated via `resolveOutputBuffer → createTrackedBuffer`
+(the POOL, not the arena) with NO cross-step hint reuse — the in-place m/v migration defeats
+`outputSequenceHints`, so each step allocs fresh and the old ones are not promptly reclaimed. This is
+`buffer-arena.ts`'s own documented "foreach 328 MB m/v leaked +640 MB/step" class, whose prior
+pool-acquire fix was REVERTED for causing slot-aliasing training divergence. Decisive discriminator:
+the OOM reproduces under pure-lowered (`COMPILED_PLAN=0`) AND without checkpointing — so it is a property
+of the lowered REFERENCE path itself, merely MASKED on the clean tree because the recorded build was the
+only compiler that ever cut the foreach plan over to compiled replay (bounding it). The charter's Target-B
+premise ("reuse arena-reclaim machinery, no new mechanism class") is therefore FALSIFIED by measurement:
+the growth is not arena-owned, so no reclaim reaches it; a correct fix needs NEW mechanism (cross-step
+buffer stability for the in-place-migrated foreach m/v, or a fence-safe reclamation of the churned pool
+outputs) — and the CLAUDE.md invariants explicitly forbid the obvious shortcuts (no mid-step pendingRelease
+flush; no pool-acquire into arena positions → both are the corruption class). Per the STOP discipline
+(don't improvise a memory fix that risks the silent-corruption class), Target B is a SEVENTH-class-shaped
+boundary: reported precisely, not force-fixed.
+
+**Re-open condition (attempt #9's charter).** Bound the foreach optimizer's lowered-path memory so
+`t-train-tape-matrix` FOREACH (FUSED=0, ±cosine) runs within the 32 GB budget — either (a) make the
+in-place-migrated m/v buffers reuse across steps (stable `outputSequenceHints`), or (b) fence-safely
+reclaim the churned 328 MB fused outputs — WITHOUT the reverted pool-acquire aliasing or a mid-step
+pendingRelease flush (both are the deterministic-corruption class). Gate (deleted tree, serial): the four
+`t-train-tape-matrix` cells 4/4 (a tape forms AND no OOM). Target A is DONE and independent; the deletion
+stays blocked ONLY on this pre-existing foreach-memory issue, which is a lowered-reference-path bug the
+sunset merely exposes — arguably fixable and landable on `main` FIRST (it reproduces there under
+`COMPILED_PLAN=0`), decoupled from the sunset. META-LESSON (eighth time): the charter's named remediation
+was itself a hypothesis — measurement falsified "reuse destroyArena"; the growth was pool-churn, not
+arena warmup. And the materialization residue (Target A) fell in one seam once traced to the actual
+overlay-release clear rather than chased through the harvest/witness derivation.
+
 ### Phase D5 — The declared-lifetime dividend (LAST; step-object phase 7)
 
 **Goal:** the observation predicates RETIRE on the captured path (they are now queries of

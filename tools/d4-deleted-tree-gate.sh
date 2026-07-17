@@ -50,7 +50,7 @@ HEAD_SHA="$(cd "$REPO" && git rev-parse HEAD)"
 # DELETED recorded-build code (e.g. the STREAM_GENERATE reconciliation in
 # executor.ts) is correctly absent on the deleted tree, so it is NOT layered.
 BASE_SHA="${D4_BASE:-71655ea8}"
-COVER_FILES="src/executor/stream-generate.ts src/executor/compiled-plan.ts"
+COVER_FILES="src/executor/stream-generate.ts src/executor/compiled-plan.ts src/executor/op-dispatch.ts"
 WT="$(mktemp -d)/d4-del"
 
 cleanup() { (cd "$REPO" && git worktree remove --force "$WT" 2>/dev/null) || true; rm -rf "$(dirname "$WT")" 2>/dev/null || true; }
@@ -58,7 +58,16 @@ trap cleanup EXIT
 
 echo "[d4-gate] scratch worktree at native base $BASE_SHA (deletion) + HEAD $HEAD_SHA coverage -> $WT"
 (cd "$REPO" && git worktree add --detach "$WT" "$BASE_SHA" >/dev/null 2>&1)
-ln -sfn "$REPO/node_modules" "$WT/node_modules"
+# Link a COMPLETE node_modules. A linked worktree may carry a partial install
+# (missing .bin/tsdown → `npm run build` exits 127, MISLABELED as a build/cell
+# failure). Prefer $REPO's node_modules only if it has the build binary; else
+# fall back to the main checkout's (which ran the install).
+NM="$REPO/node_modules"
+if [ ! -x "$NM/.bin/tsdown" ]; then
+  MAIN_CO="$(dirname "$(cd "$REPO" && git rev-parse --path-format=absolute --git-common-dir)")"
+  [ -x "$MAIN_CO/node_modules/.bin/tsdown" ] && NM="$MAIN_CO/node_modules"
+fi
+ln -sfn "$NM" "$WT/node_modules"
 # The #7 profiler + distil-ft cells LOAD real model weights (models/) and the
 # distil-ft/token blobs (ckpts/) — untracked, so a fresh worktree lacks them.
 # Without these symlinks the cells fail on model-not-found, which the gate would
@@ -117,12 +126,21 @@ echo "[d4-gate] executor.ts conflict-free after reconcile"
 SENT_REC="$( { grep -rc 'startCompilationRecording' "$WT/src/executor/compiled-plan.ts" "$WT/src/executor/executor.ts" 2>/dev/null || true; } | awk -F: '{s+=$2} END{print s+0}')"
 SENT_ARANGE="$( { grep -c 'case "arange"' "$WT/src/executor/stream-generate.ts" 2>/dev/null || true; } )"
 SENT_ARANGE="${SENT_ARANGE:-0}"
-echo "[d4-gate] tree sentinels: startCompilationRecording=$SENT_REC (want 0, full deletion) arange-coverage=$SENT_ARANGE (want 1)"
+# Target A (D4 #8): the zero-residue recompute-on-read recovery lives in
+# op-dispatch.ts (recomputeMissingResult) — a surviving file the deletion does
+# NOT touch, layered via COVER_FILES. Assert it landed, else the mixed-coverage
+# fall-through is not zero-residue and the #7 distil-ft twin regresses.
+SENT_RECOMPUTE="$( { grep -c 'recomputeMissingResult' "$WT/src/executor/op-dispatch.ts" 2>/dev/null || true; } )"
+SENT_RECOMPUTE="${SENT_RECOMPUTE:-0}"
+echo "[d4-gate] tree sentinels: startCompilationRecording=$SENT_REC (want 0, full deletion) arange-coverage=$SENT_ARANGE (want 1) recompute-on-read=$SENT_RECOMPUTE (want >=1)"
 if [ "$SENT_REC" != "0" ]; then
   echo "[d4-gate] ABORT: recorded build NOT fully deleted (partial apply — the diff's 6-reject base drift); tree is invalid"; exit 2
 fi
 if [ "$SENT_ARANGE" != "1" ]; then
   echo "[d4-gate] ABORT: HEAD coverage did not land (arange generator absent); tree is invalid"; exit 2
+fi
+if [ "${SENT_RECOMPUTE:-0}" -lt 1 ]; then
+  echo "[d4-gate] ABORT: Target A recompute-on-read did not land (op-dispatch coverage absent); tree is invalid"; exit 2
 fi
 
 echo "[d4-gate] build"
