@@ -181,12 +181,17 @@ export class GradScaler {
    */
   async resolveDeferred(): Promise<void> {
     if (this._pendingInfBuffer) {
-      // MISS path (body ran `unscale_` last step): read the flag it set. A
-      // markStep here commits the prior (possibly implied) boundary + submits
-      // the unscale writes, forming the tape during warmup — the same behavior
-      // as before scaler-as-tensor. Hits take the branch below (NO markStep, so
-      // the implied-boundary regime and its fp are undisturbed).
-      await this.api.markStep();
+      // MISS path (body ran `unscale_` last step): read the flag it set. Commit
+      // the prior (possibly implied) boundary + submit the unscale writes so the
+      // readback below is valid. When a boundary is PENDING (the ceremony-free
+      // loop: optimizer.step() queued it), commit it through the gen-scoped
+      // reclamation path — a bare markStep() SUPERSEDES it with an unsnapshotted
+      // cleanup that reclaims nothing, leaking every step's optimizer temporaries
+      // (the foreach m/v-chain buffers) → OOM under a lowered recurring plan.
+      // No pending boundary (explicit-ceremony loops) → markStep() as before.
+      if (!(await this.api.commitStepBoundaryIfPending(true))) {
+        await this.api.markStep();
+      }
       const val = await this._pendingInfBackend?.ops.readAndDestroyInfCount?.(
         this._pendingInfBuffer,
       );

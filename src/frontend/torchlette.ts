@@ -1980,11 +1980,42 @@ export class Torchlette {
    *  — work the next iteration already built lazily is untouched), fence,
    *  and snapshot persistents for the new step. Mirrors the explicit
    *  endStep(); markStep(); beginStep() sequence. */
-  private async _commitPendingStepBoundary(): Promise<void> {
+  private async _commitPendingStepBoundary(
+    finalizeRecorderStep = false,
+  ): Promise<void> {
     if (this._pendingStepBoundary === null) return;
     const gen = this._pendingStepBoundary;
     this._pendingStepBoundary = null;
-    await this._commitStepBoundaryGen(gen);
+    await this._commitStepBoundaryGen(gen, finalizeRecorderStep);
+  }
+
+  /**
+   * Commit a QUEUED implied step boundary through the correct gen-scoped
+   * reclamation path (_commitStepBoundaryGen), if one is pending. Returns true
+   * if it committed, false if there was no pending boundary.
+   *
+   * A ceremony-free training loop's boundary (queued by optimizer.step()) is
+   * normally committed by the next backward() (see line ~1519). A GradScaler
+   * driving the boundary from the step's START (resolveDeferred) previously
+   * called bare markStep(), which SUPERSEDES the queued boundary and runs an
+   * unsnapshotted cleanup: releaseStepTemps then reclaims NOTHING (no snapshot),
+   * so every step's optimizer temporaries — the foreach optimizer's large
+   * packed m/v-chain buffers — accumulate live → OOM under a lowered recurring
+   * plan. Committing the boundary instead runs the SAME gen-scoped reclamation
+   * the pure-implied path uses (proven flat by test/implied-step-boundary), and
+   * its forceAllPending + fence submit the pending writes exactly as markStep
+   * did (so a following inf-flag readback stays valid).
+   *
+   * `finalizeRecorderStep` finalizes the step-tape recorder step (stEndStep +
+   * promote) exactly as markStep does — the caller that REPLACED a markStep
+   * (GradScaler.resolveDeferred) passes true so the recorder still delimits the
+   * step (else stepsObserved collapses to 1 and no tape forms). The default
+   * (false) matches backward()'s implied-boundary commit (stNoteBoundary).
+   */
+  async commitStepBoundaryIfPending(finalizeRecorderStep = false): Promise<boolean> {
+    if (this._pendingStepBoundary === null) return false;
+    await this._commitPendingStepBoundary(finalizeRecorderStep);
+    return true;
   }
 
   /** Commit a GEN-SCOPED step boundary for the closing generation `gen`: force
