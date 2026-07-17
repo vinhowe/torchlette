@@ -50,7 +50,12 @@ HEAD_SHA="$(cd "$REPO" && git rev-parse HEAD)"
 # DELETED recorded-build code (e.g. the STREAM_GENERATE reconciliation in
 # executor.ts) is correctly absent on the deleted tree, so it is NOT layered.
 BASE_SHA="${D4_BASE:-71655ea8}"
-COVER_FILES="src/executor/stream-generate.ts src/executor/compiled-plan.ts src/executor/op-dispatch.ts"
+# Surviving (non-recorded-build) files whose HEAD version the deleted tree needs.
+# The frontend/optim pair carries the D4 #9 foreach-OOM fix (GradScaler commits
+# the pending implied boundary instead of superseding it); the deletion diff does
+# NOT touch them (verified) and they import no deleted recorded-build symbol, so a
+# plain HEAD-diff apply reconstructs their HEAD version cleanly.
+COVER_FILES="src/executor/stream-generate.ts src/executor/compiled-plan.ts src/executor/op-dispatch.ts src/frontend/torchlette.ts src/optim/grad-scaler.ts"
 WT="$(mktemp -d)/d4-del"
 
 cleanup() { (cd "$REPO" && git worktree remove --force "$WT" 2>/dev/null) || true; rm -rf "$(dirname "$WT")" 2>/dev/null || true; }
@@ -132,7 +137,14 @@ SENT_ARANGE="${SENT_ARANGE:-0}"
 # fall-through is not zero-residue and the #7 distil-ft twin regresses.
 SENT_RECOMPUTE="$( { grep -c 'recomputeMissingResult' "$WT/src/executor/op-dispatch.ts" 2>/dev/null || true; } )"
 SENT_RECOMPUTE="${SENT_RECOMPUTE:-0}"
-echo "[d4-gate] tree sentinels: startCompilationRecording=$SENT_REC (want 0, full deletion) arange-coverage=$SENT_ARANGE (want 1) recompute-on-read=$SENT_RECOMPUTE (want >=1)"
+# D4 #9 foreach-OOM fix sentinel: GradScaler must commit the pending boundary
+# (commitStepBoundaryIfPending), else the foreach cells below OOM the deleted tree.
+SENT_FOREACH_FIX="$( { grep -c 'commitStepBoundaryIfPending' "$WT/src/optim/grad-scaler.ts" 2>/dev/null || true; } )"
+SENT_FOREACH_FIX="${SENT_FOREACH_FIX:-0}"
+echo "[d4-gate] tree sentinels: startCompilationRecording=$SENT_REC (want 0, full deletion) arange-coverage=$SENT_ARANGE (want 1) recompute-on-read=$SENT_RECOMPUTE (want >=1) foreach-oom-fix=$SENT_FOREACH_FIX (want >=1)"
+if [ "${SENT_FOREACH_FIX:-0}" -lt 1 ]; then
+  echo "[d4-gate] ABORT: D4 #9 foreach-OOM fix did not land (grad-scaler coverage absent); tree is invalid"; exit 2
+fi
 if [ "$SENT_REC" != "0" ]; then
   echo "[d4-gate] ABORT: recorded build NOT fully deleted (partial apply — the diff's 6-reject base drift); tree is invalid"; exit 2
 fi
@@ -220,4 +232,63 @@ echo "[d4-gate] #7 distil-ft single-file (the in-suite Memory-Stability twin)"
 if [ "$FAIL7" -ne 0 ]; then
   echo "[d4-gate] FAIL — the #7 compilation-coverage cells are red (the sixth class stands)"; exit 1
 fi
-echo "[d4-gate] PASS — witnessing crux AND #7 compilation-coverage cells green"
+
+# --- attempt #9 cells (the SEVENTH class: FOREACH-ADAM lowered-path OOM) -------
+# The re-open condition (§D4 attempt-#8 STATUS "Re-open condition"): bound the
+# foreach optimizer's lowered-path memory so t-train-tape-matrix FOREACH
+# (FUSED=0, ±cosine) runs within the 32 GB budget — a tape forms AND no OOM.
+#
+# STATUS (attempt #9): the OOM half is FIXED (grad-scaler commits the pending
+# implied boundary; commit fd1f1c7c). On the deleted tree BOTH foreach cells now
+# report OOM=no / stepsObserved=18 — they run to completion within budget. They
+# remain RED only on "a tape forms": eligiblePairs=0 / loweredPairs=6, because
+# build-from-IR does not compile the foreach ELEMENTWISE optimizer plan (it runs
+# lowered forever). That residual is the SAME #7-class WITNESSING!=COMPILATION
+# coverage gap the fused cell escapes (its adamStep compiles build-from-IR) —
+# now exposed for foreach once the OOM stopped masking it. So the sunset's
+# foreach blocker has SHIFTED from memory (#9, resolved) to compilation coverage.
+# Failing-first before the #9 fix: these cells OOM'd a 32 GB V100 by ~step 9
+# (~3.9 GB/step) because a ceremony-free loop drives its boundary through bare
+# markStep (GradScaler.resolveDeferred), which supersedes the queued implied
+# boundary WITHOUT taking the survivor snapshot the implied-commit path takes —
+# so releaseStepTemps has no snapshot (returns 0) and every step's optimizer
+# temporaries (the packed 328 MB m/v-chain buffers) accumulate LIVE. The #9 fix
+# (frontend markStep: snapshot when superseding a pending boundary) reclaims them
+# per step. t-train-tape-matrix's PASS is `refusals==0 && eligiblePairs>0`
+# (exit 0), so a bare exit-0 check covers BOTH "a tape forms" AND "no OOM" (an
+# OOM crashes → exit 1). Run whole-node exclusive (device-chain contention
+# fabricates failures).
+FAIL9=0
+for CELL in "0 0 foreach+no-sched" "0 1 foreach+cosine"; do
+  set -- $CELL
+  gpu_settle
+  echo "[d4-gate] #9 tape ($3 — a tape must form AND no OOM)"
+  # Surface WHY: the JSON summary (eligiblePairs/stepsObserved) distinguishes an
+  # OOM (crash, no JSON, OOM=YES) from a build-from-IR compilation-coverage gap
+  # (JSON present, eligiblePairs=0 — the #7 class, NOT the #9 memory bug). set +e
+  # around the run so CELL_RC captures the real exit code without aborting the gate.
+  set +e
+  CELL_OUT="$(cd "$WT" && XDG_RUNTIME_DIR="$XDG" VULKAN_DEVICE_INDEX="$DEVICE" LD_LIBRARY_PATH=tools/vk-shim \
+    TORCHLETTE_STEP_TAPE=record FUSED=$1 SCHED=$2 npx tsx tools/t-train-tape-matrix.ts 2>&1)"
+  CELL_RC=$?
+  CELL_JSON="$(printf '%s' "$CELL_OUT" | grep -oE '"stepsObserved": [0-9]+|"eligiblePairs": [0-9]+|"loweredPairs": [0-9]+' | tr '\n' ' ')"
+  CELL_OOM=no; printf '%s' "$CELL_OUT" | grep -qi 'memory limit exceeded' && CELL_OOM=YES
+  set -e
+  echo "    ${CELL_JSON}OOM=${CELL_OOM}"
+  if [ "$CELL_RC" -eq 0 ]; then
+    echo "  PASS"
+  elif [ "$CELL_OOM" = "YES" ]; then
+    echo "  FAIL (foreach OOMs — the #9 memory bug stands)"; FAIL9=1
+  else
+    # OOM=no: the #9 memory bug is FIXED (runs within budget); the cell is red
+    # ONLY because no tape forms (eligiblePairs=0, loweredPairs>0) — build-from-IR
+    # does not compile the foreach ELEMENTWISE optimizer plan, so it runs lowered
+    # forever. That is the #7-class WITNESSING!=COMPILATION coverage gap now
+    # exposed for foreach, NOT the memory bug this gate cell was opened for.
+    echo "  FAIL (no eligible tape — #9 OOM is FIXED; residual is foreach build-from-IR coverage, a #7-class gap)"; FAIL9=1
+  fi
+done
+if [ "$FAIL9" -ne 0 ]; then
+  echo "[d4-gate] FAIL — the #9 foreach-adam lowered-path cells are red (OOM or no tape)"; exit 1
+fi
+echo "[d4-gate] PASS — witnessing crux AND #7 compilation-coverage AND #9 foreach-adam cells green"
