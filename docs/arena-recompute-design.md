@@ -436,8 +436,10 @@ recompute-fed reads. "Witnessed lowered read" does **NOT** imply "recompute-fed 
 dead-after-producer." For this config, NO witnessed pair is recompute-fed: attention
 is saved by design, and the MLP recompute never becomes a witnessed producer.
 
-**The deterministic STOP repro** (`tools/t-r2-split-stop-repro.ts`,
-`TORCHLETTE_R2_SPLIT_PROBE=1`): running the EXACT mandated mechanism — source the
+**The deterministic STOP repro** (removed 2026-07-17 — the repro tool
+`tools/t-r2-split-stop-repro.ts` and its `TORCHLETTE_R2_SPLIT_PROBE=1` gate are
+DELETED now the finding is documented; git history holds the runnable repro):
+running the EXACT mandated mechanism — source the
 recompute boundary from the LIVE witness (`getWitnessedHarvest`) and SPLIT it by
 demoting the witnessed RESULT slots to packable temps — demotes 76–77 slots and
 immediately raises WebGPU uncaptured errors ("usage includes writable usage and
@@ -477,8 +479,10 @@ target on this config.
   firing source (the R1 finding's requested fix). NULL-CLEAN: metadata only, no
   planning-decision change with the probe off; the default path is byte-identical
   to pre-R2 (registry 2833.8 MB, current 4584.7 MB — verified).
-- The SPLIT (stage b) does NOT land. It is gated behind `TORCHLETTE_R2_SPLIT_PROBE`
-  purely as the committed deterministic STOP repro; the default is unchanged.
+- The SPLIT (stage b) does NOT land. It was gated behind `TORCHLETTE_R2_SPLIT_PROBE`
+  purely as the committed deterministic STOP repro; that flag + probe block + repro
+  tool were DELETED 2026-07-17 (the STOP finding above stays; re-land from history
+  with D2b' when a sound target exists). The default was always unchanged.
 - The oracles stay FAILING-FIRST (they document the pin that the mandated mechanism
   cannot soundly collapse). R3 (bypass deletion) is BLOCKED on R2 and does not land.
 

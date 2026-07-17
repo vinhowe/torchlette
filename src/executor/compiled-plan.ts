@@ -462,18 +462,10 @@ function finalizeCompiledPlan(
   nodeResults: NodeResult[],
   externalReleases?: Array<{ slot: number; entryIdx: number }>,
   /** [task #99 R1] Declared checkpoint-boundary plan-node indices. Stamps
-   *  _recomputeSegments (visible DATA on the plan). Under the R2 split probe it
-   *  also drives which RESULT slots demote to packable temps. */
+   *  _recomputeSegments (visible DATA on the plan). */
   recomputeBoundaryIndices?: Set<number>,
-  /** [task #99 R2 PROBE] The witnessed recompute pairs (ni:oi). Under
-   *  TORCHLETTE_R2_SPLIT_PROBE=1 the matching RESULT slots are DEMOTED to temps
-   *  (the mandated witness-sourced liveness split) — the deterministic repro of
-   *  the STOP: for selective checkpointing these are GENUINE saved-for-backward
-   *  activations, so demoting them is a UAF the [lifetime] guard catches. */
-  witnessedRecomputePairs?: Set<string>,
 ): CompiledPlan {
   const usePlanner = compiledPlannedEnabled();
-  const r2SplitProbe = ENV.TORCHLETTE_R2_SPLIT_PROBE === "1";
 
   if (ENV.TORCHLETTE_DEBUG_COMPILED) {
     const dispatchCount = commands.filter((c) => c.tag === TAG_DISPATCH).length;
@@ -497,28 +489,6 @@ function finalizeCompiledPlan(
   let claimedEntries: number[] | undefined;
   if (usePlanner) {
     const resultSlots = new Set<number>(nodeResults.map((r) => r.slot));
-    // [task #99 R2 PROBE] The mandated witness-sourced liveness split: a
-    // node result whose (ni:oi) is a witnessed recompute pair is DEMOTED from a
-    // whole-step RESULT to a packable temp (the design's "split the RESULT
-    // interval at the recompute boundary"). Under selective checkpointing this
-    // is UNSOUND — the witnessed pairs are genuine saved-for-backward
-    // activations (backward binds them directly, not a recompute copy), so the
-    // demotion strands the backward read → the [lifetime] guard throws. This is
-    // the deterministic STOP repro (docs/arena-recompute-design.md R2 finding).
-    if (r2SplitProbe && witnessedRecomputePairs) {
-      let demoted = 0;
-      for (const r of nodeResults) {
-        if (witnessedRecomputePairs.has(`${r.nodeIndex}:${r.outputIndex}`)) {
-          resultSlots.delete(r.slot);
-          demoted++;
-        }
-      }
-      if (demoted > 0) {
-        console.error(
-          `[recompute-segment R2-PROBE] demoted ${demoted} witnessed RESULT slot(s) to temp (liveness split)`,
-        );
-      }
-    }
     const memPlan = planMemory(
       commands,
       plannerRegistry,
