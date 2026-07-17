@@ -841,6 +841,65 @@ was itself a hypothesis — measurement falsified "reuse destroyArena"; the grow
 arena warmup. And the materialization residue (Target A) fell in one seam once traced to the actual
 overlay-release clear rather than chased through the harvest/witness derivation.
 
+**STATUS 2026-07-17 — D4 attempt #9: the foreach-OOM half is FIXED (18/18 steps, OOM=no) so the blocker
+SHIFTED to compilation coverage as the #8 note predicted; the Stage-1 census closed ONE of three labels
+the established way; the residual TWO require a NINTH-class chunked-elementwise stream generator — STOP,
+deletion uncommitted.** The Stage-1 census (`TORCHLETTE_STEP_TAPE=record TORCHLETTE_STREAM_GENERATE=1
+FUSED=0 SCHED=0 t-train-tape-matrix`, sivri VULKAN 0, serial) named the foreach optimizer plan's
+uncovered map EXACTLY — **`op:where×2`, `op:cat×2`, `fused[oversized]×8`** — and each was assessed
+against the established closure shapes:
+
+- **`op:where` (ternary select) — CLOSED, established shape (differential-clean).** The generateSequential
+  input-resolution loop is already arity-generic; `where` only bailed at the unary/binary classification.
+  A `planWhereDirect` (mirroring `whereDirect`: whereWGSL key + `params(size, ...offsets)`, dispatchX=
+  ceil(size/WG), dispatchY=1 — single-source at the seam, like `planBinaryDirect`) plus a 3-input branch
+  covers it; a narrow-fed input (varying offset, no volatile repack) stays uncovered. Result: the foreach
+  census drops `op:where` (covered 679→681 actions, **0 diverged**), `t-stream-generate` **0 diverges**,
+  `test:gates` **6/6**. This is the CLAUDE.md ternary-op target #2 for the stream-gen path. LANDED
+  standalone (does not unblock #9 on its own; the residual two labels still strand the plan lowered).
+- **`op:cat` (foreach grad/param packing) — coverable in ISOLATION but INTERDEPENDENT.** A `generateCat`
+  mirroring the backend `cat` byte-for-byte (resolveOutput ALLOC + one TAG_COPY per input slice) makes
+  the cat segments themselves verify, BUT covering cat WHILE the oversized fused middle stays phantom
+  produces **77 `stridedScatterCopy` "copy slot bijection" divergences**: the packed buffer flows
+  cat → oversized-fused (IN-PLACE, same buffer) → scatter-back, and a REAL cat output slot beside a
+  PHANTOM in-place fused output slot breaks the buffer-identity chain the phantom mechanism kept
+  consistent when BOTH were phantom. cat cannot land without the oversized coverage. REVERTED.
+- **`fused[oversized]` — the NINTH CLASS: a chunked-elementwise stream generator (new architecture).**
+  Measured directly (`TORCHLETTE_DBG_OVERSIZED`): the foreach packed buffer is **320 MB** (distilgpt2's
+  ~82 M-param group, f32), and every oversized fused group decomposes to **312 MB elementwise nodes**
+  (`add`/`div`/`sub`/`mul`/`sqrt`/`neg`). The executor's oversized fallback is `executeSequentialSegment`
+  → `executeNode` per node → `dispatchBinary`/`dispatchUnary`, which at >128 MB take the **CHUNKED** path
+  (`binaryChunked` / `dispatchChunked`, sub-range storage bindings per chunk). `planBinaryDirect`/
+  `planUnaryDirect` BAIL at >128 MB by construction, so `generateSequential` cannot cover the decomposition.
+  There is **no chunked-elementwise stream generator** — the ONLY chunked generator is `generateFullReduction`
+  (chunked *sum*, a reduction with accumulate semantics, `planChunkedFullReduction`); chunked elementwise has
+  a distinct command shape (per-chunk sub-range bindings + broadcast-scalar handling + per-chunk params) and
+  NO plan-extraction counterpart. Building `planChunkedBinary`/`planChunkedUnary` + threading the multi-node
+  in-place group decomposition is a net-new generation SUBSYSTEM — not a CONTIGUOUS_OPERANDS declaration, not
+  a copy-prologue, not an all-dims fall-through, not a constFill, not a bespoke single-op generator. It is the
+  ninth never-before-exercised class, so per the STOP discipline the deletion stays uncommitted.
+
+**Assumption cross-check.** The finiteness assumptions (§6.2) are UNTOUCHED — this is the same OUTSIDE-the-
+frame structural claim the sixth class exposed (compilation coverage is load-bearing, not a pure
+optimization), now hitting the foreach optimizer's oversized-packed decomposition. The `where` closure and
+the empirical census confirm the two smaller labels are established-shape / interdependent; only the
+chunked-elementwise coverage is new architecture.
+
+**Re-open condition (attempt #10's charter).** Cover the oversized foreach optimizer decomposition WITHOUT
+new corruption-class risk — either (a) a chunked-elementwise stream generator (`planChunkedBinary`/
+`planChunkedUnary` mirroring `binaryChunked`/`dispatchChunked`'s per-chunk sub-range bindings, following the
+`planChunkedFullReduction` precedent for the reduction case), which also unblocks the interdependent `cat`
+(both land together so the packed-buffer identity chain is consistent); or (b) bound the foreach packing so
+no group's packed buffer exceeds 128 MB (an optimizer-level packing change that keeps every elementwise op
+on the direct path — NOT a stream-generate change, and it alters the packing semantics, so gate it against
+the foreach numerical/memory baselines first). Gate (deleted tree, whole-node exclusive, serial): the four
+`t-train-tape-matrix` cells 4/4 (`eligiblePairs>0`, `tapeCount=1`, no OOM) AND `t-stream-generate` 0
+diverged AND the foreach census fully covered (`fused[oversized]`/`op:cat` gone). META-LESSON (ninth time):
+the OOM fix worked and the memory blocker dissolved exactly as #8 predicted — but the coverage residual it
+UNMASKED is not established-shape; the foreach optimizer's >128 MB packed buffers make its whole elementwise
+update a chunked-dispatch class the generate-from-IR subsystem has never had to cover (the fused path escapes
+it via the single `adamStep` kernel, which is neither chunked nor decomposed).
+
 ### Phase D5 — The declared-lifetime dividend (LAST; step-object phase 7)
 
 **Goal:** the observation predicates RETIRE on the captured path (they are now queries of
