@@ -955,6 +955,71 @@ srcSLOC 65327→65890):
   `dispatch.ts tile-dispatch.ts segment-executors.ts` (and the executor donation-write must survive the deletion
   reconciliation) for the deleted tree to build + reproduce the donation coverage.
 
+**STATUS 2026-07-17 — D4 attempt #11 (THE LANDING PASS): STOPPED. The reconciliation LANDED and is
+verified; the deletion is UNCOMMITTED. A real regression class surfaced on the FIRST-EVER measurement of
+the #9/#10 re-open gate ON THE DELETED TREE — attempt #10's "foreach fully covered / 4/4 / `t-stream-generate`
+0 diverged" was measured on HEAD (`7c3f319e`) WITH THE RECORDED BUILD STILL PRESENT and attributed to
+build-from-IR; on the deleted tree the recorded build turns out to be the sole compilation source for the
+foreach elementwise optimizer plan.**
+
+- **Stage 1 (reconciliation) — DONE + verified.** 3-way merge of `.claude/D4-deletion-attempt5-STOPPED.diff`
+  (native base `71655ea8`) against HEAD `7c3f319e`; only `tile-dispatch.ts` + `executor.ts` truly conflicted.
+  Resolutions: (a) `tile-dispatch.ts` chunked loop — keep attempt #10's derived `geom.chunks` seam, drop the
+  deletion-target `chunkRepack`/volatile machinery; (b) `executor.ts` — drop the 4 recording imports + `TAG_DISPATCH`
+  (sole use was in the deleted `compilationRecording` finally block), keep `crossPlanEdgeHasOtherConsumer` (live at
+  the overlay-decline seam ~L2256), drop `crossPlanEdgeKeepSet` (dead), and RESTORE `currentVariantSelection` which
+  the 3-way cleanly removed but which attempt #10 made load-bearing in surviving donation code (~L2259) — the
+  recorded-build call-site semantics were the reference. The executor DONATION-WRITE (`donationSink →
+  action.cachedDonatedRecipeIdx`) SURVIVES. Reconciled diff saved to `.claude/harvest-deletion-final.diff` (applies
+  cleanly to `7c3f319e`). `npm run build` green; `tsc --noEmit` ZERO net-new errors (net −3: three pre-existing
+  unused-symbol errors resolved). Weight-norm: srcSLOC 66381→65559 (**−822**), docLOC −350, **envFlags 69→65**
+  (`TORCHLETTE_BUILD_FROM_IR` [the named opt-out dies], `TORCHLETTE_COMPILED_MAX_NODES`,
+  `TORCHLETTE_COMPILED_ONLY_NODES`, `TORCHLETTE_DEBUG_PERSISTENT`). `d4-deleted-tree-gate.sh` reworked to build the
+  deleted tree as `PREDELETION_SHA(7c3f319e) + harvest-deletion-final.diff` (the header's ORIGINAL "apply at HEAD"
+  intent) — the base+layer contraption was fatally base-drifted: HEAD's `stream-generate.ts` imports `planWhereDirect`
+  from `ops/where.ts`, an export attempts #7–#10 added to a NON-covered file, which broke the throwaway build; and
+  `tile-dispatch.ts`'s HEAD seam OVERLAPS the deletion so plain-layer `git apply` cannot apply it.
+
+- **Load-bearing correctness on the DELETED tree — ALL GREEN.** `test:gates` **5/5** (the stream-gen-vs-recording
+  gate is correctly RETIRED with the recorded build; the "build twice → identical" determinism gate is its sufficient
+  successor — it passed); `parity-fullstack-tl` compiled-vs-lowered **6.68e-6 / 30 both directions**; full suite (CPU
+  **1426 passed**; webgpu **860 passed** + 89 CONTENTION-FABRICATED failures that ALL pass in isolation on an idle
+  device — 7 files / 89 tests re-run green); witness matrix **5/5** (`scaler-inf` 6 producers threw=false,
+  `checkpoint`/`medium`/`chunked124m`/`lr-milestone` all exit 0); `t-step-object-null`, `t-step-edit-null`,
+  `t-train-capture-probe`, `t-planner-pin-attribution` (arena/free/--assert), `t-ledger-attack-probe` (24 + 48) all
+  exit 0. The recorded build's deletion does NOT break correctness anywhere measured.
+
+- **THE STOP — recorded-build-only compilation coverage of the foreach elementwise optimizer plan.** Differential,
+  clean/isolated devices, deterministic (reproduced by the d4 gate's independent tree construction AND a direct
+  working-tree run):
+
+  | check | MAIN `7c3f319e` (recorded build present) | DELETED tree (build-from-IR only) |
+  |---|---|---|
+  | `t-train-tape-matrix` fused+nosched / fused+cosine | eligiblePairs=6 / 6 PASS | 6 / 6 PASS |
+  | `t-train-tape-matrix` foreach+nosched / foreach+cosine | eligiblePairs=4 / 4 PASS | **0 / 0, loweredPairs=6 FAIL** |
+  | `t-ring-probe` (capture/ring engagement) | hits>0, PASS | **hits=0, K1/K2/K3 FAIL** |
+  | `t-stream-generate` | hook-fires=5, 3100 cmds, 0 diverged PASS | **hook-fires=0 FAIL** |
+
+  The FUSED Adam path (the DEFAULT optimizer) IS covered by build-from-IR and keeps its tape. The FOREACH (elementwise,
+  non-fused) optimizer plan is covered ONLY by the recorded build; build-from-IR does not compile it, so on the deleted
+  tree it runs LOWERED forever. This is numerically CORRECT (ring losses byte-identical across serial/ringNow/K1/K2/K3,
+  `maxΔ=0.00e+0`; foreach loweredPairs run 18/18 steps, OOM=no) — a coverage/capability regression ("correct-and-slow"),
+  not a correctness bug. But it fails the EXPLICIT Stage-2 requirement "`t-train-tape-matrix` 4/4 (foreach: tapes form)"
+  and the `d4-deleted-tree-gate.sh` #9 cells. `t-stream-generate`'s failure is EXPECTED — it tests the deleted
+  `STREAM_GENERATE` verify apparatus and is now obsolete (successor = `test:gates` determinism gate); it should retire
+  with the apparatus.
+
+- **Root of the misattribution (the campaign's own recurring lesson).** Attempt #10's re-open-gate greens were measured
+  on the tree WITH the recorded build; they never ran on the deleted tree ("the deletion is NOT yet landed… Stages 2–3
+  pending"). Component isolation cannot exonerate the deleted tree — the recorded build was silently supplying the
+  foreach optimizer plan's compilation the whole time. build-from-IR foreach optimizer coverage is NOT actually landed.
+
+- **Re-open condition (attempt #12).** Make build-from-IR COMPILE the foreach elementwise optimizer plan on the DELETED
+  tree so `t-train-tape-matrix` foreach+nosched/foreach+cosine reach `eligiblePairs>0` and `t-ring-probe` re-engages
+  (hits>0) WITHOUT the recorded build — then re-run the full authoritative matrix on the deleted tree and land. Retire
+  `t-stream-generate` (obsolete apparatus). The reconciliation + gate rework of this pass are preserved
+  (`.claude/harvest-deletion-final.diff`, the reworked `d4-deleted-tree-gate.sh`) and need no redo.
+
 ### Phase D5 — The declared-lifetime dividend (LAST; step-object phase 7)
 
 **Goal:** the observation predicates RETIRE on the captured path (they are now queries of

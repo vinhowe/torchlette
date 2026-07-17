@@ -37,32 +37,39 @@ if [ ! -f "$DIFF" ]; then
   DIFF="$MAIN_CO/.claude/D4-deletion-attempt5-STOPPED.diff"
 fi
 if [ ! -f "$DIFF" ]; then echo "[d4-gate] FAIL: deletion diff not found at $DIFF"; exit 1; fi
+# The RECONCILED deletion (attempt #11): the STOPPED diff's native base is
+# 71655ea8; attempt #10 landed the derived-chunking seam in tile-dispatch.ts,
+# whose region the deletion ALSO edits — so HEAD-coverage plain-layering fails
+# on that one file. The reconciled diff (applies to HEAD, build+tsc verified)
+# carries the hand-resolved tile-dispatch.ts; the gate layers it per-file below.
+FINAL="$REPO/.claude/harvest-deletion-final.diff"
+if [ ! -f "$FINAL" ]; then
+  MAIN_CO="$(dirname "$(cd "$REPO" && git rev-parse --path-format=absolute --git-common-dir)")"
+  FINAL="$MAIN_CO/.claude/harvest-deletion-final.diff"
+fi
+if [ ! -f "$FINAL" ]; then echo "[d4-gate] FAIL: reconciled diff not found at $FINAL"; exit 1; fi
 DEVICE="${DEVICE:-0}"
 XDG="${XDG_RUNTIME_DIR:-/run/user/0}"
 HEAD_SHA="$(cd "$REPO" && git rev-parse HEAD)"
-# The deletion diff has a NATIVE BASE (the campaign commit where the recorded
-# build is intact and the diff applies with only the two import conflicts below).
-# Applying it to a HEAD that moved PAST that base makes some hunks silently
-# fail -> a PARTIAL deletion (recorded build half-present), which corrupts the
-# cells wholesale. So we build the deleted tree AT THE NATIVE BASE and then LAYER
-# HEAD's coverage for the SURVIVING (non-recorded-build) executor files — the
-# generator + replay slot machinery build-from-IR keeps. Coverage that lands in
-# DELETED recorded-build code (e.g. the STREAM_GENERATE reconciliation in
-# executor.ts) is correctly absent on the deleted tree, so it is NOT layered.
-BASE_SHA="${D4_BASE:-71655ea8}"
-# Surviving (non-recorded-build) files whose HEAD version the deleted tree needs.
-# The frontend/optim pair carries the D4 #9 foreach-OOM fix (GradScaler commits
-# the pending implied boundary instead of superseding it); the deletion diff does
-# NOT touch them (verified) and they import no deleted recorded-build symbol, so a
-# plain HEAD-diff apply reconstructs their HEAD version cleanly.
-COVER_FILES="src/executor/stream-generate.ts src/executor/compiled-plan.ts src/executor/op-dispatch.ts src/frontend/torchlette.ts src/optim/grad-scaler.ts"
+# Attempt #11: the deletion is now RECONCILED — harvest-deletion-final.diff
+# applies cleanly to the pre-deletion HEAD (7c3f319e) and yields the exact
+# hand-resolved deleted tree (build + tsc-zero-net-new verified). This restores
+# the gate header's ORIGINAL intent ("apply the deletion diff in a throwaway
+# worktree at HEAD") which the base+layer contraption replaced only because the
+# STOPPED diff did not apply at a moved HEAD. Base-drift (native base 71655ea8
+# = attempt #6) made the layer approach fragile: every export attempts #7-#10
+# added to a NON-covered file (e.g. planWhereDirect in ops/where.ts, consumed by
+# stream-generate.ts) broke the throwaway build. HEAD + reconciled diff has no
+# drift. Pin the pre-deletion commit so the gate stays reproducible after Stage-3
+# commits the deletion (then HEAD moves and this gate retires — see docs §D4).
+PREDELETION_SHA="${D4_PREDELETION:-7c3f319e}"
 WT="$(mktemp -d)/d4-del"
 
 cleanup() { (cd "$REPO" && git worktree remove --force "$WT" 2>/dev/null) || true; rm -rf "$(dirname "$WT")" 2>/dev/null || true; }
 trap cleanup EXIT
 
-echo "[d4-gate] scratch worktree at native base $BASE_SHA (deletion) + HEAD $HEAD_SHA coverage -> $WT"
-(cd "$REPO" && git worktree add --detach "$WT" "$BASE_SHA" >/dev/null 2>&1)
+echo "[d4-gate] scratch worktree at pre-deletion $PREDELETION_SHA + reconciled deletion diff -> $WT"
+(cd "$REPO" && git worktree add --detach "$WT" "$PREDELETION_SHA" >/dev/null 2>&1)
 # Link a COMPLETE node_modules. A linked worktree may carry a partial install
 # (missing .bin/tsdown → `npm run build` exits 127, MISLABELED as a build/cell
 # failure). Prefer $REPO's node_modules only if it has the build binary; else
@@ -82,48 +89,9 @@ for d in models ckpts; do
   [ -e "$WT/$d" ] || { MAIN_CO="$(dirname "$(cd "$REPO" && git rev-parse --path-format=absolute --git-common-dir)")"; [ -e "$MAIN_CO/$d" ] && ln -sfn "$MAIN_CO/$d" "$WT/$d"; }
 done
 
-echo "[d4-gate] applying the deletion diff (3-way) + the recorded import reconciliations"
-(cd "$WT" && git apply --3way "$DIFF" 2>/dev/null) || true
-echo "[d4-gate] layering HEAD coverage for surviving executor files: $COVER_FILES"
-if [ "$BASE_SHA" != "$HEAD_SHA" ]; then
-  # PLAIN git apply (NOT --3way): the coverage lands in regions the deletion did
-  # not touch, so plain apply succeeds; --3way would re-introduce the deleted
-  # recorded-build CONTEXT lines around each hunk (partial un-deletion → the tree
-  # corrupts into recorded-build-half-present, which flips the cells wholesale).
-  (cd "$REPO" && git diff "$BASE_SHA" "$HEAD_SHA" -- $COVER_FILES) \
-    | (cd "$WT" && git apply)
-fi
-# Resolve the two import conflicts the deletion introduces vs the mechanism.
-python3 - "$WT/src/executor/executor.ts" <<'PY'
-import sys, re
-f = sys.argv[1]; s = open(f).read()
-# 1) collapse any conflict block around the cross-plan-edges import to the one
-#    symbol the mechanism still needs on the deleted tree.
-s = re.sub(
-    r"<<<<<<< ours\nimport \{[^}]*\} from \"\.\./core/cross-plan-edges\";\n=======\n>>>>>>> theirs\n",
-    'import { crossPlanEdgeHasOtherConsumer } from "../core/cross-plan-edges";\n',
-    s)
-# 2) the deletion drops currentVariantSelection from the step-variant import; the
-#    overlay-release consultation re-needs it.
-if "currentVariantSelection" not in s.split("../core/step-variant")[0].rsplit("import",1)[-1]:
-    s = s.replace(
-        'import { variantToken } from "../core/step-variant";',
-        'import { currentVariantSelection, variantToken } from "../core/step-variant";')
-# 3) any OTHER conflict left after (1) is a HEAD change that landed inside deleted
-#    recorded-build code (e.g. the D4-#7 STREAM_GENERATE count/params reconciliation
-#    + its TAG_DISPATCH import): resolve it by taking THEIRS (the deletion side —
-#    the enclosing recorded-build code is gone, so the HEAD change goes with it).
-#    Keeps the gate reproducible when HEAD moved past the diff's native base.
-s = re.sub(r"<<<<<<< ours\n.*?=======\n(.*?)>>>>>>> theirs\n",
-           lambda m: m.group(1), s, flags=re.S)
-open(f, "w").write(s)
-PY
-if grep -q "<<<<<<< ours" "$WT/src/executor/executor.ts"; then
-  echo "[d4-gate] FAIL: unresolved conflict markers remain ($(grep -c '<<<<<<< ours' "$WT/src/executor/executor.ts") in executor.ts):"
-  grep -n "<<<<<<< ours" "$WT/src/executor/executor.ts" | head
-  exit 1
-fi
-echo "[d4-gate] executor.ts conflict-free after reconcile"
+echo "[d4-gate] applying the reconciled deletion diff"
+(cd "$WT" && git apply "$FINAL") || { echo "[d4-gate] FAIL: reconciled diff did not apply to $PREDELETION_SHA (HEAD may already carry the deletion — this gate is pre-commit only)"; exit 1; }
+echo "[d4-gate] reconciled deletion applied cleanly"
 
 # Self-validate the tree: the deletion must be FULL (recorded-build symbols gone)
 # and HEAD coverage must have landed. A PARTIAL deletion (git apply leaving
@@ -131,6 +99,12 @@ echo "[d4-gate] executor.ts conflict-free after reconcile"
 SENT_REC="$( { grep -rc 'startCompilationRecording' "$WT/src/executor/compiled-plan.ts" "$WT/src/executor/executor.ts" 2>/dev/null || true; } | awk -F: '{s+=$2} END{print s+0}')"
 SENT_ARANGE="$( { grep -c 'case "arange"' "$WT/src/executor/stream-generate.ts" 2>/dev/null || true; } )"
 SENT_ARANGE="${SENT_ARANGE:-0}"
+# tile-dispatch.ts is layered per-file (HEAD verbatim + reconciled hunk). If the
+# --include apply silently no-op'd, HEAD's file survives WITH the recorded-build
+# imports (invalidateActiveRecording / recordVolatileUniform) — assert they are
+# gone so a failed per-file layer aborts instead of un-deleting the recorded build.
+SENT_TILEREC="$( { grep -c 'invalidateActiveRecording\|recordVolatileUniform' "$WT/src/backend/webgpu/tile-dispatch.ts" 2>/dev/null || true; } )"
+SENT_TILEREC="${SENT_TILEREC:-0}"
 # Target A (D4 #8): the zero-residue recompute-on-read recovery lives in
 # op-dispatch.ts (recomputeMissingResult) — a surviving file the deletion does
 # NOT touch, layered via COVER_FILES. Assert it landed, else the mixed-coverage
@@ -141,7 +115,7 @@ SENT_RECOMPUTE="${SENT_RECOMPUTE:-0}"
 # (commitStepBoundaryIfPending), else the foreach cells below OOM the deleted tree.
 SENT_FOREACH_FIX="$( { grep -c 'commitStepBoundaryIfPending' "$WT/src/optim/grad-scaler.ts" 2>/dev/null || true; } )"
 SENT_FOREACH_FIX="${SENT_FOREACH_FIX:-0}"
-echo "[d4-gate] tree sentinels: startCompilationRecording=$SENT_REC (want 0, full deletion) arange-coverage=$SENT_ARANGE (want 1) recompute-on-read=$SENT_RECOMPUTE (want >=1) foreach-oom-fix=$SENT_FOREACH_FIX (want >=1)"
+echo "[d4-gate] tree sentinels: startCompilationRecording=$SENT_REC (want 0, full deletion) arange-coverage=$SENT_ARANGE (want 1) tile-recorded-imports=$SENT_TILEREC (want 0) recompute-on-read=$SENT_RECOMPUTE (want >=1) foreach-oom-fix=$SENT_FOREACH_FIX (want >=1)"
 if [ "${SENT_FOREACH_FIX:-0}" -lt 1 ]; then
   echo "[d4-gate] ABORT: D4 #9 foreach-OOM fix did not land (grad-scaler coverage absent); tree is invalid"; exit 2
 fi
@@ -150,6 +124,9 @@ if [ "$SENT_REC" != "0" ]; then
 fi
 if [ "$SENT_ARANGE" != "1" ]; then
   echo "[d4-gate] ABORT: HEAD coverage did not land (arange generator absent); tree is invalid"; exit 2
+fi
+if [ "$SENT_TILEREC" != "0" ]; then
+  echo "[d4-gate] ABORT: tile-dispatch.ts still carries recorded-build imports (per-file layer failed); tree is invalid"; exit 2
 fi
 if [ "${SENT_RECOMPUTE:-0}" -lt 1 ]; then
   echo "[d4-gate] ABORT: Target A recompute-on-read did not land (op-dispatch coverage absent); tree is invalid"; exit 2
