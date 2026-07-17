@@ -54,7 +54,6 @@ import {
   STEP_TAPE_RECORD,
   stStats,
 } from "../src/core/step-tape";
-import { currentVariantSelection } from "../src/core/step-variant";
 import { getPayloadThrashStats } from "../src/executor/executor";
 import { Torchlette } from "../src/frontend/torchlette";
 import { Adam, GradScaler, StepLR } from "../src/optim/index.ts";
@@ -359,14 +358,14 @@ async function main() {
   const diff = shadowDiff();
   // Reify discipline: the derived object is non-null once witnessed, null when
   // absent (the "null on non-witness paths" clause — here it must be present).
-  const derivedObj = crossPlanEdges(currentVariantSelection());
+  const derivedObj = crossPlanEdges();
 
   log("=== VERDICT ===");
   log(
     `witnessedTemplates=${witnessed.size} witnessedPairs=${witnessedPairs} witnessVariances=${st.witnessVariances}`,
   );
   log(
-    `crossPlanEdges: variants=${edgeStats.variants} producers=${edgeStats.producers} ` +
+    `crossPlanEdges: producers=${edgeStats.producers} ` +
       `pairs=${edgeStats.pairs} edges=${edgeStats.edges} positions=${edgeStats.positions} ` +
       `derivedObjNull=${derivedObj === null}`,
   );

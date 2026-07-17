@@ -43,7 +43,6 @@
  */
 
 import { crossPlanEdgeKeepSet } from "../core/cross-plan-edges";
-import { currentVariantSelection } from "../core/step-variant";
 import { storageTracker } from "../graph/storage-tracker";
 import type { StorageHandle } from "../graph/types";
 
@@ -740,7 +739,7 @@ export function prunedHarvest(
   // published from one witness stream at one K_w=2 moment — so consuming only
   // the derived set is behaviour-preserving, with the single-source guarantee
   // now structural (one producer, one consumer) rather than two-run-and-diff.
-  const derived = crossPlanEdgeKeepSet(fp, currentVariantSelection());
+  const derived = crossPlanEdgeKeepSet(fp);
   const kept: Array<{ i: number; oi: number }> = [];
   const excluded: Array<{ i: number; oi: number }> = [];
   for (const p of actionPairs) {

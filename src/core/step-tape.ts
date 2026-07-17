@@ -56,7 +56,6 @@ import {
   type StepObject,
   type StepReceipts,
 } from "./step-object";
-import { currentVariantSelection, type StepVariant } from "./step-variant";
 
 /**
  * `TORCHLETTE_STEP_TAPE`:
@@ -465,10 +464,6 @@ function reconcileWitnessReads(
   // below reflect this step's observations. Every producer in `curE` (incl.
   // not-yet-eligible seeds) accumulates; only PUBLISHED producers surface.
   accumulateEdges(curE);
-  // [D1] The variant this witness belongs to (§3.3): the derived edge set is
-  // keyed by it. A singleton `"train"` in v1 (open-Q1 verdict: route-as-data),
-  // but the key is built right, not speculatively general.
-  const variant = currentVariantSelection();
   for (const [fp, reads] of curW) {
     const tr = witnessProducer.get(fp);
     if (!tr) {
@@ -494,7 +489,7 @@ function reconcileWitnessReads(
       // accumulator `witnessProducerEdges`).
       if (tr.consecutive >= 2) {
         tr.published = true;
-        publishProducerEdges(variant, fp, reads);
+        publishProducerEdges(fp, reads);
       }
     } else {
       // The read set changed between two consecutive appearances. Grow the
@@ -515,7 +510,7 @@ function reconcileWitnessReads(
         }
       }
       if (wasPublished && grew) {
-        publishProducerEdges(variant, fp, union);
+        publishProducerEdges(fp, union);
       }
     }
   }
@@ -555,11 +550,7 @@ function accumulateEdges(
 /** [D1] Publish the derived cross-plan edges for a producer, restricted to the
  *  PUBLISHED pair set (the same set handed to `witnessHarvestPublisher`) — so
  *  `crossPlanEdgeKeepSet(fp) === witnessedHarvest[fp]`. */
-function publishProducerEdges(
-  variant: StepVariant,
-  fp: number,
-  pairs: Set<string>,
-): void {
+function publishProducerEdges(fp: number, pairs: Set<string>): void {
   const acc = witnessProducerEdges.get(fp);
   const payload: Map<
     string,
@@ -571,7 +562,7 @@ function publishProducerEdges(
       if (byConsumer) payload.set(pk, byConsumer);
     }
   }
-  publishCrossPlanEdges(variant, fp, payload as ProducerEdgePayload);
+  publishCrossPlanEdges(fp, payload as ProducerEdgePayload);
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,7 +1209,6 @@ export function stDeriveStepObjects(): StepObject[] {
     structureMisses,
     planInvalidations,
     boundaryResets,
-    variant: currentVariantSelection(),
   };
   const objs: StepObject[] = [];
   for (const tape of tapes.values())
@@ -1240,7 +1230,6 @@ export function stDeriveStepObject(bucketKey: string): StepObject | null {
     structureMisses,
     planInvalidations,
     boundaryResets,
-    variant: currentVariantSelection(),
   });
 }
 

@@ -163,7 +163,6 @@ import {
   stDeclareBatchCover,
   stEndPlan,
 } from "../core/step-tape";
-import { currentVariantSelection, variantToken } from "../core/step-variant";
 import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
 import {
   assignNodeResult,
@@ -2221,7 +2220,6 @@ export async function executeLoweredPlan(
               !crossPlanEdgeHasOtherConsumer(
                 stamp.fp,
                 `${stamp.ni}:${stamp.oi}`,
-                currentVariantSelection(),
                 fp,
               );
             noteD5Candidate(
@@ -2270,7 +2268,6 @@ export async function executeLoweredPlan(
             crossPlanEdgeHasOtherConsumer(
               stamp.fp,
               `${stamp.ni}:${stamp.oi}`,
-              currentVariantSelection(),
               fp,
             )
           )
@@ -3322,19 +3319,16 @@ export async function executePlanOptimized(
   // to detect collisions (effective collision probability: 2^-64).
   // [tape-1a] G0 measurement seams (src/core/tape-profile.ts; sunset: 1c).
   const tpF0 = TAPE_PROFILE ? performance.now() : 0;
-  // [D0 variant seam] Mix the current step VARIANT's token into the fingerprint
-  // via the SAME token-mixing arg the islands I1 partition uses
-  // (docs/step-data-dependence-design.md §3.3/§3.4). The token is delivered from
-  // the step's per-step selection (NOT the S3 island-merge resolver, §3.4
-  // verdict). SINGLETON == ABSENT: `variantToken()` returns `undefined` for the
-  // base `"train"` variant, the exact value `computePlanFingerprint` treats as
-  // "no discriminator" — so this is BYTE-IDENTICAL to the pre-variant path on
-  // every plan today (null-clean). A future residual variant returns a nonzero
-  // token, re-keying its template + re-witnessing its tape through this one seam.
+  // The token-mixing arg (islands I1 seam) is the S3 island-merge channel below;
+  // the default fingerprint passes no token (byte-identical to the pre-islands
+  // path). A residual structural step VARIANT would deliver a nonzero token here
+  // — the reification was premature (V never grew past the singleton "train"),
+  // so it is re-landed from history when a genuine second variant exists
+  // (docs/step-data-dependence-design.md §3.3/§3.4).
   const defaultFingerprint = computePlanFingerprint(
     plan.nodes,
     externalNodeIds,
-    variantToken(),
+    undefined,
   );
   // [S3 FUSE LIVE WIRING] Resolve a live partition-merge edit: with an empty
   // store this returns the default fingerprint UNCHANGED (byte-identical null

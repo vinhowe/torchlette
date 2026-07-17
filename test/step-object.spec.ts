@@ -76,7 +76,6 @@ const NO_RECEIPTS: StepReceipts = {
   structureMisses: 0,
   planInvalidations: 0,
   boundaryResets: 0,
-  variant: "train",
 };
 
 describe("StepObject — reify, null-clean (task #98 phase 1)", () => {
@@ -114,7 +113,6 @@ describe("StepObject — reify, null-clean (task #98 phase 1)", () => {
       structureMisses: 7,
       planInvalidations: 5,
       boundaryResets: 3,
-      variant: "train",
     });
     // Different receipts, SAME digest — receipts are not identity.
     expect(stepObjectDigest(a)).toBe(stepObjectDigest(b));

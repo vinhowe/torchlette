@@ -80,15 +80,6 @@ export {
   stDeriveStepObjects,
   stStats,
 } from "./core/step-tape";
-// [D0] The declared step VARIANT set (docs/step-data-dependence-design.md §2,
-// §3.3): the residual structural forks after value-level variation is routed as
-// data. A singleton `["train"]` in v1; the token surface is null-clean (absent).
-export {
-  DECLARED_VARIANTS,
-  type StepVariant,
-  selectVariant,
-  type VariantSet,
-} from "./core/step-variant";
 // Step-tape observability (§6): guard-miss/hit counters for apps.
 export { stReplayStats } from "./executor/step-tape-replay";
 export {
