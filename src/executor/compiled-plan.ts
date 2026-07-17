@@ -291,33 +291,6 @@ export interface CompiledPlan {
     ni: number;
     oi: number;
   }>;
-  /** [task #99 R1] Declared checkpoint-recompute segment data reaching the
-   *  memory-planner input surface as DATA (no planning-decision change yet —
-   *  R2 acts on it; docs/arena-recompute-design.md §5 Phase R1). For a
-   *  recompute-bearing plan (one carrying an `isCheckpointBoundary` node — the
-   *  step-tape `hasRecompute` fact), this lists the plan's result values whose
-   *  producing node is a checkpoint boundary: the checkpointed forward
-   *  activations the planner today pins whole-step as RESULTs but that R2 will
-   *  split at the recompute boundary. Each entry is the cross-plan value identity
-   *  `(templateFp, nodeIndex, oi)` (templateFp stamped by the executor post-build,
-   *  alongside `templateFp`) plus the planner slot/entry it maps to. Present ONLY
-   *  when the build received boundary node indices (checkpointing ON); absent
-   *  otherwise. R1 asserts it against the planner entries, changes no allocation. */
-  _recomputeSegments?: Array<{
-    nodeIndex: number;
-    outputIndex: number;
-    slot: number;
-    /** planner registry entry this result maps to (if the planner ran). */
-    entryIdx?: number;
-    /** true = the producing node is itself the checkpoint boundary (the last
-     *  recomputed node). */
-    isBoundaryNode: boolean;
-  }>;
-  /** [task #99 R1] Whether this plan carries any checkpoint boundary (the
-   *  `hasRecompute` fact, computed from planNodes at build). Data on the plan so
-   *  the planner surface + gates see recompute-bearing plans without re-deriving
-   *  from the tape. */
-  _hasRecompute?: boolean;
 }
 
 // ============================================================================
@@ -347,73 +320,6 @@ import {
 import { getInputStorage } from "./op-dispatch";
 
 /**
- * [task #99 R2] Recompute-boundary node indices sourced from the LIVE witness
- * signal: the plan-node indices whose harvested result (ni:oi) is in the
- * derived crossPlanEdgeKeepSet (D2; formerly the witnessed-harvest oracle) — the checkpoint-recompute reads
- * observeConsumed is blind to (they resolved lowered). Returns undefined when
- * no witness data supplied (caller falls back to the declared flag set).
- *
- * ELIGIBILITY IS DERIVED, NOT ASSUMED (regression fix, landed 42ae55c5): the
- * witness read (`noteWitnessRead`) fires for ANY cross-plan read of a stamped
- * storage — which by its own doc includes "a persistent-slot bind" and other
- * pre-existing-buffer binds (params/optimizer-state read every step, external
- * scalar carries), not only the checkpoint-recompute RESULT reads this feed is
- * for. Those pairs are NOT planner-tracked RESULTs, so stamping them as
- * recompute boundaries trips the identity-seam assertion in finalizeCompiledPlan
- * (the boundary result has no planner entry). A recompute boundary is a
- * checkpoint-recomputed forward activation — always a PLAN-PRODUCED tensor
- * (an `arena`/`write` slot, the same class the planner allocates entries for).
- * Pre-existing binds (`external`/`params`/`persistent`/`constFill`) are filtered
- * out here at the single classification source (the slot kind), so the assertion
- * downstream stays a true seam check, not a filter. This was masked by device-10
- * contention OOM in two prior verification passes (the cells OOM'd before
- * reaching the assertion).
- */
-export function witnessSourcedBoundaryIndices(
-  nodeResults: NodeResult[],
-  slotSources: SlotSource[],
-  witnessedPairs?: Set<string>,
-): Set<number> | undefined {
-  if (!witnessedPairs || witnessedPairs.size === 0) return undefined;
-  let boundaries: Set<number> | undefined;
-  for (const r of nodeResults) {
-    if (!witnessedPairs.has(`${r.nodeIndex}:${r.outputIndex}`)) continue;
-    // Only PLAN-PRODUCED slots (alloc/write commands populate them) can be a
-    // recompute RESULT; the planner tracks exactly these. A witnessed read of a
-    // pre-existing bind is a persistent/external cross-plan read, not a boundary.
-    const kind = slotSources[r.slot]?.kind;
-    if (kind !== "arena" && kind !== "write") continue;
-    (boundaries ??= new Set<number>()).add(r.nodeIndex);
-  }
-  return boundaries;
-}
-
-/**
- * [task #99 R1] The set of plan-node indices flagged `isCheckpointBoundary`
- * (planted on the last recomputed node by the checkpoint unpack hook, via
- * markAsCheckpointBoundary). This is the SAME read step-tape's `hasRecompute`
- * does (step-tape.ts) — the declared recompute boundary, sourced from the node
- * flags, not sniffed. Empty ⇒ no recompute in this plan. */
-export function checkpointBoundaryIndices(
-  planNodes: readonly LazyIRNode[] | undefined,
-): Set<number> | undefined {
-  if (!planNodes) return undefined;
-  let boundaries: Set<number> | undefined;
-  for (let i = 0; i < planNodes.length; i++) {
-    if (planNodes[i].isCheckpointBoundary) {
-      if (!boundaries) boundaries = new Set<number>();
-      boundaries.add(i);
-    }
-  }
-  if (ENV.TORCHLETTE_DEBUG_COMPILED && boundaries) {
-    console.log(
-      `[recompute-segment] checkpointBoundaryIndices: ${boundaries.size} boundary node(s) in a ${planNodes.length}-node plan: ${[...boundaries].join(",")}`,
-    );
-  }
-  return boundaries;
-}
-
-/**
  * Stage-4 phase-4 cutover: build a CompiledPlan directly from a GENERATED
  * stream (stream-generate.ts) instead of the recorded log. The generator
  * already emits final GpuCommand[] + SlotSource[] (slot assignment done) and a
@@ -432,18 +338,12 @@ export function buildCompiledPlanFromGenerated(input: {
   /** [stage-3 B] Released external inputs (this plan is the observed last
    *  reader) — see planMemory's externalReleases. */
   externalReleases?: Array<{ slot: number; entryIdx: number }>;
-  /** [task #99 R1] Checkpoint-boundary plan-node indices (from planNodes'
-   *  isCheckpointBoundary flags) — the generated path has no planNodes in its
-   *  input, so the executor supplies the SAME set it computes for the recorded
-   *  path. Uniform across both build paths (the design's requirement). */
-  recomputeBoundaryIndices?: Set<number>;
 }): CompiledPlan {
   return finalizeCompiledPlan(
     input.commands,
     input.slots,
     input.nodeResults,
     input.externalReleases,
-    input.recomputeBoundaryIndices,
   );
 }
 
@@ -461,9 +361,6 @@ function finalizeCompiledPlan(
   slotSources: SlotSource[],
   nodeResults: NodeResult[],
   externalReleases?: Array<{ slot: number; entryIdx: number }>,
-  /** [task #99 R1] Declared checkpoint-boundary plan-node indices. Stamps
-   *  _recomputeSegments (visible DATA on the plan). */
-  recomputeBoundaryIndices?: Set<number>,
 ): CompiledPlan {
   const usePlanner = compiledPlannedEnabled();
 
@@ -505,58 +402,6 @@ function finalizeCompiledPlan(
     }
   }
 
-  // [task #99 R1] Stamp the declared recompute-segment DATA onto the plan — the
-  // checkpointed forward activations reaching the planner's input surface, made
-  // visible/asserted/logged WITHOUT any planning-decision change (the entries stay
-  // whole-step RESULTs; R2 splits their liveness). A recompute-bearing plan is one
-  // carrying an isCheckpointBoundary node; that node's index names the checkpointed
-  // forward value. We cross-reference boundary node indices against nodeResults
-  // (nodeIndex/outputIndex/slot) — the SAME cross-reference the stage-3 S3.0
-  // regEntries observation does — and map each to its planner entry. Pure metadata;
-  // `planMemory` above never saw recomputeBoundaryIndices.
-  const hasRecompute =
-    recomputeBoundaryIndices !== undefined && recomputeBoundaryIndices.size > 0;
-  let recomputeSegments: CompiledPlan["_recomputeSegments"];
-  if (hasRecompute && recomputeBoundaryIndices) {
-    recomputeSegments = [];
-    for (const r of nodeResults) {
-      if (!recomputeBoundaryIndices.has(r.nodeIndex)) continue;
-      recomputeSegments.push({
-        nodeIndex: r.nodeIndex,
-        outputIndex: r.outputIndex,
-        slot: r.slot,
-        entryIdx: plannerAssignment?.get(r.slot),
-        isBoundaryNode: true,
-      });
-    }
-    // Assert-agreement at the seam (single source of truth, house rule): a stamped
-    // boundary result MUST map to a planner entry when the planner ran (else the
-    // declared boundary is not a planner-tracked RESULT — an identity mismatch R2
-    // would silently mis-split).
-    if (usePlanner) {
-      for (const seg of recomputeSegments) {
-        if (seg.entryIdx === undefined) {
-          throw new Error(
-            `[recompute-segment] R1 stamp: boundary result node=${seg.nodeIndex} oi=${seg.outputIndex} slot=${seg.slot} has no planner entry — declared boundary is not a planner-tracked RESULT (identity seam violation).`,
-          );
-        }
-      }
-    }
-    if (ENV.TORCHLETTE_DEBUG_COMPILED) {
-      console.log(
-        `[recompute-segment] R1: ${recomputeSegments.length} checkpoint-recompute result(s) stamped ` +
-          `from ${recomputeBoundaryIndices.size} boundary node(s): ` +
-          recomputeSegments
-            .map(
-              (s) =>
-                `(ni=${s.nodeIndex},oi=${s.outputIndex},slot=${s.slot},entry=${s.entryIdx})`,
-            )
-            .join(" ") +
-          " — DATA only, no liveness change (R1).",
-      );
-    }
-  }
-
   const plan: CompiledPlan = {
     commands,
     slots: slotSources,
@@ -566,11 +411,6 @@ function finalizeCompiledPlan(
     plannerEntries,
     plannerGen: plannerEntries ? plannerRegistry.generation : undefined,
     _claimedEntries: claimedEntries?.length ? claimedEntries : undefined,
-    _hasRecompute: hasRecompute ? true : undefined,
-    _recomputeSegments:
-      recomputeSegments && recomputeSegments.length > 0
-        ? recomputeSegments
-        : undefined,
   };
   if (plannerEntries) {
     for (const idx of plannerEntries) {
@@ -689,54 +529,6 @@ export function debugPlannerRegistryStats(): {
     orphanResultMB: mb(orphanResult),
     deadOwnerResultMB: mb(deadOwnerResult),
   };
-}
-
-/** Debug (R2 scouting): per-owning-template RESULT registry bytes. Groups every
- *  RESULT entry by the templateFp of its (first valid) owning plan, so we can see
- *  WHICH producer templates the 1919 MB of pinned RESULT entries belong to — the
- *  split targets. Temp entries excluded (shared, not per-template). */
-export function debugResultBytesByTemplate(): Record<
-  string,
-  { resultMB: number; entries: number; hasRecompute: boolean }
-> {
-  const acc = new Map<
-    number,
-    { bytes: number; entries: number; hasRecompute: boolean }
-  >();
-  for (const e of plannerRegistry.entries) {
-    if (!e.resultHolder) continue;
-    let fp: number | undefined;
-    let hasRecompute = false;
-    for (const o of e.owners) {
-      const cp = o as CompiledPlan;
-      if (cp.valid && cp.templateFp !== undefined) {
-        fp = cp.templateFp;
-        hasRecompute = !!cp._hasRecompute;
-        break;
-      }
-    }
-    const key = fp ?? -1;
-    let a = acc.get(key);
-    if (!a) {
-      a = { bytes: 0, entries: 0, hasRecompute };
-      acc.set(key, a);
-    }
-    a.bytes += e.bytes;
-    a.entries++;
-    a.hasRecompute ||= hasRecompute;
-  }
-  const out: Record<
-    string,
-    { resultMB: number; entries: number; hasRecompute: boolean }
-  > = {};
-  for (const [fp, a] of acc) {
-    out[fp === -1 ? "unknown" : `0x${fp.toString(16)}`] = {
-      resultMB: +(a.bytes / 1e6).toFixed(1),
-      entries: a.entries,
-      hasRecompute: a.hasRecompute,
-    };
-  }
-  return out;
 }
 
 /** Test/debug: per-compiled-plan registry footprint (bytes of co-owned entries,

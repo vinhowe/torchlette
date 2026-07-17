@@ -473,12 +473,14 @@ with nothing to split. So the witness-sourced RESULT-interval split has no sound
 target on this config.
 
 **Disposition (honored, not swept):**
-- The witness-sourced boundary FEED lands (stage a, `witnessSourcedBoundaryIndices`
-  in `buildCompiledPlan`): R1's INERT `isCheckpointBoundary` source is replaced by
-  the LIVE `getWitnessedHarvest` signal, so `_recomputeSegments` now stamps from a
-  firing source (the R1 finding's requested fix). NULL-CLEAN: metadata only, no
-  planning-decision change with the probe off; the default path is byte-identical
-  to pre-R2 (registry 2833.8 MB, current 4584.7 MB — verified).
+- The witness-sourced boundary FEED + the R1 recompute-segment STAMPS
+  (`witnessSourcedBoundaryIndices`, `checkpointBoundaryIndices`, the
+  `_recomputeSegments`/`_hasRecompute` plan fields, and the step-tape
+  `recomputeFps`/`hasRecompute` → step-object `recomputeRef` plumbing) were
+  DELETED 2026-07-17: they were pure metadata whose only intended consumer (the
+  R2/D3 split below) never landed, so nothing read them for a decision. Re-land
+  from history with D2b' when a sound split target exists. The `isCheckpointBoundary`
+  flag itself stays live (it drives the segmented executor's buffer flush).
 - The SPLIT (stage b) does NOT land. It was gated behind `TORCHLETTE_R2_SPLIT_PROBE`
   purely as the committed deterministic STOP repro; that flag + probe block + repro
   tool were DELETED 2026-07-17 (the STOP finding above stays; re-land from history

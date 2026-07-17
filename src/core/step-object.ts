@@ -159,12 +159,6 @@ export interface StepDeclaration {
   readonly boundaryStructHash: string;
   /** Dynamic-slot declarations WITH STABLE NAMES (§2.1, §10 ruling 1). */
   readonly slots: readonly StepSlotDecl[];
-  /** Recompute-segment facet REFERENCE (ruling 3; NOT a mechanism here). The
-   *  ordered template fingerprints the step's plan sequence touches — the
-   *  reference from which phase-3's `RecomputeSegment[]` will be derived
-   *  (checkpoint segments are plan-builder barriers between these plans). Phase
-   *  1 reifies the reference, not the recompute knob. */
-  readonly recomputeRef: readonly number[];
   /** Partition facet REFERENCE (ruling 4). The per-plan boundaryHash projection —
    *  reified from the ordered plan fps (each plan's I1 boundaryHash mixes into
    *  its fp already, `executor.ts:259`). Kept as the ordered-fps reference the
@@ -409,14 +403,6 @@ export function deriveStepObject(
   const declaration: StepDeclaration = {
     boundaryStructHash: structHash,
     slots,
-    // Recompute-segment fact (task #98 phase 3, ruling 3): the fps of the plans
-    // that carried a checkpoint boundary this step — the DECLARED recompute
-    // segments, in plan order. Empty when the step is not checkpointed. This is
-    // now a REAL recompute fact derived from the observed boundaries, no longer
-    // a placeholder alias of the all-fps partitionRef. The executor's arena-free
-    // decision for these plans is the functional half of the same declaration
-    // (driven at run time by checkpoint() via RuntimeEngine.declareRecomputeSegments).
-    recomputeRef: tape.recomputeFps,
     // Partition reference: the per-plan boundaryHash projection is ALREADY mixed
     // into each plan's fp (islands I1); the ordered fps ARE that projection's
     // reference at step altitude. Phase 6 lifts it to a StepPartition (below).

@@ -123,12 +123,6 @@ export interface StepTape {
   regime: { stepScopedCleanup: boolean };
   /** Template fingerprints referenced (guard-4 invalidation index). */
   templateIds: Set<number>;
-  /** Fingerprints of the plans that carried a checkpoint boundary this step
-   *  (task #98 phase 3): the DECLARED recompute segments, in plan order. The
-   *  step object's `recomputeRef` is derived from this — a real recompute fact,
-   *  distinct from the all-fps `partitionRef`. Empty when the step is not
-   *  checkpointed. */
-  recomputeFps: number[];
   /** Per-plan islands partition-identity token (task #98 phase 6, ruling 4),
    *  ALIGNED with the ordered plan fps. Each entry is the executor's already-
    *  computed `PlanPartition.boundaryHash` (islands I1, `executor.ts:259`) for
@@ -288,11 +282,6 @@ interface PlanExecRecord {
    *  template run lowered, so the warmup pair is counted as such, never
    *  refused). */
   compiled: boolean;
-  /** True iff this plan carries a checkpoint boundary (task #98 phase 3): it is
-   *  a recompute-bearing plan — a DECLARED recompute segment of the step. The
-   *  step object's `recomputeRef` is derived from the fps of such plans, making
-   *  the recompute facet a real declared fact, not a placeholder over all fps. */
-  hasRecompute: boolean;
   /** The executor's already-computed islands partition-identity token for this
    *  plan (task #98 phase 6, ruling 4): `PlanPartition.boundaryHash` (I1). A
    *  read-only PROJECTION of the detector's membership — recorded, never
@@ -599,13 +588,6 @@ export function stBeginPlan(
       hadResult: n.result !== undefined,
     });
   }
-  let hasRecompute = false;
-  for (let i = 0; i < planNodes.length; i++) {
-    if (planNodes[i].isCheckpointBoundary) {
-      hasRecompute = true;
-      break;
-    }
-  }
   const rec: PlanExecRecord = {
     fp,
     image,
@@ -615,7 +597,6 @@ export function stBeginPlan(
     uniformPos: new Set(),
     scalarWrites: [],
     compiled: false,
-    hasRecompute,
     partitionHash: partitionHash >>> 0,
     xreads: 0,
   };
@@ -1083,11 +1064,6 @@ export function stEndStep(info: {
   const bucketKey = `b:${fnvStr(rec.structKey).toString(16)}:${rec.plans.map((pl) => hex(pl.fp)).join("+")}`;
   const templateIds = new Set<number>();
   for (const pl of rec.plans) templateIds.add(pl.fp);
-  // Recompute segments (task #98 phase 3): the fps of plans that carried a
-  // checkpoint boundary, in plan order — the DECLARED recompute facet.
-  const recomputeFps = rec.plans
-    .filter((pl) => pl.hasRecompute)
-    .map((pl) => pl.fp);
   // Per-plan islands partition tokens (task #98 phase 6), aligned with the
   // ordered plan fps — the read-only projection of the detector's membership.
   const partitionHashes = rec.plans.map((pl) => pl.partitionHash);
@@ -1099,7 +1075,6 @@ export function stEndStep(info: {
     structGen: rec.opSeqEnd - p.opSeqEnd,
     regime: { stepScopedCleanup: rec.stepScopedCleanup },
     templateIds,
-    recomputeFps,
     partitionHashes,
     recordedAtStep: stepOrdinal,
   });

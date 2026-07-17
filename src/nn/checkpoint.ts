@@ -220,11 +220,12 @@ function checkpointNonReentrant<T extends Tensor>(
         // [task #99 R1 finding] On the compiled/lowered training path the
         // recomputed tensor is consumed by backward in the SAME force, so by the
         // time this boundary block runs its lazyRef.kind is already "materialized"
-        // (the pending node is gone) — markAsCheckpointBoundary NEVER fires, so
-        // the declared `isCheckpointBoundary`/`hasRecompute`/`recomputeFps`
-        // substrate is INERT on the real path. See docs/arena-recompute-design.md
-        // R1 report. R2 must source the recompute boundary from the LIVE
-        // observed-liveness signal (the witnessed harvest producer), not this flag.
+        // (the pending node is gone) — markAsCheckpointBoundary rarely fires here.
+        // The isCheckpointBoundary flag still drives the segmented executor's
+        // buffer flush when it does fire; the recompute-segment STAMPS derived
+        // from it (the R1 `_recomputeSegments` / step-tape `recomputeFps` plumbing)
+        // were deleted 2026-07-17 as decision-unconsumed — see
+        // docs/arena-recompute-design.md (re-land from history with D2b').
         if (lazyRef?.kind === "pending" && lazyRef.node) {
           markAsCheckpointBoundary(lazyRef.node);
         }
