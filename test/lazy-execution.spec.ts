@@ -822,8 +822,13 @@ describe("force and execute", () => {
       ).rejects.toThrow("Cannot execute empty plan");
     });
 
-    it("throws when input is not ready", async () => {
-      // Create a node with a pending input that isn't in the plan
+    it("recomputes a missing pending input from its live producer (zero-residue contract)", async () => {
+      // A node with a pending input that isn't in the plan. Under the
+      // zero-residue mixed-coverage contract (D4 attempt #8), a missing
+      // pending-producer result with recomputable inputs is RECOMPUTED —
+      // exactly what the pure-lowered path would materialize — instead of
+      // throwing. Only async/stateful producers still throw (their misses
+      // stay loud).
       const orphanNode = createLazyIRNode(
         "tensorFromArray",
         [],
@@ -836,12 +841,13 @@ describe("force and execute", () => {
 
       const reluNode = createLazyIRNode("relu", [orphanRef], [2], "f32", "cpu");
 
-      // Create a plan with only reluNode (missing orphanNode)
+      // A plan with only reluNode (missing orphanNode): the orphan is a
+      // pure leaf constant, so it recomputes and relu succeeds.
       const badPlan = { nodes: [reluNode] };
 
-      await expect(executePlanSequential(badPlan, cpuBackend)).rejects.toThrow(
-        "Input not ready",
-      );
+      await executePlanSequential(badPlan, cpuBackend);
+      const result = reluNode.result as { data?: Float32Array } | undefined;
+      expect(result).toBeDefined();
     });
   });
 });
