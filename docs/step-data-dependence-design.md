@@ -721,6 +721,54 @@ witnessing crux and was green while compilation-coverage consequences broke thre
 device-chain contention on a shared node FABRICATES failure classes — nothing measured under
 parallel GPU load is evidence about the tree.
 
+**STATUS 2026-07-17 — D4 attempt #7: the TWO NAMED gaps CLOSED (2 of 3 #7 cells green); a THIRD,
+batch>1-only class NAMED; STOP-and-report per the #7 discipline.** The empirical census
+(`TORCHLETTE_STREAM_GENERATE=1` uncovered-map, main tree, distil@512 AND medium@512 — identical) named
+the two build-from-IR coverage gaps EXACTLY, and they were NOT what the sixth-class narrative guessed:
+- **`op:sum[all-dims-or-epilogue]`** — a `sum(dim=…)` whose dim list reduces EVERY axis with
+  keepdim=false; the dispatch routes it to the plain full reduction (`prepareDimReduction`→null), but
+  the generator blindly sent `dim!=null` to `generateDimReduction`, which bailed. FIX
+  (`stream-generate.ts generateFullReduction`): detect the all-dims/no-keepdim case, fall through to
+  the full-reduction body (byte-identical to `fullReduction`).
+- **`data-source:arange`** — a compile-time-CONSTANT index ramp (`start + i*step`, deterministic from
+  shape+payload, NOT rng). FIX (`generateDataSource`): emit a plan-owned constant buffer via the
+  constFill mechanism (array form; the ramp matches the `arange_tile` WGSL bit-for-bit via
+  `Math.fround`), outside the arena AND the harvest ledger. `SlotSource.constFill` gained `data`.
+Covering the sum EXPOSED a pre-existing latent bug: the STREAM_GENERATE reconciliation credited
+"constFill == 1 recorded command", but every dispatch-based fill records ALLOC + DISPATCH + WRITE (3)
++ a params slot — under-counting by 2, latent until a fill-bearing plan became fully covered. FIX
+(`executor.ts`): EXCLUDE the constFill'd nodes' recorded commands + dispatch params slots, keyed by the
+source node index (stored on the slot). Gates on MAIN all green (test:gates 6/6, parity-fullstack
+~5e-6/30 both dirs, t-stream-generate **0 diverged**, tape-matrix 4/4, witness-matrix 5/5, planner-pin,
+ledger STEPS=48 `totalDrift=0`, 124M DiLoCo round0=9.8089 within fp-noise); on the AUTHORITATIVE deleted
+tree (`d4-deleted-tree-gate.sh`, fixed to build a VALID tree — see below): **#7 tape PASS, #7 profiler
+PASS**, witnessing crux 6 producers `threw=false`.
+
+**THE THIRD CLASS (STOP) — batch>1 only, invisible to the batch=1 census.** The `distilgpt2-full-
+finetuning` Memory-Stability twin (batch>1) STILL throws `Input not ready: contiguous[32,128]` on the
+deleted tree. Its recurring uncovered plans (`TORCHLETTE_DBG_UNCOV` census, 24× the dominant one):
+`batched-reduction[true-batched]` (the true multi-in/out batched-reduction kernel — `reductionSize≤64`,
+a DIFFERENT command shape from the individual-fallback generator, appears only when a batched reduction
+runs over a small dim, i.e. batch>1), plus `scatterAdd[untracked-input]` and
+`fusedCrossEntropyForward[no-storage]` (the "released strided-view with no captured layout" class the
+generator fundamentally bails on). profile-training@512 is batch=1 → none of these appear → the census
+that named the two gaps never sees them. Covering them is an OPEN-ENDED TAIL requiring new mechanism
+(a true-batched generator + released-input layout capture), NOT the two established-shape fixes — the
+`STOP-and-report` boundary the #7 discipline names. The two named gaps are closed; the third class is a
+new charter, not a diff reconciliation.
+
+**GATE INFRA FIXED (necessary for a reproducible verdict).** `d4-deleted-tree-gate.sh` was structurally
+broken and reported fabricated verdicts on every axis: the preserved deletion diff is a gitignored
+artifact absent from a linked worktree (→ `git apply` no-op → non-deleted tree); applying it to a HEAD
+carrying coverage in DELETED code made hunks silently fail (→ partial deletion); the #7 profiler/distil-ft
+cells load real weights but only `node_modules` was linked (→ model-not-found MISLABELED "Input-not-ready");
+and back-to-back cells raced Dawn teardown (→ contention-fabricated failures — the exact meta-lesson). Now:
+apply the deletion at its NATIVE BASE + layer HEAD coverage for the SURVIVING files (plain apply), link
+`models/`+`ckpts/`, `gpu_settle` between cells, and ASSERT `startCompilationRecording==0` + arange
+coverage before running. With a VALID tree the two named-gap cells go green and the third class stands
+alone. Re-open for #8: cover the batch>1 true-batched reduction + the released-input scatterAdd/CE class,
+or make the mixed-coverage fall-through zero-residue so a lowered consumer can read a generated producer.
+
 ### Phase D5 — The declared-lifetime dividend (LAST; step-object phase 7)
 
 **Goal:** the observation predicates RETIRE on the captured path (they are now queries of
