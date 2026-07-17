@@ -81,7 +81,13 @@ intent; the doc's job is to make them structural, never to re-litigate them.
    build (via witness-time harvest — only AFTER proven on the CHECKPOINT config),
    `guardMiss` recovery → a should-never-fire assert (after a zero-fire soak), the
    observation predicates inside boundaries, the checkpoint bypass, the stale docs.
-   - **Recorded build — NOT EXECUTED (STOPPED 2026-07-16, D4 attempt #5).** Proving
+   - **Recorded build — EXECUTED ✓ 2026-07-17 (D4 attempt #13).** Deleted after
+     the full authoritative matrix went green on the deleted tree (witness
+     5/5 incl. the CHECKPOINT config, tape matrix 4/4, ring probe K-bit-identical,
+     124M exact, profiler memory-neutral). Deaths + post-deletion semantics:
+     `stage4-compile-from-ir.md` header; history: `step-data-dependence-design.md`
+     §D4. The historical #5 STOP record below is preserved as written.
+   - **(historical) Recorded build — NOT EXECUTED (STOPPED 2026-07-16, D4 attempt #5).** Proving
      on the CHECKPOINT config is exactly where it failed: on the deleted tree the
      `scaler-inf` crux cell threw the attempt-#4 `[1,512,768]` overlay-release, and
      distilgpt2@512 selective-ckpt threw `Input not ready: contiguous[32,128]` —

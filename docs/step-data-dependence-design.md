@@ -1087,6 +1087,56 @@ dump in the surviving build-from-IR block (`TORCHLETTE_STREAM_GENERATE` is delet
   the full §D4 authoritative matrix on the deleted tree (tape matrix 4/4 ✓ already, `t-ring-probe` hits>0, d4 gate) +
   the standing wall on main (test:gates 6/6, parity ≤1e-5/30, witness 5 cells, 124M exact, profile distil) and land.
 
+**STATUS 2026-07-17 — D4 attempt #13 (THE LANDING): DONE. The recorded build is DELETED (commit
+`43272c47`, net −822 srcSLOC / −4 envFlags, on top of the Stage-1 closures `39debb7d`); the full
+authoritative matrix ran GREEN on the deleted tree BEFORE the commit (sivri V100, vk-device 2 ==
+nvidia 2 identity-mapped, serial GPU-exclusive, under the degraded-node regime with
+environmental-first triage).** Vin ratified fork (c): the two Stage-1 closures landed the
+established way (the #12 `releasedContigViewOffset` foreach closure; the scalar-source scatter via
+the plan scalar table — per-step-refreshed persistent buffer, no frozen-scalar risk), and
+`t-ring-probe` was RE-SCOPED to a build-from-IR-covered graph (mean-as-matmul; its purpose is
+RUNAHEAD-ring verification, and the old mean-loss graph accidentally depended on the
+deliberately-uncovered released-expand-broadcast class — the probe file states this scope). The
+broadcast-into-fused class stays DELIBERATELY UNCOVERED.
+
+- **Matrix (deleted tree):** `t-ring-probe` PASS (hits=16, serial==ringNow==K1==K2==K3 at 0.0 —
+  the #12 STOP dissolved); tape matrix 4/4 (`eligiblePairs=6 loweredPairs=0 tapeCount=1` in all
+  cells); `test:gates` **5/5** (the stream-gen-vs-recording gate retired WITH the apparatus;
+  build-twice determinism is the successor and passed); parity-fullstack compiled-vs-lowered
+  **3.815e-6/30 both directions**; witness matrix 5/5 shadow-empty (scaler-inf 6 producers/459
+  pairs `threw=false`); step-object/edit nulls + capture probe PASS; planner-pin
+  arena/free/--assert PASS; ledger-attack 24+48 `totalDrift=0`; CPU suite 1416/0; webgpu suite 880
+  passed with ONLY the environmental `vkCreateDevice` device-chain class (a different random file
+  set each run; all 14 affected files pass isolated, 255/255 — the named non-class); **124M DiLoCo
+  EXACT** {0:9.8089, 3:5.9220, 6:5.1536, 9:4.6405}, peak flat 2087.6 MB; profile-training
+  distil@512 AND medium@512 exit 0 with peaks **BYTE-IDENTICAL to the pre-deletion null**
+  (6552.0 / 22098.4 MB — the deletion is memory-neutral); checkpoint ab-oracle WITNESS side PASS
+  both modes (memory side FAILs by D3-STOP design, unchanged); `d4-deleted-tree-gate.sh` ALL cells
+  PASS on its independent tree construction (`PREDELETION_SHA=39debb7d`).
+
+- **Finiteness — final form (capstones).** Assumption 3 in its final reading: witnessing
+  completeness is delivered by converged-to-lowered stamping (K_w=2), not by any extra pass — the
+  deleted-tree scaler-inf derivation is the standing measurement. The three structural capstones
+  that made the sunset safe: (1) the ZERO-RESIDUE fall-through (`recomputeMissingResult`,
+  coverage-independent — refusal-to-compile can never corrupt, only slow); (2) the DERIVED-CHUNKING
+  seam (`computeChunkGeometry` single-sources dispatch and generation — capability-forced splits
+  cannot drift); (3) the DELIBERATELY-UNCOVERED enumeration (released strided/broadcast views —
+  expand-into-fused, narrow dim≠0, transpose/permute without captured layout; released-input
+  scatterAdd/CE; non-f32 scalar-source scatter; batch>64 / non-f32 / CoW plans) — all of which run
+  lowered forever and correctly by (1).
+
+- **The d4 gate RETIRES (deleted with the docs commit).** Justification: it is pre-commit-only BY
+  CONSTRUCTION (it builds `PREDELETION_SHA + harvest-deletion-final.diff` and aborts when HEAD
+  already carries the deletion); every cell it gated has a standing successor that runs on plain
+  HEAD — witness matrix (crux cells), `t-train-tape-matrix` (#7/#9 cells), `profile-training`,
+  `test/distilgpt2-full-finetuning.spec.ts` (in `npm run test`). Keeping it would preserve a
+  script whose tree-construction premise no longer exists.
+
+- **`.claude` diff artifacts — superseded (cleanup note).** `D4-deletion-attempt5-STOPPED.diff`,
+  `harvest-deletion-43a.diff`, `harvest-deletion-43a-reconciled.diff`, `harvest-deletion-final.diff`,
+  and `d4-12-foreach-closure.diff` are all now IN GIT HISTORY (`39debb7d` + `43272c47`); the
+  untracked artifacts in the main checkout's `.claude/` are historical and safe to delete.
+
 ### Phase D5 — The declared-lifetime dividend (LAST; step-object phase 7)
 
 **Goal:** the observation predicates RETIRE on the captured path (they are now queries of

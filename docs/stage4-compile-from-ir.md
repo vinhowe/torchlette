@@ -4,6 +4,48 @@
 Written at the end of the cycle that landed stages 0–3; every claim about
 existing machinery refers to code in-tree at commit ed779c6.*
 
+> **TASK #43 "recorded-build sunset" — EXECUTED 2026-07-17 (D4 attempt #13, THE
+> LANDING).** The recorded build is DELETED: `buildCompiledPlan`,
+> `startCompilationRecording`/`stopCompilationRecording`, the whole `record*`
+> family with every call site, the executor's `compilationRecording` action-loop
+> + finally, the `TORCHLETTE_STREAM_GENERATE` verify apparatus (+ its tool
+> `tools/t-stream-generate.ts`; successor = the in-suite build-twice determinism
+> gate, `test:gates` 6→5), and FOUR flags (`TORCHLETTE_BUILD_FROM_IR`,
+> `TORCHLETTE_COMPILED_MAX_NODES`, `TORCHLETTE_COMPILED_ONLY_NODES`,
+> `TORCHLETTE_DEBUG_PERSISTENT`). Net −822 srcSLOC / −4 envFlags. build-from-IR
+> is the SOLE compiler; first execution lowered (witness-stamped,
+> converged-to-lowered K_w=2); transient plans lowered forever; uncovered plans
+> correct-and-slow by construction (the zero-residue `recomputeMissingResult`
+> fall-through). THE THIRTEEN ATTEMPTS, in one paragraph: #1–#4 (pre-D4 era)
+> died on frozen scalars, over-harvest, and overlay-release UAFs; #5 named the
+> FIFTH class (the recording pass was itself a witnessing driver — finiteness
+> assumption 3 read too strongly); #6 closed it with witness-to-convergence
+> stamping and named the SIXTH (witnessing ≠ compilation: coverage is
+> load-bearing for tape eligibility, cross-coverage materialization, arena
+> reclamation); #7 closed the two census-named coverage gaps (all-dims sum,
+> arange) and named the batch>1 third class; #8 made the fall-through
+> zero-residue BY CONSTRUCTION (coverage-independent) and root-caused the
+> foreach OOM as a pre-existing lowered-path bug; #9 fixed the OOM (implied-
+> boundary snapshot in bare markStep) and named the "ninth class"
+> chunked-elementwise; #10 measured the ninth class down to a stale hardcoded
+> 128 MB threshold + cat + donation caching (the derived-chunking seam,
+> `computeChunkGeometry`, single-sources dispatch and generation); #11 ran the
+> FIRST-ever deleted-tree measurement of the re-open gate, caught #10's greens
+> as recorded-build-masked, and reconciled the deletion diff; #12 ran the
+> deleted-tree foreach census (two labels, both established-shape, closed +
+> proven byte-identical) and split out the orthogonal ring-probe blocker; #13
+> (Vin's fork (c)) landed the foreach closure + the scalar-source scatter
+> closure, RE-SCOPED `t-ring-probe` to a build-from-IR-covered graph (its
+> purpose is ring verification, not broadcast coverage — the old graph
+> accidentally depended on the deliberately-uncovered released-expand-broadcast
+> class), and ran the full authoritative matrix green on the deleted tree
+> (tape 4/4, ring hits=16 K-bit-identical, parity 3.8e-6/30, witness 5/5,
+> 124M exact, profiler peaks byte-identical to the pre-deletion null). The
+> deliberately-uncovered classes (released strided/broadcast views, released-
+> input scatterAdd/CE, non-f32 scalar scatter, batch>64/non-f32/CoW) run
+> lowered forever — correct-and-slow, structurally guarded. Historical STOP
+> record below is preserved as written:
+>
 > **TASK #43 "recorded-build sunset" STATUS (2026-07-11, deletion-attempt pass):
 > STOPPED at the map — the recorded build is NOT deletable yet, and the named
 > flag it targeted is already dead.** See the full map at the bottom of this doc
