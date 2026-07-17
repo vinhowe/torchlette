@@ -642,6 +642,85 @@ mechanism (a witness-to-convergence cutover gate), NOT a diff reconciliation —
 forced deletion. The preserved diff re-applies 3-way clean; re-run this §D4 Stage-2 matrix once the
 re-open mechanism lands.
 
+**STATUS 2026-07-17 — D4 STOPPED at attempt #6 (Stage 2, the FULL matrix); a SIXTH class named; the
+deletion is again REVERTED (tree restored to `cfadb387`; the preserved diff is unchanged —
+`.claude/D4-deletion-attempt5-STOPPED.diff`, applies 3-way with ONE conflict, the two executor-import
+reconciliations the gate script records; build exit 0; `tsc --noEmit` ZERO net-new vs `cfadb387`,
+134 vs 137 errors, all deltas line-shift/path-prefix artifacts; weight-norm on the deleted tree
+64921 src SLOC / 65 env flags vs 65723 / 69 = −802 code-only, −4 flags).** The attempt-#6 mechanism
+(witness-to-convergence stamping, `ef76d1b9`/`cfadb387`) DID close the FIFTH class: on the real
+deleted tree, run whole-node-exclusive and strictly serial (every earlier mixed-parallel result was
+re-run — device-chain contention fabricates failures wholesale; see the vk note below), the entire
+WITNESSING side of the matrix is green — `t-witness-harvest-matrix` ALL FIVE cells PASS (scaler-inf
+**6** producers / 459 pairs / **941** edges `threw=false`, shadow EMPTY everywhere, `inputNotReady=0`
+in every cell), `t-witness-harvest-probe` PASS, `test:gates` 6/6, `parity-fullstack`
+compiled-vs-lowered worst |Δ|=7.63e-6/30 steps both directions, `t-stream-determinism` PASS,
+`t-ledger-attack-probe` default+STEPS=48 clean, `t-planner-pin-attribution` arena/free/--assert
+PASS, `t-checkpoint-ab-oracle` witness side PASS both modes (memory side FAILs by D3-STOP design —
+unchanged), and the **124M DiLoCo regression EXACT** ({0:9.8089, 3:5.9225, 6:5.1522, 9:4.6386} vs
+baselines {9.81, 5.92, 5.15, 4.64}, peak flat 2087.6 MB).
+
+**THE SIXTH CLASS — WITNESSING ≠ COMPILATION: build-from-IR does not COVER the plans the recorded
+build COMPILED, and a recurring template stranded lowered-forever breaks three load-bearing
+properties.** The witness-to-convergence mechanism reproduces the recorded build's witnessing; it
+does not reproduce its COMPILING. The canonical fullstack training step's plans (the fused-Adam
+optimizer plan; the embedding-gradient `contiguous → scatterAdd[vocab,E]` backward plan) were
+compiled by the recorded build; `generateStream` cannot fully cover them, so on the deleted tree
+they fall through and run lowered EVERY execution. Three deterministic manifestations (all
+whole-node-exclusive, serial, real deleted tree; all green on clean `cfadb387` under identical
+conditions):
+
+1. **The step-tape/capture family collapses** — no compiled step ever enters the tape.
+   `t-train-tape-matrix` fused cells: `eligiblePairs=0 loweredPairs=6 tapeCount=0` (clean control:
+   `6/0/1` PASS); `t-step-object-null`, `t-step-edit-null`, `t-ring-probe` (`hits=0`; trajectories
+   still byte-identical), `t-train-capture-probe` (`captureHits=0`), `t-stream-generate`
+   (`hook-fires=0 verified-cmds=0`) ALL FAIL. The step-object/D-campaign surface is built on the
+   tape; the deletion un-builds it.
+2. **The mixed-coverage fall-through has a materialization bug** (`executor.ts` "falls through …
+   with zero residue" — measured FALSE): `profile-training` distil@512 AND medium@512 BOTH crash at
+   step 5 (the 2nd+ template execution, i.e. the moment build-from-IR engages) with
+   `Input not ready: contiguous[0] shape=[512,768]` (distil) / `[512,1024]` (medium) feeding the
+   embedding-grad `scatterAdd` — a build-from-IR-covered producer's output is not visible as a
+   lowered `node.result` to the uncovered consumer plan. Clean tree: PASS (distil 5233 MB @512);
+   clean pure-lowered (`COMPILED_PLAN=0`): PASS (2110 MB). Only the MIXED state crashes. The
+   IN-SUITE twin is `test/distilgpt2-full-finetuning.spec.ts > Memory Stability`, which throws the
+   same class (`Input not ready: contiguous[0] shape=[32,128]`, retry x2, deterministic) —
+   single-file A/B: deleted FAIL / clean PASS. This is the standing `npm run test` gate that
+   catches the class; the attempt-#5 STOP already named it (the "class-#2 twin").
+3. **Lowered-forever recurring plans revive the unbudgeted arena** — the per-position arena is only
+   reclaimed when a plan reaches compiled/planner replay (the 78c6f73 arena-reclaim); a permanently
+   lowered recurring template never gets there. The foreach `t-train-tape-matrix` cells OOM the
+   32 GB device (`GPU memory limit exceeded: requested 320.00MB, current usage 31.88GB`) — the
+   arena-memory-blowup class, structurally re-opened for every uncovered template.
+
+NOT the sixth class (named to prevent re-chasing): the full-suite `vkCreateDevice: Failed to create
+device chain` / `VK_ERROR_INITIALIZATION_FAILED` cascade — an ENVIRONMENTAL device-chain flake on
+this node's whole-suite runs (a different random file set each run; the affected files pass on
+isolated single-file rerun). Discriminate any suite failure with a single-file rerun before
+attributing it to a tree.
+
+**Finiteness assumptions — final form.** Assumptions 1–4 HOLD as stated once assumption 3 is read
+in its final form: witnessing completeness is delivered by STAMPING via converged-to-lowered (K_w=2
+consecutive lowered executions with no valid compiled plan ⇒ stamp harvest outputs on the lowered
+path), NOT by an extra witnessing pass — scaler-inf's 6-producer/941-edge derivation on the deleted
+tree is the measurement. The assumption the sixth class breaks is OUTSIDE the finiteness frame: the
+implicit structural claim that the build-from-IR fall-through is zero-residue and that
+compilation coverage is a pure optimization. It is not — compilation is load-bearing for (i) tape
+eligibility, (ii) cross-coverage result materialization, (iii) arena reclamation.
+
+**Re-open condition (attempt #7's charter).** Either (a) `generateStream` COVERS the fullstack
+optimizer plan and the embedding-grad backward plan (nothing recurring falls through), or (b) the
+fall-through is made genuinely zero-residue AND lowered-forever recurring templates get tape
+eligibility + arena reclamation by another route. Gates (all on the deleted tree, whole-node
+exclusive, serial): `t-train-tape-matrix` 4/4 (a tape FORMS, no OOM); `profile-training` distil@512
+AND medium@512 exit 0 at baseline memory; the single-file `distilgpt2-full-finetuning.spec.ts` green
+(6/6 — the Memory-Stability twin is the cheapest in-suite discriminator of the class);
+plus the standing attempt-#6 crux (scaler-inf ≥6 producers `threw=false`, checkpoint clean).
+META-LESSON (sixth time): the acceptance gate was again NECESSARY-not-SUFFICIENT — it gated the
+witnessing crux and was green while compilation-coverage consequences broke three subsystems; and
+device-chain contention on a shared node FABRICATES failure classes — nothing measured under
+parallel GPU load is evidence about the tree.
+
 ### Phase D5 — The declared-lifetime dividend (LAST; step-object phase 7)
 
 **Goal:** the observation predicates RETIRE on the captured path (they are now queries of

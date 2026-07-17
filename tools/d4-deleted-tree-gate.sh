@@ -87,6 +87,38 @@ req("scaler-inf", si.threw === false, "threw");
 req("scaler-inf", si.shadowDerivedMissing === 0, `derived-missing ${si.shadowDerivedMissing}`);
 req("checkpoint", ck.threw === false, "threw");
 req("checkpoint", ck.inputNotReady === 0, `inputNotReady ${ck.inputNotReady}`);
-if (ok) console.log(`[d4-gate] PASS — scaler-inf ${si.edgeProducers} producers/${si.edgePairs} pairs/${si.edges} edges threw=${si.threw}; checkpoint threw=${ck.threw}`);
-else { console.error("[d4-gate] FAIL"); process.exit(1); }
+if (ok) console.log(`[d4-gate] witnessing crux PASS — scaler-inf ${si.edgeProducers} producers/${si.edgePairs} pairs/${si.edges} edges threw=${si.threw}; checkpoint threw=${ck.threw}`);
+else { console.error("[d4-gate] FAIL (witnessing crux)"); process.exit(1); }
 ' "$SI" "$CK"
+
+# --- attempt #7 cells (the SIXTH class: WITNESSING != COMPILATION) ------------
+# Failing-first as of 2026-07-17: build-from-IR does not COVER the fullstack
+# optimizer plan / the embedding-grad backward plan the recorded build compiled,
+# so on the deleted tree they run lowered forever. Consequences gated here:
+#   tape      : t-train-tape-matrix fused+cosine must FORM a tape (today:
+#               eligiblePairs=0 loweredPairs=6 tapeCount=0 -> exit 1).
+#   profiler  : profile-training distil@512 must survive the build-from-IR
+#               cutover at step 5 (today: Input not ready contiguous[512,768]
+#               feeding the embedding-grad scatterAdd -> exit 139).
+#   distil-ft : the in-suite Memory-Stability twin, single-file (today:
+#               Input not ready contiguous[32,128], retry x2 -> exit 1).
+# All three PASS on main under identical conditions. Run whole-node exclusive:
+# device-chain contention on this node fabricates failures wholesale.
+FAIL7=0
+echo "[d4-gate] #7 tape (t-train-tape-matrix fused+cosine — a tape must form)"
+(cd "$WT" && XDG_RUNTIME_DIR="$XDG" VULKAN_DEVICE_INDEX="$DEVICE" LD_LIBRARY_PATH=tools/vk-shim \
+  TORCHLETTE_STEP_TAPE=record FUSED=1 SCHED=1 npx tsx tools/t-train-tape-matrix.ts >/dev/null 2>&1) \
+  && echo "  PASS" || { echo "  FAIL (no eligible tape without the recorded build)"; FAIL7=1; }
+echo "[d4-gate] #7 profiler (distil@512, 8 steps — the fall-through materialization)"
+(cd "$WT" && XDG_RUNTIME_DIR="$XDG" VULKAN_DEVICE_INDEX="$DEVICE" LD_LIBRARY_PATH=tools/vk-shim \
+  TORCHLETTE_PROFILE=1 TORCHLETTE_MODEL=distilgpt2 TORCHLETTE_SEQ_LEN=512 NUM_STEPS=8 \
+  npx tsx tools/profile-training.ts >/dev/null 2>&1) \
+  && echo "  PASS" || { echo "  FAIL (Input-not-ready at the build-from-IR cutover)"; FAIL7=1; }
+echo "[d4-gate] #7 distil-ft single-file (the in-suite Memory-Stability twin)"
+(cd "$WT" && XDG_RUNTIME_DIR="$XDG" VULKAN_DEVICE_INDEX="$DEVICE" LD_LIBRARY_PATH=tools/vk-shim \
+  npx vitest run --project webgpu test/distilgpt2-full-finetuning.spec.ts >/dev/null 2>&1) \
+  && echo "  PASS" || { echo "  FAIL (Memory-Stability throws Input-not-ready contiguous[32,128])"; FAIL7=1; }
+if [ "$FAIL7" -ne 0 ]; then
+  echo "[d4-gate] FAIL — the #7 compilation-coverage cells are red (the sixth class stands)"; exit 1
+fi
+echo "[d4-gate] PASS — witnessing crux AND #7 compilation-coverage cells green"
