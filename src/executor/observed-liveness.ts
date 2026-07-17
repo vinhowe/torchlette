@@ -1,10 +1,10 @@
 /**
  * Stage-1 observed cross-plan liveness (docs/stage4-compile-from-ir.md §Stage-1).
  *
- * The build-from-IR path (TORCHLETTE_BUILD_FROM_IR=1) has no after-the-fact
- * refcount signal, so it harvests the FULL action-output set of every plan —
- * every intermediate becomes an exclusive planner result entry (≈+34% memory
- * over the recorded cutover's live-result survivor set). This module recovers
+ * The build-from-IR path has no after-the-fact refcount signal, so it harvests
+ * the FULL action-output set of every plan — every intermediate becomes an
+ * exclusive planner result entry (≈+34% memory over a live-result survivor
+ * set). This module recovers
  * the survivor set by OBSERVATION: from the first executed steps it learns which
  * harvested results the plan set actually consumes (the same signal the lowered
  * path prunes by), converges per recurring template, and rebuilds the template

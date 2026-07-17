@@ -15,11 +15,6 @@
  * ```
  */
 
-import {
-  invalidateActiveRecording,
-  isCompilationRecordingActive,
-  recordVolatileUniform,
-} from "../../executor/compiled-plan";
 import type { LazyIRNode } from "../../graph/types";
 import {
   cachedCreateBindGroup,
@@ -226,12 +221,11 @@ export interface TileKernelInstance {
   getWGSL(): string;
 
   /**
-   * Stage-4 stream generation: build the volatile-uniform PACK function the
-   * recorded path uses (getConfigBuffer → recordVolatileUniform with
-   * `node => packUniforms(spec, volatileRepack(node)).data`). A generated
-   * TAG_UNIFORM for a kernel with per-step-varying config (Adam's bias-
+   * Stage-4 stream generation: build the volatile-uniform PACK function
+   * (`node => packUniforms(spec, volatileRepack(node)).data`) the generated
+   * TAG_UNIFORM carries. A kernel with per-step-varying config (Adam's bias-
    * corrected step_size) MUST carry this packer, not a no-op — else the config
-   * freezes at the recording-time value (the frozen-step_size class).
+   * freezes at the build-time value (the frozen-step_size class).
    */
   volatilePack(
     volatileRepack: VolatileUniformRepack,
@@ -363,7 +357,6 @@ export function createTileKernelDispatcher(
     key: string,
     sizeBytes: number,
     data: Uint8Array,
-    volatileRepack: VolatileUniformRepack | undefined,
   ): GPUBuffer {
     let entry = configCache.get(key);
     if (!entry) {
@@ -375,28 +368,6 @@ export function createTileKernelDispatcher(
         lastData: data.slice(),
       };
       configCache.set(key, entry);
-    } else if (isCompilationRecordingActive() && !volatileRepack) {
-      // Staleness seam: the lowered path rewrites this buffer every dispatch,
-      // a replay binds the record-time contents forever. If the data changed
-      // since the previous execution and the caller declared no volatile
-      // repack, a replay WOULD compute with stale values — refuse to compile
-      // (lowered fallback is always correct). This is the structural guard
-      // for the frozen-step-size bug class.
-      const prev = entry.lastData;
-      let same = prev.length === data.length;
-      if (same) {
-        for (let i = 0; i < data.length; i++) {
-          if (prev[i] !== data[i]) {
-            same = false;
-            break;
-          }
-        }
-      }
-      if (!same) {
-        invalidateActiveRecording(
-          `tile kernel '${spec.name}' config data changed across executions with no volatile repack`,
-        );
-      }
     }
     if (entry.lastData.length === data.length) {
       entry.lastData.set(data);
@@ -404,11 +375,6 @@ export function createTileKernelDispatcher(
       entry.lastData = data.slice();
     }
     device.queue.writeBuffer(entry.buffer, 0, data);
-    if (isCompilationRecordingActive() && volatileRepack) {
-      recordVolatileUniform(entry.buffer, (node) => {
-        return packUniforms(spec, volatileRepack(node)).data;
-      });
-    }
     return entry.buffer;
   }
 
@@ -447,12 +413,11 @@ export function createTileKernelDispatcher(
     device: GPUDevice,
     uniforms: Record<string, number>,
     keyPrefix = "",
-    volatileRepack?: VolatileUniformRepack,
   ): GPUBuffer | null {
     if (Object.keys(spec.uniforms).length === 0) return null;
     const configKey = keyPrefix + uniformCacheKey(spec, uniforms);
     const { data, sizeBytes } = packUniforms(spec, uniforms);
-    return getConfigBuffer(device, configKey, sizeBytes, data, volatileRepack);
+    return getConfigBuffer(device, configKey, sizeBytes, data);
   }
 
   return {
@@ -496,19 +461,14 @@ export function createTileKernelDispatcher(
     dispatch(
       buffers: Record<string, GPUBuffer>,
       uniforms: Record<string, number>,
-      volatileRepack?: VolatileUniformRepack,
+      _volatileRepack?: VolatileUniformRepack,
     ): void {
       const ctx = requireContext();
       const device = ctx.device;
       const wgsl = getWGSL();
       const pipeline = getPipeline(ctx, wgsl, wgsl);
 
-      const configBuf = prepareConfigBuffer(
-        device,
-        uniforms,
-        "",
-        volatileRepack,
-      );
+      const configBuf = prepareConfigBuffer(device, uniforms, "");
       const bindingNames = Object.keys(spec.bindings);
       const bufferArray: GPUBuffer[] = [];
 
@@ -535,7 +495,7 @@ export function createTileKernelDispatcher(
       buffers: Record<string, GPUBuffer>,
       uniforms: Record<string, number>,
       chunking: ChunkedBindingConfig,
-      volatileRepack?: VolatileUniformRepack,
+      _volatileRepack?: VolatileUniformRepack,
     ): void {
       const ctx = requireContext();
       const device = ctx.device;
@@ -552,19 +512,10 @@ export function createTileKernelDispatcher(
 
       for (const chunk of geom.chunks) {
         const patchedUniforms = chunk.patchedUniforms;
-        // Per-chunk volatile repack: re-derive from the node, then re-apply
-        // this chunk's element count (chunk layout is step-invariant).
-        const chunkRepack: VolatileUniformRepack | undefined = volatileRepack
-          ? (node) => ({
-              ...volatileRepack(node),
-              [chunking.sizeUniform]: chunk.chunkSize,
-            })
-          : undefined;
         const configBuf = prepareConfigBuffer(
           device,
           patchedUniforms,
           "chunked:",
-          chunkRepack,
         );
 
         type Entry = {

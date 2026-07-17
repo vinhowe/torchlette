@@ -13,7 +13,6 @@
  */
 
 import { ENV } from "../../core/env";
-import { recordAlloc } from "../../executor/compiled-plan";
 import { getSizeClass, getSizeForClass } from "../../graph/lifetime-analysis";
 import type { BackendTensor } from "../types";
 import { bufAcquire, bufRegister } from "./buffer-debug";
@@ -73,10 +72,8 @@ export function allocateOutputBuffer(sizeBytes: number): GPUBuffer {
           sizeBytes,
         );
         arenaLocal.conflictDetected = true;
-        recordAlloc(freshBuffer as GPUBuffer, sizeBytes, 1, []);
         return freshBuffer as GPUBuffer;
       }
-      recordAlloc(arenaBuffer, sizeBytes, 1, []);
       return arenaBuffer;
     }
   }
@@ -90,7 +87,6 @@ export function allocateOutputBuffer(sizeBytes: number): GPUBuffer {
       GPUBufferUsage.COPY_SRC |
       GPUBufferUsage.COPY_DST,
   }) as GPUBuffer;
-  recordAlloc(buffer, sizeBytes, 1, []);
   return buffer;
 }
 
@@ -505,7 +501,6 @@ export function resolveOutputBuffer(
         // Still need to check direct aliasing on the fresh buffer
         if (freshBuffer && !inputBuffers.some((b) => b === freshBuffer)) {
           arenaLocal.resolveHits++;
-          recordAlloc(freshBuffer, sizeBytes, 0, inputBuffers);
           return freshBuffer;
         }
         // Fresh buffer aliased with direct input — fall through to normal path
@@ -513,7 +508,6 @@ export function resolveOutputBuffer(
       } else if (!inputBuffers.some((b) => b === arenaBuffer)) {
         // No conflict, no aliasing — use arena buffer directly
         arenaLocal.resolveHits++;
-        recordAlloc(arenaBuffer, sizeBytes, 0, inputBuffers);
         return arenaBuffer;
       } else {
         // Direct aliasing with current op's input — fall through to normal path.
@@ -556,7 +550,6 @@ export function resolveOutputBuffer(
         bufAcquire(pinned, "resolveOutputBuffer.pinned");
         outputSequenceHints[outIdx] = pinned;
         pinnedOutputBuffers[outIdx] = null; // consumed
-        recordAlloc(pinned, sizeBytes, 0, inputBuffers);
         return pinned;
       }
       // Pin didn't match (size class changed or aliased with input) — return to pool
@@ -593,7 +586,6 @@ export function resolveOutputBuffer(
     outputSequenceHints[outIdx] = outBuffer;
   }
 
-  recordAlloc(outBuffer, sizeBytes, 0, inputBuffers);
   return outBuffer;
 }
 

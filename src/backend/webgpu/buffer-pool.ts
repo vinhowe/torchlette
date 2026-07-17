@@ -731,9 +731,9 @@ class SimpleBufferPool {
     const keep: Array<{ buffer: GPUBuffer; size: number }> = [];
     for (const entry of this.pendingDestroy) {
       // A buffer can be PINNED (adopted by a compiled plan) after it was
-      // queued here — e.g. a recording-step temp queued for deferred
-      // destruction, then captured by buildCompiledPlan as a planned/
-      // persistent binding. Destroying it would reject every replay submit.
+      // queued here — e.g. a temp queued for deferred destruction, then bound
+      // by a compiled plan as a planned/persistent binding. Destroying it
+      // would reject every replay submit.
       if (pinnedBufferSet.has(entry.buffer)) {
         keep.push(entry);
         continue;

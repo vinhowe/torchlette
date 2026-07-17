@@ -8,8 +8,9 @@
  * as JSON. Big enough to trigger the compiled plan (multi-layer → arena
  * populated → compiled replay on 2nd+ step), so running it under
  * TORCHLETTE_COMPILED_PLAN=0 vs default is the compiled-vs-lowered
- * trajectory gate (the frozen-step_size / clip-divergence class), and under
- * TORCHLETTE_STREAM_GENERATE=1 it exercises the stage-4 generator diff.
+ * trajectory gate (the frozen-step_size / clip-divergence class). Under
+ * TORCHLETTE_DEBUG_COMPILED=1 it logs each plan built from IR
+ * (`[compiled] ...BUILD-FROM-IR fp=...`).
  *
  * Deterministic init keeps the trajectory reproducible across processes
  * WITHOUT a global RNG seed: LayerNorm weight=1/bias=0, other biases=0,

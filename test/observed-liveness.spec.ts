@@ -71,7 +71,7 @@ async function runProbe(
         .trim()
         .split("\n")
         .reverse()
-        .find((l) => l.trim().startsWith('{"buildFromIR"'));
+        .find((l) => l.trim().startsWith('{"compiled"'));
       if (!line) throw new Error(`no probe JSON:\n${stdout.slice(-500)}`);
       return JSON.parse(line);
     } catch (e) {

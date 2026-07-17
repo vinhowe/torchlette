@@ -40,26 +40,6 @@ export function setActiveBatch(batch: BatchExecutionContext | null): void {
 }
 
 // ============================================================================
-// Compilation Recording Flag
-// ============================================================================
-
-/**
- * Whether compilation recording is active. Backend ops check this to bypass
- * optimization caches (e.g., f16WeightCache) that return pre-existing buffers —
- * such buffers wouldn't be tracked in bufferToSlot and would be silently
- * dropped from the compiled plan's results.
- */
-let compilationRecordingActive = false;
-
-export function isCompilationRecording(): boolean {
-  return compilationRecordingActive;
-}
-
-export function setCompilationRecording(active: boolean): void {
-  compilationRecordingActive = active;
-}
-
-// ============================================================================
 // Shared Encoder Active Flag (moved from shared-encoder.ts)
 // ============================================================================
 

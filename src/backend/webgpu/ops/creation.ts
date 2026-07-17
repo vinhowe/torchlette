@@ -2,7 +2,6 @@
  * Tensor creation ops: tensorFromArray, zeros, full, arange, tril/triu, rand/randn/bernoulli.
  */
 
-import { recordClear } from "../../../executor/compiled-plan";
 import type { DType } from "../../types";
 import {
   cachedCreateBindGroup,
@@ -14,7 +13,6 @@ import { bufferPool, destroyCopy } from "../buffer-pool";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { f32ArrayToF16Array, requireContext } from "../gpu-context";
 import type { GPUBuffer as LocalGPUBuffer, WebGPUTensor } from "../gpu-types";
-import { profileApiCall } from "../profiler";
 import {
   alignBufferSize,
   compute2DDispatch,
@@ -167,15 +165,6 @@ export function zeros(shape: number[], dtype: DType = "f32"): WebGPUTensor {
       submitOrCollect(encoder.finish());
     }
   }
-  // Record the clear UNCONDITIONALLY — outside the reuse check above. The
-  // encode-time clear is skippable for a fresh (spec-zeroed) buffer, but a
-  // REPLAY always binds a reused buffer: a recording taken on a step where
-  // this allocation happened to be fresh would replay without re-zeroing,
-  // corrupting accumulating ops that read a zeroed buffer (the embedding-
-  // grad scatter-add class, latent variant). No-op when not recording.
-  // recordClear relies on the slot assigned by resolveOutputBuffer above.
-  recordClear(buffer, alignedSize);
-
   return createTensor(shape, buffer, undefined, 0, dtype);
 }
 

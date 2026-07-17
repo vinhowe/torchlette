@@ -62,7 +62,7 @@ HEAD_SHA="$(cd "$REPO" && git rev-parse HEAD)"
 # stream-generate.ts) broke the throwaway build. HEAD + reconciled diff has no
 # drift. Pin the pre-deletion commit so the gate stays reproducible after Stage-3
 # commits the deletion (then HEAD moves and this gate retires — see docs §D4).
-PREDELETION_SHA="${D4_PREDELETION:-7c3f319e}"
+PREDELETION_SHA="${D4_PREDELETION:-39debb7d}"
 WT="$(mktemp -d)/d4-del"
 
 cleanup() { (cd "$REPO" && git worktree remove --force "$WT" 2>/dev/null) || true; rm -rf "$(dirname "$WT")" 2>/dev/null || true; }

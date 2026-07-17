@@ -1,13 +1,11 @@
 /**
  * Stage-4 phase 4.2 probe: is the chunked full-reduction sum (>128MB input)
- * correct under (a) recorded compiled replay and (b) — once covered —
- * generated replay? Sums a >128MB tensor inside a compiled plan, runs it
- * enough times to activate replay, and checks the scalar against the CPU
- * reference each step. Also reports whether the plan FULLY GENERATED.
+ * correct under the compiled (build-from-IR) replay? Sums a >128MB tensor
+ * inside a compiled plan, runs it enough times to activate replay, and checks
+ * the scalar against the CPU reference each step.
  *
  * Run: VULKAN_DEVICE_INDEX=0 LD_LIBRARY_PATH=tools/vk-shim \
  *        npx tsx tools/t-chunked-sum-probe.ts
- * Add TORCHLETTE_BUILD_FROM_IR=0 to force the recorded path.
  */
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
 import { Torchlette } from "../src/frontend/torchlette";

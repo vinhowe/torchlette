@@ -3,11 +3,6 @@
  * binary/unary/matmul dispatch.
  */
 
-import {
-  getAndClearLastBindGroupBuffers,
-  isCompilationRecordingActive,
-  recordDispatch as recordCompiledDispatch,
-} from "../../executor/compiled-plan";
 import type { DType } from "../types";
 import {
   cachedCreateBindGroup,
@@ -42,7 +37,7 @@ import {
 } from "./ops/ops-tile-ir";
 import { detectSimpleTranspose, ensureContiguous } from "./ops/views";
 import { getWarmupPipeline, recordPipeline } from "./pipeline-warmup";
-import { getProfileModule, getTimestampWrites } from "./profiler";
+import { getTimestampWrites } from "./profiler";
 import {
   broadcastShapes,
   compute2DDispatch,
@@ -79,22 +74,6 @@ export function dispatchComputePass(
 ): void {
   const ctx = requireContext();
   const label = labelOverride ?? getCurrentOpLabel();
-
-  // Record dispatch for compiled plan (label/module restore profiler
-  // attribution during replay — without them all replayed GPU time shows
-  // as "unknown").
-  if (isCompilationRecordingActive()) {
-    recordCompiledDispatch({
-      pipeline,
-      bindGroup: bindGroup as GPUBindGroup,
-      workgroupsX,
-      workgroupsY,
-      workgroupsZ,
-      buffers: getAndClearLastBindGroupBuffers(),
-      label: label ?? undefined,
-      module: getProfileModule(),
-    });
-  }
 
   const sharedEnc = getSharedEncoderInstance();
   const tsWrites = getTimestampWrites(label ?? "unknown");

@@ -11,14 +11,6 @@
 
 import { ENV } from "../../core/env";
 import {
-  invalidateActiveRecording,
-  assignSlot,
-  consumePendingParamsVolatilePack,
-  isCompilationRecordingActive,
-  recordVolatileUniform,
-  setLastBindGroupBuffers,
-} from "../../executor/compiled-plan";
-import {
   isArenaBuffer,
   outputSequenceHints,
   pinnedOutputBuffers,
@@ -114,24 +106,12 @@ const cacheState: BindGroupCacheState = {
   paramsSequenceBuffers: [],
 };
 
-/**
- * Task #71: if the executor flagged this node's params as carrying a volatile
- * offset (view chain contains a narrow), record a TAG_UNIFORM repack on the
- * params buffer so the recorded stream matches the generator's (both re-derive
- * the offset per replay). No-op unless recording AND a pending pack is set.
- */
-function maybeRecordParamsVolatile(buffer: GPUBuffer): void {
-  const pack = consumePendingParamsVolatilePack();
-  if (pack) recordVolatileUniform(buffer, pack);
-}
-
 export function createParamsBuffer(
   device: GPUDevice,
   data: Uint32Array,
 ): GPUBuffer {
   const sizeClass = paramsBufferSizeClass(data.byteLength);
   const idx = cacheState.paramsSeqIndex++;
-  const compiling = isCompilationRecordingActive();
 
   // Try to reuse the buffer from the same dispatch position (previous step).
   // This keeps the GPUBuffer pointer stable so bind group caching can hit.
@@ -149,33 +129,8 @@ export function createParamsBuffer(
           }
         }
         if (same) {
-          if (compiling) {
-            assignSlot(cached.buffer, {
-              kind: "params",
-              seqIndex: idx,
-              data: data.slice(),
-            });
-            maybeRecordParamsVolatile(cached.buffer);
-          }
           return cached.buffer; // Skip writeBuffer entirely
         }
-      }
-      // Data changed at a stable dispatch position. If a compiled plan is
-      // being RECORDED right now, the recorded "params" slot would bake THIS
-      // execution's bytes and every replay would reuse them — but bytes that
-      // changed between consecutive executions of one template will keep
-      // changing (per-step-varying value reaching a raw params buffer: the
-      // frozen-data form of the frozen-scalar disease, previously guarded
-      // only for tile-IR configs via getConfigBuffer). Invalidate the
-      // recording: the plan falls back to lowered execution, which rewrites
-      // params every dispatch. The payload-fingerprint hash (2809588) makes
-      // this rare — values reaching params buffers normally derive from
-      // hashed payload/shape — so invalidation here is a correctness
-      // backstop, not a hot path.
-      if (compiling) {
-        invalidateActiveRecording(
-          `params bytes changed across executions at seq ${idx} (label=${getCurrentOpLabel() ?? "?"}) — raw params buffers cannot carry per-step-varying values into replays`,
-        );
       }
       if (ENV.TORCHLETTE_DEBUG_PARAMS_CHANGED) {
         const diffs: string[] = [];
@@ -202,14 +157,6 @@ export function createParamsBuffer(
       } else {
         cached.data = data.slice();
       }
-      if (compiling) {
-        assignSlot(cached.buffer, {
-          kind: "params",
-          seqIndex: idx,
-          data: data.slice(),
-        });
-        maybeRecordParamsVolatile(cached.buffer);
-      }
       return cached.buffer;
     }
 
@@ -226,14 +173,6 @@ export function createParamsBuffer(
         data: data.slice(),
       };
       paramsSequenceSet.add(buffer);
-      if (compiling) {
-        assignSlot(buffer, {
-          kind: "params",
-          seqIndex: idx,
-          data: data.slice(),
-        });
-        maybeRecordParamsVolatile(buffer);
-      }
       return buffer;
     }
   }
@@ -254,10 +193,6 @@ export function createParamsBuffer(
       data: data.slice(),
     };
     paramsSequenceSet.add(buffer);
-  }
-  if (compiling) {
-    assignSlot(buffer, { kind: "params", seqIndex: idx, data: data.slice() });
-    maybeRecordParamsVolatile(buffer);
   }
   return buffer;
 }
@@ -305,17 +240,6 @@ export function profiledCreateBindGroup(
   const bg = profileApiCall("createBindGroup", () =>
     device.createBindGroup(descriptor),
   );
-  // When recording, capture buffer references from the descriptor for compilation
-  if (isCompilationRecordingActive() && descriptor.entries) {
-    const entries: Array<{ buffer: GPUBuffer; offset?: number; size?: number }> = [];
-    for (const e of descriptor.entries) {
-      const r = e.resource;
-      if (r && typeof r === "object" && "buffer" in r) {
-        entries.push({ buffer: r.buffer, offset: r.offset, size: r.size });
-      }
-    }
-    setLastBindGroupBuffers(entries);
-  }
   return bg;
 }
 
@@ -361,8 +285,6 @@ export function cachedCreateBindGroup(
     }
     if (match) {
       cacheState.hits++;
-      if (isCompilationRecordingActive())
-        setLastBindGroupBuffers(entry.buffers);
       return entry.bindGroup;
     }
   }
@@ -413,7 +335,6 @@ export function cachedCreateBindGroup(
 
   const bufCopy = buffers.slice();
   cacheState.sequenceEntries[idx] = { bindGroup, pipeline, buffers: bufCopy };
-  if (isCompilationRecordingActive()) setLastBindGroupBuffers(bufCopy);
   return bindGroup;
 }
 

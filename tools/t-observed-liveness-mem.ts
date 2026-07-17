@@ -7,11 +7,12 @@
  *   - "conservative": build-from-IR with observation DISABLED (the +34%
  *     over-harvest — every action output becomes an exclusive planner result).
  *   - "pruned":       build-from-IR with observed pruning (the fix).
- *   - "cutover":      the default recorded cutover (the reference baseline the
- *     delta was measured against).
  *
- * The pruned peak must collapse the conservative delta down toward the cutover
- * peak. process.exit(0) at end (Dawn holds threads).
+ * The pruned peak must collapse the conservative delta. process.exit(0) at end
+ * (Dawn holds threads).
+ * (The "cutover" recorded-reference mode retired with the recorded build —
+ * task #43 sunset. The lowered path (TORCHLETTE_COMPILED_PLAN=0) is the
+ * surviving non-compiled reference.)
  */
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
 import { gpuMemoryTracker } from "../src/backend/webgpu/memory-tracker";
@@ -55,20 +56,11 @@ function fillFor(name: string, n: number): number[] {
 
 async function main() {
   process.env.TORCHLETTE_POOL_BUDGET_MB ??= "12000";
-  // Mode wiring (no new env flags): "conservative" opts observation OFF while
-  // build-from-IR still builds — the pre-pruning baseline. Stage-2 flip:
-  // build-from-IR is the default, so "cutover" (the recorded reference) is the
-  // =0 opt-out.
-  if (MODE === "conservative") {
-    process.env.TORCHLETTE_BUILD_FROM_IR = "1";
-    setObservedLivenessEnabled(false);
-  } else if (MODE === "pruned") {
-    process.env.TORCHLETTE_BUILD_FROM_IR = "1";
-    setObservedLivenessEnabled(true);
-  } else {
-    process.env.TORCHLETTE_BUILD_FROM_IR = "0";
-    setObservedLivenessEnabled(false);
-  }
+  // Mode wiring (no new env flags): build-from-IR is unconditional now
+  // (task #43 recorded-build sunset). "conservative" opts observation OFF (the
+  // pre-pruning over-harvest baseline); "pruned" enables observed pruning (the
+  // fix). Any non-"conservative" MODE runs pruned.
+  setObservedLivenessEnabled(MODE !== "conservative");
 
   if (!(await initWebGPU())) {
     console.error("no webgpu");

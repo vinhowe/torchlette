@@ -92,9 +92,7 @@ import type {
   LazyRef,
   StorageHandle,
 } from "../graph/types";
-import { diffSegmentsAligned, diffStreams } from "./stream-diff";
 import {
-  buildDirectOffsetRepack,
   type GeneratedStream,
   generateStream,
 } from "./stream-generate";
@@ -110,8 +108,6 @@ import {
   getLivePendingRootNodes,
 } from "../runtime/tensor";
 import {
-  assignSlot,
-  buildCompiledPlan,
   buildCompiledPlanFromGenerated,
   type CompiledPlan,
   checkpointBoundaryIndices,
@@ -119,18 +115,10 @@ import {
   debugEntryBufferIndex,
   destroyCompiledPlanBuffers,
   executeCompiledPlan,
-  isCompilationRecordingActive,
   type NodeResult,
   plannerEntryBytes,
   plannerEntryClaimable,
-  recordBarrier,
-  recordWrite,
   resetPlannerRegistry,
-  setPendingParamsVolatilePack,
-  setRecordingNodeIndex,
-  startCompilationRecording,
-  stopCompilationRecording,
-  TAG_DISPATCH,
 } from "./compiled-plan";
 import {
   buildLoweredPlanFromAnalysis,
@@ -165,10 +153,7 @@ const IN_PLACE_COMMIT_OPS: ReadonlySet<string> = new Set([
   "stridedScatterAdd",
 ]);
 
-import {
-  crossPlanEdgeHasOtherConsumer,
-  crossPlanEdgeKeepSet,
-} from "../core/cross-plan-edges";
+import { crossPlanEdgeHasOtherConsumer } from "../core/cross-plan-edges";
 import {
   STEP_TAPE_RECORD,
   STEP_TAPE_REPLAY,
@@ -754,29 +739,16 @@ export function debugCrossPlanPersistentBindings(): Record<
   return out;
 }
 
-/** Stage-2 FLIP (2026-07-08): build-from-IR is THE default build source —
- *  plans compile from IR on their FIRST execution, no recording. RECORDING
- *  survives only for:
- *   - verify modes: TORCHLETTE_STREAM_GENERATE=1 diffs the generated stream
- *     against a recording, so it keeps the recorded build (the stream-diff
- *     gates; the determinism gate pins BUILD_FROM_IR=0 explicitly);
- *   - uncovered plans (census-driven, per-plan): when generateStream cannot
- *     fully cover a plan the build-from-IR block falls through with zero
- *     residue and the plan records on its next execution (recorded cutover);
- *   - the opt-outs: BUILD_FROM_IR=0 (the recorded-replay reference; dies when
- *     the recorded build source is deleted) / COMPILED_PLAN=0 (the lowered
- *     reference), which must disable build-from-IR too or they'd measure
- *     nothing. (The GENERATED_PLAN flag died at stage-2 inc-3c, 2026-07-08:
- *     after inc-3a deleted the cutover swap it was an exact behavioral twin
- *     of BUILD_FROM_IR=0 — the named B5 sunset, executed.)
- *  Single predicate so the observation enable below and the build block can
- *  never disagree. */
+/** Build-from-IR is THE (and now only) compiled build source: plans compile
+ *  from IR on their FIRST execution, no recording. The recorded build path was
+ *  deleted (2026-07), so build-from-IR is unconditional — the sole opt-out is
+ *  COMPILED_PLAN=0 (the lowered reference), which must disable build-from-IR
+ *  too or it would measure nothing. An uncovered plan (generateStream cannot
+ *  fully cover it) falls through the build block with zero residue and runs on
+ *  the lowered path. Single predicate so the observation enable below and the
+ *  build block can never disagree. */
 function buildFromIRActive(): boolean {
-  return (
-    ENV.TORCHLETTE_BUILD_FROM_IR !== "0" &&
-    ENV.TORCHLETTE_COMPILED_PLAN !== "0" &&
-    ENV.TORCHLETTE_STREAM_GENERATE !== "1"
-  );
+  return ENV.TORCHLETTE_COMPILED_PLAN !== "0";
 }
 
 // fp → number of times it reached the build-from-IR block. Distinguishes
@@ -2061,7 +2033,7 @@ export async function executeLoweredPlan(
     ENV.TORCHLETTE_COMPILED_PLAN !== "0" &&
     // Liveness-aware arena reuses one buffer across multiple positions, so
     // compiled replay needs planned mode (the memory planner derives a
-    // lifetime-split buffer assignment per plan — see buildCompiledPlan).
+    // lifetime-split buffer assignment per plan).
     (!arenaLivenessEnabled() || compiledPlannedEnabled())
   ) {
     if (ENV.TORCHLETTE_DEBUG_COMPILED) {
@@ -2115,13 +2087,12 @@ export async function executeLoweredPlan(
   // execution, NO recording. Populate the layout captures from IR-derived
   // metadata stubs, generate the stream, harvest the result metadata from the
   // IR (the liveness-output set), build the planner-backed plan, and replay it.
-  // THE DEFAULT build source (stage-2 flip; opt-out TORCHLETTE_BUILD_FROM_IR=0
-  // restores the record-then-cutover build everywhere — see buildFromIRActive
-  // for the recording-survivor cases). Any failure (uncovered stream,
-  // underivable result, invalid plan) resets the captures and falls through to
-  // the lowered path with zero residue — so opt-out behaviour and the fallback
-  // are byte-identical to the unmodified normal path, and an uncovered plan
-  // simply records on its next execution (the census-driven fallback).
+  // THE (only) compiled build source; opt-out TORCHLETTE_COMPILED_PLAN=0
+  // stays on the lowered path (see buildFromIRActive). Any failure (uncovered
+  // stream, underivable result, invalid plan) resets the captures and falls
+  // through to the lowered path with zero residue — so the opt-out behaviour
+  // and the fallback are byte-identical to the unmodified normal path, and an
+  // uncovered plan simply runs lowered every execution.
   if (
     !scalarAdaptPending &&
     buildFromIRActive() &&
@@ -2420,78 +2391,6 @@ export async function executeLoweredPlan(
     setArenaExternalInputBuffers(collectExternalInputBuffers(planNodes));
   }
 
-  // Start compilation recording for compiled plan.
-  // Bounded-arena (liveness) mode is supported via PLANNED BUFFERS: slot
-  // resolution happens at record time (lifetime splitting in recordAlloc),
-  // and buildCompiledPlan pins the recorded pool-buffer assignment to the
-  // plan — replays bind the exact lifetime-reusing assignment the recording
-  // proved safe, with memory bounded to the recording's working set.
-  const shouldCompile =
-    useTopLevelSharedEncoder &&
-    options.bufferArena &&
-    !loweredPlan.compiledPlan &&
-    options.bufferArena.resolve.length > 0 && // Arena populated from prior execution
-    // Bounded-arena mode: compile only under the experimental planned-buffer
-    // flag (see buildCompiledPlan), else stay on the lowered path as before.
-    (!arenaLivenessEnabled() || compiledPlannedEnabled()) &&
-    // Debug bisection: only compile plans up to N nodes.
-    (!ENV.TORCHLETTE_COMPILED_MAX_NODES ||
-      planNodes.length <= parseInt(ENV.TORCHLETTE_COMPILED_MAX_NODES, 10)) &&
-    // Debug bisection: only compile plans whose node count is in the list.
-    (!ENV.TORCHLETTE_COMPILED_ONLY_NODES ||
-      ENV.TORCHLETTE_COMPILED_ONLY_NODES.split(",").includes(
-        String(planNodes.length),
-      ));
-  let compilationRecording: ReturnType<
-    typeof startCompilationRecording
-  > | null = null;
-  /** [stage-3 A] Node ids whose results EXISTED before this execution
-   *  (skip-executed shared nodes — e.g. attention nodes shared with a
-   *  sibling template that already ran this step). A recording claims only
-   *  results THIS execution produced: pre-existing ones are excluded from
-   *  the result collection instead of tripping the unrecordedNodes
-   *  invalidation (consumers re-resolve them per replay as externals via
-   *  planNodes[i].inputs, exactly like any prior-plan result). */
-  let preExistingResults: Set<number> | null = null;
-  if (shouldCompile) {
-    if (ENV.TORCHLETTE_DEBUG_COMPILED) {
-      console.log(`[exec] RECORDING nodes=${planNodes.length}`);
-    }
-    compilationRecording = startCompilationRecording();
-    preExistingResults = new Set();
-    for (const node of planNodes) {
-      if (node.result || (node.results && node.results.some((r) => !!r))) {
-        preExistingResults.add(node.id);
-      }
-    }
-    // Pre-assign external input slots for inputs that are already materialized
-    // (results from prior plan executions). Inputs produced within this plan
-    // are NOT yet materialized and will get slots during recording via arena alloc.
-    for (let i = 0; i < planNodes.length; i++) {
-      const node = planNodes[i];
-      for (let j = 0; j < node.inputs.length; j++) {
-        const ref = node.inputs[j];
-        // Only assign if the input is already materialized
-        let storage: StorageHandle | undefined;
-        if (ref.kind === "materialized") {
-          storage = ref.storage;
-        } else if (ref.kind === "scalar") {
-          continue; // Scalar constants don't have GPU buffers
-        } else {
-          const idx = ref.outputIndex ?? 0;
-          storage = idx === 0 ? ref.node.result : ref.node.results?.[idx];
-        }
-        if (!storage) continue;
-        const buf = gpuBuffer(storage.backendTensor);
-        assignSlot(buf, {
-          kind: "external",
-          planNodeIndex: i,
-          inputIndex: j,
-        });
-      }
-    }
-  }
-
   // Pre-resolve dynamic imports before the action loop so subsequent calls
   // to executeFusedSegment avoid per-call async import overhead.
   await ensureFusionImports();
@@ -2579,20 +2478,8 @@ export async function executeLoweredPlan(
       actionIndex++
     ) {
       const action = loweredPlan.actions[actionIndex];
-      // Task #71: the per-node offset-repack flag is scoped to ONE direct-
-      // elementwise node's dispatch. Clear it at every action boundary so a
-      // throw that skipped a node's post-exec clear can't leak its closure into
-      // a later action's createParamsBuffer (defensive; a throw normally aborts
-      // the plan). No-op when not recording.
-      if (compilationRecording) setPendingParamsVolatilePack(null);
       switch (action.kind) {
         case "fused": {
-          // Attribute recorded commands to the group's output node — without
-          // this they inherit the PREVIOUS sequential node's index, polluting
-          // its segment in the stream differential (and misattributing any
-          // volatile-uniform recordings).
-          if (compilationRecording)
-            setRecordingNodeIndex(action.outputNodeIndex);
           // Reconstruct FusionGroup from plan nodes
           const groupNodes = action.coveredNodeIndices.map((i) => planNodes[i]);
           const outputNode = planNodes[action.outputNodeIndex];
@@ -2752,8 +2639,6 @@ export async function executeLoweredPlan(
         }
 
         case "matmul-epilogue": {
-          if (compilationRecording)
-            setRecordingNodeIndex(action.matmulNodeIndex);
           const matmulNode = planNodes[action.matmulNodeIndex];
           const outputNode = planNodes[action.outputNodeIndex];
 
@@ -2919,7 +2804,6 @@ export async function executeLoweredPlan(
             // flushBufferPool() safe.
             flushSharedEncoder();
             flushBufferPool();
-            recordBarrier();
           }
 
           const adamBackend =
@@ -2963,10 +2847,6 @@ export async function executeLoweredPlan(
               });
             }
             if (items.length === 0) return;
-            // Attribute volatile uniform recordings (Adam config) to the first
-            // adamStep node — all items in a batch share hyperparameters by
-            // construction, so any node is a valid replay-time config source.
-            if (compilationRecording) setRecordingNodeIndex(firstNodeIdx);
             // [step-tape 2b G-cover] declare the batch members' payload
             // variance as carried by the representative's TAG_UNIFORM repack.
             // The recorder additionally asserts member↔representative payload
@@ -2990,8 +2870,6 @@ export async function executeLoweredPlan(
         }
 
         case "batched-reduction": {
-          if (compilationRecording)
-            setRecordingNodeIndex(action.nodeIndices[0]);
           const batchNodes = action.nodeIndices.map((i) => planNodes[i]);
           const batchBackend = getBackend(batchNodes[0].device) ?? backend;
           const batchInputs = batchNodes.map((node) => {
@@ -3040,19 +2918,6 @@ export async function executeLoweredPlan(
           const node = planNodes[nodeIdx];
           if (node.result) break;
 
-          // Tag the node for recording hooks (volatile uniform attribution).
-          if (compilationRecording) {
-            setRecordingNodeIndex(nodeIdx);
-            // Task #71: if this strided-elementwise node's input offset can
-            // vary (view chain contains a narrow), flag its direct-dispatch
-            // params buffer for a TAG_UNIFORM offset repack so the recorded
-            // stream matches the generator's. Set fresh each node (overwriting
-            // any prior value — so a throw in a previous node's dispatch, which
-            // skips its post-exec clear below, cannot leak that node's closure
-            // into this one's createParamsBuffer). Cleared after execution too.
-            setPendingParamsVolatilePack(buildDirectOffsetRepack(node));
-          }
-
           setProfileModule(node.module ?? "unknown");
           let inputs;
           try {
@@ -3087,16 +2952,7 @@ export async function executeLoweredPlan(
               ? await resultOrPromise
               : resultOrPromise;
           assignNodeResult(node, handlerResult, backendInputs, inputs);
-          // Task #71: clear the pending offset-repack flag (consumed by
-          // createParamsBuffer during the dispatch above; clear even if the op
-          // took a non-direct path and never consumed it).
-          if (compilationRecording) setPendingParamsVolatilePack(null);
           stats.sequentialNodes++;
-
-          // Record data-source for compiled plan (re-executed each step)
-          if (action.kind === "data-source" && isCompilationRecordingActive()) {
-            recordWrite(gpuBuffer(node.result!.backendTensor), nodeIdx);
-          }
 
           // Stage-4 phase-3/4.4: capture the layout metadata the stream
           // generator needs (matmul geometry, attention/reshape/strided-view
@@ -3122,8 +2978,6 @@ export async function executeLoweredPlan(
         }
 
         case "row-program": {
-          if (compilationRecording)
-            setRecordingNodeIndex(action.outputNodeIndex);
           // Remap inputRefs to current step's nodes (template reuse makes
           // the original refs stale — they point to cleared previous-step nodes).
           const remappedRefs = action.inputRefs.map((ref, i) => {
@@ -3156,22 +3010,13 @@ export async function executeLoweredPlan(
             flushSharedEncoder();
             flushBufferPool();
           }
-          recordBarrier();
           break;
         }
       }
 
       // Liveness-based early release: free dead buffers after each action.
       // Uses the pre-built release schedule (action-index based, not step based).
-      // Liveness releases stay ON during recording in planned-buffer mode:
-      // the pool reuse they enable IS the planned-buffer assignment the
-      // compiled plan captures (recordAlloc splits lifetimes into distinct
-      // slots). In default (unbounded-arena) mode, releases are skipped
-      // during recording as before — arena identities are already stable.
-      if (
-        livenessReleaseSchedule &&
-        (!compilationRecording || compiledPlannedEnabled())
-      ) {
+      if (livenessReleaseSchedule) {
         // Register newly-produced storages for release tracking
         const covered = getActionNodeIndices(action);
         for (const ni of covered) {
@@ -3232,245 +3077,6 @@ export async function executeLoweredPlan(
       );
     }
   } finally {
-    // Build compiled plan from recording
-    if (compilationRecording) {
-      stopCompilationRecording();
-      // Collect node results for the compiled plan.
-      //
-      // The compiled plan is a dispatch-level replay: it can only reproduce results
-      // that were produced by GPU dispatches recorded during this execution. If a
-      // backend op returned a cached/pre-existing buffer (no dispatch), that buffer
-      // won't be in bufferToSlot and the compiled plan can't reproduce it.
-      //
-      // Backend ops must check isCompilationRecording() (from webgpu-state) and
-      // bypass optimization caches during recording. If any result still slips
-      // through, we invalidate the compiled plan rather than silently dropping it.
-      const nodeResults: NodeResult[] = [];
-      const unrecordedNodes: string[] = [];
-      for (let i = 0; i < planNodes.length; i++) {
-        const node = planNodes[i];
-        // [stage-3 A] Results that pre-existed this execution are not this
-        // recording's products — skip them (see preExistingResults above).
-        if (preExistingResults?.has(node.id)) continue;
-        if (node.results && node.results.length > 0) {
-          for (let oi = 0; oi < node.results.length; oi++) {
-            const sh = node.results[oi];
-            if (!sh) continue;
-            const bt = asGPUTensor(sh.backendTensor);
-            const slot = compilationRecording.bufferToSlot.get(bt.buffer);
-            if (slot !== undefined) {
-              nodeResults.push({
-                nodeIndex: i,
-                outputIndex: oi,
-                slot,
-                shape: bt.shape.slice(),
-                strides: bt.strides.slice(),
-                dtype: bt.dtype,
-                offset: bt.offset,
-              });
-            } else {
-              unrecordedNodes.push(
-                `node[${i}].results[${oi}] op=${node.op} shape=${JSON.stringify(node.shape)} dtype=${bt.dtype}`,
-              );
-            }
-          }
-        } else if (node.result) {
-          const bt = asGPUTensor(node.result.backendTensor);
-          const slot = compilationRecording.bufferToSlot.get(bt.buffer);
-          if (slot !== undefined) {
-            nodeResults.push({
-              nodeIndex: i,
-              outputIndex: 0,
-              slot,
-              shape: bt.shape.slice(),
-              strides: bt.strides.slice(),
-              dtype: bt.dtype,
-              offset: bt.offset,
-            });
-          } else {
-            unrecordedNodes.push(
-              `node[${i}] op=${node.op} shape=${JSON.stringify(node.shape)} dtype=${bt.dtype}`,
-            );
-          }
-        }
-      }
-      // [task #99 R2 / D2] The LIVE witness signal for this template (the
-      // checkpoint-recompute cross-plan reads observeConsumed is blind to) —
-      // sourced from the DERIVED crossPlanEdges keep-set (D2 collapse: the
-      // per-producer witnessed-harvest oracle it used to read is gone). The
-      // projection equals the retired oracle's set by construction (D1 gate).
-      // Empty unless the template has been witnessed (K_w=2 identical reads).
-      const witnessedRecomputePairs =
-        options.templateFp !== undefined
-          ? crossPlanEdgeKeepSet(options.templateFp, currentVariantSelection())
-          : undefined;
-      const compiled = buildCompiledPlan({
-        commandLog: compilationRecording.commandLog,
-        arena: options.bufferArena!,
-        planNodes,
-        bufferToSlot: compilationRecording.bufferToSlot,
-        slotSources: compilationRecording.slotSources,
-        nodeResults,
-        witnessedRecomputePairs,
-      });
-      if (unrecordedNodes.length > 0) {
-        // A backend op returned a cached buffer that wasn't tracked during
-        // recording. The op needs to check isCompilationRecording() and bypass
-        // its cache. Log details so the developer knows exactly which op to fix.
-        console.warn(
-          `[compiled-plan] Invalidated: ${unrecordedNodes.length} node(s) have result buffers not tracked during recording.\n` +
-            `  This means a backend op returned a cached/pre-existing buffer instead of dispatching.\n` +
-            `  Fix: check isCompilationRecording() from webgpu-state and bypass the cache.\n` +
-            unrecordedNodes.map((s) => `  - ${s}`).join("\n"),
-        );
-        compiled.valid = false;
-        // [stage-3 A leak fix] The build already assigned planner registry
-        // entries (finalizeCompiledPlan → planMemory, owners = this plan).
-        // Dropping the plan without releasing them leaks every result entry
-        // as a dead-owner resultHolder FOREVER (measured ~390 MB/step when a
-        // template re-recorded each step). Route through the one teardown
-        // path — same rule as every other invalidation.
-        destroyCompiledPlanBuffers(compiled);
-      }
-      // Arena conflicts no longer block compiled plan storage. The arena
-      // hands evicted buffers back to the pool's release chain (see
-      // buffer-arena.ts arenaAllocAt + allocateOutputBuffer + resolveOutputBuffer),
-      // so orphaned buffers from conflict resolution get destroyed once their
-      // owners release. The compiled plan's per-command bind group cache
-      // (compiled-plan.ts) handles buffer pointer changes between replays.
-      if (compiled.valid) {
-        compiled.endCounters = getDispatchSequenceCounters();
-        loweredPlan.compiledPlan = compiled;
-      }
-      // Stage-4: generate the command stream from the lowered plan for the
-      // VERIFY mode only (stage-2 B1 deletion, 2026-07-08: the recorded→
-      // generated cutover swap is DELETED — build-from-IR builds generated
-      // plans directly on first execution, so a plan that reaches this
-      // recording path is an uncovered/opt-out plan whose replay source IS the
-      // recorded plan just built; swapping it for a generated one was the
-      // pre-flip default's job and is dead weight after the flip).
-      const wantStreamGen = ENV.TORCHLETTE_STREAM_GENERATE === "1";
-      const gen =
-        wantStreamGen && compiled.valid
-          ? // VERIFY path: constFill applies (a plan reaching the recording
-            // path recurs), but the fused row-program for stamped scalars does
-            // NOT — the recording being diffed used the sequential fallback
-            // for that input class, so the generator must mirror it.
-            generateStream(loweredPlan, planNodes, backend, {
-              coverConstFill: true,
-              fuseStampedScalarExternals: false,
-            })
-          : undefined;
-
-      // Phase-2 cross-check (TORCHLETTE_STREAM_GENERATE=1): diff the generated
-      // stream against the recording at the command level. Divergence = a
-      // generator bug or a recording gap, surfaced at build time instead of in
-      // a loss curve. Coverage is reported per uncovered op class.
-      if (wantStreamGen && gen) {
-        const top = [...gen.uncovered.entries()]
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 8)
-          .map(([k, v]) => `${k}×${v}`)
-          .join(" ");
-        // Always segment-aligned: gen-vs-record slot numbering matches only
-        // up to a bijection (the recording assigns slots in recordAlloc
-        // order; the generator in its own order), and the stream is
-        // slot-renaming-invariant by design — so raw-slot diffStreams (right
-        // for record-vs-record determinism) is too strict here. When fully
-        // covered, additionally assert the flat command COUNTS agree, which
-        // catches any non-node-attributed command (barriers) the generator
-        // failed to emit.
-        const seg = diffSegmentsAligned(gen.segments, compiled.commands);
-        for (const div of seg.divergences.slice(0, 3)) {
-          console.warn(
-            `[stream-gen] DIVERGE node[${div.nodeIndex}] op=${planNodes[div.nodeIndex]?.op ?? "?"}: ${div.detail}`,
-          );
-        }
-        if (gen.fullyCovered) {
-          // A constFill slot pre-fills a data-source's value at build and emits
-          // NO command, so the generated stream is SHORTER than the recording by
-          // exactly the commands (and any dispatch params slot) that data-source
-          // recorded — ALLOC + (DISPATCH fill_tile/arange_tile | CLEAR for
-          // full([],0)) + WRITE. Reconcile by EXCLUDING those recorded artifacts,
-          // keyed by the source node index the recording tags on every one of
-          // them (recordingNodeIndex during the data-source's execution, stored
-          // on the constFill slot). This is exact and shape-agnostic — no fixed
-          // "constFill == 1 command" credit, which under-counted every
-          // dispatch-based fill by 2 (latent until a fill-bearing plan became
-          // fully covered). The VALUE equivalence (pre-fill == the elided
-          // dispatch's output) is gated by parity-fullstack + test:gates.
-          const constFillNodes = new Set<number>();
-          for (const s of gen.slots)
-            if (s.kind === "constFill" && s.nodeIndex !== undefined)
-              constFillNodes.add(s.nodeIndex);
-          const excludedParamsSlots = new Set<number>();
-          let recordedNonConstFill = 0;
-          for (const c of compiled.commands) {
-            const ni = (c as { nodeIndex?: number }).nodeIndex;
-            if (ni !== undefined && constFillNodes.has(ni)) {
-              if (c.tag === TAG_DISPATCH)
-                for (const b of (c as { bindings: number[] }).bindings)
-                  if (compiled.slots[b]?.kind === "params")
-                    excludedParamsSlots.add(b);
-              continue;
-            }
-            recordedNonConstFill++;
-          }
-          const countMatch = gen.commands.length === recordedNonConstFill;
-          if (!countMatch) {
-            console.warn(
-              `[stream-gen] DIVERGE flat command count: generated ${gen.commands.length} vs recorded-non-constFill ${recordedNonConstFill} (raw recorded ${compiled.commands.length}, ${constFillNodes.size} constFill nodes)`,
-            );
-          }
-          // Params/uniform DATA multiset must agree. diffSegmentsAligned
-          // compares DISPATCH by pipeline + workgroups + binding SLOTS but
-          // NOT the params bytes — a wrong config (e.g. a shared paramsData
-          // array stored by reference and later mutated) is otherwise
-          // invisible yet computes garbage. This guard closes that hole. The
-          // recorded params slots bound by an excluded constFill dispatch are
-          // skipped (the constFill has no params — it pre-filled the value).
-          const paramsBag = (
-            ss: typeof gen.slots,
-            skip?: ReadonlySet<number>,
-          ) => {
-            const m = new Map<string, number>();
-            for (let i = 0; i < ss.length; i++) {
-              if (skip?.has(i)) continue;
-              const s = ss[i];
-              if (s.kind === "params") {
-                const k = Array.from(s.data).join(",");
-                m.set(k, (m.get(k) ?? 0) + 1);
-              }
-            }
-            return m;
-          };
-          const gpar = paramsBag(gen.slots);
-          const rpar = paramsBag(compiled.slots, excludedParamsSlots);
-          let paramsMatch = gpar.size === rpar.size;
-          if (paramsMatch)
-            for (const [k, v] of gpar)
-              if (rpar.get(k) !== v) {
-                paramsMatch = false;
-                break;
-              }
-          if (!paramsMatch) {
-            console.warn(
-              `[stream-gen] DIVERGE params-data multiset (generated vs recorded uniform bytes differ)`,
-            );
-          }
-          console.log(
-            `[stream-gen] FULLY GENERATED ${gen.actionCount} actions: ${seg.verifiedActions}/${gen.segments.length} segments verified, ${seg.divergences.length} diverged, flat ${gen.commands.length}/${compiled.commands.length} cmds${countMatch && paramsMatch ? " ✓" : " ✗"}`,
-          );
-        } else {
-          console.log(
-            `[stream-gen] VERIFIED ${seg.verifiedActions}/${gen.segments.length} segments (${seg.verifiedCommands} cmds, ${seg.divergences.length} diverged, ${seg.unmatched} unmatched; covered ${gen.coveredActions}/${gen.actionCount} actions; uncovered: ${top})`,
-          );
-        }
-      }
-
-      compilationRecording = null;
-    }
-
     // Clear arena conflict flag
     if (getArenaConflictDetected()) {
       clearArenaConflictDetected();
@@ -3750,8 +3356,8 @@ export async function executePlanOptimized(
     // bufferArena, recreate it as an empty arena that the executor
     // will populate during the upcoming plan execution. Without this,
     // the cache-hit path would proceed with options.bufferArena =
-    // undefined, the shouldCompile check would fail, and compiled-plan
-    // recording would never engage for the rest of the process — every
+    // undefined, the build-from-IR check would fail, and compiled-plan
+    // building would never engage for the rest of the process — every
     // subsequent session would run 3-4× slower than the first because
     // every plan would go through the slow normal path forever.
     if (backend.name === "webgpu" && !validatedTemplate.bufferArena) {

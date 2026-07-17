@@ -1,8 +1,8 @@
 /**
  * Compiled-plan correctness gates, promoted from loose tools/ scripts into
  * the suite so they FAIL THE BUILD instead of rotting (they were manual-only;
- * see task #44 / the 2026-06-13 project audit). Three load-bearing checks,
- * each subprocess-isolated (the engine's module-global caches make multiple
+ * see task #44 / the 2026-06-13 project audit). Load-bearing checks, each
+ * subprocess-isolated (the engine's module-global caches make multiple
  * Torchlette instances per process interfere — same one-engine-per-process
  * methodology as fused-vs-elementwise.spec.ts):
  *
@@ -10,10 +10,14 @@
  *     class. Runs the full production inner step (autocast+checkpoint+
  *     scaler+clip+AdamW) on a tiny real GPT-2 twice (default vs
  *     TORCHLETTE_COMPILED_PLAN=0); per-step losses must agree to fp noise.
- *  2. stream generation: no divergence — the stage-4 generated stream must
- *     match the recording (TORCHLETTE_STREAM_GENERATE=1 → segment diff).
- *  3. stream determinism — recording one template twice is byte-identical
- *     (everything downstream assumes it).
+ *  2. stream build determinism — building one template from IR twice is
+ *     byte-identical (everything downstream assumes it).
+ *  3. chunked full-reduction sum (>128MB input) — correct in a compiled plan.
+ *  4. view-offset templates + cross-offset replay (task #71).
+ *
+ * (The former "stream generation matches the recording" cross-check retired
+ * with the recorded build — task #43 sunset; the generated build is the only
+ * build now, so #1 + #2 carry its correctness/determinism guarantee.)
  *
  * These exercise the compiled plan (the tiny GPT-2 is multi-layer → arena
  * populated → compiled replay on the 2nd+ step). No PyTorch fixtures: init
@@ -99,26 +103,13 @@ describe("compiled-plan correctness gates", () => {
     TIMEOUT,
   );
 
-  it(
-    "stream generation matches the recording (no divergence)",
-    async () => {
-      if (!webgpu) return;
-      const { stdout, stderr } = await runTool(PARITY_PROBE, {
-        STEPS: "4",
-        TORCHLETTE_STREAM_GENERATE: "1",
-      });
-      const out = `${stdout}\n${stderr}`;
-      const lines = out.split("\n").filter((l) => l.includes("[stream-gen]"));
-      const diverged = lines.filter((l) => l.includes("DIVERGE"));
-      const verified = lines.filter(
-        (l) => l.includes("VERIFIED") || l.includes("FULLY GENERATED"),
-      );
-      expect(diverged, `divergences:\n${diverged.join("\n")}`).toHaveLength(0);
-      // Must actually have generated+verified something (else the gate is vacuous).
-      expect(verified.length).toBeGreaterThan(0);
-    },
-    TIMEOUT,
-  );
+  // REMOVED (task #43 recorded-build sunset): "stream generation matches the
+  // recording (no divergence)" cross-checked the GENERATED stream against a
+  // RECORDING at build time. The recorded build is gone — the generated build
+  // IS the build now, so there is nothing to diff it against. Its correctness
+  // guarantee is fully subsumed by the surviving "compiled == lowered
+  // trajectory" gate (the generated stream computes the lowered path's values)
+  // + the "stream build is deterministic" gate (build-from-IR twice → identical).
 
   it(
     "stream build is deterministic (build twice → identical)",
@@ -137,26 +128,21 @@ describe("compiled-plan correctness gates", () => {
   );
 
   it(
-    "chunked full-reduction sum: correct + fully generated (>128MB input)",
+    "chunked full-reduction sum: correct in a compiled plan (>128MB input)",
     async () => {
       if (!webgpu) return;
       // The chunked sum (input > maxStorageBufferBindingSize) is the lone
-      // chunked op the 124M plan hits; it cuts over to the generated stream
-      // only because its partials/out buffers are arena-allocated (recordable).
-      // Small-model gates never allocate >128MB, so this path needs its own
-      // gate: correctness (Δ=0 vs CPU) AND generated == recorded (0 diverged).
-      const { stdout, stderr, code } = await runTool(CHUNKED_SUM, {
-        TORCHLETTE_STREAM_GENERATE: "1",
-      });
+      // chunked op the 124M plan hits. Small-model gates never allocate >128MB,
+      // so this path needs its own gate: correctness (Δ=0 vs CPU) under the
+      // default compiled (build-from-IR) replay.
+      // RE-BASED (task #43 recorded-build sunset): the old generated-vs-recorded
+      // stream-diff half (STREAM_GENERATE=1 → FULLY GENERATED / 0 DIVERGE) is
+      // gone with the recorded build; the surviving check is the CPU-reference
+      // correctness across compiled replays.
+      const { stdout, stderr, code } = await runTool(CHUNKED_SUM, {});
       const out = `${stdout}\n${stderr}`;
       expect(out, out.slice(-400)).toContain("CHUNKED-SUM: OK");
       expect(code).toBe(0);
-      const sg = out.split("\n").filter((l) => l.includes("[stream-gen]"));
-      expect(sg.filter((l) => l.includes("DIVERGE")), out.slice(-600)).toHaveLength(0);
-      expect(
-        sg.filter((l) => l.includes("FULLY GENERATED")).length,
-        `expected the chunked-sum plan to FULLY GENERATE:\n${sg.join("\n")}`,
-      ).toBeGreaterThan(0);
     },
     TIMEOUT,
   );

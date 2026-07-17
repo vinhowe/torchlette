@@ -66,6 +66,12 @@ async function main() {
   }
   // Invalidate compiled plans (templates survive) → next step re-builds.
   invalidateCompiledKeepTemplates();
+  // Mirror the FIRST phase's 3-step settle. The recorded build re-populated
+  // getCompiledStreams() one step sooner; on the build-from-IR-only path (the
+  // recorded build sunset, #43/D4) the post-invalidation rebuild needs the same
+  // 3-step settle as the initial build (step 1 stale, step 2 empty as the
+  // invalidation clears, step 3 rebuilt byte-identical) before it is stable.
+  await step();
   await step();
   await step();
   const second = getCompiledStreams();

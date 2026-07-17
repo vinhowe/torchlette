@@ -110,7 +110,9 @@ async function main() {
   const stats = getPayloadThrashStats();
   console.log(
     JSON.stringify({
-      buildFromIR: process.env.TORCHLETTE_BUILD_FROM_IR !== "0",
+      // build-from-IR is unconditional now (task #43 sunset); COMPILED_PLAN=0
+      // selects the lowered reference arm.
+      compiled: process.env.TORCHLETTE_COMPILED_PLAN !== "0",
       losses,
       resultSets,
       neededSets,
