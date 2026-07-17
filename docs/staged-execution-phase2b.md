@@ -374,13 +374,54 @@ The frozen-scalar family's kill-zone. Composition, stated precisely:
   falsification proved the guard fires. That triad is the structural defense — the
   7th frozen-scalar instance was caught by it at design time, not in production.
 
-### 5. THE DECLARED-LIFETIME DIVIDEND (extension point — DO NOT BUILD)
+### 5. THE DECLARED-LIFETIME DIVIDEND (DONE — D5, 2026-07-17)
 
-> **Step-object update (task #98, 2026-07-15):** this dividend is now the
-> DESTINATION of the step-object campaign (`docs/step-object-design.md`, ruling 2
-> + phase 7), not a speculative maybe. It stays "DO NOT BUILD" here — the step
-> object sequences it LAST, gated on its own re-open condition (captured path warm
-> + observation-layer watcher cost measured). The design aims at it explicitly.
+> **DONE (D5, step-object phase 7 / ruling 2, 2026-07-17).** The re-open condition
+> was honored, not assumed: the watcher cost was MEASURED (`tools/t-d5-watcher-cost.ts`
+> + a `TORCHLETTE_MEASURE_D5` claim-seam probe) before any retirement, and the
+> retirement is captured-path-only. See the D5 record below and
+> `docs/step-data-dependence-design.md §D5`.
+>
+> **The measurement (the design-decision data).** For every stamped external the
+> stage-3 B claim seam could release, the predicate verdict
+> (`everSurvived`/`everReadback`/`everAliased` via `diagnoseReleasable`) was
+> compared against the DERIVED guards (`graphHeldAt` + `crossPlanEdgeHasOtherConsumer`),
+> captured vs uncaptured, across distil{ckpt on/off} + gpt2-medium:
+>
+> | path | converged | structural | predicate-blocked | REDUNDANT prune | REAL prune | releasableMB |
+> |---|---|---|---|---|---|---|
+> | **captured** | 0 | 0 | 0 | 0 | **0** | 0 |
+> | uncaptured (distil) | 8 | 112 | 65 | 64 | **1** | 564 |
+> | uncaptured (medium) | 8 | 418 | 245 | 244 | **1** | 1780 |
+>
+> **Finding — the dividend is FREE on the captured path.** The predicates prune
+> NOTHING there because the convergence machinery they gate NEVER activates under
+> step-tape replay: a warm tape stops executing lowered, so no template reaches the
+> `K_HYSTERESIS` stable *executed* steps convergence needs (measured
+> convergedTemplates=0 even over 60 steps / 56 hits). The overlay-release and read
+> guards were already suppressed on replay. So retiring the observation RECORDING on
+> the captured path changes NO decision — verified by a BIT-IDENTICAL trajectory
+> pre/post (distil last-loss 11.0766, every per-step value unchanged).
+>
+> **Finding — a full deletion would be UNSOUND; the retirement is captured-path
+> only (partial dividend beats wrong dividend).** Off-capture the same predicate is
+> LOAD-BEARING: `everSurvived` carries exactly ONE real prune the derived guards
+> miss — the `[1,S,vocab]` CE-logits boundary survivor (a value that survives the
+> step with no cross-plan consumer edge; declared-live under capture, observation-only
+> without a declaration). `everReadback`/`everAliased` carry zero real prunes
+> everywhere but stay on the uncaptured path (a future readback is unordered). So the
+> UNCAPTURED path keeps the full observation layer, and strict-lifetime stays armed
+> as the wrong-derivation detector.
+>
+> **The retirement (landed).** The four observation-RECORDING hooks (`stampResult`,
+> `observeConsumed`, `observeReadback`, `noteAliasedBase`) no-op while
+> `isStepTapeReplayActive()` — inside a declared boundary liveness DERIVES from
+> `crossPlanEdges` + the declared survivors. This reclaims the per-replay watcher
+> cost (27,392 recording calls skipped over 16 distil replays: the survival scan's
+> per-stamp `storageTracker.isDestroyed` + the growing predicate/needed sets). The
+> shared consultation code (`releasableLastReader`, `prunedHarvest`) is untouched —
+> dormant on the captured path by construction. Gate: `test/observed-liveness.spec.ts`
+> "captured-path retirement (D5)".
 
 Inside a captured training region, the step's dataflow is known at capture time
 — which buffers a plan writes, which are read cross-plan, which die at the

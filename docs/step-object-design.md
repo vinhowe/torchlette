@@ -87,6 +87,17 @@ intent; the doc's job is to make them structural, never to re-litigate them.
      124M exact, profiler memory-neutral). Deaths + post-deletion semantics:
      `stage4-compile-from-ir.md` header; history: `step-data-dependence-design.md`
      §D4. The historical #5 STOP record below is preserved as written.
+   - **Observation predicates inside boundaries — RETIRED (captured path) ✓
+     2026-07-17 (D5, phase 7).** NOT a full deletion: the re-open-condition
+     MEASUREMENT (`tools/t-d5-watcher-cost.ts`) proved the predicates prune NOTHING
+     on the captured path (convergence never activates under replay → the release
+     machinery is dormant → zero decisions change; trajectory bit-identical
+     pre/post) but `everSurvived` is LOAD-BEARING on the UNCAPTURED path (one real
+     prune the derived guards miss — the `[1,S,vocab]` CE-logits boundary survivor).
+     So the RECORDING (`stampResult`/`observeConsumed`/`observeReadback`/
+     `noteAliasedBase`) no-ops under `isStepTapeReplayActive()`; the uncaptured
+     path keeps all three. "Partial dividend beats wrong dividend" — the sound
+     outcome the task anticipated. See phase 7 below + `phase2b.md §5`.
    - **(historical) Recorded build — NOT EXECUTED (STOPPED 2026-07-16, D4 attempt #5).** Proving
      on the CHECKPOINT config is exactly where it failed: on the deleted tree the
      `scaler-inf` crux cell threw the attempt-#4 `[1,512,768]` overlay-release, and
@@ -858,20 +869,77 @@ policies).
   the UI binds it). The islands cross-path numeric gate + the four-mechanism deletion
   gate are the SEPARATE campaign's (deferred with I3/I4).
 
-### Phase 7 — The declared-lifetime dividend (LAST; its own re-open condition)
+### Phase 7 — The declared-lifetime dividend (DONE ✓ 2026-07-17; D5)
 
 **Goal:** ruling 2. Inside a captured boundary, the observation predicates
 `everSurvived`/`everReadback`/`everAliased` RETIRE on the captured path (`phase2b.md
 §5`). Sequenced LAST, gated on §5's own re-open condition: the captured training path
 is WARM (phase 2 done) AND the observation-layer watcher cost on the training path is
 MEASURED to be worth retiring.
-- **Gate:** the derived-lifetime path produces the SAME liveness the predicates
-  observed (set-parity vs the observation layer, on the captured path), measured
-  watcher-cost delta > the derivation cost; captured-path only (the LOWERED fallback
-  keeps all three — a captured-path dividend, not a global deletion).
-- **Deletes (captured path only):** `everReadback` (ring outputs declared),
-  `everSurvived` (registered persistent + ring survivors declared), `everAliased`
-  (statically-visible aliasing in the recorded plan sequence).
+
+**EXECUTED (D5).** The re-open condition was honored: the watcher cost was MEASURED
+FIRST (`tools/t-d5-watcher-cost.ts` + a `TORCHLETTE_MEASURE_D5` claim-seam probe),
+and the measurement RESHAPED the deletion into a retirement.
+- **What the measurement found.** The predicates are consulted only at the stage-3 B
+  claim seam (`releasableLastReader`), gated on `converged`. On the captured path
+  convergence NEVER activates — a warm step-tape stops executing lowered, so no
+  template reaches the `K_HYSTERESIS` stable *executed* steps convergence requires
+  (measured convergedTemplates=0 / releasableMB=0 / zero predicate prunes across
+  distil{ckpt on/off} + gpt2-medium, even at 60 steps / 56 hits). So the release
+  machinery + the read guards + the overlay-release application are ALL dormant on the
+  captured path; the predicates prune NOTHING there. Off-capture they DO converge, and
+  `everSurvived` carries one real prune the derived guards (`graphHeldAt` +
+  `crossPlanEdgeHasOtherConsumer`) miss: the `[1,S,vocab]` CE-logits boundary survivor.
+- **Gate (met):** the derived-lifetime path produces the SAME liveness the predicates
+  observed on the captured path — trivially, because the predicates change no decision
+  there (dormant); the captured trajectory is BIT-IDENTICAL pre/post retirement.
+  Captured-path only (the UNCAPTURED path keeps all three — the one real
+  `everSurvived` prune is load-bearing there). Strict-lifetime stays armed as the
+  wrong-derivation detector.
+- **What actually retired (captured path only):** the observation RECORDING —
+  `stampResult` / `observeConsumed` / `observeReadback` / `noteAliasedBase` no-op under
+  `isStepTapeReplayActive()` (reclaiming the per-replay survival scan + the growing
+  predicate/needed sets, 27k+ recording calls skipped over 16 distil replays). The
+  predicates were NOT deleted (uncaptured needs `everSurvived`); the shared
+  consultation code is untouched, dormant on captured by construction. "Partial
+  dividend beats wrong dividend."
+
+### Campaign CLOSING summary (phases 0–7 final state)
+
+The step-object campaign is COMPLETE. Final state, per phase:
+- **P0** optimizer-config slot coverage — LANDED (the mundane gate on everything).
+- **P1** StepObject as union identity (reify, null-clean) — LANDED (`t-step-object-null`).
+- **P2** whole-step capture warm (runahead ring) — LANDED (K≥2 ships; `t-ring-probe`
+  K-bit-identical; INC-3 COMPLETE, `phase2b.md`).
+- **P3** checkpointing first-class; the `setBufferArenaDisabled` bypass dies — LANDED
+  (D3, `arena-recompute-design.md` R2′+R3).
+- **P4** witness-time harvest; recorded-build harvest role retires — LANDED (D2:
+  `crossPlanEdges` is the sole harvest owner; the per-producer witnessed-harvest oracle
+  DELETED).
+- **P5** `guardMiss` recovery → should-never-fire assert — LANDED (zero-fire soak;
+  recovery deleted, `observed-liveness.ts` `guardMiss`).
+- **P4′/D4** recorded build DELETED — EXECUTED 2026-07-17 (attempt #13; net −1186;
+  `step-data-dependence-design.md §D4`).
+- **P6** partition as a step facet; edit channel generalized — LANDED
+  (`t-step-edit-null` identity-edit null-clean).
+- **P7** declared-lifetime dividend — DONE 2026-07-17 (D5, this section): observation
+  RECORDING retired on the captured path; a full deletion was measured UNSOUND
+  (uncaptured `everSurvived` load-bearing) and correctly held to a captured-path
+  retirement.
+
+**What remains, uncaptured-only (by design, not debt).** The observation layer
+(`everSurvived`/`everReadback`/`everAliased` + convergence + overlay-release) stays
+LIVE on the UNCAPTURED path — it is the surviving mechanism where no declaration
+exists to derive from. The measurement is the standing justification: off-capture the
+predicates converge and `everSurvived` carries a real prune the derived edge set
+cannot see. `tools/t-d5-watcher-cost.ts` is the re-runnable regression gate for the
+re-open condition — if a captured path ever converges and the predicates begin to
+prune, it surfaces there.
+
+- **Deletes (captured path only):** the RECORDING of `everReadback` (ring outputs
+  declared), `everSurvived` (registered persistent + ring survivors declared),
+  `everAliased` (statically-visible aliasing) — no-op'd under replay. The predicate
+  Sets themselves stay (uncaptured owns them).
 
 ### Task subsumption / redirection
 
