@@ -249,9 +249,89 @@ export function getInputStorage(
     noteWitnessRead(sh);
     return sh;
   }
+  // [zero-residue fall-through] The producer's result is missing. In a
+  // mixed-coverage step (some templates compiled build-from-IR, some lowered)
+  // the stage-3 B overlay-release can claim a cross-plan value's registry entry
+  // — soundly for a COMPILED consumer (its bind-time guard recovers) but not for
+  // a LOWERED one, whose read lands here. The recorded build masked this by
+  // keeping the value in its harvest; without it the value is genuinely gone
+  // (its bytes overlaid). Recover the way the lowered path IS the reference:
+  // recompute the producer from its still-live inputs (exactly what a
+  // COMPILED_PLAN=0 run materialises). This makes refusal-to-compile
+  // correct-and-slow, never corrupting — the ratified construction. Bounded to
+  // synchronously-recomputable ops (the boundary-materialisation class:
+  // contiguous / cast / reshape / gather …); async/stateful producers fall
+  // through to the throw (they are never overlay-claimed).
+  if (ref.kind === "pending" && backend) {
+    const recovered = recomputeMissingResult(ref.node, idx, backend, 0);
+    if (recovered) {
+      noteWitnessRead(recovered);
+      return recovered;
+    }
+  }
   throw new Error(
     `Input not ready: node id=${ref.node.id} op=${ref.node.op}[${idx}] shape=${JSON.stringify(ref.node.shape)} caller=${new Error().stack?.split("\n")[2]?.trim()}`,
   );
+}
+
+/**
+ * [zero-residue fall-through] Recompute a producer node whose cross-plan result
+ * was overlay-released / pruned in a mixed-coverage step, reproducing exactly
+ * the value the pure-lowered path would hold. Recurses to re-materialise any
+ * missing pending inputs first, then re-executes the op synchronously. Returns
+ * undefined (→ caller throws the original "Input not ready") when the node is
+ * not synchronously recomputable — an async/stateful producer (adamStep,
+ * transfer) is never overlay-claimed, so a miss there is a real bug that must
+ * stay loud. `depth` bounds pathological recursion.
+ */
+function recomputeMissingResult(
+  node: LazyIRNode,
+  idx: number,
+  backend: Backend,
+  depth: number,
+): StorageHandle | undefined {
+  const existing = node.results?.[idx] ?? (idx === 0 ? node.result : undefined);
+  if (existing) return existing;
+  if (depth > 256) return undefined;
+  const inputs: StorageHandle[] = [];
+  for (const inp of node.inputs) {
+    if (inp.kind === "pending") {
+      const have =
+        inp.node.results?.[inp.outputIndex ?? 0] ??
+        ((inp.outputIndex ?? 0) === 0 ? inp.node.result : undefined);
+      if (!have) {
+        const rec = recomputeMissingResult(
+          inp.node,
+          inp.outputIndex ?? 0,
+          backend,
+          depth + 1,
+        );
+        if (!rec) return undefined;
+      }
+    }
+    let s: StorageHandle;
+    try {
+      s = getInputStorage(inp, backend);
+    } catch {
+      return undefined;
+    }
+    inputs.push(s);
+  }
+  const backendInputs = inputs.map((s) => s.backendTensor);
+  let result: BackendTensor | MultiOutputResult | Promise<unknown>;
+  try {
+    result = executeOpSync(node, backendInputs, backend) as
+      | BackendTensor
+      | MultiOutputResult
+      | Promise<unknown>;
+  } catch {
+    return undefined;
+  }
+  // Async producer (adamStep/transfer): not the overlay class — decline so the
+  // caller throws loudly rather than swallowing a real bug.
+  if (result instanceof Promise) return undefined;
+  assignNodeResult(node, result, backendInputs, inputs);
+  return node.results?.[idx] ?? (idx === 0 ? node.result : undefined);
 }
 
 // ---------------------------------------------------------------------------
