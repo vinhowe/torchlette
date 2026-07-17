@@ -1020,6 +1020,73 @@ foreach elementwise optimizer plan.**
   `t-stream-generate` (obsolete apparatus). The reconciliation + gate rework of this pass are preserved
   (`.claude/harvest-deletion-final.diff`, the reworked `d4-deleted-tree-gate.sh`) and need no redo.
 
+**STATUS 2026-07-17 — D4 attempt #12 (THE DELETED-TREE FOREACH CENSUS): the foreach plan's uncovered labels are
+MEASURED for the first time on the true deleted tree, and BOTH are established-shape — CLOSED and PROVEN
+byte-identical (the fullstack tape matrix is now 4/4 on the deleted tree). BUT the full #12 re-open gate has a
+SECOND, DISTINCT blocker that attempt #11 mis-bundled under "foreach": `t-ring-probe`'s synthetic tiny fused-Adam
+graph strands on a BROADCAST-into-fused view, the deliberately-excluded strided-view class — STOP on that residual,
+deletion NOT landed.** Measured on the reconciled deleted tree (`7c3f319e` + `harvest-deletion-final.diff`),
+sivri VULKAN device 3 (== nvidia 3, identity map; free), GPU-exclusive serial, via a temporary `gen.uncovered`
+dump in the surviving build-from-IR block (`TORCHLETTE_STREAM_GENERATE` is deleted; instrument-and-revert).
+
+- **THE FOREACH CENSUS (definitive).** The ONLY recurring, structurally-stable plan that strands lowered is the
+  foreach elementwise optimizer plan `fp=0xfa7c442` (reach climbs 1→16 every step; every other uncovered census
+  entry is a reach-1 warmup graph variant or a checkpoint-re-fingerprinting forward/backward plan → `structureMisses`,
+  not `loweredPairs`). Its steady (reach≥2) uncovered map is EXACTLY two labels, `covered 613/691`:
+
+  | label | count | root |
+  |---|---|---|
+  | `op:stridedScatterCopy[no-storage]` | 76 | scatter-back src `reshape(narrow(pNew, 0, offsets[k], sizes[k]), shape)` (adam.ts:448) — a RELEASED contiguous view with a non-zero packed-buffer offset; `refSlotAndMeta` bailed all released VIEW_OPS |
+  | `op:cat[no-storage]` | 2 | grad/param packing `cat(reshape(param, [size]))` (adam.ts:370/374) — released contiguous reshape input to `generateCat` |
+
+  (At reach=1 only, warmup `fused[no-input-pattern]=50`/`data-source:full=2` also appear; they vanish by reach≥2 and
+  never block eligibility.) The `fused[oversized]×8` / `op:cat` interdependence the #9/#10 STOP feared is GONE on the
+  deleted tree — attempt #10's stale-128 MB-threshold fix holds without the recorded build (device
+  `maxStorageBufferBindingSize = 2048 MB` ⇒ the 320 MB packed buffer binds whole).
+
+- **VERDICT — established-shape; CLOSED + PROVEN.** Both labels are the SAME class: a released CONTIGUOUS view
+  (`reshape`, optionally over a dim-0 `narrow`) whose layout is fully IR-derivable — `contiguousViewShapeDtype` /
+  `CONTIGUOUS_VIEW_OPS` already exist and `generateScatterAdd` already consumes exactly this precedent. The slot
+  aliases the base buffer (views alias to their input's slot); only the ELEMENT OFFSET (the narrow `start`, in the
+  IR payload) had to be recovered — the DMA scatter route (`generateScatterCopyDMA`) already threads `srcOffset`.
+  Fix: a `releasedContigViewOffset(ref)` helper (walks the contiguous-view + dim-0-narrow chain accumulating
+  `start·innerSize`, mirroring `stridedScatterImpl`), wired into `refSlotAndMeta` and `generateCat` (stream-generate.ts
+  only; the deletion does not touch this file). Result on the deleted tree: `fp=0xfa7c442` FULLY covered, all four
+  `t-train-tape-matrix` cells PASS (`eligiblePairs=6`, `loweredPairs=0`, `tapeCount=1`), foreach loss trajectory
+  **BYTE-IDENTICAL to lowered (`COMPILED_PLAN=0`) over 12 steps at 8-decimal precision** — the anti-silent-corruption
+  gate. Preserved as `.claude/d4-12-foreach-closure.diff` (124 lines, stream-generate.ts, applies clean to `9e60023e`
+  and to the deletion base; NOT landed — the landing is a fresh pass on the full green report per the campaign pattern).
+
+- **THE STOP — a SECOND, non-foreach uncovered class the #11 table mis-attributed.** The #12 re-open gate also
+  requires `t-ring-probe` (hits>0). `t-ring-probe` uses FUSED single-weight Adam (NOT foreach); on the deleted tree it
+  fails `hits=0` for a class ORTHOGONAL to the foreach fix (unchanged by the closure). Its recurring uncovered map:
+  `fused[no-storage]` (90×) = a released `expand` broadcast `[1,1]→[1,2]` fed to a fused elementwise kernel; and
+  `op:stridedScatterCopy[scalar-operand]` (5×) = a scatter from a SCALAR source into `[1]`. The broadcast-into-fused is
+  the deliberately-excluded STRIDED/broadcast-view class: even a LIVE broadcast bails `non-contiguous`
+  (stream-generate.ts:3743) and is materialized by an executor copy-prologue, so covering the RELEASED case needs a
+  BROADCAST-copy-prologue synthesized FROM IR (input-shape + broadcast dims → contiguous materialization) — NOT the
+  contiguous-view shape, NONE of the shapes #7–#10 used. #11 attributed ALL deleted-tree reds to "the foreach optimizer
+  plan"; the census shows `t-ring-probe`'s red is a different plan (a tiny synthetic graph), while the REAL training
+  workload (fullstack fused AND foreach) now compiles fully (tape matrix 4/4).
+
+- **Sizing for the residual (Vin's fork).** (a) `stridedScatterCopy[scalar-operand]`: a scalar-source scatter
+  generator (constFill-shape into a base slice) — ~20–30 SLOC, low risk. (b) `fused[expand-broadcast]`: a
+  broadcast-copy-prologue-from-IR (materialize the released `expand`'s [1,1]→[N] contiguous, mirroring the executor's
+  `asContiguous`/#99a copy-prologue but deriving the broadcast layout from the IR view chain instead of live storage)
+  — ~40–80 SLOC + a byte-identical cross-path gate; this crosses the strided-view line the campaign held for 10
+  attempts and carries the silent-corruption risk of any offset/stride reconstruction. Alternative to (b): re-scope
+  `t-ring-probe` to a build-from-IR-covered graph (change the PROBE, not the framework) — it is a synthetic
+  ring-mechanism test, and the ring works on real models. **FORK:** close the two ring-probe labels (small, but (b) is
+  new strided-view capability) vs re-rule the bar for `t-ring-probe` (the real training arms are now byte-identical
+  correct-AND-compiled) vs re-scope the probe. The foreach half — the named #11 blocker — is dissolved; only this
+  synthetic-probe residual stands between here and the authoritative matrix.
+
+- **Re-open condition (attempt #13 / the landing).** Resolve the fork above; if closing: land the two ring-probe
+  labels the established way (with a byte-identical gate for the broadcast prologue), fold `d4-12-foreach-closure.diff`
+  into `harvest-deletion-final.diff` (stream-generate.ts is untouched by the deletion, so it layers cleanly), then run
+  the full §D4 authoritative matrix on the deleted tree (tape matrix 4/4 ✓ already, `t-ring-probe` hits>0, d4 gate) +
+  the standing wall on main (test:gates 6/6, parity ≤1e-5/30, witness 5 cells, 124M exact, profile distil) and land.
+
 ### Phase D5 — The declared-lifetime dividend (LAST; step-object phase 7)
 
 **Goal:** the observation predicates RETIRE on the captured path (they are now queries of
