@@ -13,6 +13,7 @@ import {
   cachedCreateBindGroup,
   createParamsBuffer,
   params,
+  profiledCreateBindGroup,
   releaseParamsBuffer,
 } from "./bind-group-cache";
 import { resolveOutputBuffer } from "./buffer-arena";
@@ -61,7 +62,12 @@ import {
 
 // Tensor construction helpers (extracted to tensor.ts)
 import { createTensor } from "./tensor";
+import type {
+  ChunkedBindingConfig,
+  TileKernelChunkedPlan,
+} from "./tile-dispatch";
 import { createTileKernelDispatcher } from "./tile-dispatch";
+import type { TileKernelSpec } from "./tile-ir";
 
 export function dispatchComputePass(
   pipeline: GPUComputePipeline,
@@ -388,6 +394,119 @@ export function dispatchBinary(
   return createTensor(outShape, outBuffer, undefined, 0, dtype, ownsBuffer);
 }
 
+/** The spec + uniforms + chunking config for a chunked binary elementwise op.
+ *  SINGLE SOURCE consumed by both the execution path (binaryChunked →
+ *  dispatchChunked) and the stream generator (planChunkedBinary → planChunked),
+ *  so the recorded and generated command streams cannot drift. Task #71: chunked
+ *  binds each operand from element 0 → offsets are 0. */
+function chunkedBinaryConfig(
+  op: string,
+  aIsScalar: boolean,
+  bIsScalar: boolean,
+  outSize: number,
+  dtype: DType,
+  bytesPerElement: number,
+): {
+  spec: TileKernelSpec;
+  uniforms: Record<string, number>;
+  chunking: ChunkedBindingConfig;
+} {
+  return {
+    spec: binaryBroadcastSpec(
+      op,
+      [outSize],
+      aIsScalar ? [0] : [1],
+      bIsScalar ? [0] : [1],
+      0,
+      0,
+      dtype as "f32" | "f16" | "u32" | "i32",
+    ),
+    uniforms: { size: outSize, a_offset: 0, b_offset: 0 },
+    chunking: {
+      modes: {
+        a: aIsScalar ? "scalar" : "chunked",
+        b: bIsScalar ? "scalar" : "chunked",
+        out: "chunked",
+      },
+      sizeUniform: "size",
+      totalElements: outSize,
+      maxBytesPerElement: bytesPerElement,
+    },
+  };
+}
+
+/** Stage-4 chunked plan: the chunked binary elementwise dispatch fully described
+ *  WITHOUT encoding, derived from the SAME chunkedBinaryConfig the execution path
+ *  dispatches. The stream generator (generateChunkedBinary) consumes this. */
+export function planChunkedBinary(
+  op: string,
+  aIsScalar: boolean,
+  bIsScalar: boolean,
+  outSize: number,
+  dtype: DType,
+): TileKernelChunkedPlan {
+  const bytesPerElement = dtypeBytes(dtype);
+  const { spec, uniforms, chunking } = chunkedBinaryConfig(
+    op,
+    aIsScalar,
+    bIsScalar,
+    outSize,
+    dtype,
+    bytesPerElement,
+  );
+  return createTileKernelDispatcher(spec).planChunked(uniforms, chunking);
+}
+
+/**
+ * Execute a chunked elementwise op from a TileKernelChunkedPlan. Uses a FRESH
+ * per-chunk params buffer (createParamsBuffer → recorded as a self-contained
+ * `params` slot) rather than the tile-dispatch config cache (a `persistent`
+ * config buffer the build-from-IR replay cannot own) — exactly the
+ * sumFullReductionChunked pattern, and the reason chunked elementwise is now
+ * generatable. Both execution and the stream generator consume `plan`, so their
+ * command streams cannot drift. `buffers` maps spec binding names (a/b/out) to
+ * GPUBuffers; the uniform config slot (null in bindingOrder) binds the params.
+ */
+function dispatchChunkedElementwise(
+  plan: TileKernelChunkedPlan,
+  buffers: Record<string, GPUBuffer>,
+): void {
+  const ctx = requireContext();
+  for (const chunk of plan.chunks) {
+    const u32 = new Uint32Array(
+      chunk.paramsData.buffer,
+      chunk.paramsData.byteOffset,
+      chunk.paramsData.byteLength >> 2,
+    );
+    const paramsBuffer = createParamsBuffer(ctx.device, u32);
+    const entries = plan.bindingOrder.map((name, i) => {
+      if (name === null) {
+        return { binding: i, resource: { buffer: paramsBuffer } };
+      }
+      const range = chunk.ranges[i];
+      const buf = buffers[name];
+      return {
+        binding: i,
+        resource: range
+          ? { buffer: buf, offset: range.offset, size: range.size }
+          : { buffer: buf },
+      };
+    });
+    const bindGroup = profiledCreateBindGroup(ctx.device, {
+      layout: plan.pipeline.getBindGroupLayout(0),
+      entries,
+    });
+    dispatchComputePass(
+      plan.pipeline,
+      bindGroup,
+      chunk.grid[0],
+      chunk.grid[1],
+      chunk.grid[2],
+    );
+    releaseParamsBuffer(paramsBuffer);
+  }
+}
+
 /** Chunked binary dispatch for large contiguous tensors exceeding maxStorageBufferBindingSize. */
 function binaryChunked(
   op: string,
@@ -408,31 +527,12 @@ function binaryChunked(
     [a.buffer, b.buffer],
     options?.outBuffer,
   );
-  const spec = binaryBroadcastSpec(
-    op,
-    [outSize],
-    aIsScalar ? [0] : [1],
-    bIsScalar ? [0] : [1],
-    0,
-    0,
-    dtype as "f32" | "f16" | "u32" | "i32",
-  );
-  const dispatcher = createTileKernelDispatcher(spec);
-  dispatcher.dispatchChunked(
-    { a: a.buffer, b: b.buffer, out: outBuffer },
-    // Task #71: chunked binds each operand from element 0 → offsets are 0.
-    { size: outSize, a_offset: 0, b_offset: 0 },
-    {
-      modes: {
-        a: aIsScalar ? "scalar" : "chunked",
-        b: bIsScalar ? "scalar" : "chunked",
-        out: "chunked",
-      },
-      sizeUniform: "size",
-      totalElements: outSize,
-      maxBytesPerElement: bytesPerElement,
-    },
-  );
+  const plan = planChunkedBinary(op, aIsScalar, bIsScalar, outSize, dtype);
+  dispatchChunkedElementwise(plan, {
+    a: a.buffer,
+    b: b.buffer,
+    out: outBuffer,
+  });
   const ownsBuffer = options?.outBuffer === undefined;
   return createTensor(outShape, outBuffer, undefined, 0, dtype, ownsBuffer);
 }
@@ -499,6 +599,65 @@ function unaryOutputDtype(opKey: string, inDtype: DType): DType {
   return opKey === "isfinite" ? "f32" : inDtype;
 }
 
+/** The spec + uniforms + chunking config for a chunked unary elementwise op.
+ *  SINGLE SOURCE consumed by both the execution path (dispatchUnary's chunked
+ *  branch) and the stream generator (planChunkedUnary → planChunked). Task #71:
+ *  chunked binds from element 0 → base_offset is 0. The chunk element stride
+ *  uses the LARGER of in/out bytes so a dtype-widening op never over-runs. */
+function chunkedUnaryConfig(
+  opKey: string,
+  outSize: number,
+  dtype: DType,
+  outDtype: DType,
+  bytesPerElement: number,
+  outBytesPerElement: number,
+): {
+  spec: TileKernelSpec;
+  uniforms: Record<string, number>;
+  chunking: ChunkedBindingConfig;
+} {
+  return {
+    spec: unaryStridedSpec(
+      opKey,
+      [outSize],
+      [1],
+      0,
+      dtype as "f32" | "f16" | "u32" | "i32",
+      outDtype as "f32" | "f16" | "u32" | "i32",
+    ),
+    uniforms: { size: outSize, base_offset: 0 },
+    chunking: {
+      modes: { a: "chunked", out: "chunked" },
+      sizeUniform: "size",
+      totalElements: outSize,
+      maxBytesPerElement: Math.max(bytesPerElement, outBytesPerElement),
+    },
+  };
+}
+
+/** Stage-4 chunked plan: the chunked unary elementwise dispatch fully described
+ *  WITHOUT encoding, derived from the SAME chunkedUnaryConfig the execution path
+ *  dispatches. The stream generator (generateChunkedUnary) consumes this. */
+export function planChunkedUnary(
+  opKey: string,
+  outSize: number,
+  dtype: DType,
+): TileKernelChunkedPlan {
+  const bytesPerElement = dtypeBytes(dtype);
+  const outDtype = unaryOutputDtype(opKey, dtype);
+  const outBytesPerElement =
+    outDtype === dtype ? bytesPerElement : dtypeBytes(outDtype);
+  const { spec, uniforms, chunking } = chunkedUnaryConfig(
+    opKey,
+    outSize,
+    dtype,
+    outDtype,
+    bytesPerElement,
+    outBytesPerElement,
+  );
+  return createTileKernelDispatcher(spec).planChunked(uniforms, chunking);
+}
+
 export function dispatchUnary(
   opKey: string,
   a: WebGPUTensor,
@@ -531,26 +690,8 @@ export function dispatchUnary(
       [a.buffer],
       options?.outBuffer,
     );
-    const spec = unaryStridedSpec(
-      opKey,
-      [outSize],
-      [1],
-      0,
-      dtype as "f32" | "f16" | "u32" | "i32",
-      outDtype as "f32" | "f16" | "u32" | "i32",
-    );
-    const dispatcher = createTileKernelDispatcher(spec);
-    dispatcher.dispatchChunked(
-      { a: a.buffer, out: outBuffer },
-      // Task #71: chunked binds from element 0 → base_offset is 0.
-      { size: outSize, base_offset: 0 },
-      {
-        modes: { a: "chunked", out: "chunked" },
-        sizeUniform: "size",
-        totalElements: outSize,
-        maxBytesPerElement: Math.max(bytesPerElement, outBytesPerElement),
-      },
-    );
+    const plan = planChunkedUnary(opKey, outSize, dtype);
+    dispatchChunkedElementwise(plan, { a: a.buffer, out: outBuffer });
     const ownsBuffer = options?.outBuffer === undefined;
     return createTensor(a.shape, outBuffer, undefined, 0, outDtype, ownsBuffer);
   }

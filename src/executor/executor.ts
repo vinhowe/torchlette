@@ -2730,13 +2730,22 @@ export async function executeLoweredPlan(
               }
             }
           }
+          // Capture the donation decision so the stream generator can
+          // reproduce it — its post-hoc detection reads the primary output's
+          // result buffer, already cleared for a step-scoped in-place output
+          // (the foreach optimizer's in-place m/v update). Structural for a
+          // recurring template; the generator runs right after this recording.
+          const donationSink: { idx?: number } = {};
           await executeFusedSegment(
             group,
             action.recipe,
             backend,
             action.enableVectorization,
             donatableInputIds,
+            donationSink,
           );
+          (action as { cachedDonatedRecipeIdx?: number }).cachedDonatedRecipeIdx =
+            donationSink.idx;
           stats.fusedNodes += groupNodes.length;
           stats.fusionGroups++;
           break;

@@ -32,8 +32,11 @@ import type { BareMatmulPlan } from "../backend/webgpu/dispatch";
 import {
   getPipeline,
   planBinaryDirect,
+  planChunkedBinary,
+  planChunkedUnary,
   planUnaryDirect,
 } from "../backend/webgpu/dispatch";
+import type { TileKernelChunkedPlan } from "../backend/webgpu/tile-dispatch";
 import { planFusedKernel } from "../backend/webgpu/fusion-dispatch";
 import { requireContext } from "../backend/webgpu/gpu-context";
 import { gpuBuffer } from "../backend/webgpu/gpu-types";
@@ -836,6 +839,7 @@ function generateSequential(
   if (node.op === "fusedLayerNormForward")
     return generateLayerNormForward(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "gather") return generateGather(node, slots, resolveRefSlot);
+  if (node.op === "cat") return generateCat(node, slots, resolveRefSlot);
   if (node.op === "scatterAdd")
     return generateScatterAdd(node, slots, resolveRefSlot);
   if (node.op === "fusedLayerNormBackwardGradX")
@@ -964,6 +968,57 @@ function generateSequential(
     inSlots.push(slot);
     aliasInSlots.push(slot);
   }
+  // Oversized (>maxStorageBufferBindingSize) elementwise → chunked dispatch.
+  // dispatchBinary/dispatchUnary route these to the chunked path (per-chunk
+  // sub-range bindings); planBinaryDirect/planUnaryDirect BAIL at >128 MB by
+  // construction. Mirror the routing exactly and derive the per-chunk commands
+  // from the SAME plan the execution path dispatches (planChunkedBinary/Unary →
+  // planChunked → computeChunkGeometry). This is the foreach optimizer's
+  // oversized packed-buffer decomposition (add/div/sub/mul/sqrt/neg over the
+  // 320 MB m/v-class buffer). Only the contiguous-offset-0 case is chunkable
+  // (the dispatch forces contiguity otherwise, inserting uncaptured copies), so
+  // a strided/offset input stays an honest miss.
+  const dtype = (node.dtype ?? "f32") as WebGPUTensor["dtype"];
+  const outSize = sizeOf(node.shape);
+  const maxBinding =
+    requireContext().device.limits?.maxStorageBufferBindingSize ??
+    128 * 1024 * 1024;
+  const outOversized = outSize * dtypeBytes(dtype) > maxBinding;
+  if (outOversized && (wgslOp || (isUnary && node.op !== "cast"))) {
+    const contigOk = (m: WebGPUTensor) =>
+      m.isContiguous !== false && (m.offset ?? 0) === 0;
+    if (!ins.every(contigOk)) return "chunked-noncontig";
+    if (wgslOp) {
+      const aIsScalar = ins[0].size === 1;
+      const bIsScalar = ins[1].size === 1;
+      return generateChunkedBinary(
+        wgslOp,
+        aIsScalar,
+        bIsScalar,
+        outSize,
+        dtype,
+        inSlots,
+        aliasInSlots,
+        slots,
+      );
+    }
+    // Unary chunked (sqrt/neg/…): gelu maps to its opKey; plain unary uses node.op.
+    const opKey =
+      node.op === "gelu"
+        ? ((node.payload as { approximate?: string } | undefined)?.approximate ??
+            "tanh") === "tanh"
+          ? "gelu"
+          : "gelu_erf"
+        : node.op;
+    return generateChunkedUnary(
+      opKey,
+      outSize,
+      dtype,
+      inSlots[0],
+      aliasInSlots,
+      slots,
+    );
+  }
   let plan;
   if (wgslOp) {
     plan = planBinaryDirect(wgslOp, ins[0], ins[1]);
@@ -1045,6 +1100,207 @@ function generateSequential(
     gz: 1,
   });
   return { commands, outSlot };
+}
+
+/**
+ * Emit the ALLOC + per-chunk DISPATCH commands for a chunked elementwise op
+ * (binary/unary >maxStorageBufferBindingSize). Consumes a TileKernelChunkedPlan
+ * derived from the SAME chunkedBinaryConfig/chunkedUnaryConfig the execution
+ * path dispatches (planChunkedBinary/Unary → planChunked → computeChunkGeometry)
+ * — the single source for the capability-forced split. Mirrors
+ * generateChunkedFullReduction's command shape: one ALLOC then one DISPATCH per
+ * chunk with sub-range bindings + a FRESH params slot per chunk. One-per-chunk
+ * (no dedup) mirrors the execution path's createParamsBuffer, which advances its
+ * sequence index per chunk → a distinct recorded `params` slot per chunk even
+ * when same-size chunks carry identical bytes; the params-data MULTISET still
+ * matches (same byte pattern, same count).
+ */
+function emitChunkedElementwise(
+  plan: TileKernelChunkedPlan,
+  inputNames: string[],
+  inSlots: Slot[],
+  aliasInSlots: Slot[],
+  outBytes: number,
+  slots: SlotSource[],
+): SequentialGen {
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const commands: GpuCommand[] = [
+    {
+      tag: TAG_ALLOC,
+      slot: outSlot,
+      bytes: outBytes,
+      allocKind: 0,
+      inputSlots: aliasInSlots,
+    },
+  ];
+  const nameToSlot: Record<string, Slot> = {};
+  for (let i = 0; i < inputNames.length; i++) nameToSlot[inputNames[i]] = inSlots[i];
+  for (const chunk of plan.chunks) {
+    const pslot = slots.length;
+    // params data is a u32 view of the packed uniform bytes (matches the
+    // createParamsBuffer(Uint32Array) the execution path writes).
+    slots.push({
+      kind: "params",
+      seqIndex: -1,
+      data: new Uint32Array(
+        chunk.paramsData.buffer.slice(
+          chunk.paramsData.byteOffset,
+          chunk.paramsData.byteOffset + chunk.paramsData.byteLength,
+        ),
+      ),
+    });
+    const bindings: Slot[] = plan.bindingOrder.map((name) =>
+      name === null ? pslot : name === "out" ? outSlot : nameToSlot[name],
+    );
+    commands.push({
+      tag: TAG_DISPATCH,
+      pipeline: plan.pipeline,
+      bindings,
+      bindingRanges: chunk.ranges,
+      gx: chunk.grid[0],
+      gy: chunk.grid[1],
+      gz: chunk.grid[2],
+    });
+  }
+  return { commands, outSlot };
+}
+
+/**
+ * cat generator — mirrors the backend `cat` (ops/gather-scatter.ts) byte-for-
+ * byte: resolveOutputBuffer's ALLOC then one recordedCopyBufferToBuffer per
+ * (input, outer-position). The foreach optimizer packs per-param flats into one
+ * [total] buffer (dim 0, rank-1 → outerSize 1, one copy per input); the general
+ * strided loop is reproduced so any cat matches. An input that the backend would
+ * ensureContiguous (non-contiguous, or an offset not 4-byte-aligned) inserts an
+ * uncaptured copy → stays an honest miss. A released view producer (no
+ * recoverable layout) also bails.
+ */
+function generateCat(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  const payload = node.payload as { dim?: number } | undefined;
+  const outShape = node.shape;
+  const rank = outShape.length;
+  const dim = payload?.dim ?? 0;
+  const dtype = (node.dtype ?? "f32") as WebGPUTensor["dtype"];
+  const bpe = dtypeBytes(dtype);
+
+  // Resolve each input's slot + (shape, offset). Live storage gives the real
+  // layout; a released NON-VIEW producer allocated fresh (contiguous, offset 0)
+  // so its shape is the node shape; strided/offset views stay bailed.
+  interface CatIn {
+    slot: Slot;
+    shape: number[];
+    offset: number;
+  }
+  const ins: CatIn[] = [];
+  for (const ref of node.inputs) {
+    if (ref.kind === "scalar") return "scalar-operand";
+    const slot = resolveRefSlot(ref);
+    if (slot === undefined) return "untracked-input";
+    const storage =
+      ref.kind === "materialized"
+        ? ref.storage
+        : (ref.outputIndex ?? 0) === 0
+          ? ref.node.result
+          : ref.node.results?.[ref.outputIndex ?? 0];
+    if (storage) {
+      const t = storage.backendTensor as WebGPUTensor;
+      const off = t.offset ?? 0;
+      // The backend ensureContiguous's a non-contiguous input or an offset not
+      // 4-byte-aligned (inserting an uncaptured copy) — bail to match.
+      if (t.isContiguous === false || (off * bpe) % 4 !== 0)
+        return "cat-noncontig";
+      ins.push({ slot, shape: t.shape, offset: off });
+    } else if (ref.kind !== "materialized" && !VIEW_OPS.has(ref.node.op)) {
+      ins.push({ slot, shape: ref.node.shape, offset: 0 });
+    } else {
+      return "no-storage";
+    }
+  }
+  if (ins.length === 0) return "no-inputs";
+  if (ins.length === 1) return { commands: [], outSlot: ins[0].slot };
+
+  const outSize = sizeOf(outShape);
+  const innerSize = dim === rank - 1 ? 1 : sizeOf(outShape.slice(dim + 1));
+  const outerSize = dim === 0 ? 1 : sizeOf(outShape.slice(0, dim));
+  const outDimSize = outShape[dim];
+
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const commands: GpuCommand[] = [
+    {
+      tag: TAG_ALLOC,
+      slot: outSlot,
+      bytes: outSize * bpe,
+      allocKind: 0,
+      inputSlots: ins.map((i) => i.slot),
+    },
+  ];
+  let dimOffset = 0;
+  for (const t of ins) {
+    const tDimSize = t.shape[dim];
+    const copyBytes = tDimSize * innerSize * bpe;
+    const tBaseByteOffset = t.offset * bpe;
+    for (let o = 0; o < outerSize; o++) {
+      commands.push({
+        tag: TAG_COPY,
+        src: t.slot,
+        dst: outSlot,
+        srcOffset: tBaseByteOffset + o * tDimSize * innerSize * bpe,
+        dstOffset: (o * outDimSize + dimOffset) * innerSize * bpe,
+        bytes: copyBytes,
+      });
+    }
+    dimOffset += tDimSize;
+  }
+  return { commands, outSlot };
+}
+
+/** Chunked binary elementwise generator (add/sub/mul/div over >128 MB buffers).
+ *  outBytes uses the binary output dtype (== input dtype). */
+function generateChunkedBinary(
+  wgslOp: string,
+  aIsScalar: boolean,
+  bIsScalar: boolean,
+  outSize: number,
+  dtype: WebGPUTensor["dtype"],
+  inSlots: Slot[],
+  aliasInSlots: Slot[],
+  slots: SlotSource[],
+): SequentialGen {
+  const plan = planChunkedBinary(wgslOp, aIsScalar, bIsScalar, outSize, dtype);
+  return emitChunkedElementwise(
+    plan,
+    ["a", "b"],
+    inSlots,
+    aliasInSlots,
+    outSize * dtypeBytes(dtype),
+    slots,
+  );
+}
+
+/** Chunked unary elementwise generator (sqrt/neg/… over >128 MB buffers). */
+function generateChunkedUnary(
+  opKey: string,
+  outSize: number,
+  dtype: WebGPUTensor["dtype"],
+  inSlot: Slot,
+  aliasInSlots: Slot[],
+  slots: SlotSource[],
+): SequentialGen {
+  const plan = planChunkedUnary(opKey, outSize, dtype);
+  return emitChunkedElementwise(
+    plan,
+    ["a"],
+    [inSlot],
+    aliasInSlots,
+    outSize * dtypeBytes(dtype),
+    slots,
+  );
 }
 
 /** The narrow-offset param word count per direct-elementwise op: one offset
@@ -3223,6 +3479,68 @@ interface FusedActionShape {
  * dispatch; a needed-intermediate that itself can't be generated bails the
  * whole action (kept atomic — partial segments would break the diff).
  */
+/**
+ * Oversized fused group → sequential decomposition. Mirrors the executor's
+ * executeSequentialSegment fallback (taken for a fused group whose external
+ * input buffers exceed maxStorageBufferBindingSize): run each covered node's
+ * plain elementwise dispatch in coveredNodeIndices order, all recorded under
+ * this one action (setRecordingNodeIndex(outputNodeIndex)). Each node is the
+ * plain dispatch executeNode would run, so generateSequential reproduces it —
+ * and at >128 MB generateSequential now routes to the chunked-elementwise path.
+ * Group-internal producers feed later nodes via a local slot channel; all
+ * covered nodes are mapped for the outer walker so any external consumer of an
+ * intermediate resolves. Kept atomic — a node that can't be generated bails the
+ * whole action (a partial segment would break the diff).
+ */
+function generateFusedDecomposed(
+  action: FusedActionShape,
+  planNodes: LazyIRNode[],
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+):
+  | {
+      commands: GpuCommand[];
+      outputs: Array<{ nodeIndex: number; slot: Slot }>;
+    }
+  | string {
+  const commands: GpuCommand[] = [];
+  const outputs: Array<{ nodeIndex: number; slot: Slot }> = [];
+  const localById = new Map<number, Slot>();
+  const localResolve = (
+    ref: LazyIRNode["inputs"][number],
+  ): Slot | undefined => {
+    if (
+      ref.kind !== "materialized" &&
+      ref.kind !== "scalar" &&
+      (ref.outputIndex ?? 0) === 0
+    ) {
+      const s = localById.get(ref.node.id);
+      if (s !== undefined) return s;
+    }
+    return resolveRefSlot(ref);
+  };
+  for (const niIdx of action.coveredNodeIndices) {
+    const niNode = planNodes[niIdx];
+    const g = generateSequential(niNode, slots, localResolve, bufferSlot);
+    if (typeof g === "string") {
+      return `oversized-decomp:${niNode.op}[${g || "?"}]`;
+    }
+    // The whole segment records under action.outputNodeIndex; patch any
+    // node-local TAG_UNIFORM placeholder (offset repack) to it. Chunked
+    // elementwise carries no volatile uniform, so this is defensive.
+    for (const c of g.commands) {
+      if (c.tag === TAG_UNIFORM && c.nodeIndex < 0) {
+        c.nodeIndex = action.outputNodeIndex;
+      }
+    }
+    commands.push(...g.commands);
+    localById.set(niNode.id, g.outSlot);
+    outputs.push({ nodeIndex: niIdx, slot: g.outSlot });
+  }
+  return { commands, outputs };
+}
+
 function generateFused(
   action: FusedActionShape,
   planNodes: LazyIRNode[],
@@ -3245,6 +3563,46 @@ function generateFused(
     (p) => groupNodes[p.nodeLocalIdx].inputs[p.inputIdx],
   );
   const recipe = action.recipe;
+
+  // Oversized fused group → the executor routes to executeSequentialSegment
+  // (its `hasOversizedBuffer` check on the external input buffers), running each
+  // group node's plain elementwise dispatch, which at >128 MB takes the chunked
+  // path. Mirror it: DECOMPOSE the group and generate each covered node via
+  // generateSequential (now chunked-aware) under this one segment. This is the
+  // foreach optimizer's 320 MB packed-buffer decomposition. Detected the same
+  // way the executor detects it — any external input buffer > maxBinding.
+  const maxBindingSize =
+    device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const extInputOversized = extInputs.some((ref) => {
+    if (!ref) return false;
+    const oi = ref.kind === "materialized" ? 0 : (ref.outputIndex ?? 0);
+    const storage =
+      ref.kind === "materialized"
+        ? ref.storage
+        : ref.kind === "scalar"
+          ? undefined
+          : oi === 0
+            ? ref.node.result
+            : ref.node.results?.[oi];
+    let bytes: number;
+    if (storage) {
+      bytes = (storage.backendTensor as WebGPUTensor).buffer.size;
+    } else if (ref.kind !== "materialized" && ref.kind !== "scalar") {
+      bytes = sizeOf(ref.node.shape) * dtypeBytes(ref.node.dtype ?? "f32");
+    } else {
+      return false;
+    }
+    return bytes > maxBindingSize;
+  });
+  if (extInputOversized) {
+    return generateFusedDecomposed(
+      action,
+      planNodes,
+      slots,
+      resolveRefSlot,
+      bufferSlot,
+    );
+  }
 
   // Resolve the non-inlined inputs in recipe order (mirrors
   // executeFusedSegment). planFusedKernel never dereferences input buffers
@@ -3276,7 +3634,14 @@ function generateFused(
       if (t.isContiguous === false || (t.offset != null && t.offset > 0)) {
         return "non-contiguous"; // executor inserts a contiguous-copy prologue
       }
-      if (t.buffer.size > 128 * 1024 * 1024) return "oversized";
+      // Oversized is DERIVED from the device limit (single source with
+      // executeFusedSegment's hasOversizedBuffer check + dispatchBinary/Unary),
+      // NOT a hardcoded 128 MB — on a device whose maxStorageBufferBindingSize
+      // exceeds the buffer (e.g. 2 GB), the executor runs the fused kernel
+      // WHOLE (no sequential fallback), so this must generate the fused path,
+      // not bail. The genuinely-oversized case is caught earlier by
+      // extInputOversized → generateFusedDecomposed (chunked elementwise).
+      if (t.buffer.size > maxBindingSize) return "oversized";
       const slot =
         ref.kind === "scalar"
           ? bufferSlot(t.buffer as unknown, "persistent")
@@ -3305,10 +3670,17 @@ function generateFused(
     }
   }
 
-  // POST-HOC donation: out0's result buffer aliasing one of the (live) inputs.
+  // Donation: prefer the executor's cached decision (the recording's actual
+  // donation), which is authoritative and survives the primary output's result
+  // being cleared (step-scoped in-place outputs — the foreach optimizer's m/v
+  // update). Fall back to POST-HOC detection (out0's result buffer aliasing an
+  // input) for actions not executed under recording (e.g. isolated unit tests).
+  const cachedDonated = (action as { cachedDonatedRecipeIdx?: number })
+    .cachedDonatedRecipeIdx;
   const outNode = planNodes[action.outputNodeIndex];
-  let donatedRecipeIdx: number | undefined;
+  let donatedRecipeIdx: number | undefined = cachedDonated;
   if (
+    donatedRecipeIdx === undefined &&
     outNode?.result &&
     (outNode.result.backendTensor as WebGPUTensor).buffer
   ) {

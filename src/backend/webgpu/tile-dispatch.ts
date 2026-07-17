@@ -154,6 +154,33 @@ export interface TileKernelPlan {
   configBuffer: GPUBuffer | null;
 }
 
+/**
+ * Stage-4 chunked plan/encode: a chunked tile dispatch (>maxStorageBufferBinding
+ * Size) fully described WITHOUT encoding. This is the SINGLE SOURCE for both the
+ * execution path (dispatchChunked) and the stream generator (generateChunked
+ * Binary/Unary), following the planChunkedFullReduction precedent: the per-chunk
+ * geometry (numChunks, sub-range byte windows, per-chunk grid + packed uniforms)
+ * is derived once from the capability-forced split `numChunks = f(bytes,
+ * maxStorageBufferBindingSize)` so the recorded and generated command streams
+ * cannot drift. Chunk geometry is step-invariant for a fixed-size buffer, so the
+ * per-chunk params are baked (no volatile repack) — exactly as the chunked
+ * full-reduction bakes them.
+ */
+export interface TileKernelChunkedPlan {
+  pipeline: GPUComputePipeline;
+  numChunks: number;
+  /** Binding names in bind-group order; null marks the uniform config slot. */
+  bindingOrder: (string | null)[];
+  chunks: Array<{
+    /** Per-binding sub-range aligned to bindingOrder (null = whole buffer /
+     *  scalar binding / uniform slot). */
+    ranges: (({ offset: number; size: number }) | null)[];
+    /** Packed uniform bytes for this chunk (chunkSize patched into sizeUniform). */
+    paramsData: Uint8Array;
+    grid: [number, number, number];
+  }>;
+}
+
 export interface TileKernelInstance {
   /**
    * Derive the dispatch plan WITHOUT encoding or mutating the config cache.
@@ -184,6 +211,17 @@ export interface TileKernelInstance {
     volatileRepack?: VolatileUniformRepack,
   ): void;
 
+  /**
+   * Derive the chunked dispatch plan WITHOUT encoding or mutating the config
+   * cache. Single source shared with dispatchChunked (both consume
+   * computeChunkGeometry) so the stream generator's per-chunk commands match the
+   * recorded ones by construction. See TileKernelChunkedPlan.
+   */
+  planChunked(
+    uniforms: Record<string, number>,
+    chunking: ChunkedBindingConfig,
+  ): TileKernelChunkedPlan;
+
   /** Get the compiled WGSL source (for debugging/testing). */
   getWGSL(): string;
 
@@ -201,6 +239,99 @@ export interface TileKernelInstance {
 
   /** Reset cached pipelines and config buffers. */
   reset(): void;
+}
+
+/**
+ * Compute the bind-group order (spec bindings interleaved with the uniform
+ * config slot) for a spec. Shared by plan() and computeChunkGeometry so their
+ * null-placement for the uniform slot cannot drift.
+ */
+function computeBindingOrder(
+  spec: TileKernelSpec,
+  hasConfig: boolean,
+): (string | null)[] {
+  const bindingNames = Object.keys(spec.bindings);
+  const bindingOrder: (string | null)[] = [];
+  const uniformIdx = spec.uniformBindingIndex;
+  let bindingIndex = 0;
+  for (let i = 0; i < bindingNames.length; i++) {
+    if (hasConfig && uniformIdx !== undefined && bindingIndex === uniformIdx) {
+      bindingOrder.push(null);
+      bindingIndex++;
+    }
+    bindingOrder.push(bindingNames[i]);
+    bindingIndex++;
+  }
+  if (hasConfig && (uniformIdx === undefined || bindingIndex <= uniformIdx)) {
+    bindingOrder.push(null);
+  }
+  return bindingOrder;
+}
+
+/** Per-chunk geometry shared by dispatchChunked (execution) and planChunked
+ *  (stream generation) — the SINGLE SOURCE for the capability-forced split
+ *  `numChunks = f(bytes, maxStorageBufferBindingSize)`. Returns, per chunk, the
+ *  sub-range byte windows (aligned to bindingOrder), the chunk element count,
+ *  and the per-chunk uniform record with `sizeUniform` patched. Neither caller
+ *  packs or dispatches here, so this touches no config cache / recording. */
+interface ChunkGeometry {
+  numChunks: number;
+  bindingOrder: (string | null)[];
+  chunks: Array<{
+    chunkSize: number;
+    ranges: (({ offset: number; size: number }) | null)[];
+    patchedUniforms: Record<string, number>;
+  }>;
+}
+
+function computeChunkGeometry(
+  spec: TileKernelSpec,
+  uniforms: Record<string, number>,
+  chunking: ChunkedBindingConfig,
+  limits: { maxStorageBufferBindingSize?: number } | undefined,
+): ChunkGeometry {
+  const maxBindingSize =
+    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const minAlignment =
+    (limits as Record<string, number> | undefined)
+      ?.minStorageBufferOffsetAlignment ?? 256;
+
+  const layout = computeFlatChunkLayout(
+    chunking.totalElements,
+    chunking.maxBytesPerElement,
+    maxBindingSize,
+    minAlignment,
+    chunking.elementsPerAlignment,
+  );
+
+  const hasConfig = Object.keys(spec.uniforms).length > 0;
+  const bindingOrder = computeBindingOrder(spec, hasConfig);
+
+  const chunks: ChunkGeometry["chunks"] = [];
+  for (let chunk = 0; chunk < layout.numChunks; chunk++) {
+    const chunkStart = chunk * layout.elementsPerChunk;
+    const chunkEnd = Math.min(
+      chunkStart + layout.elementsPerChunk,
+      chunking.totalElements,
+    );
+    const chunkSize = chunkEnd - chunkStart;
+    const ranges: (({ offset: number; size: number }) | null)[] =
+      bindingOrder.map((name) => {
+        if (name === null) return null; // uniform config slot
+        const mode = chunking.modes[name] ?? "chunked";
+        if (mode === "scalar") return null; // whole buffer
+        const bpe =
+          chunking.bytesPerElement?.[name] ??
+          dtypeBytes(spec.bindings[name].type);
+        return { offset: chunkStart * bpe, size: chunkSize * bpe };
+      });
+    chunks.push({
+      chunkSize,
+      ranges,
+      patchedUniforms: { ...uniforms, [chunking.sizeUniform]: chunkSize },
+    });
+  }
+  return { numChunks: layout.numChunks, bindingOrder, chunks };
 }
 
 /**
@@ -409,44 +540,24 @@ export function createTileKernelDispatcher(
       const ctx = requireContext();
       const device = ctx.device;
 
-      const limits = device.limits;
-      const maxBindingSize =
-        limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
-      const minAlignment =
-        (limits as Record<string, number>)?.minStorageBufferOffsetAlignment ??
-        256;
-
-      const layout = computeFlatChunkLayout(
-        chunking.totalElements,
-        chunking.maxBytesPerElement,
-        maxBindingSize,
-        minAlignment,
-        chunking.elementsPerAlignment,
-      );
+      // Single source: derive the per-chunk geometry (same split planChunked
+      // and the stream generator consume). This path adds only the config-buffer
+      // + volatile-repack handling on top.
+      const geom = computeChunkGeometry(spec, uniforms, chunking, device.limits);
 
       const wgsl = getWGSL();
       const pipeline = getPipeline(ctx, wgsl, wgsl);
       const bindingNames = Object.keys(spec.bindings);
       const gridFn = resolveGrid(spec);
 
-      for (let chunk = 0; chunk < layout.numChunks; chunk++) {
-        const chunkStart = chunk * layout.elementsPerChunk;
-        const chunkEnd = Math.min(
-          chunkStart + layout.elementsPerChunk,
-          chunking.totalElements,
-        );
-        const chunkSize = chunkEnd - chunkStart;
-
-        const patchedUniforms = {
-          ...uniforms,
-          [chunking.sizeUniform]: chunkSize,
-        };
+      for (const chunk of geom.chunks) {
+        const patchedUniforms = chunk.patchedUniforms;
         // Per-chunk volatile repack: re-derive from the node, then re-apply
         // this chunk's element count (chunk layout is step-invariant).
         const chunkRepack: VolatileUniformRepack | undefined = volatileRepack
           ? (node) => ({
               ...volatileRepack(node),
-              [chunking.sizeUniform]: chunkSize,
+              [chunking.sizeUniform]: chunk.chunkSize,
             })
           : undefined;
         const configBuf = prepareConfigBuffer(
@@ -461,31 +572,28 @@ export function createTileKernelDispatcher(
           resource: { buffer: GPUBuffer; offset?: number; size?: number };
         };
         const entries: Entry[] = [];
-
+        // The geometry's ranges are aligned to bindingOrder (uniform slot = the
+        // null entries); buildBindings walks the spec bindings + inserts the
+        // config buffer at the same index, so we index geom.ranges by the same
+        // interleaved position via a shared cursor.
+        let orderIdx = 0;
         buildBindings(
           bindingNames,
           buffers,
           configBuf,
-          (idx, name, buf) => {
-            const mode = chunking.modes[name] ?? "chunked";
-            if (mode === "scalar") {
-              entries.push({ binding: idx, resource: { buffer: buf } });
-            } else {
-              const bpe =
-                chunking.bytesPerElement?.[name] ??
-                dtypeBytes(spec.bindings[name].type);
-              entries.push({
-                binding: idx,
-                resource: {
-                  buffer: buf,
-                  offset: chunkStart * bpe,
-                  size: chunkSize * bpe,
-                },
-              });
-            }
+          (idx, _name, buf) => {
+            const range = chunk.ranges[orderIdx++];
+            entries.push({
+              binding: idx,
+              resource: range
+                ? { buffer: buf, offset: range.offset, size: range.size }
+                : { buffer: buf },
+            });
           },
-          (idx, buf) =>
-            entries.push({ binding: idx, resource: { buffer: buf } }),
+          (idx, buf) => {
+            orderIdx++; // skip the uniform slot's (null) range entry
+            entries.push({ binding: idx, resource: { buffer: buf } });
+          },
         );
 
         const bindGroup = profiledCreateBindGroup(device, {
@@ -501,6 +609,35 @@ export function createTileKernelDispatcher(
           ...(gridFn(patchedUniforms) as [number, number, number]),
         );
       }
+    },
+
+    planChunked(
+      uniforms: Record<string, number>,
+      chunking: ChunkedBindingConfig,
+    ): TileKernelChunkedPlan {
+      const ctx = requireContext();
+      const wgsl = getWGSL();
+      const pipeline = getPipeline(ctx, wgsl, wgsl);
+      const gridFn = resolveGrid(spec);
+      const geom = computeChunkGeometry(
+        spec,
+        uniforms,
+        chunking,
+        ctx.device.limits,
+      );
+      return {
+        pipeline,
+        numChunks: geom.numChunks,
+        bindingOrder: geom.bindingOrder,
+        chunks: geom.chunks.map((c) => ({
+          ranges: c.ranges,
+          // Bake this chunk's params (chunk geometry is step-invariant for a
+          // fixed buffer — no volatile repack, exactly as the chunked full
+          // reduction bakes them). The generator emits one params slot per chunk.
+          paramsData: packUniforms(spec, c.patchedUniforms).data,
+          grid: gridFn(c.patchedUniforms) as [number, number, number],
+        })),
+      };
     },
 
     getWGSL,

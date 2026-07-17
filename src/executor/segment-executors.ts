@@ -63,6 +63,13 @@ export async function executeFusedSegment(
   backend: Backend,
   enableVectorization: boolean,
   donatableInputIds?: Set<number>,
+  // Sink for the donation decision (which recipe input the primary output was
+  // donated into, or undefined). The executor caches this on the fused ACTION
+  // during recording so the stream generator can reproduce the donation — the
+  // generator's post-hoc detection reads the primary output's result buffer,
+  // which is already cleared for a step-scoped in-place output (the foreach
+  // optimizer's in-place m/v update).
+  donationSink?: { idx?: number },
 ): Promise<void> {
   // For CPU or other backends without fusion support, fall back to sequential execution
   if (!isFusedBackend(backend) || !("dispatchFusedKernel" in backend)) {
@@ -298,6 +305,7 @@ export async function executeFusedSegment(
       break;
     }
   }
+  if (donationSink) donationSink.idx = donatedRecipeIdx;
   if (ENV.TORCHLETTE_DEBUG_DONATION) {
     const outElems = sizeOf(recipe.outputs[0].shape);
     if (outElems > 1_000_000) {
