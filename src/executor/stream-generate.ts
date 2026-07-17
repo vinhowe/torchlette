@@ -835,7 +835,7 @@ function generateSequential(
   if (node.op === "unscaleGrad")
     return generateUnscaleGrad(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "stridedScatterCopy")
-    return generateScatterCopyDMA(node, resolveRefSlot);
+    return generateScatterCopyDMA(node, resolveRefSlot, bufferSlot);
   if (node.op === "fusedLayerNormForward")
     return generateLayerNormForward(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "gather") return generateGather(node, slots, resolveRefSlot);
@@ -1217,6 +1217,16 @@ function generateCat(
       ins.push({ slot, shape: t.shape, offset: off });
     } else if (ref.kind !== "materialized" && !VIEW_OPS.has(ref.node.op)) {
       ins.push({ slot, shape: ref.node.shape, offset: 0 });
+    } else if (
+      ref.kind !== "materialized" &&
+      (ref.outputIndex ?? 0) === 0 &&
+      CONTIGUOUS_VIEW_OPS.has(ref.node.op)
+    ) {
+      // [D4 #12] Released contiguous-view input (reshape[/narrow-dim0]) —
+      // IR-derivable element offset into the aliased base buffer.
+      const eoff = releasedContigViewOffset(ref);
+      if (eoff === undefined) return "no-storage";
+      ins.push({ slot, shape: ref.node.shape, offset: eoff });
     } else {
       return "no-storage";
     }
@@ -2104,6 +2114,76 @@ const CONTIGUOUS_VIEW_OPS = new Set([
   "squeeze",
   "unsqueeze",
 ]);
+
+/** [D4 #12 EXPERIMENT] Element offset (into the aliased base buffer) of a
+ *  RELEASED view chain built ONLY from contiguous views (reshape/view/…) and
+ *  dim-0 narrows — the foreach packed-optimizer scatter-back src
+ *  `reshape(narrow(pNew, 0, off, len), shape)` and the cat-input
+ *  `reshape(param, [size])`. Walks node.inputs[0] accumulating dim-0-narrow
+ *  starts (offset += start·innerSize; dim-0 keeps contiguity by construction),
+ *  passing through contiguous views unchanged, until a non-view / live-storage
+ *  base. resolveRefSlot already aliases the whole chain to the base slot; this
+ *  recovers the offset the slot can't carry. Returns undefined (→ keep bailing)
+ *  for ANY strided hop (transpose/permute/expand/narrow-dim≠0) or a
+ *  materialized base with a nonzero own-offset we can't confirm contiguous. */
+function releasedContigViewOffset(
+  ref: LazyIRNode["inputs"][number],
+): number | undefined {
+  if (ref.kind === "scalar" || ref.kind === "materialized") return undefined;
+  if ((ref.outputIndex ?? 0) !== 0) return undefined;
+  let node = ref.node;
+  let offset = 0;
+  // Bound the walk (defensive; chains are 1–2 deep in practice).
+  for (let guard = 0; guard < 64; guard++) {
+    // Live storage on this hop: fold its own (confirmed-contiguous) offset.
+    const storage = node.result;
+    if (storage) {
+      const t = storage.backendTensor as WebGPUTensor;
+      if (t.isContiguous === false) return undefined;
+      return offset + (t.offset ?? 0);
+    }
+    if (CONTIGUOUS_VIEW_OPS.has(node.op)) {
+      const inp = node.inputs[0];
+      if (inp.kind === "scalar") return undefined;
+      if (inp.kind === "materialized") {
+        const t = inp.storage.backendTensor as WebGPUTensor;
+        if (t.isContiguous === false) return undefined;
+        return offset + (t.offset ?? 0);
+      }
+      node = inp.node;
+      continue;
+    }
+    if (node.op === "narrow") {
+      const p = node.payload as
+        | { dim?: number; start?: number; length?: number }
+        | undefined;
+      if (!p || p.dim !== 0 || p.start == null) return undefined;
+      const inp = node.inputs[0];
+      const inShape =
+        inp.kind === "materialized"
+          ? (inp.storage.backendTensor as WebGPUTensor).shape
+          : inp.kind === "scalar"
+            ? undefined
+            : inp.node.shape;
+      if (!inShape) return undefined;
+      // dim-0 narrow of a contiguous base: element offset = start · innerSize.
+      let inner = 1;
+      for (let d = 1; d < inShape.length; d++) inner *= inShape[d];
+      offset += p.start * inner;
+      if (inp.kind === "materialized") {
+        const t = inp.storage.backendTensor as WebGPUTensor;
+        if (t.isContiguous === false) return undefined;
+        return offset + (t.offset ?? 0);
+      }
+      if (inp.kind === "scalar") return undefined;
+      node = inp.node;
+      continue;
+    }
+    // Non-view producer base (contiguous, offset 0 relative to its buffer).
+    return offset;
+  }
+  return undefined;
+}
 
 /** Logical shape/dtype for a released contiguous-view producer (oi 0). Returns
  *  undefined for non-views, strided views, or multi-output extras. */
@@ -3148,6 +3228,27 @@ function refSlotAndMeta(
       isContiguous: true,
       buffer: { size: alignBufferSize(size * 4) },
     } as unknown as WebGPUTensor;
+  } else if (
+    ref.kind !== "materialized" &&
+    (ref.outputIndex ?? 0) === 0 &&
+    CONTIGUOUS_VIEW_OPS.has(ref.node.op)
+  ) {
+    // [D4 #12] A released contiguous-view chain (reshape[/narrow-dim0]) whose
+    // offset is IR-derivable — the packed-optimizer scatter-back src. slot
+    // aliases the base buffer; meta is contiguous at the recovered offset.
+    const eoff = releasedContigViewOffset(ref);
+    if (eoff === undefined) return "no-storage";
+    const shape = ref.node.shape;
+    const size = sizeOf(shape);
+    meta = {
+      shape,
+      strides: contiguousStrides(shape),
+      offset: eoff,
+      size,
+      dtype: (ref.node.dtype ?? "f32") as WebGPUTensor["dtype"],
+      isContiguous: true,
+      buffer: { size: alignBufferSize((size + eoff) * 4) },
+    } as unknown as WebGPUTensor;
   } else {
     return "no-storage";
   }
@@ -3163,6 +3264,7 @@ function refSlotAndMeta(
 function generateScatterCopyDMA(
   node: LazyIRNode,
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
 ): { commands: GpuCommand[]; outSlot: Slot } | string {
   const payload = node.payload as
     | { offset: number; viewShape: number[]; viewStrides: number[] }
@@ -3171,8 +3273,27 @@ function generateScatterCopyDMA(
   if (node.inputs.length !== 2) return "arity";
   const base = refSlotAndMeta(node.inputs[0], resolveRefSlot);
   if (typeof base === "string") return base;
-  const src = refSlotAndMeta(node.inputs[1], resolveRefSlot);
-  if (typeof src === "string") return src;
+  const srcRef = node.inputs[1];
+  let src: { slot: Slot; meta: WebGPUTensor };
+  if (srcRef.kind === "scalar") {
+    // [D4 #13] SCALAR-source scatter (a host scalar written into a slice of a
+    // state tensor, e.g. into shape [1]). The scalar resolves through the
+    // plan's scalar table to a PERSISTENT buffer — stable identity, refreshed
+    // from the CURRENT step's value by the executor before every execution —
+    // so the value flows as DATA (never frozen into the plan; the
+    // frozen-scalar class). Same shape as the direct-elementwise scalar
+    // operand. Scalar-table storage is f32; a non-f32 base takes the
+    // execution's dtype-guarded dispatch route → keep it uncovered.
+    const sh = lookupScalarStorage(srcRef);
+    if (!sh) return "scalar-no-table";
+    if ((node.dtype ?? "f32") !== "f32") return "scalar-non-f32";
+    const t = sh.backendTensor as WebGPUTensor;
+    src = { slot: bufferSlot(gpuBuffer(t) as unknown, "persistent"), meta: t };
+  } else {
+    const resolved = refSlotAndMeta(srcRef, resolveRefSlot);
+    if (typeof resolved === "string") return resolved;
+    src = resolved;
+  }
   const { offset, viewShape, viewStrides } = payload;
   const baseSize = sizeOf(base.meta.shape);
   const viewSize = sizeOf(viewShape);

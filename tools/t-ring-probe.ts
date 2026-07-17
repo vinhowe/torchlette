@@ -8,6 +8,20 @@
  * Small MSE-on-matmul step (no model load — fast, GPU-only). Prints, per arm,
  * the loss trajectory + capture hits + whether the body froze on hits.
  *
+ * SCOPE (re-ruled, D4 #13): this probe verifies the RUNAHEAD RING MECHANISM
+ * (tape formation, body freeze, ring-depth K purity) — NOT stream-generation
+ * coverage. Its graph is therefore deliberately BUILD-FROM-IR-COVERED: the MSE
+ * mean is computed as a matmul against a constant [0.5,0.5] column
+ * (numerically identical to mean over 2 elements) instead of api.mean, because
+ * a reduction's backward (`_expandGrad`) emits a liveness-released
+ * expand-broadcast into a fused elementwise kernel — the strided/broadcast
+ * released-view class the stream generator DELIBERATELY leaves uncovered
+ * (correct-and-slow lowered by construction). The old mean-based graph made
+ * the probe accidentally depend on that class: without the recorded build its
+ * plan stranded lowered (hits=0) for a reason orthogonal to the ring. Real
+ * training workloads (fullstack fused AND foreach) compile fully; the ring is
+ * exercised there by t-train-tape-matrix.
+ *
  * K=1 vs K=3 BIT-IDENTITY is the step-object §6 Phase 2 / phase2b §8 G-ring gate
  * ("K=1 vs K=3 ring trajectory bit-identical"): runahead reorders only the CPU
  * submission relative to the GPU fence, so the GPU trajectory MUST be byte-
@@ -38,6 +52,12 @@ async function run(mode: "serial" | "ringNow" | "ringK1" | "ringK2" | "ringK3"):
     api.tensorFromArray([0.5, -0.5, 0.25, 0.75], [2, 2], { requiresGrad: true }),
   );
   const target = api.registerState(api.tensorFromArray([1, 0], [1, 2]));
+  // Mean-as-matmul (covered-graph re-scope, see header): loss =
+  // (diff·diff) · [0.5,0.5]ᵀcol == mean(diff²) over 2 elements, with a matmul
+  // backward (covered) instead of a reduction backward
+  // (released-expand-broadcast, deliberately uncovered). All arms run the
+  // SAME graph, so the K-bit-identity assertions are unchanged in meaning.
+  const meanW = api.registerState(api.tensorFromArray([0.5, 0.5], [2, 1]));
   const opt = new Adam([w], { lr: 1e-2 }, api);
   let bodyRuns = 0;
 
@@ -45,7 +65,9 @@ async function run(mode: "serial" | "ringNow" | "ringK1" | "ringK2" | "ringK3"):
     bodyRuns++;
     const pred = api.matmul(x, w);
     const diff = api.sub(pred, target);
-    const loss = api.mean(api.mul(diff, diff));
+    // reshape([]) keeps the scalar-loss backward() ceremony (0-d seed);
+    // reshape is a covered contiguous view.
+    const loss = api.reshape(api.matmul(api.mul(diff, diff), meanW), []);
     const lossOut = api.noGrad(() => api.mul(loss, 1));
     await loss.backward();
     opt.step();
