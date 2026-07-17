@@ -62,7 +62,19 @@ export type SlotSource =
       // PRIMITIVE.
       kind: "constFill";
       elements: number;
-      fillValue: number;
+      // Scalar fill (`full([...], const)`). Mutually exclusive with `data`.
+      fillValue?: number;
+      // Precomputed constant f32 payload (`arange` index ramps — deterministic
+      // from shape+payload, NOT rng). Takes precedence over `fillValue`; same
+      // plan-owned FIXED-buffer lifecycle (born at build, byte-identical every
+      // replay, outside the arena AND the harvest ledger).
+      data?: Float32Array;
+      // Plan-node index of the data-source this constFill replaced. Used by the
+      // STREAM_GENERATE=1 count/params reconciliation to exclude the recorded
+      // ALLOC + (DISPATCH|CLEAR) + WRITE (and any dispatch params slot) the
+      // constFill legitimately elides — the recording tags all of them with
+      // this index (recordingNodeIndex during the data-source's execution).
+      nodeIndex?: number;
       cachedBuffer?: GPUBuffer;
     };
 
@@ -1780,7 +1792,8 @@ export async function executeCompiledPlan(
               GPUBufferUsage.COPY_DST,
           });
           gpuMemoryTracker.trackAllocation(buf, bytes);
-          const fill = new Float32Array(src.elements).fill(src.fillValue);
+          const fill =
+            src.data ?? new Float32Array(src.elements).fill(src.fillValue ?? 0);
           device.queue.writeBuffer(buf, 0, fill);
           src.cachedBuffer = buf;
           (compiled._constFillBufs ??= []).push(buf);

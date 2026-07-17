@@ -130,6 +130,7 @@ import {
   setRecordingNodeIndex,
   startCompilationRecording,
   stopCompilationRecording,
+  TAG_DISPATCH,
 } from "./compiled-plan";
 import {
   buildLoweredPlanFromAnalysis,
@@ -3377,38 +3378,65 @@ export async function executeLoweredPlan(
           );
         }
         if (gen.fullyCovered) {
-          // Each constFill slot replaces exactly ONE recorded data-source
-          // command (the `full` node's TAG_WRITE): its buffer is pre-filled at
-          // build, so the generated stream is shorter by the constFill count.
-          // Reconcile before comparing so a covered constFill isn't a false
-          // divergence — the VALUE equivalence (pre-fill == write of the same
-          // constant) is gated by parity-fullstack + test:gates, not here.
-          const constFillCount = gen.slots.filter(
-            (s) => s.kind === "constFill",
-          ).length;
-          const countMatch =
-            gen.commands.length + constFillCount === compiled.commands.length;
+          // A constFill slot pre-fills a data-source's value at build and emits
+          // NO command, so the generated stream is SHORTER than the recording by
+          // exactly the commands (and any dispatch params slot) that data-source
+          // recorded — ALLOC + (DISPATCH fill_tile/arange_tile | CLEAR for
+          // full([],0)) + WRITE. Reconcile by EXCLUDING those recorded artifacts,
+          // keyed by the source node index the recording tags on every one of
+          // them (recordingNodeIndex during the data-source's execution, stored
+          // on the constFill slot). This is exact and shape-agnostic — no fixed
+          // "constFill == 1 command" credit, which under-counted every
+          // dispatch-based fill by 2 (latent until a fill-bearing plan became
+          // fully covered). The VALUE equivalence (pre-fill == the elided
+          // dispatch's output) is gated by parity-fullstack + test:gates.
+          const constFillNodes = new Set<number>();
+          for (const s of gen.slots)
+            if (s.kind === "constFill" && s.nodeIndex !== undefined)
+              constFillNodes.add(s.nodeIndex);
+          const excludedParamsSlots = new Set<number>();
+          let recordedNonConstFill = 0;
+          for (const c of compiled.commands) {
+            const ni = (c as { nodeIndex?: number }).nodeIndex;
+            if (ni !== undefined && constFillNodes.has(ni)) {
+              if (c.tag === TAG_DISPATCH)
+                for (const b of (c as { bindings: number[] }).bindings)
+                  if (compiled.slots[b]?.kind === "params")
+                    excludedParamsSlots.add(b);
+              continue;
+            }
+            recordedNonConstFill++;
+          }
+          const countMatch = gen.commands.length === recordedNonConstFill;
           if (!countMatch) {
             console.warn(
-              `[stream-gen] DIVERGE flat command count: generated ${gen.commands.length} (+${constFillCount} constFill) vs recorded ${compiled.commands.length}`,
+              `[stream-gen] DIVERGE flat command count: generated ${gen.commands.length} vs recorded-non-constFill ${recordedNonConstFill} (raw recorded ${compiled.commands.length}, ${constFillNodes.size} constFill nodes)`,
             );
           }
           // Params/uniform DATA multiset must agree. diffSegmentsAligned
           // compares DISPATCH by pipeline + workgroups + binding SLOTS but
           // NOT the params bytes — a wrong config (e.g. a shared paramsData
           // array stored by reference and later mutated) is otherwise
-          // invisible yet computes garbage. This guard closes that hole.
-          const paramsBag = (ss: typeof gen.slots) => {
+          // invisible yet computes garbage. This guard closes that hole. The
+          // recorded params slots bound by an excluded constFill dispatch are
+          // skipped (the constFill has no params — it pre-filled the value).
+          const paramsBag = (
+            ss: typeof gen.slots,
+            skip?: ReadonlySet<number>,
+          ) => {
             const m = new Map<string, number>();
-            for (const s of ss)
+            for (let i = 0; i < ss.length; i++) {
+              if (skip?.has(i)) continue;
+              const s = ss[i];
               if (s.kind === "params") {
                 const k = Array.from(s.data).join(",");
                 m.set(k, (m.get(k) ?? 0) + 1);
               }
+            }
             return m;
           };
           const gpar = paramsBag(gen.slots);
-          const rpar = paramsBag(compiled.slots);
+          const rpar = paramsBag(compiled.slots, excludedParamsSlots);
           let paramsMatch = gpar.size === rpar.size;
           if (paramsMatch)
             for (const [k, v] of gpar)

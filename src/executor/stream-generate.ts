@@ -1292,10 +1292,32 @@ function generateFullReduction(
 ): { commands: GpuCommand[]; outSlot: Slot } | string {
   const reduceOp = "sum";
   const payload = node.payload as
-    | { dim?: number | number[] | null }
+    | { dim?: number | number[] | null; keepdim?: boolean }
     | undefined;
-  if (payload?.dim != null)
-    return generateDimReduction(node, slots, resolveRefSlot, bufferSlot);
+  if (payload?.dim != null) {
+    // A `sum(dim=…)` whose dim list reduces EVERY axis with keepdim=false is
+    // what the DISPATCH routes to the plain full-reduction path — reductions.ts
+    // prepareDimReduction returns null (outShape empty), so `reduction()` calls
+    // fullReduction, NOT the dim-reduction kernel. planDimReductionDispatch
+    // mirrors that null → generateDimReduction would bail `all-dims-or-epilogue`
+    // and strand the plan lowered. Detect the all-dims/no-keepdim case and fall
+    // through to the full-reduction body below (byte-identical to fullReduction);
+    // anything else is a genuine dim reduction. (keepdim=true over all axes keeps
+    // a [1,…,1] output → prepareDimReduction returns a setup → a real dim
+    // reduction, so it must still route to generateDimReduction.)
+    const ref0 = node.inputs[0];
+    const inRank =
+      ref0.kind === "materialized"
+        ? (ref0.storage.backendTensor as WebGPUTensor).shape.length
+        : ref0.kind === "scalar"
+          ? 0
+          : ref0.node.shape.length;
+    const dims = Array.isArray(payload.dim) ? payload.dim : [payload.dim];
+    const norm = new Set(dims.map((d) => (d < 0 ? d + inRank : d)));
+    const allDims = !(payload.keepdim ?? false) && norm.size === inRank;
+    if (!allDims)
+      return generateDimReduction(node, slots, resolveRefSlot, bufferSlot);
+  }
   if (node.inputs.length !== 1) return "arity";
   const ref = node.inputs[0];
   if (ref.kind === "scalar") return "scalar-operand";
@@ -3697,7 +3719,7 @@ function generateDataSource(
       )
         return null;
       const slot = slots.length;
-      slots.push({ kind: "constFill", elements, fillValue });
+      slots.push({ kind: "constFill", elements, fillValue, nodeIndex });
       return { commands: [], outSlot: slot };
     }
     case "tensorFromArray": {
@@ -3711,6 +3733,31 @@ function generateDataSource(
         outSlot: slot,
       };
     }
+    case "arange": {
+      // arange is a compile-time-CONSTANT index ramp (start + i*step), fully
+      // determined by shape + payload — NOT rng state (unlike rand/randn/
+      // bernoulli, which stay bailed). Emit a plan-owned constant buffer (the
+      // constFill mechanism, array form): the ramp is materialized at build and
+      // reused byte-identical every replay, sitting OUTSIDE the arena AND the
+      // harvest ledger — so it sidesteps the legacy TAG_WRITE-allocates-fresh
+      // problem that keeps rng data-sources uncovered. Only for RECURRING
+      // templates (coverConstFill); a transient warmup arange stays lowered so
+      // its one-shot buffer never leaks (same gate as `full`).
+      if (!coverConstFill) return null;
+      const ap = node.payload as { start?: number; step?: number } | undefined;
+      const start = ap?.start ?? 0;
+      const step = ap?.step ?? 1;
+      // Match the arange_tile WGSL bit-for-bit: `start + f32(i)*step`, every op
+      // in f32 (Math.fround), so a non-integer step can't drift 1 ULP from the
+      // GPU (the pre-fill is the elided dispatch's exact output). Float32Array
+      // assignment already rounds the final add.
+      const data = new Float32Array(elements);
+      for (let i = 0; i < elements; i++)
+        data[i] = start + Math.fround(Math.fround(i) * step);
+      const slot = slots.length;
+      slots.push({ kind: "constFill", elements, data, nodeIndex });
+      return { commands: [], outSlot: slot };
+    }
     // NOTE (2026-07-12): `full` IS now generated — as a constFill slot (see the
     // `full` case above), NOT via the TAG_WRITE legacy path. The reason the old
     // TAG_WRITE approach leaked is exactly why constFill sidesteps it: the
@@ -3721,13 +3768,16 @@ function generateDataSource(
     // constFill slot is a plan-owned FIXED buffer (no fresh alloc) that is NOT
     // harvested (no NodeResult), so it leaks nothing.
     //
-    // arange / rand / randn / bernoulli are STILL NOT generated: they are not
-    // compile-time constants (rng state / index ramps) and would need the
-    // TAG_WRITE legacy path to write INTO a planned slot instead of allocating
-    // fresh. tensorFromArray is safe (small stable-upload fast path, plan-owned
-    // buffer) and zeros is safe (TAG_CLEAR into the slot). Covering rand/etc. needs
-    // the TAG_WRITE legacy path to write INTO the planned slot instead of
-    // allocating fresh — a separate executor change. They stay bailed (lowered).
+    // arange IS now generated — as a constFill slot (array form; see the
+    // `arange` case above), because it is a compile-time-CONSTANT index ramp
+    // (start + i*step, deterministic from shape+payload). rand / randn /
+    // bernoulli are STILL NOT generated: they carry rng STATE (not a pure
+    // function of shape/payload) and would need the TAG_WRITE legacy path to
+    // write INTO a planned slot instead of allocating fresh. tensorFromArray is
+    // safe (small stable-upload fast path, plan-owned buffer) and zeros is safe
+    // (TAG_CLEAR into the slot). Covering rand/etc. needs the TAG_WRITE legacy
+    // path to write INTO the planned slot instead of allocating fresh — a
+    // separate executor change. They stay bailed (lowered).
     case "zeros": {
       const slot = slots.length;
       slots.push({ kind: "arena" });
