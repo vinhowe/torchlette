@@ -900,6 +900,61 @@ UNMASKED is not established-shape; the foreach optimizer's >128 MB packed buffer
 update a chunked-dispatch class the generate-from-IR subsystem has never had to cover (the fused path escapes
 it via the single `adamStep` kernel, which is neither chunked nor decomposed).
 
+**STATUS 2026-07-17 — D4 attempt #10: the #9 census residual is CLOSED (the foreach optimizer plan is
+FULLY covered, `t-stream-generate` 0 diverged, the tape forms); the "ninth class" was substantially a
+STALE HARDCODED-128 MB threshold, not a missing chunked-elementwise subsystem — MEASURED. The deletion is
+NOT yet landed: it now needs a fresh 3-way reconciliation of the coverage against the preserved deletion
+diff (they touch the same files) + the full authoritative matrix — Stage 1 landed and validated, Stages
+2–3 pending.** The Stage-1 coverage (commit `1d74b70c`, worktree off `4e06b015`, +762 lines across
+`dispatch.ts`/`tile-dispatch.ts`/`executor.ts`/`segment-executors.ts`/`stream-generate.ts`, weight-norm
+srcSLOC 65327→65890):
+
+- **THE DERIVED CHUNKING SEAM (the ratified refinement, landed).** `computeChunkGeometry` (tile-dispatch.ts)
+  is the ONE capability-forced split `numChunks = f(bytes, maxStorageBufferBindingSize)` deriving per-chunk
+  sub-range windows + grid + packed uniforms; `dispatchChunked` (execution) and the new `planChunked`
+  (generation) BOTH consume it (dispatchChunked refactored to derive from it — cannot drift).
+  `chunkedBinaryConfig`/`chunkedUnaryConfig` are the single spec+chunking source; `planChunkedBinary`/
+  `planChunkedUnary` expose the plan; `dispatchChunkedElementwise` executes it with a FRESH per-chunk
+  `createParamsBuffer` (a self-contained `params` slot, NOT the config-cache `persistent` buffer a
+  build-from-IR replay cannot own — the `sumFullReductionChunked` precedent, the reason chunked elementwise
+  is generatable). `generateChunkedBinary`/`Unary` + `generateFusedDecomposed` (the `executeSequentialSegment`
+  fallback) + `generateCat` (the interdependent op:cat) are the generator side. Chunk geometry is baked as
+  per-chunk params (step-invariant for a fixed buffer, no volatile repack — following
+  `planChunkedFullReduction`); the "volatile-uniforms" phrasing in the charter was over-specified — the
+  chunk SIZE already flows as data in the packed params, and a fresh params slot per chunk is what the
+  execution's per-chunk `createParamsBuffer` records.
+
+- **THE MEASURED FINDING that reframes the class.** On the authoritative device (V100 via the `tools/vk-shim`),
+  `maxStorageBufferBindingSize = 2048 MB`, so the 320 MB foreach packed buffer is **NEVER chunked** — it binds
+  whole and runs as a fused kernel. The `fused[oversized]×8` census label came from a stale HARDCODED 128 MB
+  check in `generateFused` that DISAGREED with execution (which uses the device limit in `executeFusedSegment`'s
+  `hasOversizedBuffer` check + `dispatchBinary/Unary`). The real unblock was (a) deriving that threshold from
+  the device limit (single-source with execution), (b) `generateCat`, and (c) caching the executor's donation
+  decision on the fused action (`donationSink → action.cachedDonatedRecipeIdx`) — the generator's post-hoc
+  donation detection reads the primary output's result, already cleared for a step-scoped in-place output
+  (the foreach in-place m/v update; this was the node[632] `mul+add` gen=4/rec=3 divergence + the downstream
+  node[635] `stridedScatterCopy` slot-bijection divergence, both now 0). The chunked-elementwise generator IS
+  the correct handling for genuinely-oversized ops (>2 GB, or a 128 MB-limit device) and is single-sourced,
+  but it is a NO-OP on the gate device; so the #9 charter's "net-new chunked-elementwise SUBSYSTEM is required"
+  premise is FALSIFIED for the authoritative device — the residual was a threshold + cat + donation, all
+  established shapes.
+
+- **Gates (V100 vk-shim, device 5, current tree):** `test:gates` **6/6** (incl. the chunked full-reduction
+  sum); `parity-fullstack-tl` compiled-vs-lowered ~1e-6/30 BOTH directions; `t-stream-generate` **0 diverges /
+  3100 verified cmds**; all four `t-train-tape-matrix` cells **PASS** (`refusals=0`, `eligiblePairs>0`), every
+  plan FULLY GENERATED **0 diverged** (foreach: 383/383 segments, `fused[oversized]`/`op:cat` GONE).
+
+- **Re-open condition (attempt #11 / the landing).** NOT a tenth class — no new never-witnessed cross-plan
+  boundary; the #9 re-open gate (`t-train-tape-matrix` 4/4, `t-stream-generate` 0 diverged, foreach census
+  fully covered) is MET. What remains is the LANDING: (1) re-reconcile `.claude/D4-deletion-attempt5-STOPPED.diff`
+  against this HEAD — the deletion touches `dispatch.ts`/`tile-dispatch.ts`/`executor.ts`, the same files Stage 1
+  modifies, and `stream-generate.ts`'s chunked generators import Stage-1 `dispatch.ts` exports, so the mechanical
+  `d4-deleted-tree-gate.sh` COVER_FILES layering (plain `git apply`) cannot build the deleted tree without a real
+  3-way merge; (2) run the full §D4 authoritative matrix on the reconciled deleted tree, serial/whole-node
+  exclusive; (3) commit the deletion only if ALL green. The `d4-deleted-tree-gate.sh` COVER_FILES must gain
+  `dispatch.ts tile-dispatch.ts segment-executors.ts` (and the executor donation-write must survive the deletion
+  reconciliation) for the deleted tree to build + reproduce the donation coverage.
+
 ### Phase D5 — The declared-lifetime dividend (LAST; step-object phase 7)
 
 **Goal:** the observation predicates RETIRE on the captured path (they are now queries of
