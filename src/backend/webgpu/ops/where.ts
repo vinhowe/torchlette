@@ -96,6 +96,71 @@ export function where(
   );
 }
 
+/** The stream-generate plan shape a direct `where` produces (mirrors
+ *  ElementwiseDirectPlan: key IS the WGSL, params ride [size, ...offsets]). */
+export interface WhereDirectPlan {
+  key: string;
+  shader: string;
+  outputSizeBytes: number;
+  paramsData: ArrayBufferView;
+  dispatchX: number;
+  dispatchY: number;
+}
+
+/**
+ * Generator-facing plan builder for a direct (non-chunked) `where`. Returns the
+ * exact command geometry `whereDirect` dispatches — key/shader/params/dispatch —
+ * or null when `where()` would route away from the direct path (the chunked
+ * >128MB branch, which stays uncovered → the plan keeps record/replay). The
+ * stream generator consumes this so the generated stream is byte-identical to
+ * the recording (single-source-at-seams, like planBinaryDirect).
+ */
+export function planWhereDirect(
+  condTensor: WebGPUTensor,
+  xTensor: WebGPUTensor,
+  yTensor: WebGPUTensor,
+): WhereDirectPlan | null {
+  const outShape = broadcastThreeShapes(
+    condTensor.shape,
+    xTensor.shape,
+    yTensor.shape,
+  );
+  const outSize = sizeOf(outShape);
+  if (outSize === 0) return null;
+  // `where()` routes to whereChunked when the output exceeds the binding limit;
+  // that is a different command shape (chunked dispatcher) — leave it uncovered.
+  const maxBindingSize =
+    requireContext().device.limits?.maxStorageBufferBindingSize ??
+    DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
+  if (outSize * F32_BYTES > maxBindingSize) return null;
+  const indexShape = toIndexShape(outShape);
+  const condStrides = computeEffectiveBroadcastStrides(condTensor, indexShape);
+  const xStrides = computeEffectiveBroadcastStrides(xTensor, indexShape);
+  const yStrides = computeEffectiveBroadcastStrides(yTensor, indexShape);
+  const code = whereWGSL(
+    indexShape,
+    condStrides,
+    xStrides,
+    yStrides,
+    condTensor.offset,
+    xTensor.offset,
+    yTensor.offset,
+  );
+  return {
+    key: code,
+    shader: code,
+    outputSizeBytes: outSize * F32_BYTES,
+    paramsData: params(
+      outSize,
+      condTensor.offset,
+      xTensor.offset,
+      yTensor.offset,
+    ),
+    dispatchX: Math.ceil(outSize / WORKGROUP_SIZE),
+    dispatchY: 1,
+  };
+}
+
 /**
  * Direct (non-chunked) where dispatch using broadcast indexing.
  */

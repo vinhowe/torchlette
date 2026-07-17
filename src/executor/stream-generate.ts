@@ -68,6 +68,7 @@ import {
   planContiguousDirect,
   planNarrowBackward,
 } from "../backend/webgpu/ops/views";
+import { planWhereDirect } from "../backend/webgpu/ops/where";
 import { planRowProgramDispatch } from "../backend/webgpu/row-program-dispatch";
 import { alignBufferSize, dtypeBytes } from "../backend/webgpu/shape-utils";
 import type { WebGPUTensor } from "../backend/webgpu/tensor";
@@ -865,9 +866,14 @@ function generateSequential(
     node.op === "cast" ||
     node.op === "contiguous" ||
     node.op === "gelu";
-  if (!wgslOp && !isUnary) return "";
+  // `where` is a 3-input elementwise select (whereDirect): the input-resolution
+  // loop below is already arity-generic, so covering it is a plan-builder branch
+  // (planWhereDirect) — no new resolution machinery.
+  const isWhere = node.op === "where";
+  if (!wgslOp && !isUnary && !isWhere) return "";
   if (wgslOp && node.inputs.length !== 2) return "arity";
   if (isUnary && node.inputs.length !== 1) return "arity";
+  if (isWhere && node.inputs.length !== 3) return "arity";
   const ins: WebGPUTensor[] = [];
   const inSlots: Slot[] = [];
   // Aliasing candidates for the output ALLOC: only POOLABLE operands. Scalar-
@@ -961,6 +967,13 @@ function generateSequential(
   let plan;
   if (wgslOp) {
     plan = planBinaryDirect(wgslOp, ins[0], ins[1]);
+  } else if (isWhere) {
+    // The direct `where` carries frozen offsets in paramsData with NO volatile
+    // repack (buildDirectOffsetRepack excludes it — clip/scaler run it on
+    // offset-0 tensors). A narrow-fed input's offset could vary across replays,
+    // stranding the frozen params stale → keep such a `where` uncovered.
+    if (node.inputs.some((r) => inputHasNarrow(r))) return "where-narrow";
+    plan = planWhereDirect(ins[0], ins[1], ins[2]);
   } else if (node.op === "cast") {
     plan = planCastDirect(ins[0], node.dtype);
   } else if (node.op === "contiguous") {
