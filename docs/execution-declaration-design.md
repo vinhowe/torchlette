@@ -508,6 +508,101 @@ pool-entangled path untouched under the degraded verification window.
   from the declaration's derived split, NOT a hand-mirror; all-dims sum + arange
   (the #7 errands) covered by construction.
 
+#### P1 STATUS — LANDED (serializer cutover complete; interpreter boundary named)
+
+Three commits off `main` @ `4e3353be` (branch `worktree-agent-a9381ae240b1a867a`,
+unpushed): `5e823b9a` (declarations) → `02aa033f` (serializer cutover + shadow) →
+`79c5f96c` (delete legacy + shadow).
+
+- **c1 — the reduction family as data** (`execution-declaration.ts`): the
+  `ReductionDeclaration` record (`monoid` ∈ {sum,max,min} = the schedule-state
+  monoid fact; `meanEpilogue` = mean is reduce(sum)÷count; `layout` =
+  contiguous-input) + the `REDUCTION_DECLARATIONS` table (sum/mean/max/min).
+  `OpFamilyUid` gains `reduction`; `assertNoGeneratorLeaf` generalized to
+  `AnyDeclaration`. CPU gate 13/13. Zero behaviour change.
+- **c2 — serializer cutover**: the 5 legacy generators (`generateFullReduction`/
+  `generateChunkedFullReduction`/`generateDimReduction`/`generateMean`/
+  `generateBatchedReduction`) → ONE walker family (`serializeReduction` →
+  `serializeSumReduction`/`serializeDimReduction`/`serializeMeanReduction`/
+  `serializeBatchedReduction`) + two shared helpers (`reduceContigInput` = the
+  layout prologue, `emitReduceStage` = the ALLOC+DISPATCH the four paths shared).
+  A transitional in-code shadow byte-diffed the walker against the retained legacy
+  on a FULLY ISOLATED snapshot (own slots copy + `bufferToSlot` clone), throwing
+  on any divergence — it caught one real wiring bug (snapshot after mutation).
+- **c3 — shadow + legacy deleted**: the wall proved green with the shadow live, so
+  the 5 generators + the shadow machinery are removed; the declaration is the sole
+  serializer source (`stream-generate.ts` −662 lines net).
+
+**The carried-axis / two-stage ruling, realized.** Reductions ARE the carried-axis
+case. The declaration composes the answer: (a) in-bind reduction → one
+`emitReduceStage`; (b) oversized on the CARRIED axis → the MULTI-KERNEL
+partials+combine lowering (`planChunkedFullReduction`) reified as the declared
+two-stage skeleton (`serializeChunkedReduction`) — the existing chunked machinery
+is its REALIZED IMAGE, the `sum` monoid supplies the partial/combine kernels; (c)
+mean → the two-stage sum+meanDiv. Consistent with the P0 refinement, full-vs-dim
+and the two-stage selection are DERIVED at the walker (`payload.dim`,
+`fullReductionNeedsChunking`), NOT schema fields — the crux `test:gates` chunked
+>128 MB gate passes through the DECLARED two-stage skeleton, no hand-mirror.
+
+**Schema extension (named + rejected alternatives).** The reduction family adds
+`ReductionDeclaration` (`monoid`/`meanEpilogue`/`layout`) as a thin sibling of the
+elementwise `ExecutionDeclaration`. REJECTED: reusing
+`ExecutionDeclaration.skeleton` for reductions — a static ALLOC→[UNIFORM]→DISPATCH
+list cannot express the structurally-variable reduction command shape (full / dim
+/ two-stage / +meanDiv), which is DERIVED like elementwise windowing. Only the
+monoid + epilogue + layout are genuinely authored; zero-schema-delta on the
+elementwise declaration.
+
+**Net SLOC (P1, directional per §5.4):** P0-end 65686 → P1-end **65703 = +17**
+(code-only; comments free). The serializer cutover is near-NEUTRAL, not negative:
+the walker is slightly SMALLER than the 5 generators it replaces (≈ −13 code), and
+the new `ReductionDeclaration` table adds ≈ +30. This is exactly §5.4's prediction
+— "the campaign dips below the pre-campaign size only after the bigger families
+cut over" — because the big deletion for reductions is the INTERPRETER's 979 SLOC
+(`ops/reductions.ts` `reduction()`/`fullReduction()`/dim-dispatch decision code),
+which the SERIALIZER cutover does not touch. Campaign net vs pre-campaign 65651:
+**+52**. HONEST against the revert criterion (a CAMPAIGN-END, not per-phase, gate):
+the trajectory is still positive; the dip below pre-campaign is gated on the P1
+interpreter cutover + P2–P4. The serializer-cutover deletion pool that DID retire:
+the 5 hand-mirrored generators; the "mirrors sumFullReductionChunked" /
+"mirrors that null → generateDimReduction" confessions; the per-generator
+`reduceOp = "sum"` hardcode; the batched action's inline `op` classification.
+
+**Interpreter cutover — the named P1-continuation boundary (the P0 precedent).**
+The serializer now derives from the declaration; the INTERPRETER
+(`ops/reductions.ts` `reduction()` → `fullReduction()`/`sumFullReductionChunked`/
+the dim-reduction dispatch) still hand-encodes. It already realizes the SAME
+skeleton (the plan-builders `planFullReductionDispatch`/`planDimReductionDispatch`/
+`planMeanDivDispatch`/`planChunkedFullReduction` are the KernelRef-realizer
+analogues the walker CALLS) and is held in agreement by the record-vs-generate
+differential + the compiled==lowered parity gate + the chunked-full-reduction gate
+— NOT a stranded mirror. Its literal cutover unifies `reduction()`'s live-encode
+with the walker's command-emit under ONE skeleton walker + TWO emitters
+(interpreter binds live pooled buffers; serializer pushes `GpuCommand[]`), and it
+is where the 979-SLOC decision code retires (the P1 negative). DEFERRED to keep the
+hot, pool-entangled, oldest-in-repo path (§8 risk #1) untouched under the degraded
+verification window (~4× host, GPU-neighbour contention, SIGTERM-only) — the P0
+precedent exactly: a clean partial beats a stranded whole.
+
+**Gates (measured, degraded host ~4×; ALL green both shadow-ACTIVE and after the
+shadow deletion — walker byte-identical to legacy everywhere, ZERO divergence):**
+`test:gates` 5/5 (compiled==lowered trajectory, build-twice determinism, chunked
+>128 MB full-reduction through the DECLARED two-stage, view-offsets-as-data,
+cross-offset replay). `parity-fullstack-tl` BOTH directions: max |Δloss| 4.77e-6
+(shadow on) / 6.20e-6 (shadow off) over 30 steps, at the run-to-run noise floor.
+124M DiLoCo regression EXACT ({0:9.81, 3:5.92, 6:5.15, 9:4.64}, peak flat
+2087.6 MB) — the chunked-sum two-stage is IN its plan. Witness matrix 5/5 cells
+`shadowEmpty:true` (incl. `chunked124m`, the >128 MB path). train-tape-matrix 4/4
+zero refusals; step-object-null + step-edit-null; ring-probe bit-identical;
+ledger-attack default+48. Reduction + topk specs green. Profiles distil@512
+late-step ≈49–64 ms (baseline 50/54) and medium@512 ≈189–259 ms (baseline 190),
+8 / 17–18 submits — the interpreter is UNTOUCHED (generation is build-time only),
+so steady-state ms/step is structurally unchanged. Full suites: cpu 111 files /
+0 fail (incl. all oracle PyTorch-parity specs); webgpu 83 files pass (13
+GPU-neighbour-OOM cascades, all green on isolated rerun — the P0 environmental
+pattern). `tsc` 134 (baseline); build green; biome 6→2 in-`stream-generate.ts`
+lint errors (deleted 4 legacy `noNonNullAssertion`; the walker's are biome-ignored).
+
 ### P2 — matmul-adjacent + the route-as-declaration fix
 - Cut over `generateBareMatmul`/`generateMatmulEpilogue` (205) + the command-
   sequence parts of `matmul/dispatch.ts` (1510). Fold the tiled-vs-GEMV route
