@@ -47,8 +47,10 @@
 // The schema
 // ============================================================================
 
-/** Op-family identity. P0 declared `elementwise`; P1 adds `reduction`. */
-export type OpFamilyUid = "elementwise" | "reduction";
+/** Op-family identity. P0 declared `elementwise`; P1 adds `reduction`; P2 adds
+ *  `matmul` (the matmul + matmul-epilogue family — the biggest duplication
+ *  pair). */
+export type OpFamilyUid = "elementwise" | "reduction" | "matmul";
 
 /**
  * Per-operand role, resolved per-NODE from the input ref kind:
@@ -316,8 +318,104 @@ export interface ReductionDeclaration {
   layout: "contiguous-input";
 }
 
-/** Any command-stream declaration (the schema-gate accepts either family). */
-export type AnyDeclaration = ExecutionDeclaration | ReductionDeclaration;
+// ============================================================================
+// The MATMUL family, authored as data (P2)
+// ============================================================================
+
+/**
+ * Matmul operand roles, in bind-group order. The variadic `epilogue-inputs`
+ * role expands to the node's epilogue inputs (empty for a bare matmul). SINGLE
+ * SOURCE for the `[a, b, out, params, ...epi]` binding array both matmul
+ * generators hardcoded.
+ */
+export type MatmulBindRole =
+  | "a"
+  | "b"
+  | "output"
+  | "params"
+  | "epilogue-inputs";
+
+/**
+ * A matmul op-family declaration. Matmul is the biggest duplication pair
+ * (dispatch ~1510 + generation ~205). Following the P1 thin-sibling-record
+ * ruling, only the genuinely-AUTHORED family facts live here; everything
+ * structural (which route engaged, dispatch grid, pipeline, K-split geometry)
+ * is DERIVED at the walker from the plan the realizer (`planTiledMatmul`)
+ * returns — the KernelRef-resolution analogue P1's reduction walker CALLS. The
+ * authored facts:
+ *   - `bindingTemplate`: the operand-role bind order, replacing the two
+ *     hand-mirrored `[a, b, out, params, ...epi]` arrays (bare + epilogue). The
+ *     K-split path composes its OWN two-stage bindings (partials temp + reduce)
+ *     from the plan — not this template.
+ *   - `layout`: matmul binds operand storage buffers RAW — a simple-transpose
+ *     input is a non-owning view on the SAME buffer, a contiguous input is
+ *     itself; a contiguous-copy prologue is a typed CAPTURE bail
+ *     (`planBareMatmul` → "contiguous-prologue"), never a walker prologue.
+ *   - `route`: the tiled-vs-GEMV-vs-K-split decision (incl. the #95 inputCast
+ *     admit and the #93 quantB exclusion) is decided ONCE inside
+ *     `planTiledMatmul` (`selectMatmulChoice`) and carried on the plan as a
+ *     `SelectionReceipt`. Every consumer — lowered dispatch, build-from-IR
+ *     capture, and BOTH serializer walkers — READS that receipt's
+ *     `gemvEngaged`; none re-parses the profiler label (retiring the #95
+ *     replay-blind `plan.label?.startsWith("_gemv")` re-derivation the epilogue
+ *     generator carried). K-split is the carried-axis two-stage schedule fact,
+ *     COMPOSED from the plan (partials + combine), never re-owned — the
+ *     reductions two-stage analogue.
+ *   - `operandFormat`: the StorageFormat axes that participate in the route
+ *     decision (#93/#95 rule — StorageFormat participates at every route
+ *     decision): a packed-int8 B operand is route-EXCLUDED (a fused-dequant
+ *     GEMV realizer the tiled-matmul stream cannot serialize → typed capture
+ *     bail "quantized-operand"), inputCast (a read-wider stored dtype) is a
+ *     route AXIS (admits GEMV NT). Declared so the route's format inputs are
+ *     legible at ONE place, not re-discovered at each decision site.
+ * REJECTED extension: reusing the elementwise `ExecutionDeclaration.skeleton`
+ * for matmul — a static ALLOC→[UNIFORM]→DISPATCH list cannot express the
+ * route-variable command shape (bare / epilogue / K-split two-stage), which is
+ * DERIVED from the plan like elementwise windowing and reductions' two-stage.
+ * The binding template + layout + route-source + operand-format axes are the
+ * only genuinely-authored facts; zero-schema-delta on the sibling declarations.
+ */
+export interface MatmulDeclaration {
+  family: "matmul";
+  bindingTemplate: readonly MatmulBindRole[];
+  layout: "raw-bindable";
+  route: "receipt-consumed";
+  operandFormat: {
+    quantB: "route-excluded";
+    inputCast: "route-axis";
+  };
+}
+
+/**
+ * The matmul family declaration. Keyed by `LazyIRNode.op === "matmul"` — the
+ * ONE declaration covers both the bare matmul (a `sequential` action over a
+ * `matmul` node) and the `matmul-epilogue` action (whose underlying node op is
+ * also `matmul`); the walker branches on bare-vs-epilogue by entry point, not
+ * by a second declaration.
+ */
+export const MATMUL_DECLARATION: MatmulDeclaration = {
+  family: "matmul",
+  bindingTemplate: ["a", "b", "output", "params", "epilogue-inputs"],
+  layout: "raw-bindable",
+  route: "receipt-consumed",
+  operandFormat: { quantB: "route-excluded", inputCast: "route-axis" },
+};
+
+/** The matmul-family declaration for `op`, or undefined (not this family). */
+export function matmulDeclaration(op: string): MatmulDeclaration | undefined {
+  return op === "matmul" ? MATMUL_DECLARATION : undefined;
+}
+
+/** Whether `op` is a declared matmul-family op. */
+export function isDeclaredMatmul(op: string): boolean {
+  return op === "matmul";
+}
+
+/** Any command-stream declaration (the schema-gate accepts every family). */
+export type AnyDeclaration =
+  | ExecutionDeclaration
+  | ReductionDeclaration
+  | MatmulDeclaration;
 
 /**
  * The reduction family declarations, keyed by `LazyIRNode.op`. `sum`/`mean` are

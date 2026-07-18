@@ -15,7 +15,10 @@ import {
   type ExecutionDeclaration,
   elementwiseDeclaration,
   isDeclaredElementwise,
+  isDeclaredMatmul,
   isDeclaredReduction,
+  MATMUL_DECLARATION,
+  matmulDeclaration,
   REDUCTION_DECLARATIONS,
   reductionDeclaration,
 } from "../src/executor/execution-declaration";
@@ -122,6 +125,38 @@ describe("execution-declaration schema (P0 elementwise)", () => {
     for (const op of REDUCTION_DECLARATIONS.keys()) {
       expect(isDeclaredElementwise(op)).toBe(false);
     }
+  });
+
+  it("the matmul declaration is generator-free data", () => {
+    expect(() =>
+      assertNoGeneratorLeaf(MATMUL_DECLARATION, "matmul"),
+    ).not.toThrow();
+  });
+
+  it("the matmul family binds [a, b, out, params, ...epi] over roles", () => {
+    const d = matmulDeclaration("matmul");
+    expect(d).toBeDefined();
+    expect(d?.bindingTemplate).toEqual([
+      "a",
+      "b",
+      "output",
+      "params",
+      "epilogue-inputs",
+    ]);
+    // Route is receipt-consumed (selected once at planTiledMatmul); operands
+    // bind raw; the #93/#95 format axes are declared at one place.
+    expect(d?.route).toBe("receipt-consumed");
+    expect(d?.layout).toBe("raw-bindable");
+    expect(d?.operandFormat.quantB).toBe("route-excluded");
+    expect(d?.operandFormat.inputCast).toBe("route-axis");
+  });
+
+  it("isDeclaredMatmul is exact and disjoint from the other families", () => {
+    expect(isDeclaredMatmul("matmul")).toBe(true);
+    expect(isDeclaredMatmul("add")).toBe(false);
+    expect(isDeclaredMatmul("sum")).toBe(false);
+    expect(isDeclaredElementwise("matmul")).toBe(false);
+    expect(isDeclaredReduction("matmul")).toBe(false);
   });
 
   it("the schema gate REJECTS a buffer leaf", () => {
