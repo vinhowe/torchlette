@@ -284,11 +284,87 @@ both directions of every toggle. This is `tools/parity-fullstack-tl.ts` lifted t
 compare `compiled-step` vs `eager` (the existing compiled-plan-vs-lowered gate, one
 level up). No phase lands without it green in both directions.
 
-- **P0 — Scale the passes (no behavior change).** Convert `buildMergedPlan.visit`
-  recursion → explicit stack; heap-back the Kahn ready sets; bound the fusion gap
-  scan and checkpoint all-pairs edges. Gate: existing suite green + a synthetic
-  5k-node graph builds in bounded time. *Ships nothing user-visible; derisks the
-  whole-step graph.*
+- **P0 — Scale the passes (no behavior change). DONE (2026-07-18).** Convert
+  `buildMergedPlan.visit` recursion → explicit stack; heap-back the Kahn ready sets;
+  bound the fusion gap scan and checkpoint all-pairs edges. Gate: existing suite
+  green + a synthetic 15k-node graph compiles in bounded time. *Ships nothing
+  user-visible; derisks the whole-step graph.* **See §P0 below for the measured
+  before/after tables.**
+
+### P0 status — pass-scaling measured, all spots linearized
+
+Harness: `probe/pass-scaling.ts` (captures the DEFERRED-LOSS fwd+bwd whole-step
+graph at the single backward force — the census's 630-node config at distil/6L —
+and synthetically scales it by layer replication with honest per-layer op mix;
+node count is independent of hidden size, so tiny dims keep param materialization
+cheap). Times each compile-path pass in isolation plus the end-to-end
+`analyzeGraph`. Reproduce a size:
+`VULKAN_DEVICE_INDEX=0 LD_LIBRARY_PATH=tools/vk-shim npx tsx probe/pass-scaling.ts <numLayers>`.
+
+**Baseline (before P0), fwd+bwd graph, ms (median), A100 dw-2-1:**
+
+| layers | nodes | plan-build | fusion-reorder | WAR-order | CSE/DCE | segmentation | **analyzeGraph** |
+|---|---|---|---|---|---|---|---|
+| 6 | 621 | 0.16 | 2.23 | 0.04 | 1.69 | 6.18 | **9.47** |
+| 24 | 2367 | 0.57 | 12.29 | 0.12 | 3.60 | 79.90 | **102.29** |
+| 60 | 5859 | 1.51 | 72.84 | 0.12 | 10.13 | 530.55 | **664.44** |
+| 150 | 14589 | 3.61 | 438.97 | 0.37 | 30.26 | 4160.24 | **5050.83** |
+
+**Post-P0, same harness/machine:**
+
+| layers | nodes | plan-build | fusion-reorder | WAR-order | CSE/DCE | segmentation | **analyzeGraph** |
+|---|---|---|---|---|---|---|---|
+| 6 | 621 | 0.41 | 1.15 | 0.05 | 2.42 | 1.89 | **3.87** |
+| 24 | 2367 | 0.55 | 2.12 | 0.05 | 3.44 | 5.86 | **14.30** |
+| 60 | 5859 | 1.57 | 3.48 | 0.12 | 9.40 | 11.58 | **31.32** |
+| 150 | 14589 | 3.84 | 11.67 | 0.38 | 30.48 | 33.47 | **84.13** |
+
+**The 15k-node compile: 5050 ms → 84 ms.** Every pass is now ~linear (all under the
+bar of "seconds acceptable, minutes not" by two orders of magnitude); the dominant
+residual is CSE/DCE at 30 ms, which measured ~linear all along.
+
+**Which spots bit vs which were cold** (the doc named the recursive collector +
+four O(n²) spots; fix what measures, report what doesn't):
+
+- **Recursive collector** (`buildMergedPlan.visit`) — linear in time but a JS
+  stack-overflow risk on deep chains at 15k. Converted to an explicit work-stack
+  (iterative postorder, byte-identical order). *Fixed (mandated for stack safety).*
+- **Fusion `segmentPlanForExecution` / `detectFusionGroups` — BIT HARDEST (4.16 s
+  @15k).** Two distinct O(n²): (a) `processCandidate` rescanned *every plan node*
+  per intermediate to find external references — replaced by a per-producer
+  consumer map built once (O(edges)); (b) the segmentation wrapper's gap-node
+  ancestor walk used a per-gap-node `visited` set — shared it across gap nodes
+  (groups only ever go un-emitted→emitted, so a resolved subtree never needs
+  re-walking). A third, `batchGlobalSingletons`' gap rescan, was **provably
+  redundant** (the preceding earliest-consumer guard already excludes any gap
+  consumer) and deleted; its O(batch) rescan collapsed to a running min.
+- **Fusion reorder ready-set / `selectBestForFusion` scan — BIT (0.44 s @15k).**
+  The old full-ready-set scan per emit is O(n²) because the backward frontier is
+  O(n) wide (one gradient branch per parameter). Replaced by per-priority
+  min-heaps with epoch-stamped chain-continuation (P0), preserving the exact
+  (priority, original-position) tie-break.
+- **Checkpoint all-pairs edges + WAR Kahn ready-set/affinity** (in
+  `enforceWriteAfterReadOrder`) — **COLD in the fwd+bwd graph** (it early-returns
+  with no in-place ops), but the *whole-step* graph folds in the optimizer
+  (in-place adamStep) and its wide fan-out. A realistic wide-frontier synthetic
+  (`PS_MODE=warsynth`) confirmed the splice ready-set + O(ready) affinity scan go
+  O(n²) there (2.2 s @6k wide, timing out @16k) and the checkpoint all-pairs edges
+  are O(B·n) (136 ms @16k, 159 boundaries). All three fixed: O(n) segment-barrier
+  edges (transitively identical partial order → identical deterministic Kahn
+  output), min-heap ready-set, per-op affinity heaps → all linear (~18 ms @16k).
+- **`redirectConsumers` filter + DCE fixpoint** (CSE/DCE) — **COLD** (~linear,
+  30 ms @15k). Not touched.
+
+**Behavior-identity (the NULL discipline).** Every fix is order-preserving:
+`test/fusion-decision-corpus.spec.ts` (byte-identical fusion decisions) green,
+`test/second-run-determinism.spec.ts` green, `test:gates` 5/5 (incl. compiled ==
+lowered over the full inner step). A tl-vs-tl trajectory differential
+(`probe/traj-check.ts`, 30 steps, checkpoint+scaler+clip+Adam — exercises reorder,
+segmentation, and the WAR in-place/checkpoint-edge paths): the modified code's
+losses fall inside the *original code's own* cross-process fp variance (~1e-6 at a
+single step; the baseline is itself not bit-stable run-to-run), and compiled ==
+lowered bit-for-bit. `probe/census.ts` numbers unchanged (630-node DEFERRED-LOSS,
+4/5/6/3 forces).
 
 - **P1 — Whole-step trace acquisition behind a flag.** Capture scope that defers
   loss/grad-write/boundary forces and forces the step output set once. Run
