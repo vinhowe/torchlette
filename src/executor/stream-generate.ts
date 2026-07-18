@@ -37,7 +37,6 @@ import {
   planChunkedUnary,
   planUnaryDirect,
 } from "../backend/webgpu/dispatch";
-import type { TileKernelChunkedPlan } from "../backend/webgpu/tile-dispatch";
 import { planFusedKernel } from "../backend/webgpu/fusion-dispatch";
 import { requireContext } from "../backend/webgpu/gpu-context";
 import { gpuBuffer } from "../backend/webgpu/gpu-types";
@@ -76,7 +75,10 @@ import { planWhereDirect } from "../backend/webgpu/ops/where";
 import { planRowProgramDispatch } from "../backend/webgpu/row-program-dispatch";
 import { alignBufferSize, dtypeBytes } from "../backend/webgpu/shape-utils";
 import type { WebGPUTensor } from "../backend/webgpu/tensor";
-import type { TileKernelPlan } from "../backend/webgpu/tile-dispatch";
+import type {
+  TileKernelChunkedPlan,
+  TileKernelPlan,
+} from "../backend/webgpu/tile-dispatch";
 import { planUnscaleGradDispatch } from "../backend/webgpu/unscale-kernel";
 import { sizeOf } from "../core/shape";
 import type { LazyIRNode, StorageHandle } from "../graph/types";
@@ -98,13 +100,16 @@ import { operandRequiresContiguous } from "./contiguous-operands";
 import {
   ELEMENTWISE_BINARY_WGSL,
   ELEMENTWISE_SPLIT_AXIS_PARALLEL,
-  elementwiseDeclaration,
   type ExecutionDeclaration,
+  elementwiseDeclaration,
   isDeclaredElementwise,
+  type ReductionDeclaration,
+  reductionDeclaration,
 } from "./execution-declaration";
 import type { AttnInputContig, LoweredPlan } from "./lowered-plan";
 import { getInputStorage } from "./op-dispatch";
 import { lookupScalarStorage } from "./scalar-table";
+import { canonicalizeStream } from "./stream-diff";
 
 export interface GeneratedStream {
   /** Per-covered-action command segments, in action order. Verified against
@@ -452,6 +457,7 @@ export function generateStream(
                   .cachedInputShapes,
                 (action as { cachedStridedInputs?: (AttnInputContig | null)[] })
                   .cachedStridedInputs,
+                bufferToSlot,
               );
         if (typeof gen === "string") {
           miss(`op:${node.op}${gen ? `[${gen}]` : ""}`);
@@ -597,13 +603,53 @@ export function generateStream(
           reduceOp: string;
           payload: { dim: number | number[]; keepdim?: boolean };
         };
-        const gen = generateBatchedReduction(
+        // Reduction-family WALKER (monoid from the action's ReductionDeclaration);
+        // transitional shadow byte-diffs it against the retained legacy generator
+        // on an isolated snapshot (deleted in P1 commit 3).
+        const shadow = makeReductionShadowEnv(slots, bufferToSlot);
+        const gen = serializeBatchedReduction(
           br,
           planNodes,
           slots,
           resolveRefSlot,
           bufferSlot,
         );
+        const legacyBr = generateBatchedReduction(
+          br,
+          planNodes,
+          shadow.shadowSlots,
+          resolveRefSlot,
+          shadow.shadowBufferSlot,
+        );
+        if (typeof gen === "string" || typeof legacyBr === "string") {
+          if (gen !== legacyBr) {
+            throw new Error(
+              `[exec-decl shadow] batched-reduction walker diverged: ` +
+                `walker=${JSON.stringify(gen)} legacy=${JSON.stringify(legacyBr)}`,
+            );
+          }
+        } else {
+          const a = canonicalizeStream(legacyBr.commands);
+          const b = canonicalizeStream(gen.commands);
+          const outsMatch =
+            gen.outputs.length === legacyBr.outputs.length &&
+            gen.outputs.every(
+              (o, i) =>
+                o.nodeIndex === legacyBr.outputs[i].nodeIndex &&
+                o.slot === legacyBr.outputs[i].slot,
+            );
+          if (
+            !outsMatch ||
+            gen.firstNodeIndex !== legacyBr.firstNodeIndex ||
+            a.length !== b.length ||
+            a.some((l, i) => l !== b[i])
+          ) {
+            throw new Error(
+              `[exec-decl shadow] batched-reduction walker diverged: ` +
+                `legacy=[${a.join(" | ")}] walker=[${b.join(" | ")}]`,
+            );
+          }
+        }
         if (typeof gen === "string") {
           miss(`batched-reduction[${gen}]`);
           for (const ni of br.nodeIndices) phantom(planNodes[ni], ni);
@@ -858,7 +904,8 @@ function resolveElementwiseKernel(
     }
     case "contiguousDirect": {
       // Already-contiguous fast path: a non-owning view, ZERO commands.
-      if (ins[0].isContiguous && (ins[0].offset ?? 0) === 0) return { alias: true };
+      if (ins[0].isContiguous && (ins[0].offset ?? 0) === 0)
+        return { alias: true };
       const plan = planContiguousDirect(ins[0]);
       return plan ? { plan } : "non-direct-route";
     }
@@ -960,7 +1007,11 @@ function serializeElementwiseDirect(
       });
     } else if (cmd.op === "uniform") {
       paramsSlot = slots.length;
-      slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData.slice() });
+      slots.push({
+        kind: "params",
+        seqIndex: -1,
+        data: plan.paramsData.slice(),
+      });
       // Task #71: emit the volatile repack only when an input offset can vary
       // across replays (a narrow-fed view). nodeIndex -1 is patched by caller.
       if (offsetRepack) {
@@ -999,10 +1050,45 @@ function generateSequential(
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
   cachedInputShapes?: number[][],
   cachedStridedInputs?: (AttnInputContig | null)[],
+  // The generateStream-level bufferToSlot map, threaded ONLY for the P1
+  // reduction transitional shadow (undefined on the nested oversized-decomp
+  // callers → the walker still runs, the shadow is skipped). Deleted in commit 3.
+  shadowBufferToSlot?: Map<unknown, Slot>,
 ): SequentialGen | string {
+  // Reduction family (sum/mean): the ReductionDeclaration is the SINGLE SOURCE
+  // for the monoid + mean epilogue; the walker derives the command stream. A
+  // transitional shadow byte-diffs it against the retained legacy generator.
+  const reduceDecl = reductionDeclaration(node.op);
+  if (reduceDecl && (node.op === "sum" || node.op === "mean")) {
+    // Snapshot the shadow env BEFORE the walker mutates the real slots/map, so
+    // the legacy run starts from the identical state (its slot indices MUST then
+    // match the walker's).
+    const shadow = shadowBufferToSlot
+      ? makeReductionShadowEnv(slots, shadowBufferToSlot)
+      : null;
+    const walker = serializeReduction(
+      reduceDecl,
+      node,
+      slots,
+      resolveRefSlot,
+      bufferSlot,
+    );
+    if (shadow) {
+      const { shadowSlots, shadowBufferSlot } = shadow;
+      const legacy =
+        node.op === "mean"
+          ? generateMean(node, shadowSlots, resolveRefSlot, shadowBufferSlot)
+          : generateFullReduction(
+              node,
+              shadowSlots,
+              resolveRefSlot,
+              shadowBufferSlot,
+            );
+      assertReductionShadowMatch(node.op, walker, legacy);
+    }
+    return walker;
+  }
   // Tile-kernel ops with bespoke command patterns.
-  if (node.op === "sum")
-    return generateFullReduction(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "unscaleGrad")
     return generateUnscaleGrad(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "stridedScatterCopy")
@@ -1033,8 +1119,6 @@ function generateSequential(
       resolveRefSlot,
       bufferSlot,
     );
-  if (node.op === "mean")
-    return generateMean(node, slots, resolveRefSlot, bufferSlot);
   // Elementwise family: the declaration (execution-declaration.ts) is the SINGLE
   // SOURCE for which ops are elementwise, their arity, kernel family, and
   // decomposition capability — absorbing the old private BINARY_OPS/UNARY_OPS
@@ -1221,7 +1305,8 @@ function emitChunkedElementwise(
     },
   ];
   const nameToSlot: Record<string, Slot> = {};
-  for (let i = 0; i < inputNames.length; i++) nameToSlot[inputNames[i]] = inSlots[i];
+  for (let i = 0; i < inputNames.length; i++)
+    nameToSlot[inputNames[i]] = inSlots[i];
   for (const chunk of plan.chunks) {
     const pslot = slots.length;
     // params data is a u32 view of the packed uniform bytes (matches the
@@ -2163,6 +2248,545 @@ function generateBatchedReduction(
     outputs.push({ nodeIndex: nodeIdx, slot: outSlot });
   }
   return { commands, outputs, firstNodeIndex };
+}
+
+// ============================================================================
+// Reduction family — the ReductionDeclaration walker (docs/execution-
+// declaration-design.md P1). The SERIALIZER for the reduction family derives its
+// command stream from the declaration's authored facts (monoid, meanEpilogue,
+// layout) + the DERIVED structural decisions (full-vs-dim from payload.dim; the
+// oversized two-stage partials+combine skeleton from fullReductionNeedsChunking —
+// the carried-axis analogue of elementwise transport windowing). The monoid that
+// the legacy generators HARDCODED as "sum" (generateFullReduction /
+// generateDimReduction / the mean sum stage) and the batched action's `op`
+// classification are now READ from the declaration. The interpreter
+// (reductions.ts reduction()/fullReduction()/dim dispatch) still hand-encodes;
+// the two are held in agreement by the record-vs-generate differential + the
+// chunked-full-reduction gate (P1 step 3 — the interpreter cutover — is the named
+// boundary; see the design doc P1 status).
+// ============================================================================
+
+/** The reduction layout prologue + operand tensor, SHARED by every reduction
+ *  stage: the storage-present branch forces input(0) contiguous via the
+ *  single-source `resolveContiguousOperand` (decl.layout = "contiguous-input";
+ *  the CONTIGUOUS_OPERANDS entry is its ground truth), returning the live
+ *  WebGPUTensor so the caller reads shape/size/dtype. Returns `null` when the
+ *  operand has no live storage (a producer whose result was cleared) — the
+ *  caller applies its own historical no-storage fallback (which differs between
+ *  full and dim/mean/batched, so it is NOT unified here). */
+function reduceContigInput(
+  node: LazyIRNode,
+  // Callers guard `scalar` before calling (→ "scalar-operand"); exclude it so
+  // the storage resolution narrows to materialized|pending (as the legacy
+  // generators do post-guard).
+  ref: Exclude<LazyIRNode["inputs"][number], { kind: "scalar" }>,
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  slots: SlotSource[],
+  prologue: GpuCommand[],
+): { inSlot: Slot; t: WebGPUTensor } | string | null {
+  const storage =
+    ref.kind === "materialized"
+      ? ref.storage
+      : (ref.outputIndex ?? 0) === 0
+        ? ref.node.result
+        : ref.node.results?.[ref.outputIndex ?? 0];
+  if (!storage) return null;
+  const t = storage.backendTensor as WebGPUTensor;
+  const r = resolveContiguousOperand(node.op, 0, ref, resolveRefSlot, slots);
+  if (typeof r === "string") return r;
+  prologue.push(...r.prologue);
+  return { inSlot: r.slot, t };
+}
+
+/** ONE reduce dispatch: ALLOC(output, kind 0, aliasing [inSlot]) + tile
+ *  dispatch [input, out, config]. The single ALLOC+DISPATCH emission shared by
+ *  the full / dim / mean-stage / batched-member paths (the per-generator
+ *  duplication collapses here). Pushes the out slot BEFORE resolving bindings —
+ *  byte-identical slot ordering to the legacy generators. */
+function emitReduceStage(
+  plan: TileKernelPlan,
+  inSlot: Slot,
+  outBytes: number,
+  aliasInputs: Slot[],
+  slots: SlotSource[],
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | "config-missing" {
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const bindings = tilePlanBindings(
+    plan,
+    { input: inSlot, out: outSlot },
+    bufferSlot,
+  );
+  if (!bindings) return "config-missing";
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: outBytes,
+        allocKind: 0,
+        inputSlots: aliasInputs,
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: plan.pipeline,
+        bindings,
+        gx: plan.grid[0],
+        gy: plan.grid[1],
+        gz: plan.grid[2],
+      },
+    ],
+    outSlot,
+  };
+}
+
+/** Node-level reduction WALKER (sum/mean). meanEpilogue selects the two-stage
+ *  mean composition; else the sum path (which itself routes full-vs-dim). */
+function serializeReduction(
+  decl: ReductionDeclaration,
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): SequentialGen | string {
+  return decl.meanEpilogue
+    ? serializeMeanReduction(decl, node, slots, resolveRefSlot, bufferSlot)
+    : serializeSumReduction(decl, node, slots, resolveRefSlot, bufferSlot);
+}
+
+/** sum: full reduction, routing a dim-subset sum to the dim path (the all-dims/
+ *  keepdim detection that reductions.ts routes to fullReduction vs the dim
+ *  kernel). Oversized on the carried axis → the two-stage partials+combine
+ *  skeleton (serializeChunkedReduction). */
+function serializeSumReduction(
+  decl: ReductionDeclaration,
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): SequentialGen | string {
+  const payload = node.payload as
+    | { dim?: number | number[] | null; keepdim?: boolean }
+    | undefined;
+  if (payload?.dim != null) {
+    const ref0 = node.inputs[0];
+    const inRank =
+      ref0.kind === "materialized"
+        ? (ref0.storage.backendTensor as WebGPUTensor).shape.length
+        : ref0.kind === "scalar"
+          ? 0
+          : ref0.node.shape.length;
+    const dims = Array.isArray(payload.dim) ? payload.dim : [payload.dim];
+    const norm = new Set(dims.map((d) => (d < 0 ? d + inRank : d)));
+    const allDims = !(payload.keepdim ?? false) && norm.size === inRank;
+    if (!allDims)
+      return serializeDimReduction(
+        decl,
+        node,
+        slots,
+        resolveRefSlot,
+        bufferSlot,
+      );
+  }
+  if (node.inputs.length !== 1) return "arity";
+  const ref = node.inputs[0];
+  if (ref.kind === "scalar") return "scalar-operand";
+  const prologue: GpuCommand[] = [];
+  let inSlot: Slot;
+  let size: number;
+  let bytesPerElement = 4;
+  const c = reduceContigInput(node, ref, resolveRefSlot, slots, prologue);
+  if (typeof c === "string") return c;
+  if (c) {
+    inSlot = c.inSlot;
+    size = c.t.size; // logical element count is copy-invariant
+    bytesPerElement = dtypeBytes(c.t.dtype);
+  } else if (ref.kind !== "materialized" && !VIEW_OPS.has(ref.node.op)) {
+    const s = resolveRefSlot(ref);
+    if (s === undefined) return "untracked-producer";
+    inSlot = s;
+    size = sizeOf(ref.node.shape);
+    const sd = refShapeDtype(ref);
+    if (sd) bytesPerElement = dtypeBytes(sd.dtype);
+  } else {
+    return "no-storage";
+  }
+  if (fullReductionNeedsChunking(size, bytesPerElement)) {
+    const chunked = serializeChunkedReduction(
+      size,
+      bytesPerElement,
+      inSlot,
+      slots,
+    );
+    return {
+      commands: [...prologue, ...chunked.commands],
+      outSlot: chunked.outSlot,
+    };
+  }
+  const plan = planFullReductionDispatch(decl.monoid, size);
+  const stage = emitReduceStage(plan, inSlot, 4, [inSlot], slots, bufferSlot);
+  if (typeof stage === "string") return stage;
+  return { commands: [...prologue, ...stage.commands], outSlot: stage.outSlot };
+}
+
+/** sum/max/min over dim(s), NON-epilogue: ALLOC(outSize*4) + one dim-reduction
+ *  dispatch. monoid from the declaration (the batched action supplies max/min). */
+function serializeDimReduction(
+  decl: ReductionDeclaration,
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): SequentialGen | string {
+  if (node.inputs.length !== 1) return "arity";
+  const payload = node.payload as
+    | { dim?: number | number[] | null; keepdim?: boolean }
+    | undefined;
+  if (payload?.dim == null) return "no-dim";
+  const ref = node.inputs[0];
+  if (ref.kind === "scalar") return "scalar-operand";
+  const prologue: GpuCommand[] = [];
+  let inSlot: Slot;
+  let inShape: number[];
+  const c = reduceContigInput(node, ref, resolveRefSlot, slots, prologue);
+  if (typeof c === "string") return c;
+  if (c) {
+    inSlot = c.inSlot;
+    inShape = c.t.shape;
+  } else {
+    const s = resolveRefSlot(ref);
+    if (s === undefined) return "untracked-producer";
+    inSlot = s;
+    const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
+    if (!sd) return "no-shape";
+    inShape = sd.shape;
+  }
+  const plan = planDimReductionDispatch(
+    decl.monoid,
+    inShape,
+    payload.dim,
+    payload.keepdim ?? false,
+  );
+  if (!plan) return "all-dims-or-epilogue";
+  const stage = emitReduceStage(
+    plan,
+    inSlot,
+    sizeOf(node.shape) * 4,
+    [inSlot],
+    slots,
+    bufferSlot,
+  );
+  if (typeof stage === "string") return stage;
+  return { commands: [...prologue, ...stage.commands], outSlot: stage.outSlot };
+}
+
+/** The two-stage oversized reduction (input > maxStorageBufferBindingSize): the
+ *  partials+combine skeleton, realized by the shared planChunkedFullReduction
+ *  (the single source both this serializer and sumFullReductionChunked derive
+ *  from). This is the carried-axis case — the declared two-stage skeleton whose
+ *  REALIZED IMAGE is the existing chunked machinery; the sum monoid supplies the
+ *  per-chunk (sumChunk) and combine (finalSum) kernels. When numChunks === 1 the
+ *  partials buffer IS the scalar output (no combine stage). */
+function serializeChunkedReduction(
+  size: number,
+  bytesPerElement: number,
+  inSlot: Slot,
+  slots: SlotSource[],
+): { commands: GpuCommand[]; outSlot: Slot } {
+  const plan = planChunkedFullReduction(
+    size,
+    bytesPerElement,
+    requireContext(),
+  );
+  const commands: GpuCommand[] = [];
+
+  const partialsSlot = slots.length;
+  slots.push({ kind: "arena" });
+  commands.push({
+    tag: TAG_ALLOC,
+    slot: partialsSlot,
+    bytes: plan.partialsBytes,
+    allocKind: 1,
+    inputSlots: [],
+  });
+
+  for (const ch of plan.chunks) {
+    const pSlot = slots.length;
+    slots.push({ kind: "params", seqIndex: -1, data: ch.paramsData.slice() });
+    commands.push({
+      tag: TAG_DISPATCH,
+      pipeline: plan.pipeline,
+      bindings: [inSlot, partialsSlot, pSlot],
+      bindingRanges: [{ offset: ch.byteOffset, size: ch.byteSize }, null, null],
+      gx: 1,
+      gy: 1,
+      gz: 1,
+    });
+  }
+
+  if (plan.numChunks === 1) {
+    return { commands, outSlot: partialsSlot };
+  }
+
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  commands.push({
+    tag: TAG_ALLOC,
+    slot: outSlot,
+    bytes: 4,
+    allocKind: 1,
+    inputSlots: [],
+  });
+  const fpSlot = slots.length;
+  slots.push({
+    kind: "params",
+    seqIndex: -1,
+    // biome-ignore lint/style/noNonNullAssertion: numChunks > 1 ⇒ present.
+    data: plan.finalParamsData!.slice(),
+  });
+  commands.push({
+    tag: TAG_DISPATCH,
+    // biome-ignore lint/style/noNonNullAssertion: numChunks > 1 ⇒ present.
+    pipeline: plan.finalPipeline!,
+    bindings: [partialsSlot, outSlot, fpSlot],
+    gx: 1,
+    gy: 1,
+    gz: 1,
+  });
+  return { commands, outSlot };
+}
+
+/** mean = reduce(sum, full-or-dim) ÷ count — the TWO-stage skeleton: a sum into
+ *  an intermediate, then a meanDiv dispatch (count in a UNIFORM). The oversized
+ *  full case is refused ("chunked") exactly as the legacy did — mean does not
+ *  compose the chunked two-stage. */
+function serializeMeanReduction(
+  decl: ReductionDeclaration,
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): SequentialGen | string {
+  if (node.inputs.length !== 1) return "arity";
+  const payload = node.payload as
+    | { dim?: number | number[] | null; keepdim?: boolean }
+    | undefined;
+  const ref = node.inputs[0];
+  if (ref.kind === "scalar") return "scalar-operand";
+  const prologue: GpuCommand[] = [];
+  let inSlot: Slot;
+  let inShape: number[];
+  const c = reduceContigInput(node, ref, resolveRefSlot, slots, prologue);
+  if (typeof c === "string") return c;
+  if (c) {
+    inSlot = c.inSlot;
+    inShape = c.t.shape;
+  } else {
+    const s = resolveRefSlot(ref);
+    if (s === undefined) return "untracked-producer";
+    inSlot = s;
+    const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
+    if (!sd) return "no-shape";
+    inShape = sd.shape;
+  }
+  const outSize = sizeOf(node.shape);
+  const dims =
+    payload?.dim == null
+      ? null
+      : (Array.isArray(payload.dim) ? payload.dim : [payload.dim]).map((d) =>
+          d < 0 ? d + inShape.length : d,
+        );
+  const count =
+    dims == null
+      ? sizeOf(inShape)
+      : dims.reduce((acc, d) => acc * inShape[d], 1);
+
+  // --- sum stage (cached full or dim reduction) ---
+  let sumPlan: TileKernelPlan;
+  let sumOutBytes: number;
+  if (dims == null) {
+    const inSize = sizeOf(inShape);
+    if (inSize * 4 > 128 * 1024 * 1024) return "chunked";
+    sumPlan = planFullReductionDispatch(decl.monoid, inSize);
+    sumOutBytes = 4;
+  } else {
+    const p = planDimReductionDispatch(
+      decl.monoid,
+      inShape,
+      // biome-ignore lint/style/noNonNullAssertion: dims != null ⇒ dim present.
+      payload!.dim!,
+      payload?.keepdim ?? false,
+    );
+    if (!p) return "all-dims-or-epilogue";
+    sumPlan = p;
+    sumOutBytes = outSize * 4;
+  }
+  const sumStage = emitReduceStage(
+    sumPlan,
+    inSlot,
+    sumOutBytes,
+    [inSlot],
+    slots,
+    bufferSlot,
+  );
+  if (typeof sumStage === "string") return sumStage;
+
+  // --- meanDiv stage (cached "meanDiv", size+count uniforms) ---
+  const divPlan = planMeanDivDispatch(outSize, count);
+  const divStage = emitReduceStage(
+    divPlan,
+    sumStage.outSlot,
+    outSize * 4,
+    [sumStage.outSlot],
+    slots,
+    bufferSlot,
+  );
+  if (typeof divStage === "string") return divStage;
+
+  return {
+    commands: [...prologue, ...sumStage.commands, ...divStage.commands],
+    outSlot: divStage.outSlot,
+  };
+}
+
+/** The batched-reduction ACTION walker: for reductionSize > 64 the executor
+ *  falls back to N individual dim reductions (all recorded under nodeIndices[0]).
+ *  The action's `reduceOp` resolves its ReductionDeclaration (the monoid);
+ *  reductionSize ≤ 64 (the true-batched kernel) is a DIFFERENT command shape,
+ *  refused ("true-batched" — the deliberately-uncovered carried-axis[true-batched]
+ *  class). */
+function serializeBatchedReduction(
+  action: {
+    nodeIndices: number[];
+    reduceOp: string;
+    payload: { dim: number | number[]; keepdim?: boolean };
+  },
+  planNodes: LazyIRNode[],
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+):
+  | {
+      commands: GpuCommand[];
+      outputs: Array<{ nodeIndex: number; slot: Slot }>;
+      firstNodeIndex: number;
+    }
+  | string {
+  if (action.nodeIndices.length === 0) return "empty";
+  const decl = reductionDeclaration(action.reduceOp);
+  if (!decl) return "epilogue-op";
+  const dim = action.payload.dim;
+  const keepdim = action.payload.keepdim ?? false;
+  const firstNodeIndex = action.nodeIndices[0];
+  const commands: GpuCommand[] = [];
+  const outputs: Array<{ nodeIndex: number; slot: Slot }> = [];
+  for (const nodeIdx of action.nodeIndices) {
+    const node = planNodes[nodeIdx];
+    if (node.inputs.length !== 1) return "arity";
+    const ref = node.inputs[0];
+    if (ref.kind === "scalar") return "scalar-operand";
+    let inSlot: Slot;
+    let inShape: number[];
+    const c = reduceContigInput(node, ref, resolveRefSlot, slots, commands);
+    if (typeof c === "string") return c;
+    if (c) {
+      inSlot = c.inSlot;
+      inShape = c.t.shape;
+    } else {
+      const s = resolveRefSlot(ref);
+      if (s === undefined) return "untracked-input";
+      inSlot = s;
+      const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
+      if (!sd) return "no-shape";
+      inShape = sd.shape;
+    }
+    const dims = (Array.isArray(dim) ? dim : [dim]).map((d) =>
+      d < 0 ? d + inShape.length : d,
+    );
+    const reductionSize = dims.reduce((acc, d) => acc * inShape[d], 1);
+    if (reductionSize <= 64) return "true-batched";
+    const plan = planDimReductionDispatch(decl.monoid, inShape, dim, keepdim);
+    if (!plan) return "all-dims-or-epilogue";
+    const stage = emitReduceStage(
+      plan,
+      inSlot,
+      sizeOf(node.shape) * 4,
+      [inSlot],
+      slots,
+      bufferSlot,
+    );
+    if (typeof stage === "string") return stage;
+    commands.push(...stage.commands);
+    outputs.push({ nodeIndex: nodeIdx, slot: stage.outSlot });
+  }
+  return { commands, outputs, firstNodeIndex };
+}
+
+/**
+ * TRANSITIONAL shadow (docs/execution-declaration-design.md §4.1 step 2, the P0
+ * ritual): byte-diff the reduction WALKER against the retained legacy generator
+ * on a FULLY ISOLATED snapshot — its own `slots` copy + `bufferToSlot` clone
+ * (taken BEFORE the walker mutated the real ones), so the legacy run's slot
+ * indices are computed from the identical starting state and MUST match the
+ * walker's. `resolveRefSlot` is read-only (input lookups), so it is shared.
+ * Any divergence is a STOP, not a tolerance. Deleted with the legacy generators
+ * in P1 commit 3. `undefined` bufferToSlot (the nested oversized-decomp callers)
+ * skips the check — the walker still runs in production.
+ */
+function assertReductionShadowMatch(
+  op: string,
+  walker: SequentialGen | string,
+  legacy: SequentialGen | string,
+): void {
+  if (typeof walker === "string" || typeof legacy === "string") {
+    if (walker !== legacy) {
+      throw new Error(
+        `[exec-decl shadow] reduction walker diverged for ${op}: ` +
+          `walker=${JSON.stringify(walker)} legacy=${JSON.stringify(legacy)}`,
+      );
+    }
+    return;
+  }
+  const a = canonicalizeStream(legacy.commands);
+  const b = canonicalizeStream(walker.commands);
+  if (
+    walker.outSlot !== legacy.outSlot ||
+    a.length !== b.length ||
+    a.some((l, i) => l !== b[i])
+  ) {
+    throw new Error(
+      `[exec-decl shadow] reduction walker diverged for ${op}: ` +
+        `legacy=[${a.join(" | ")}] walker=[${b.join(" | ")}] ` +
+        `outSlot legacy=${legacy.outSlot} walker=${walker.outSlot}`,
+    );
+  }
+}
+
+/** Build a fully isolated (slots copy, bufferSlot over a cloned map) for a
+ *  shadow legacy run. MUST be called BEFORE the walker mutates the real state. */
+function makeReductionShadowEnv(
+  slots: SlotSource[],
+  bufferToSlot: Map<unknown, Slot>,
+): {
+  shadowSlots: SlotSource[];
+  shadowBufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot;
+} {
+  const shadowSlots = slots.slice();
+  const shadowMap = new Map(bufferToSlot);
+  const shadowBufferSlot = (buf: unknown, kind: SlotSource["kind"]): Slot => {
+    const existing = shadowMap.get(buf);
+    if (existing !== undefined) return existing;
+    const slot = shadowSlots.length;
+    shadowSlots.push(
+      kind === "persistent"
+        ? { kind: "persistent", buffer: buf as never }
+        : { kind: "arena" },
+    );
+    shadowMap.set(buf, slot);
+    return slot;
+  };
+  return { shadowSlots, shadowBufferSlot };
 }
 
 /** Resolve a ref's [shape, dtype] from live storage, else the producer
