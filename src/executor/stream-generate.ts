@@ -103,11 +103,18 @@ import {
   type ExecutionDeclaration,
   elementwiseDeclaration,
   isDeclaredElementwise,
+  MATMUL_DECLARATION,
+  type MatmulBindRole,
+  type MatmulDeclaration,
+  matmulDeclaration,
   type ReductionDeclaration,
   reductionDeclaration,
 } from "./execution-declaration";
 import type { AttnInputContig, LoweredPlan } from "./lowered-plan";
 import { getInputStorage } from "./op-dispatch";
+// TRANSITIONAL: the P2 matmul serializer-cutover shadow byte-diffs the walker
+// against the retained legacy generator (deleted with the shadow in commit 3).
+import { canonicalizeStream } from "./stream-diff";
 import { lookupScalarStorage } from "./scalar-table";
 
 export interface GeneratedStream {
@@ -437,26 +444,46 @@ export function generateStream(
           coveredActions++;
           break;
         }
-        const gen =
-          node.op === "matmul"
-            ? generateBareMatmul(
-                (action as { cachedMatmulPlan?: BareMatmulPlan | string })
-                  .cachedMatmulPlan,
-                node,
-                slots,
-                resolveRefSlot,
-                bufferSlot,
-              )
-            : generateSequential(
-                node,
-                slots,
-                resolveRefSlot,
-                bufferSlot,
-                (action as { cachedInputShapes?: number[][] })
-                  .cachedInputShapes,
-                (action as { cachedStridedInputs?: (AttnInputContig | null)[] })
-                  .cachedStridedInputs,
-              );
+        const matmulDecl =
+          node.op === "matmul" ? matmulDeclaration(node.op) : undefined;
+        let gen: SequentialGen | string;
+        if (matmulDecl) {
+          // Matmul family: the walker derives the command stream from the
+          // MatmulDeclaration (bindingTemplate + route-from-receipt). A
+          // TRANSITIONAL shadow byte-diffs it against the retained legacy
+          // generator on an isolated snapshot; any divergence THROWS
+          // (STOP-and-diagnose). Deleted in P2 commit 3.
+          const cachedPlan = (
+            action as { cachedMatmulPlan?: BareMatmulPlan | string }
+          ).cachedMatmulPlan;
+          const shadow = makeMatmulShadowEnv(slots, bufferToSlot);
+          gen = serializeBareMatmul(
+            matmulDecl,
+            cachedPlan,
+            node,
+            slots,
+            resolveRefSlot,
+            bufferSlot,
+          );
+          const legacy = generateBareMatmul(
+            cachedPlan,
+            node,
+            shadow.shadowSlots,
+            resolveRefSlot,
+            shadow.shadowBufferSlot,
+          );
+          assertMatmulShadowMatch("matmul", gen, legacy);
+        } else {
+          gen = generateSequential(
+            node,
+            slots,
+            resolveRefSlot,
+            bufferSlot,
+            (action as { cachedInputShapes?: number[][] }).cachedInputShapes,
+            (action as { cachedStridedInputs?: (AttnInputContig | null)[] })
+              .cachedStridedInputs,
+          );
+        }
         if (typeof gen === "string") {
           miss(`op:${node.op}${gen ? `[${gen}]` : ""}`);
           phantom(node, action.nodeIndex);
@@ -526,16 +553,35 @@ export function generateStream(
       }
       case "matmul-epilogue": {
         const me = action as MatmulEpilogueActionShape;
-        const gen = backend
-          ? generateMatmulEpilogue(
-              me,
-              planNodes,
-              slots,
-              resolveRefSlot,
-              bufferSlot,
-              backend,
-            )
-          : "no-backend";
+        const epiDecl = MATMUL_DECLARATION;
+        let gen: { commands: GpuCommand[]; outSlot: Slot } | string;
+        if (!backend) {
+          gen = "no-backend";
+        } else {
+          // Matmul family (epilogue): the walker derives the command stream
+          // from the MatmulDeclaration. A TRANSITIONAL shadow byte-diffs it
+          // against the retained legacy generator on an isolated snapshot;
+          // any divergence THROWS. Deleted in P2 commit 3.
+          const shadow = makeMatmulShadowEnv(slots, bufferToSlot);
+          gen = serializeMatmulEpilogue(
+            epiDecl,
+            me,
+            planNodes,
+            slots,
+            resolveRefSlot,
+            bufferSlot,
+            backend,
+          );
+          const legacy = generateMatmulEpilogue(
+            me,
+            planNodes,
+            shadow.shadowSlots,
+            resolveRefSlot,
+            shadow.shadowBufferSlot,
+            backend,
+          );
+          assertMatmulShadowMatch("matmul-epilogue", gen, legacy);
+        }
         if (typeof gen === "string") {
           miss(`matmul-epilogue[${gen}]`);
           phantom(planNodes[me.outputNodeIndex], me.outputNodeIndex);
@@ -3607,6 +3653,344 @@ function generateMatmulEpilogue(
     ],
     outSlot,
   };
+}
+
+// ============================================================================
+// Matmul family — the MatmulDeclaration walker (docs/execution-declaration-
+// design.md P2). The SERIALIZER for the matmul + matmul-epilogue family derives
+// its command stream from the declaration's authored facts (bindingTemplate,
+// layout, route-source) + the DERIVED structural decisions (which route
+// engaged, dispatch grid, K-split two-stage) READ from the plan the realizer
+// (planTiledMatmul / the captured BareMatmulPlan) returns — the KernelRef-
+// resolution analogue P1's reduction walker CALLS. The route (tiled / GEMV /
+// K-split, incl. the #95 inputCast axis) is decided ONCE at planTiledMatmul and
+// carried on the plan as a SelectionReceipt; BOTH walkers read that receipt's
+// gemvEngaged — NEITHER re-parses the profiler label (retiring the #95 replay-
+// blind `plan.label?.startsWith("_gemv")` re-derivation the epilogue generator
+// carried). The interpreter (matmul/dispatch.ts dispatchTiledMatmul + the
+// tiled/GEMV kernel realizers + pool decisions) is UNTOUCHED — it is the
+// realizer both consumers share (§5.4); the named boundary is the P2 status.
+// ============================================================================
+
+/** The bind-operand roles that are pool-aliasing ALLOC candidates (`inputSlots`
+ *  of TAG_ALLOC) — a, b, and the epilogue inputs; output and params are
+ *  excluded (output is the alloc target, params is a fresh persistent buffer). */
+const MATMUL_ALLOC_ALIAS_ROLES: ReadonlySet<MatmulBindRole> =
+  new Set<MatmulBindRole>(["a", "b", "epilogue-inputs"]);
+
+/** Expand the declaration's role bind-order into the concrete DISPATCH bindings
+ *  AND the ALLOC pool-aliasing inputs (the bind-operand subset). SINGLE SOURCE
+ *  for the [a, b, out, params, ...epi] array both matmul generators hardcoded —
+ *  the walker reads the template, never a local literal. The K-split path does
+ *  NOT use this (it composes its own two-stage bindings from the plan). */
+function expandMatmulRoles(
+  template: readonly MatmulBindRole[],
+  roleSlots: {
+    a: Slot;
+    b: Slot;
+    output: Slot;
+    params: Slot;
+    epilogueInputs: Slot[];
+  },
+): { bindings: Slot[]; allocInputs: Slot[] } {
+  const bindings: Slot[] = [];
+  const allocInputs: Slot[] = [];
+  for (const role of template) {
+    const roleSlotList =
+      role === "a"
+        ? [roleSlots.a]
+        : role === "b"
+          ? [roleSlots.b]
+          : role === "output"
+            ? [roleSlots.output]
+            : role === "params"
+              ? [roleSlots.params]
+              : roleSlots.epilogueInputs;
+    bindings.push(...roleSlotList);
+    if (MATMUL_ALLOC_ALIAS_ROLES.has(role)) allocInputs.push(...roleSlotList);
+  }
+  return { bindings, allocInputs };
+}
+
+/**
+ * Bare matmul WALKER (the dispatchMatmul slow path — no epilogue). Derives the
+ * command stream from the MatmulDeclaration: the STANDARD path expands
+ * `decl.bindingTemplate` into ALLOC(out) + DISPATCH [a, b, out, params]; the
+ * K-split path composes its own two-stage skeleton (partials temp + reduce)
+ * from the plan (a carried-axis two-stage, like reductions). The route is READ
+ * from the plan's SelectionReceipt (`m.selection?.gemvEngaged`), never
+ * re-selected. Bails identically to the legacy generator (string reasons).
+ */
+function serializeBareMatmul(
+  decl: MatmulDeclaration,
+  cached: BareMatmulPlan | string | undefined,
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (cached === undefined) return "no-cached-plan";
+  if (typeof cached === "string") return cached; // bail reason from capture
+  if (node.inputs.length !== 2) return "arity";
+  const aRef = node.inputs[0];
+  const bRef = node.inputs[1];
+  if (aRef.kind === "scalar" || bRef.kind === "scalar") return "scalar-operand";
+  const aSlot = resolveRefSlot(aRef);
+  const bSlot = resolveRefSlot(bRef);
+  if (aSlot === undefined || bSlot === undefined) return "untracked-input";
+  const outBytes = sizeOf(cached.outShape) * dtypeBytes(cached.outputDtype);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const m = cached.matmul;
+  // Route engagement is a PROPERTY of the R9 SelectionReceipt (decl.route =
+  // "receipt-consumed") — a single source both walkers read, not a label
+  // re-parse.
+  if (m.selection?.gemvEngaged) generatedGemvDispatchCount++;
+
+  if (m.kSplit) {
+    // K-split: the declared two-stage carried-axis skeleton — ALLOC(out) then
+    // matmul→partials (persistent temp, looked up by byte size) then reduce→out.
+    // The two-stage bindings are COMPOSED from the plan (decl says K-split does
+    // not use bindingTemplate); the ALLOC aliasing is the declared operand set.
+    const temp = lookupKSplitTempBuffer(m.tempBytes);
+    if (!temp) return "ksplit-temp-missing";
+    const tempSlot = bufferSlot(temp as unknown, "persistent");
+    const ksplitParamsSlot = slots.length;
+    slots.push({
+      kind: "params",
+      seqIndex: -1,
+      data: m.ksplitParamsData.slice(),
+    });
+    const reduceParamsSlot = slots.length;
+    slots.push({
+      kind: "params",
+      seqIndex: -1,
+      data: m.reduceParamsData.slice(),
+    });
+    const { allocInputs } = expandMatmulRoles(decl.bindingTemplate, {
+      a: aSlot,
+      b: bSlot,
+      output: outSlot,
+      params: ksplitParamsSlot,
+      epilogueInputs: [],
+    });
+    return {
+      commands: [
+        {
+          tag: TAG_ALLOC,
+          slot: outSlot,
+          bytes: outBytes,
+          allocKind: 0,
+          inputSlots: allocInputs,
+        },
+        {
+          tag: TAG_DISPATCH,
+          pipeline: m.ksplitPipeline,
+          bindings: [aSlot, bSlot, tempSlot, ksplitParamsSlot],
+          gx: m.ksplitDispatch[0],
+          gy: m.ksplitDispatch[1],
+          gz: m.ksplitDispatch[2],
+        },
+        {
+          tag: TAG_DISPATCH,
+          pipeline: m.reducePipeline,
+          bindings: [tempSlot, outSlot, reduceParamsSlot],
+          gx: m.reduceDispatch[0],
+          gy: m.reduceDispatch[1],
+          gz: m.reduceDispatch[2],
+        },
+      ],
+      outSlot,
+    };
+  }
+
+  const paramsSlot = slots.length;
+  slots.push({ kind: "params", seqIndex: -1, data: m.paramsData.slice() });
+  const { bindings, allocInputs } = expandMatmulRoles(decl.bindingTemplate, {
+    a: aSlot,
+    b: bSlot,
+    output: outSlot,
+    params: paramsSlot,
+    epilogueInputs: [],
+  });
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: outBytes,
+        allocKind: 0,
+        inputSlots: allocInputs,
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: m.pipeline,
+        bindings,
+        gx: m.dispatchX,
+        gy: m.dispatchY,
+        gz: m.dispatchZ,
+      },
+    ],
+    outSlot,
+  };
+}
+
+/**
+ * matmul-epilogue WALKER. Resolves the KernelRef via the realizer
+ * (`planTiledMatmul`) from the captured geometry (the inputs are liveness-
+ * released so geometry is cached, like the bare path caches its plan) and emits
+ * ALLOC(out) + DISPATCH via `decl.bindingTemplate` = [a, b, out, params, ...epi].
+ * The route is READ from the plan's SelectionReceipt (`plan.selection?.
+ * gemvEngaged`) — the #95 fix, replacing the legacy generator's replay-blind
+ * `plan.label?.startsWith("_gemv")` re-parse, so BOTH matmul walkers consume the
+ * SAME receipt object. Bails identically to the legacy generator.
+ */
+function serializeMatmulEpilogue(
+  decl: MatmulDeclaration,
+  action: MatmulEpilogueActionShape,
+  planNodes: LazyIRNode[],
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+  backend: import("../backend/types").Backend,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  const cfg = action.cachedDispatchConfig;
+  if (!cfg) return "no-config";
+  const device = (backend as { device?: GPUDevice }).device;
+  if (!device) return "no-device";
+
+  const pathSlot = (p: PlanNodePath): Slot | undefined => {
+    const ref = planNodes[p.planNodeIndex]?.inputs[p.inputIndex];
+    return ref ? resolveRefSlot(ref) : undefined;
+  };
+  const aSlot = pathSlot(cfg.inputAPath);
+  const bSlot = pathSlot(cfg.inputBPath);
+  if (aSlot === undefined || bSlot === undefined) return "untracked-input";
+  const epiSlots: Slot[] = [];
+  for (const p of cfg.epilogueInputPaths) {
+    const s = pathSlot(p);
+    if (s === undefined) return "untracked-epilogue-input";
+    epiSlots.push(s);
+  }
+
+  const plan = planTiledMatmul({
+    device,
+    a: undefined as unknown as GPUBuffer, // planTiledMatmul reads geometry only
+    b: undefined as unknown as GPUBuffer,
+    out: undefined as unknown as GPUBuffer,
+    m: cfg.m,
+    n: cfg.n,
+    k: cfg.k,
+    batchSize: cfg.batchSize,
+    batchStrideA: cfg.batchStrideA,
+    batchStrideB: cfg.batchStrideB,
+    batchStrideC: cfg.batchStrideC,
+    transA: cfg.transA,
+    transB: cfg.transB,
+    dtype: cfg.dtypeA,
+    dtypeB: cfg.dtypeB,
+    epilogue: cfg.epilogueConfig as never,
+    epilogueInputs: epiSlots.map(() => undefined as unknown as never), // count only
+    inputCastA: cfg.inputCastA as never,
+    inputCastB: cfg.inputCastB as never,
+  });
+  if (plan.kSplit) return "ksplit";
+  // Route engagement from the SelectionReceipt (decl.route = "receipt-consumed")
+  // — the #95 fix: NOT a re-parse of the profiler label.
+  if (plan.selection?.gemvEngaged) generatedGemvDispatchCount++;
+
+  const outBytes = sizeOf(cfg.outShape) * dtypeBytes(cfg.outputDtype);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const paramsSlot = slots.length;
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData.slice() });
+  const { bindings, allocInputs } = expandMatmulRoles(decl.bindingTemplate, {
+    a: aSlot,
+    b: bSlot,
+    output: outSlot,
+    params: paramsSlot,
+    epilogueInputs: epiSlots,
+  });
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: outBytes,
+        allocKind: 0,
+        inputSlots: allocInputs,
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: plan.pipeline,
+        bindings,
+        gx: plan.dispatchX,
+        gy: plan.dispatchY,
+        gz: plan.dispatchZ,
+      },
+    ],
+    outSlot,
+  };
+}
+
+/**
+ * TRANSITIONAL P2 shadow (P0/P1 ritual): snapshot the slot env so the retained
+ * legacy generator runs from the IDENTICAL state the walker started at (its slot
+ * indices MUST then match the walker's). Deleted in P2 commit 3.
+ */
+function makeMatmulShadowEnv(
+  slots: SlotSource[],
+  bufferToSlot: Map<unknown, Slot>,
+): {
+  shadowSlots: SlotSource[];
+  shadowBufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot;
+} {
+  const shadowSlots = slots.slice();
+  const shadowMap = new Map(bufferToSlot);
+  const shadowBufferSlot = (buf: unknown, kind: SlotSource["kind"]): Slot => {
+    const existing = shadowMap.get(buf);
+    if (existing !== undefined) return existing;
+    const slot = shadowSlots.length;
+    shadowSlots.push(
+      kind === "persistent"
+        ? { kind: "persistent", buffer: buf as never }
+        : { kind: "arena" },
+    );
+    shadowMap.set(buf, slot);
+    return slot;
+  };
+  return { shadowSlots, shadowBufferSlot };
+}
+
+/** Assert the matmul walker's stream is byte-identical to the legacy
+ *  generator's (canonicalized), THROWING on any divergence. Deleted in commit 3. */
+function assertMatmulShadowMatch(
+  which: string,
+  walker: { commands: GpuCommand[]; outSlot: Slot } | string,
+  legacy: { commands: GpuCommand[]; outSlot: Slot } | string,
+): void {
+  if (typeof walker === "string" || typeof legacy === "string") {
+    if (walker !== legacy) {
+      throw new Error(
+        `[exec-decl shadow] ${which} walker diverged: ` +
+          `walker=${JSON.stringify(walker)} legacy=${JSON.stringify(legacy)}`,
+      );
+    }
+    return;
+  }
+  const a = canonicalizeStream(legacy.commands);
+  const b = canonicalizeStream(walker.commands);
+  if (
+    walker.outSlot !== legacy.outSlot ||
+    a.length !== b.length ||
+    a.some((l, i) => l !== b[i])
+  ) {
+    throw new Error(
+      `[exec-decl shadow] ${which} walker diverged: ` +
+        `legacy=[${a.join(" | ")}] walker=[${b.join(" | ")}] ` +
+        `outSlot legacy=${legacy.outSlot} walker=${walker.outSlot}`,
+    );
+  }
 }
 
 interface FusedActionShape {
