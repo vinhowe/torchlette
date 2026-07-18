@@ -103,7 +103,6 @@ import {
   isDeclaredElementwise,
 } from "./execution-declaration";
 import type { AttnInputContig, LoweredPlan } from "./lowered-plan";
-import { canonicalizeStream } from "./stream-diff";
 import { getInputStorage } from "./op-dispatch";
 import { lookupScalarStorage } from "./scalar-table";
 
@@ -993,55 +992,6 @@ function serializeElementwiseDirect(
   return { commands, outSlot };
 }
 
-/**
- * TRANSITIONAL shadow (docs/execution-declaration-design.md §4.1 step 2): the
- * old per-op inline emission, retained ONLY to byte-diff against the walker on
- * every generated elementwise plan. Deleted with `ELEMENTWISE_WALKER_SHADOW`
- * once the full wall is green — the walker's output is then the sole source.
- */
-const ELEMENTWISE_WALKER_SHADOW = true;
-
-function emitElementwiseDirectLegacy(
-  node: LazyIRNode,
-  plan: ElementwiseDirectPlan,
-  inSlots: Slot[],
-  aliasInSlots: Slot[],
-  slots: SlotSource[],
-): SequentialGen {
-  const pipeline = getPipeline(requireContext(), plan.key, plan.shader);
-  const outSlot = slots.length;
-  slots.push({ kind: "arena" });
-  const paramsSlot = slots.length;
-  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData.slice() });
-  const commands: GpuCommand[] = [
-    {
-      tag: TAG_ALLOC,
-      slot: outSlot,
-      bytes: plan.outputSizeBytes,
-      allocKind: 0,
-      inputSlots: aliasInSlots,
-    },
-  ];
-  const offsetRepack = buildDirectOffsetRepack(node);
-  if (offsetRepack) {
-    commands.push({
-      tag: TAG_UNIFORM,
-      slot: paramsSlot,
-      nodeIndex: -1,
-      pack: offsetRepack,
-    });
-  }
-  commands.push({
-    tag: TAG_DISPATCH,
-    pipeline,
-    bindings: [...inSlots, outSlot, paramsSlot],
-    gx: plan.dispatchX,
-    gy: plan.dispatchY,
-    gz: 1,
-  });
-  return { commands, outSlot };
-}
-
 function generateSequential(
   node: LazyIRNode,
   slots: SlotSource[],
@@ -1228,41 +1178,6 @@ function generateSequential(
   // Task #71: the volatile offset repack (a narrow-fed input's offset can vary
   // across replays); null when the offset is a compile-time constant.
   const offsetRepack = buildDirectOffsetRepack(node);
-  if (ELEMENTWISE_WALKER_SHADOW) {
-    // TRANSITIONAL byte-diff: the legacy inline emitter vs the walker on a
-    // THROWAWAY slot copy (running both on `slots` would double-allocate). Any
-    // divergence is a STOP, not a tolerance.
-    const shadowSlots = slots.slice();
-    const legacy = emitElementwiseDirectLegacy(
-      node,
-      plan,
-      inSlots,
-      aliasInSlots,
-      shadowSlots,
-    );
-    const walker = serializeElementwiseDirect(
-      decl,
-      plan,
-      inSlots,
-      aliasInSlots,
-      offsetRepack,
-      slots,
-    );
-    const a = canonicalizeStream(legacy.commands);
-    const b = canonicalizeStream(walker.commands);
-    if (
-      walker.outSlot !== legacy.outSlot ||
-      a.length !== b.length ||
-      a.some((l, i) => l !== b[i])
-    ) {
-      throw new Error(
-        `[exec-decl shadow] elementwise walker diverged for ${node.op}: ` +
-          `legacy=[${a.join(" | ")}] walker=[${b.join(" | ")}] ` +
-          `outSlot legacy=${legacy.outSlot} walker=${walker.outSlot}`,
-      );
-    }
-    return walker;
-  }
   return serializeElementwiseDirect(
     decl,
     plan,
