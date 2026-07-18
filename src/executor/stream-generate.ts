@@ -30,6 +30,7 @@ import {
 } from "../backend/webgpu/cross-entropy-kernel";
 import type { BareMatmulPlan } from "../backend/webgpu/dispatch";
 import {
+  type ElementwiseDirectPlan,
   getPipeline,
   planBinaryDirect,
   planChunkedBinary,
@@ -94,7 +95,15 @@ import {
   TAG_WRITE,
 } from "./compiled-plan";
 import { operandRequiresContiguous } from "./contiguous-operands";
+import {
+  ELEMENTWISE_BINARY_WGSL,
+  ELEMENTWISE_SPLIT_AXIS_PARALLEL,
+  elementwiseDeclaration,
+  type ExecutionDeclaration,
+  isDeclaredElementwise,
+} from "./execution-declaration";
 import type { AttnInputContig, LoweredPlan } from "./lowered-plan";
+import { canonicalizeStream } from "./stream-diff";
 import { getInputStorage } from "./op-dispatch";
 import { lookupScalarStorage } from "./scalar-table";
 
@@ -768,38 +777,6 @@ function planContigCopy(
   };
 }
 
-/** node.op → the WGSL symbol dispatchBinary receives from the backend. */
-const BINARY_OPS = new Map<string, string>([
-  ["add", "+"],
-  ["sub", "-"],
-  ["mul", "*"],
-  ["div", "/"],
-  ["pow", "pow"],
-  ["minimum", "min"],
-  ["maximum", "max"],
-]);
-
-/** Table-driven unary ops routed to dispatchUnary with identity opKeys. */
-const UNARY_OPS = new Set([
-  "sqrt",
-  "relu",
-  "exp",
-  "log",
-  "neg",
-  "abs",
-  "tanh",
-  "sigmoid",
-  "silu",
-  "sin",
-  "cos",
-  "rsqrt",
-  "floor",
-  "ceil",
-  "round",
-  "sign",
-  "isfinite",
-]);
-
 /**
  * Sequential-action generator. Increment 1: DIRECT binary elementwise via
  * planBinaryDirect — the SAME plan dispatchBinary's direct tail executes,
@@ -819,6 +796,250 @@ interface SequentialGen {
   commands: GpuCommand[];
   outSlot: Slot;
   extraOutputs?: Array<{ outputIndex: number; slot: Slot }>;
+}
+
+// ============================================================================
+// Elementwise family — the ExecutionDeclaration walker (docs/execution-
+// declaration-design.md P0). The SERIALIZER for the elementwise family derives
+// its command stream from the declaration + the resolved kernel plan, instead
+// of a per-op inline emission. The interpreter (dispatchBinary/dispatchUnary)
+// still hand-encodes; the two are held in agreement by the record-vs-generate
+// differential + the compiled==lowered parity gate (P0 step 3 routes the
+// interpreter through the SAME walker).
+// ============================================================================
+
+/** The gelu payload → opKey (`gelu`/`gelu_erf`); identity for every other
+ *  unary. A KERNEL-realization detail read by both the direct and size-split
+ *  realizers. */
+function unaryOpKey(node: LazyIRNode): string {
+  if (node.op !== "gelu") return node.op;
+  const p = node.payload as { approximate?: string } | undefined;
+  return (p?.approximate ?? "tanh") === "tanh" ? "gelu" : "gelu_erf";
+}
+
+/** Resolve a declaration's KernelRef against the live operand metadata to an
+ *  ElementwiseDirectPlan (WGSL + geometry + params) — the ScheduleState-
+ *  realization analogue. `{ alias: true }` is the already-contiguous
+ *  `contiguous` fast path (zero commands). A string is a typed refusal. */
+function resolveElementwiseKernel(
+  decl: ExecutionDeclaration,
+  node: LazyIRNode,
+  ins: WebGPUTensor[],
+): { alias: true } | { plan: ElementwiseDirectPlan } | string {
+  switch (decl.kernel.kernel) {
+    case "binaryDirect": {
+      const wgslOp = ELEMENTWISE_BINARY_WGSL.get(node.op);
+      if (!wgslOp) return "unknown-binary";
+      const plan = planBinaryDirect(wgslOp, ins[0], ins[1]);
+      return plan ? { plan } : "non-direct-route";
+    }
+    case "whereDirect": {
+      // The direct `where` carries frozen offsets with NO volatile repack
+      // (buildDirectOffsetRepack excludes it). A narrow-fed input's offset
+      // could vary across replays, stranding the frozen params stale — refuse.
+      if (node.inputs.some((r) => inputHasNarrow(r))) return "where-narrow";
+      const wp = planWhereDirect(ins[0], ins[1], ins[2]);
+      if (!wp) return "non-direct-route";
+      // WhereDirectPlan types paramsData as ArrayBufferView; it is a Uint32Array
+      // at runtime (params()). Normalize to the ElementwiseDirectPlan shape.
+      return {
+        plan: {
+          ...wp,
+          paramsData: new Uint32Array(
+            wp.paramsData.buffer,
+            wp.paramsData.byteOffset,
+            wp.paramsData.byteLength >> 2,
+          ),
+        },
+      };
+    }
+    case "castDirect": {
+      const plan = planCastDirect(ins[0], node.dtype);
+      return plan ? { plan } : "non-direct-route";
+    }
+    case "contiguousDirect": {
+      // Already-contiguous fast path: a non-owning view, ZERO commands.
+      if (ins[0].isContiguous && (ins[0].offset ?? 0) === 0) return { alias: true };
+      const plan = planContiguousDirect(ins[0]);
+      return plan ? { plan } : "non-direct-route";
+    }
+    case "unaryDirect": {
+      const plan = planUnaryDirect(unaryOpKey(node), ins[0]);
+      return plan ? { plan } : "non-direct-route";
+    }
+  }
+}
+
+/**
+ * Transport windowing (Vin's P0 refinement): the UNIVERSAL walker transform for
+ * an oversized operand whose split axis is PARALLEL. Decomposition is NOT a
+ * per-declaration fact — it is derived here from (a) `ELEMENTWISE_SPLIT_AXIS_
+ * PARALLEL` (element-parallel on every axis) AND (b) whether the kernel realizer
+ * supports sub-range binding. binary/unary/contiguous have a windowed realizer
+ * (`planChunkedBinary`/`planChunkedUnary`); cast/where do NOT → returns null,
+ * and the caller falls to the direct plan (whose own oversize-null bails to
+ * lowered — byte-identical to before). The per-chunk windows derive from the
+ * SAME `computeChunkGeometry` the execution path dispatches. A CARRIED split
+ * axis (reductions) would be a typed refusal — not this family's concern.
+ */
+function serializeElementwiseSizeSplit(
+  decl: ExecutionDeclaration,
+  node: LazyIRNode,
+  ins: WebGPUTensor[],
+  inSlots: Slot[],
+  aliasInSlots: Slot[],
+  outSize: number,
+  dtype: WebGPUTensor["dtype"],
+  slots: SlotSource[],
+): SequentialGen | string | null {
+  const kernel = decl.kernel.kernel;
+  const windowable =
+    kernel === "binaryDirect" ||
+    kernel === "unaryDirect" ||
+    kernel === "contiguousDirect";
+  if (!windowable) return null; // cast/where: no windowed realizer → direct
+  // Layout prologue runs BEFORE windowing: chunked binding slices from element
+  // 0, so a strided/offset operand can't window (its copy is uncaptured) —
+  // honest miss.
+  const contigOk = (m: WebGPUTensor) =>
+    m.isContiguous !== false && (m.offset ?? 0) === 0;
+  if (!ins.every(contigOk)) return "chunked-noncontig";
+  if (kernel === "binaryDirect") {
+    const wgslOp = ELEMENTWISE_BINARY_WGSL.get(node.op) as string;
+    return generateChunkedBinary(
+      wgslOp,
+      ins[0].size === 1,
+      ins[1].size === 1,
+      outSize,
+      dtype,
+      inSlots,
+      aliasInSlots,
+      slots,
+    );
+  }
+  return generateChunkedUnary(
+    unaryOpKey(node),
+    outSize,
+    dtype,
+    inSlots[0],
+    aliasInSlots,
+    slots,
+  );
+}
+
+/**
+ * The elementwise-family serializer WALKER: emit the ordered command stream by
+ * walking `decl.skeleton` over roles, binding role→slot from the resolved
+ * kernel plan. ALLOC allocates the output (aliasing poolable binds), UNIFORM
+ * allocates the params slot (emitting the volatile repack only when
+ * `offsetRepack` is present — the packer's volatility, a per-node fact), and
+ * DISPATCH binds `[…inputs, output, params]`. This is the ONE emission path for
+ * every elementwise op — the per-op inline emitters are gone.
+ */
+function serializeElementwiseDirect(
+  decl: ExecutionDeclaration,
+  plan: ElementwiseDirectPlan,
+  inSlots: Slot[],
+  aliasInSlots: Slot[],
+  offsetRepack: ((node: LazyIRNode) => ArrayBufferView) | null,
+  slots: SlotSource[],
+): SequentialGen {
+  const pipeline = getPipeline(requireContext(), plan.key, plan.shader);
+  let outSlot = -1;
+  let paramsSlot = -1;
+  const commands: GpuCommand[] = [];
+  for (const cmd of decl.skeleton) {
+    if (cmd.op === "alloc") {
+      outSlot = slots.length;
+      slots.push({ kind: "arena" });
+      commands.push({
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: plan.outputSizeBytes,
+        allocKind: 0,
+        inputSlots: aliasInSlots,
+      });
+    } else if (cmd.op === "uniform") {
+      paramsSlot = slots.length;
+      slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData.slice() });
+      // Task #71: emit the volatile repack only when an input offset can vary
+      // across replays (a narrow-fed view). nodeIndex -1 is patched by caller.
+      if (offsetRepack) {
+        commands.push({
+          tag: TAG_UNIFORM,
+          slot: paramsSlot,
+          nodeIndex: -1,
+          pack: offsetRepack,
+        });
+      }
+    } else {
+      const bindings: Slot[] = [];
+      for (const b of cmd.bindings) {
+        if (b.role === "all-inputs") bindings.push(...inSlots);
+        else if (b.role === "input") bindings.push(inSlots[b.index]);
+        else if (b.role === "output") bindings.push(outSlot);
+        else bindings.push(paramsSlot);
+      }
+      commands.push({
+        tag: TAG_DISPATCH,
+        pipeline,
+        bindings,
+        gx: plan.dispatchX,
+        gy: plan.dispatchY,
+        gz: 1,
+      });
+    }
+  }
+  return { commands, outSlot };
+}
+
+/**
+ * TRANSITIONAL shadow (docs/execution-declaration-design.md §4.1 step 2): the
+ * old per-op inline emission, retained ONLY to byte-diff against the walker on
+ * every generated elementwise plan. Deleted with `ELEMENTWISE_WALKER_SHADOW`
+ * once the full wall is green — the walker's output is then the sole source.
+ */
+const ELEMENTWISE_WALKER_SHADOW = true;
+
+function emitElementwiseDirectLegacy(
+  node: LazyIRNode,
+  plan: ElementwiseDirectPlan,
+  inSlots: Slot[],
+  aliasInSlots: Slot[],
+  slots: SlotSource[],
+): SequentialGen {
+  const pipeline = getPipeline(requireContext(), plan.key, plan.shader);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const paramsSlot = slots.length;
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData.slice() });
+  const commands: GpuCommand[] = [
+    {
+      tag: TAG_ALLOC,
+      slot: outSlot,
+      bytes: plan.outputSizeBytes,
+      allocKind: 0,
+      inputSlots: aliasInSlots,
+    },
+  ];
+  const offsetRepack = buildDirectOffsetRepack(node);
+  if (offsetRepack) {
+    commands.push({
+      tag: TAG_UNIFORM,
+      slot: paramsSlot,
+      nodeIndex: -1,
+      pack: offsetRepack,
+    });
+  }
+  commands.push({
+    tag: TAG_DISPATCH,
+    pipeline,
+    bindings: [...inSlots, outSlot, paramsSlot],
+    gx: plan.dispatchX,
+    gy: plan.dispatchY,
+    gz: 1,
+  });
+  return { commands, outSlot };
 }
 
 function generateSequential(
@@ -864,20 +1085,14 @@ function generateSequential(
     );
   if (node.op === "mean")
     return generateMean(node, slots, resolveRefSlot, bufferSlot);
-  const wgslOp = BINARY_OPS.get(node.op);
-  const isUnary =
-    UNARY_OPS.has(node.op) ||
-    node.op === "cast" ||
-    node.op === "contiguous" ||
-    node.op === "gelu";
-  // `where` is a 3-input elementwise select (whereDirect): the input-resolution
-  // loop below is already arity-generic, so covering it is a plan-builder branch
-  // (planWhereDirect) — no new resolution machinery.
-  const isWhere = node.op === "where";
-  if (!wgslOp && !isUnary && !isWhere) return "";
-  if (wgslOp && node.inputs.length !== 2) return "arity";
-  if (isUnary && node.inputs.length !== 1) return "arity";
-  if (isWhere && node.inputs.length !== 3) return "arity";
+  // Elementwise family: the declaration (execution-declaration.ts) is the SINGLE
+  // SOURCE for which ops are elementwise, their arity, kernel family, and
+  // decomposition capability — absorbing the old private BINARY_OPS/UNARY_OPS
+  // classification. The input-resolution loop below is arity-generic; the
+  // command shape is walked from `decl.skeleton` (serializeElementwiseDirect).
+  const decl = elementwiseDeclaration(node.op);
+  if (!decl) return "";
+  if (node.inputs.length !== decl.arity) return "arity";
   const ins: WebGPUTensor[] = [];
   const inSlots: Slot[] = [];
   // Aliasing candidates for the output ALLOC: only POOLABLE operands. Scalar-
@@ -984,122 +1199,78 @@ function generateSequential(
     requireContext().device.limits?.maxStorageBufferBindingSize ??
     128 * 1024 * 1024;
   const outOversized = outSize * dtypeBytes(dtype) > maxBinding;
-  if (outOversized && (wgslOp || (isUnary && node.op !== "cast"))) {
-    const contigOk = (m: WebGPUTensor) =>
-      m.isContiguous !== false && (m.offset ?? 0) === 0;
-    if (!ins.every(contigOk)) return "chunked-noncontig";
-    if (wgslOp) {
-      const aIsScalar = ins[0].size === 1;
-      const bIsScalar = ins[1].size === 1;
-      return generateChunkedBinary(
-        wgslOp,
-        aIsScalar,
-        bIsScalar,
-        outSize,
-        dtype,
-        inSlots,
-        aliasInSlots,
-        slots,
-      );
-    }
-    // Unary chunked (sqrt/neg/…): gelu maps to its opKey; plain unary uses node.op.
-    const opKey =
-      node.op === "gelu"
-        ? ((node.payload as { approximate?: string } | undefined)?.approximate ??
-            "tanh") === "tanh"
-          ? "gelu"
-          : "gelu_erf"
-        : node.op;
-    return generateChunkedUnary(
-      opKey,
+  // Transport windowing: decomposition is a WALKER transform, not a declaration
+  // fact (Vin's P0 refinement). When the split axis is parallel (elementwise:
+  // always) and oversized, the walker windows wherever the kernel realizer
+  // supports it; cast/where return null and fall to the direct tail.
+  if (outOversized && ELEMENTWISE_SPLIT_AXIS_PARALLEL) {
+    const windowed = serializeElementwiseSizeSplit(
+      decl,
+      node,
+      ins,
+      inSlots,
+      aliasInSlots,
       outSize,
       dtype,
-      inSlots[0],
-      aliasInSlots,
       slots,
     );
+    if (windowed !== null) return windowed;
   }
-  let plan;
-  if (wgslOp) {
-    plan = planBinaryDirect(wgslOp, ins[0], ins[1]);
-  } else if (isWhere) {
-    // The direct `where` carries frozen offsets in paramsData with NO volatile
-    // repack (buildDirectOffsetRepack excludes it — clip/scaler run it on
-    // offset-0 tensors). A narrow-fed input's offset could vary across replays,
-    // stranding the frozen params stale → keep such a `where` uncovered.
-    if (node.inputs.some((r) => inputHasNarrow(r))) return "where-narrow";
-    plan = planWhereDirect(ins[0], ins[1], ins[2]);
-  } else if (node.op === "cast") {
-    plan = planCastDirect(ins[0], node.dtype);
-  } else if (node.op === "contiguous") {
-    // Already-contiguous fast path: a non-owning view, ZERO commands — the
-    // node's result shares the input buffer (mapNodeResult will re-map the
-    // same buffer to the input's slot; out slot is the input's).
-    if (ins[0].isContiguous && (ins[0].offset ?? 0) === 0) {
-      return { commands: [], outSlot: inSlots[0] };
-    }
-    plan = planContiguousDirect(ins[0]);
-  } else if (node.op === "gelu") {
-    // Backend convention (elementwise.ts gelu): approximate ?? "tanh";
-    // tanh -> opKey "gelu", erf -> "gelu_erf".
-    const p = node.payload as { approximate?: string } | undefined;
-    plan = planUnaryDirect(
-      (p?.approximate ?? "tanh") === "tanh" ? "gelu" : "gelu_erf",
-      ins[0],
-    );
-  } else {
-    plan = planUnaryDirect(node.op, ins[0]);
-  }
-  if (!plan) return "non-direct-route";
-  // Resolve the pipeline through the SAME cache the dispatcher used (at
-  // build time it is warm — this just interns the identity for the diff).
-  const pipeline = getPipeline(requireContext(), plan.key, plan.shader);
-  const outSlot = slots.length;
-  slots.push({ kind: "arena" });
-  const paramsSlot = slots.length;
-  slots.push({
-    kind: "params",
-    seqIndex: -1,
-    data: plan.paramsData.slice(),
-  });
-  const commands: GpuCommand[] = [
-    {
-      tag: TAG_ALLOC,
-      slot: outSlot,
-      bytes: plan.outputSizeBytes,
-      allocKind: 0,
-      // Only poolable operands are aliasing candidates; scalar-table buffers
-      // are persistent and excluded by resolveOutputBuffer.
-      inputSlots: aliasInSlots,
-    },
-  ];
-  // Task #71: if any input's offset can VARY across replays (its view chain
-  // contains a narrow), the frozen paramsData holds only the record-time
-  // offset — a start-N replay of a start-0-built template would read the wrong
-  // region (the falsified shortcut). Emit a TAG_UNIFORM that re-derives every
-  // input offset from the CURRENT step's node and rewrites the params buffer
-  // (params layout: [size, ...offsets] in uniform-declaration order). Emitted
-  // BEFORE the dispatch to match the recording order (createParamsBuffer runs
-  // the repack at params-buffer creation, before dispatchComputePass encodes).
-  // nodeIndex -1 is patched to this node's plan index by the caller.
+  // Direct tail: resolve the KernelRef to an ElementwiseDirectPlan (the
+  // ScheduleState-realization analogue), then WALK the declaration's skeleton to
+  // emit ALLOC → [UNIFORM] → DISPATCH. The per-op inline emission is gone — one
+  // walker serves every elementwise op.
+  const resolved = resolveElementwiseKernel(decl, node, ins);
+  if (typeof resolved === "string") return resolved;
+  // contiguous already-contiguous fast path: a non-owning view, ZERO commands.
+  if ("alias" in resolved) return { commands: [], outSlot: inSlots[0] };
+  const plan = resolved.plan;
+  // Task #71: the volatile offset repack (a narrow-fed input's offset can vary
+  // across replays); null when the offset is a compile-time constant.
   const offsetRepack = buildDirectOffsetRepack(node);
-  if (offsetRepack) {
-    commands.push({
-      tag: TAG_UNIFORM,
-      slot: paramsSlot,
-      nodeIndex: -1,
-      pack: offsetRepack,
-    });
+  if (ELEMENTWISE_WALKER_SHADOW) {
+    // TRANSITIONAL byte-diff: the legacy inline emitter vs the walker on a
+    // THROWAWAY slot copy (running both on `slots` would double-allocate). Any
+    // divergence is a STOP, not a tolerance.
+    const shadowSlots = slots.slice();
+    const legacy = emitElementwiseDirectLegacy(
+      node,
+      plan,
+      inSlots,
+      aliasInSlots,
+      shadowSlots,
+    );
+    const walker = serializeElementwiseDirect(
+      decl,
+      plan,
+      inSlots,
+      aliasInSlots,
+      offsetRepack,
+      slots,
+    );
+    const a = canonicalizeStream(legacy.commands);
+    const b = canonicalizeStream(walker.commands);
+    if (
+      walker.outSlot !== legacy.outSlot ||
+      a.length !== b.length ||
+      a.some((l, i) => l !== b[i])
+    ) {
+      throw new Error(
+        `[exec-decl shadow] elementwise walker diverged for ${node.op}: ` +
+          `legacy=[${a.join(" | ")}] walker=[${b.join(" | ")}] ` +
+          `outSlot legacy=${legacy.outSlot} walker=${walker.outSlot}`,
+      );
+    }
+    return walker;
   }
-  commands.push({
-    tag: TAG_DISPATCH,
-    pipeline,
-    bindings: [...inSlots, outSlot, paramsSlot],
-    gx: plan.dispatchX,
-    gy: plan.dispatchY,
-    gz: 1,
-  });
-  return { commands, outSlot };
+  return serializeElementwiseDirect(
+    decl,
+    plan,
+    inSlots,
+    aliasInSlots,
+    offsetRepack,
+    slots,
+  );
 }
 
 /**
@@ -1318,20 +1489,17 @@ function generateChunkedUnary(
  *  in paramsData. `where` is not on the generated direct path (clip/scaler run
  *  it on offset-0 tensors). */
 function directOpInputCount(node: LazyIRNode): number {
-  if (BINARY_OPS.has(node.op)) return 2;
+  if (ELEMENTWISE_BINARY_WGSL.has(node.op)) return 2;
   return 1; // cast / contiguous / unary / gelu
 }
 
 /** Ops that dispatch through the direct-elementwise params path (the only ops
  *  whose paramsData carries the #71 base_offset uniform). */
 function isDirectElementwiseOp(op: string): boolean {
-  return (
-    BINARY_OPS.has(op) ||
-    UNARY_OPS.has(op) ||
-    op === "cast" ||
-    op === "contiguous" ||
-    op === "gelu"
-  );
+  // Every declared elementwise op EXCEPT `where` dispatches through the
+  // direct-elementwise params path (carries the #71 base_offset uniform); `where`
+  // runs on offset-0 tensors and is excluded from the offset repack.
+  return isDeclaredElementwise(op) && op !== "where";
 }
 
 /** Does this node's input view chain contain a narrow (→ potentially-varying

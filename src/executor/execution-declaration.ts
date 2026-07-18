@@ -15,9 +15,22 @@
  * This file lands the schema and the elementwise family authored as data. The
  * elementwise command shape is uniform: ALLOC(output) → [UNIFORM(params) when
  * the config packer is volatile] → DISPATCH(kernel, bind=[…inputs, output,
- * params]). Chunked (>maxStorageBufferBindingSize) is the family's `size-split`
- * decomposition — same declaration, N dispatches derived by the shared splitter
- * (`computeChunkGeometry`), never enumerated here.
+ * params]).
+ *
+ * ## Decomposition is a WALKER transform, NOT a schema field (Vin's P0 refinement)
+ * Chunking (>maxStorageBufferBindingSize) is NOT a per-declaration or per-family
+ * concern. It is TRANSPORT WINDOWING: when the oversized operand's split axis is
+ * PARALLEL — which for elementwise is EVERY axis — windowing is a universal
+ * transform `windows = f(operand bytes, device binding limit, 256-byte
+ * alignment)` applied identically by the interpreter and the serializer, with
+ * window offsets/sizes as volatile uniforms. The declaration NEVER mentions it.
+ * Parallelism is DERIVED (`ELEMENTWISE_SPLIT_AXIS_PARALLEL`), not declared;
+ * oversized on a CARRIED axis (reductions) is a typed walker refusal —
+ * schedule-state's territory (stream/kSplit + monoid obligations), not this
+ * stratum's. Transform ordering: the layout prologue (`CONTIGUOUS_OPERANDS`,
+ * generalized by `layout`) runs BEFORE windowing; co-bound operands get
+ * co-partitioned windows from the shared index map. This supersedes the design
+ * doc's "derived geometry carried in the declaration" phrasing.
  *
  * ## The schema gate (structural, not hopeful)
  * A `KernelRef` is a discriminated TAG, resolved to WGSL + workgroup geometry +
@@ -117,31 +130,31 @@ export type SkeletonCommand =
  */
 export type LayoutRequirement = "strided-ok" | "contiguous-offset0";
 
-/**
- * The decomposition RULE (derived, never stored — the loop-nest-VIEW analogue):
- *  - `direct`    : one dispatch.
- *  - `size-split`: N dispatches when any operand/output exceeds
- *                  `maxStorageBufferBindingSize`, split by the shared
- *                  `computeChunkGeometry`. A device with a different limit
- *                  re-derives; nothing is baked (the stale-128 MB scar,
- *                  structurally prevented).
- */
-export type DecompositionRule = "direct" | "size-split";
-
 export interface ExecutionDeclaration {
   family: OpFamilyUid;
   /** Fixed arity; a node with a different input count is a typed refusal. */
   arity: number;
   /** How the kernel is realized (WGSL + geometry + params). */
   kernel: KernelRef;
-  /** Layout requirement of the DIRECT path (`size-split` tightens to
-   *  `contiguous-offset0` at the realizer). */
+  /** Layout requirement of the DIRECT path (windowing tightens it to
+   *  `contiguous-offset0` at the walker — the prologue runs BEFORE windowing). */
   layout: LayoutRequirement;
-  /** Whether this op can `size-split` when oversized (else direct-only). */
-  decompose: DecompositionRule;
-  /** The ordered command shape, over roles. Shared family template. */
+  /** The ordered command shape, over roles. Shared family template. Carries NO
+   *  decomposition field — chunking is a walker transform (see file header). */
   skeleton: SkeletonCommand[];
 }
+
+/**
+ * DERIVED-not-authored (P0 interim). Elementwise is element-parallel on every
+ * axis, so its oversized split axis is ALWAYS parallel — transport windowing
+ * (the universal walker transform) applies wherever the kernel realizer supports
+ * sub-range binding. When schedule-state receipts land, this is READ from the
+ * composed `KernelRef`'s parallel-vs-carried axis classification rather than
+ * asserted here; it is exposed as the smallest honest interim, sourced from the
+ * schedule side, NOT a per-declaration authored choice. A carried split axis
+ * (reductions) is a typed walker refusal, not this family's concern.
+ */
+export const ELEMENTWISE_SPLIT_AXIS_PARALLEL = true;
 
 // ============================================================================
 // The ELEMENTWISE family, authored as data
@@ -192,16 +205,18 @@ export const ELEMENTWISE_UNARY_OPS: ReadonlySet<string> = new Set([
 function elementwiseDecl(
   arity: number,
   kernel: KernelRef,
-  decompose: DecompositionRule,
 ): ExecutionDeclaration {
   return {
     family: "elementwise",
     arity,
     kernel,
     layout: "strided-ok",
-    decompose,
     skeleton: [
-      { op: "alloc", slot: { role: "output" }, aliasOperands: "poolable-binds" },
+      {
+        op: "alloc",
+        slot: { role: "output" },
+        aliasOperands: "poolable-binds",
+      },
       { op: "uniform", slot: { role: "params" } },
       {
         op: "dispatch",
@@ -221,34 +236,27 @@ function elementwiseDecl(
  * per-op classification that lived duplicated across `generateSequential`
  * (BINARY_OPS / UNARY_OPS / the cast|where|contiguous|gelu branches) and
  * `dispatchBinary`/`dispatchUnary`. A node whose op is here IS the elementwise
- * family; its arity, kernel family, and decomposition capability are DATA.
- *
- * `size-split`: binary and plain-unary decompose when oversized (their
- * dispatchers route to the chunked path). `cast`/`where`/`contiguous` are
- * direct-only (their dispatchers force contiguity / stay direct at the
- * oversized boundary) — a typed `direct` refusal is honest, not a bail.
+ * family; its arity and kernel family are DATA. Whether an oversized op WINDOWS
+ * is NOT declared — it is derived at the walker from whether the kernel realizer
+ * supports sub-range binding (binary/unary/contiguous: yes; cast/where: no
+ * windowed realizer, so their oversized case falls to the direct plan's own
+ * null → lowered).
  */
-export const ELEMENTWISE_DECLARATIONS: ReadonlyMap<string, ExecutionDeclaration> =
-  new Map<string, ExecutionDeclaration>([
-    ...[...ELEMENTWISE_BINARY_WGSL.keys()].map(
-      (op) =>
-        [
-          op,
-          elementwiseDecl(2, { kernel: "binaryDirect" }, "size-split"),
-        ] as const,
-    ),
-    ...[...ELEMENTWISE_UNARY_OPS].map(
-      (op) =>
-        [
-          op,
-          elementwiseDecl(1, { kernel: "unaryDirect" }, "size-split"),
-        ] as const,
-    ),
-    ["gelu", elementwiseDecl(1, { kernel: "unaryDirect" }, "size-split")],
-    ["cast", elementwiseDecl(1, { kernel: "castDirect" }, "direct")],
-    ["contiguous", elementwiseDecl(1, { kernel: "contiguousDirect" }, "direct")],
-    ["where", elementwiseDecl(3, { kernel: "whereDirect" }, "direct")],
-  ]);
+export const ELEMENTWISE_DECLARATIONS: ReadonlyMap<
+  string,
+  ExecutionDeclaration
+> = new Map<string, ExecutionDeclaration>([
+  ...[...ELEMENTWISE_BINARY_WGSL.keys()].map(
+    (op) => [op, elementwiseDecl(2, { kernel: "binaryDirect" })] as const,
+  ),
+  ...[...ELEMENTWISE_UNARY_OPS].map(
+    (op) => [op, elementwiseDecl(1, { kernel: "unaryDirect" })] as const,
+  ),
+  ["gelu", elementwiseDecl(1, { kernel: "unaryDirect" })],
+  ["contiguous", elementwiseDecl(1, { kernel: "contiguousDirect" })],
+  ["cast", elementwiseDecl(1, { kernel: "castDirect" })],
+  ["where", elementwiseDecl(3, { kernel: "whereDirect" })],
+]);
 
 /** The elementwise-family declaration for `op`, or undefined (not this family). */
 export function elementwiseDeclaration(
@@ -295,7 +303,9 @@ export function assertNoGeneratorLeaf(
         );
       }
       if (Array.isArray(value)) {
-        value.forEach((v, i) => walk(v, `${p}[${i}]`));
+        value.forEach((v, i) => {
+          walk(v, `${p}[${i}]`);
+        });
         return;
       }
       for (const [k, v] of Object.entries(value as Record<string, unknown>)) {

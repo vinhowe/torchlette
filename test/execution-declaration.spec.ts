@@ -12,8 +12,8 @@ import {
   ELEMENTWISE_BINARY_WGSL,
   ELEMENTWISE_DECLARATIONS,
   ELEMENTWISE_UNARY_OPS,
-  elementwiseDeclaration,
   type ExecutionDeclaration,
+  elementwiseDeclaration,
   isDeclaredElementwise,
 } from "../src/executor/execution-declaration";
 
@@ -41,7 +41,6 @@ describe("execution-declaration schema (P0 elementwise)", () => {
       const d = elementwiseDeclaration(op);
       expect(d?.arity).toBe(2);
       expect(d?.kernel.kernel).toBe("binaryDirect");
-      expect(d?.decompose).toBe("size-split");
     }
     for (const op of ELEMENTWISE_UNARY_OPS) {
       const d = elementwiseDeclaration(op);
@@ -50,7 +49,6 @@ describe("execution-declaration schema (P0 elementwise)", () => {
     }
     expect(elementwiseDeclaration("where")?.arity).toBe(3);
     expect(elementwiseDeclaration("where")?.kernel.kernel).toBe("whereDirect");
-    expect(elementwiseDeclaration("where")?.decompose).toBe("direct");
     expect(elementwiseDeclaration("cast")?.kernel.kernel).toBe("castDirect");
     expect(elementwiseDeclaration("contiguous")?.kernel.kernel).toBe(
       "contiguousDirect",
