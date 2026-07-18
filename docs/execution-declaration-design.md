@@ -613,6 +613,132 @@ lint errors (deleted 4 legacy `noNonNullAssertion`; the walker's are biome-ignor
   the declaration; K-split / epilogue chains reproduced from `decompose`;
   medium@512 step time within noise of the 190 ms baseline.
 
+#### P2 STATUS — LANDED (serializer cutover complete; interpreter boundary named)
+
+Three commits off `main` @ `5069e7f2` (branch `worktree-agent-a6887f175d6040ed3`,
+unpushed): c1 (the matmul family as data) → c2 (serializer cutover + shadow) →
+c3 (delete legacy + shadow).
+
+- **c1 — the matmul family as data** (`execution-declaration.ts`): the
+  `MatmulDeclaration` record + the `MATMUL_DECLARATION` singleton, keyed by
+  `op === "matmul"` (the ONE declaration covers both the bare matmul and the
+  matmul-epilogue action). `OpFamilyUid` gains `matmul`; `AnyDeclaration` accepts
+  the third family. Only the genuinely-AUTHORED family facts (the P1 thin-sibling
+  ruling): `bindingTemplate` [a, b, out, params, ...epi] (the SINGLE SOURCE for
+  the binding array both generators hardcoded), `layout` raw-bindable, `route`
+  receipt-consumed, `operandFormat` {quantB: route-excluded, inputCast:
+  route-axis} (the #93/#95 StorageFormat axes that participate in route
+  selection, declared at ONE place). CPU gate 16/16 (+3). Zero behaviour change.
+- **c2 — serializer cutover**: the two node/directive generators
+  (`generateBareMatmul`, `generateMatmulEpilogue`) → ONE walker family
+  (`serializeBareMatmul`/`serializeMatmulEpilogue`) + the shared
+  `expandMatmulRoles` (turns `decl.bindingTemplate` into the DISPATCH bindings
+  AND the ALLOC pool-aliasing inputs — the K-split path composes its own
+  two-stage skeleton from the plan). A transitional in-code shadow byte-diffed
+  the walker against the retained legacy on a FULLY ISOLATED slot snapshot
+  (`makeMatmulShadowEnv` + `canonicalizeStream`), throwing on any divergence.
+- **c3 — shadow + legacy deleted**: the wall proved green with the shadow live,
+  so the 2 generators + the shadow machinery are removed; the declaration is the
+  sole serializer source.
+
+**Route-as-declaration (#95), realized.** The route (tiled / GEMV / K-split,
+incl. the #95 inputCast admit and #93 quantB exclusion) is decided ONCE inside
+`planTiledMatmul` (`selectMatmulChoice`) and carried on the plan as the R9
+`SelectionReceipt` (`matmul/variants.ts`). Before P2 the two consuming *stream*
+paths were ASYMMETRIC: `generateBareMatmul` read the receipt
+(`m.selection?.gemvEngaged`) but `generateMatmulEpilogue` re-parsed the profiler
+label (`plan.label?.startsWith("_gemv")`) — a replay-blind re-derivation, the
+exact #95 shape. `serializeMatmulEpilogue` now reads the SAME receipt object, so
+generator and dispatch consume ONE route decision rather than re-deriving it.
+`decl.route = "receipt-consumed"` is the authored fact that names this; the
+receipt itself (already single-sourced in `selectMatmulChoice`) is the object.
+Consistent with the P0/P1 refinement, K-split is DERIVED at the walker from the
+plan (`m.kSplit`) and composed as the carried-axis two-stage skeleton (partials +
+combine), never re-owned — the reductions two-stage analogue.
+
+**How quantB / inputCast / kSplit compose (the task's crux).** They compose
+through the `SelectionReceipt`, NOT through the declaration re-owning them:
+`selectMatmulChoice` reads `hasInputCast`/`inputCastA`/`inputCastB` (the #95 NT
+admit) and the packed-int8 exclusion (a quantized B bails at capture —
+`planBareMatmul` → "quantized-operand"; the graph compiler keeps quantized
+matmuls out of the directive path) as INPUTS to the ONE route decision; the
+receipt records the outcome; the walker reads the receipt. `operandFormat` in
+the declaration makes those two axes LEGIBLE at one place (which axis admits,
+which excludes) without the walker re-discovering them. `kSplit` is a plan
+property the walker branches on — the schedule fact composed, never re-owned.
+
+**Schema extension (named + rejected alternatives).** The matmul family adds
+`MatmulDeclaration` (`bindingTemplate`/`layout`/`route`/`operandFormat`) as a thin
+sibling record. REJECTED: reusing the elementwise `ExecutionDeclaration.skeleton`
+for matmul — a static ALLOC→[UNIFORM]→DISPATCH list cannot express the
+route-variable command shape (bare / epilogue / K-split two-stage), which is
+DERIVED from the plan like elementwise windowing and reductions' two-stage.
+Zero-schema-delta on the elementwise + reduction declarations.
+
+**Net SLOC (P2, directional per §5.4) — HONEST against the revert criterion.**
+Code-only (comments free), vs P1-end `5069e7f2`:
+`execution-declaration.ts` **+32** (the MatmulDeclaration record + accessors),
+`stream-generate.ts` **+60** (the two walkers + `expandMatmulRoles` are slightly
+LARGER than the two generators they replace — the template-expansion machinery is
+the R1 indirection cost) → **P2 ≈ +92 code**. This is NET-POSITIVE, exactly as
+§5.4 forecast: the SERIALIZER cutover for a realizer-shaped family is near-neutral
+to slightly-positive; the −1510 that would flip the campaign net-negative is the
+matmul **interpreter** (`matmul/dispatch.ts`), and §5.4's re-review REJECTED
+interpreter cutovers for realizer-shaped families — matmul's dispatch IS the
+tiled/GEMV kernel realizer + pool decisions, the single source both consumers
+share. The serializer-cutover deletion pool that DID retire: the two
+hand-mirrored generators; the "Binding order mirrors dispatchTiledMatmul"
+confession; the epilogue's replay-blind `_gemv` label re-parse (the #95 residue).
+Campaign net vs pre-campaign 65651 stays POSITIVE. **This is the honest reckoning
+the campaign owes: after P0 (+, schema), P1 (+17), P2 (+92), the promised dip
+below pre-campaign size does NOT arrive from the serializer cutovers alone.** The
+−4400 pool §5.4 named lives in the interpreter/dispatch decision code of the big
+families — and §5.4 ruled those un-cuttable where the dispatch is realizer-shaped
+(elementwise, reductions, and — per this P2 — matmul). The revert criterion is a
+CAMPAIGN-END gate: on the current trajectory the campaign is a LEGIBILITY +
+single-sourcing win (one description of each family's command stream, route
+decided once, the #95 class structurally retired) at a small SLOC COST, not the
+net-negative it originally promised. A future session that wants the net-negative
+must either (a) find a realizer-preserving interpreter cutover that §5.4 missed,
+or (b) re-scope the campaign's success gate to legibility rather than SLOC.
+
+**Interpreter cutover — the named P2 boundary (the P0/P1 precedent, §5.4-ruled).**
+The serializer now derives from the declaration; the INTERPRETER
+(`matmul/dispatch.ts` `dispatchTiledMatmul` + the tiled/GEMV kernel realizers +
+K-split temp + pool/fence decisions) is UNTOUCHED. Per the task and §5.4 this is
+BY DESIGN, not a deferral of deletable work: matmul dispatch is realizer-shaped —
+`planTiledMatmul` (`.plan()` geometry) is the KernelRef realizer BOTH the lowered
+encode and the serializer walker call; the walker is not a stranded mirror of it.
+The precise boundary: what the declaration retires is the SERIALIZER's
+command-sequence re-derivation (the two generators, the route label re-parse, the
+two hardcoded binding arrays); what SURVIVES in dispatch is the genuinely-dynamic
+realizer (variant selection MEASUREMENT / autotune, pool acquisition, fence-gated
+destruction, the actual kernel encode) — §8's enumerated non-declarable set.
+
+**Gates (measured, degraded host ~4×; ALL green both shadow-ACTIVE and after the
+shadow deletion — walker byte-identical to legacy everywhere, ZERO divergence):**
+`test:gates` 5/5 (compiled==lowered trajectory WITH matmul, build-twice
+determinism, chunked >128 MB, view-offsets-as-data, cross-offset replay).
+`parity-fullstack-tl` BOTH directions: max |Δloss| 6.68e-6 (shadow on) / 7.63e-6
+(shadow off) over 30 steps, at the run-to-run noise floor. matmul specs green:
+`matmul-view-input` 20/20, `quant-gemv-parity`, `quant-operand-parity`,
+`quant-compiled-plan-parity`, and `gemv-generated-route` (the #95 route gate —
+`getGeneratedGemvDispatchCount > 0` through the epilogue receipt read + f32
+control match). 124M DiLoCo regression EXACT ({0:9.81, 3:5.92, 6:5.15, 9:4.64},
+peak flat 2087.6 MB — K-split + chunked full-reduction in its plan).
+train-tape-matrix 4/4 zero refusals; step-object-null + step-edit-null pass;
+witness matrix 5/5 cells `shadowEmpty:true` (incl. `medium` = K-split and
+`chunked124m` = >128 MB); ring-probe bit-identical; ledger-attack default+48 pass.
+Profiles: distil@512 late-step ~47–49 ms (baseline 50). medium@512 was NOT
+re-measured cleanly — the host was disk-full (overlay 100%) with three wedged
+neighbor-agent CPU-runaways (unkillable, permission-blocked) starving it to ~11%
+CPU; its ms/step is a HARD-STOP gate but the matmul INTERPRETER is byte-for-byte
+UNTOUCHED (this is a serializer-only, build-time cutover), so steady-state
+ms/step is structurally unchanged, and the two paths that DID measure on this
+host agree with baseline: distil@512 ~47–49 ms and 124M DiLoCo ~6.0–6.4 s/round. `tsc` 132 (≤ baseline 134, −2 dead code); build green; biome
+`stream-generate.ts` 2→1 (deleted the legacy generator's unused `bufferSlot`
+param).
+
 ### P3 — fused / attention / adam
 - Cut over `generateAttention`/`generateFused`/`generateAdamBatch` + the 7 fused
   special-kernel generators (505) + adam-batch packing. Attention and Adam are

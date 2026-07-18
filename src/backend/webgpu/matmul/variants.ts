@@ -112,13 +112,16 @@ export interface MatmulVariant {
 /**
  * R9 SelectionReceipt — the record of the ONE route decision.
  *
- * Design-doc §7 P1 R9 note (task #95 follow-up): the route (tiled vs GEMV, incl.
- * the #95 inputCast axis) is decided ONCE, at `selectMatmulChoice` inside
- * `planTiledMatmul`. All three consuming paths (lowered dispatch, build-from-IR
- * `planBareMatmul` capture, stage-4 stream `generateBareMatmul`/`generateMatmul-
- * Epilogue`) funnel through `planTiledMatmul` and therefore consume the SAME
- * plan — they never re-run selection. This receipt makes that decision a
- * first-class OBJECT the plan carries, so:
+ * Design-doc §7 P1 R9 note (task #95 follow-up); realized structurally at the
+ * command-stream altitude by exec-decl P2 (route = "receipt-consumed" in the
+ * MatmulDeclaration): the route (tiled vs GEMV, incl. the #95 inputCast axis) is
+ * decided ONCE, at `selectMatmulChoice` inside `planTiledMatmul`. All consuming
+ * paths (lowered dispatch, build-from-IR `planBareMatmul` capture, and the
+ * stage-4 stream matmul walkers `serializeBareMatmul`/`serializeMatmulEpilogue`)
+ * funnel through `planTiledMatmul` and therefore consume the SAME plan — they
+ * never re-run selection, and BOTH stream walkers read this receipt's
+ * `gemvEngaged` rather than re-parsing the profiler label. This receipt makes
+ * that decision a first-class OBJECT the plan carries, so:
  *   (1) route engagement is a PROPERTY of the receipt (`family === "gemv"`),
  *       readable post-cutover — NOT the replay-blind `getGemvDispatchCount`
  *       per-dispatch counter (which reads 0 once a template cuts over to the
