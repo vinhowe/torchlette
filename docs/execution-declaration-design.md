@@ -419,6 +419,86 @@ dispatch), delete both hand descriptions. `npm run build` + full suite +
   time within noise of the pre-campaign 50 ms baseline; net SLOC for the phase
   reported (generators deleted − walker added).
 
+#### P0 STATUS — LANDED (serializer cutover complete; interpreter boundary named)
+
+Three commits off `main` @ `7b31fa6a` (branch `worktree-agent-a43a9fb9caae184b0`,
+unpushed):
+- **c1 — the schema** (`src/executor/execution-declaration.ts`): the
+  `ExecutionDeclaration` types + the elementwise family authored as data
+  (one entry per op, absorbing the per-op classification), + the STRUCTURAL
+  schema gate `assertNoGeneratorLeaf` (no leaf may be a function/callback/buffer —
+  the adapter-cheat is unconstructible). CPU gate `test/execution-declaration.spec.ts`
+  7/7. Zero behaviour change.
+- **c2 — serializer cutover**: `generateSequential`'s per-op inline emission
+  (binary/unary/cast/where/contiguous/gelu direct + chunked) → one
+  declaration-walker (`serializeElementwiseDirect`) + KernelRef resolver
+  (`resolveElementwiseKernel`) + transport-windowing transform
+  (`serializeElementwiseSizeSplit`). A transitional in-code shadow byte-diffed the
+  walker against the retained legacy emitter on every generated plan (throw on
+  divergence).
+- **c3 — shadow + legacy deleted**: the wall proved green with the shadow live, so
+  the legacy emitter + shadow are removed; the declaration is the sole source.
+
+**Vin's chunking refinement (adopted, supersedes §3.1's "derived geometry carried
+in the declaration").** Decomposition is NOT a per-declaration/per-family field.
+It is TRANSPORT WINDOWING: when the oversized operand's split axis is PARALLEL
+(elementwise = every axis), windowing is a universal WALKER transform
+`windows = f(bytes, binding limit, 256-B align)`, applied identically by both
+consumers; the declaration never mentions it. Parallelism is DERIVED
+(`ELEMENTWISE_SPLIT_AXIS_PARALLEL` — the smallest honest P0 interim, sourced from
+the schedule side, until schedule-state receipts classify parallel-vs-carried
+axes). Oversized on a CARRIED axis (reductions) is a typed walker refusal —
+schedule-state's territory, NOT this stratum's. The `decompose` schema field was
+deleted. Full dissolution of `chunkedBinaryConfig`/`planChunkedBinary`/`planChunkedUnary`
+into ONE index-map windowing transform (co-partitioning co-bound operands) is P1
+work — it touches the interpreter's chunked dispatch (hot path), out of P0's
+serializer scope.
+
+**Deletions (named):** private `BINARY_OPS`/`UNARY_OPS` in `stream-generate.ts`
+(→ `ELEMENTWISE_BINARY_WGSL`/`ELEMENTWISE_UNARY_OPS` in the declaration); the per-op
+plan-build switch + inline ALLOC/UNIFORM/DISPATCH emission; the `decompose`
+schema field; the transitional shadow + legacy emitter.
+
+**Net SLOC (P0, directional per §5.4):** NET-POSITIVE, as designed — the
+schema+walker land before P1–P4's family-generator deletions. `stream-generate.ts`
+shrinks (classification tables + inline emission gone) but the new declaration file
+(~330 SLOC) + walker/resolver/transform (~140 SLOC) exceed the elementwise-only
+deletion. The campaign dips below the pre-campaign size only after the bigger
+families (reductions 979+538, matmul 1510+205, fused 1013+505) cut over.
+
+**Gates (measured, degraded host ~4×):** `test:gates` 5/5 with the shadow ACTIVE
+(walker == legacy byte-identical), then 5/5 AGAIN after the shadow deletion (walker
+stands alone) — compiled==lowered trajectory, build-twice determinism, chunked
+full-reduction (>128 MB), view-offsets-as-data (the TAG_UNIFORM repack), cross-offset
+replay. `parity-fullstack-tl` BOTH directions: max |Δloss| 1.1e-5 / 30 steps at the
+run-to-run noise floor (two compiled runs of byte-identical streams differ by
+5.7e-6; step-29 endpoints agree to all printed digits — the documented "~1e-5"
+criterion). Full ledger: train-tape-matrix 4/4 zero refusals; step-object-null +
+step-edit-null pass; witness matrix 5/5 cells `shadowEmpty:true`; ring-probe
+bit-identical; ledger-attack default+48 pass; 124M DiLoCo regression EXACT
+({0:9.81, 3:5.92, 6:5.15, 9:4.64}, peak flat 2087.6 MB); profile distil@512
+late-step ≈54 ms (fwd 22/bwd 20/opt 1/cleanup 10; baseline 50), medium@512
+late-step ≈200 ms (baseline 190) — the interpreter is UNTOUCHED by P0 (generation
+is build-time-only), so steady-state ms/step is structurally unchanged; measured
+values sit on baseline within degraded-host noise. Full suites green (all failures
+were worktree-environmental — missing `.venv`/`models/` symlinks + 3 transient
+`vkCreateDevice` — and pass on isolated rerun: cpu 44/44 oracle, webgpu 18/18
+files 138/138 tests). `tsc` 134 (baseline 135, −1 dead code); build green; biome
+net −1 error.
+
+**Interpreter cutover — the named P0-continuation boundary.** The serializer now
+derives from the declaration; the INTERPRETER (`dispatchBinary`/`dispatchUnary` →
+`dispatchElementwise`) still hand-encodes, but it already realizes the SAME
+skeleton (ALLOC via `resolveOutputBuffer` → params → DISPATCH bind=[…inputs, out,
+params]) and is held in agreement by the record-vs-generate differential + the
+compiled==lowered parity gate — NOT a stranded mirror. Its literal cutover is:
+unify `dispatchElementwise`'s live-encode walk with `serializeElementwiseDirect`'s
+command-emit walk under ONE skeleton walker + TWO emitters (interpreter binds live
+pooled buffers; serializer pushes `GpuCommand[]`). It requires plumbing op identity
+to the dispatch seam (today `dispatchBinary` receives the WGSL symbol, not
+`node.op`, so the declaration is not reachable there) — deferred to keep the hot,
+pool-entangled path untouched under the degraded verification window.
+
 ### P1 — reductions
 - Cut over the 6 reduction generators (538 SLOC) + `ops/reductions.ts` decision
   code (979 SLOC). Reductions carry the all-dims / row-program / batched /
