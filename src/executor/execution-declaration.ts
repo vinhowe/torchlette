@@ -47,8 +47,8 @@
 // The schema
 // ============================================================================
 
-/** Op-family identity. P0 declares only `elementwise`; P1–P4 add the rest. */
-export type OpFamilyUid = "elementwise";
+/** Op-family identity. P0 declared `elementwise`; P1 adds `reduction`. */
+export type OpFamilyUid = "elementwise" | "reduction";
 
 /**
  * Per-operand role, resolved per-NODE from the input ref kind:
@@ -271,6 +271,115 @@ export function isDeclaredElementwise(op: string): boolean {
 }
 
 // ============================================================================
+// The REDUCTION family, authored as data (P1)
+// ============================================================================
+
+/**
+ * The reduction MONOID — the associative combiner over the reduced axis (a
+ * schedule-state monoid fact). `sum`/`max`/`min`. `mean` is NOT a monoid: it is
+ * a `sum` reduction followed by a div-by-count epilogue (`meanEpilogue`).
+ */
+export type ReduceMonoid = "sum" | "max" | "min";
+
+/**
+ * A reduction op-family declaration. Reductions ARE the carried-axis case: the
+ * declaration COMPOSES the answer, it never re-owns it. Only the composition
+ * FACTS that are not derivable are authored here —
+ *   - `monoid`: the op's combiner (the schedule-state monoid fact);
+ *   - `meanEpilogue`: whether a `meanDiv` (÷count) stage composes after the
+ *     reduce (`mean` = reduce(`sum`) ÷ count — a TWO-stage skeleton);
+ *   - `layout`: input(0) is forced contiguous-offset0 before binding (a real
+ *     generalization of this op's `CONTIGUOUS_OPERANDS` entry — the reduce
+ *     kernels read their operand flat-from-element-0).
+ * Everything STRUCTURAL is DERIVED at the walker, NOT stored (the P0 refinement,
+ * extended to the carried axis):
+ *   - full-vs-dim from `payload.dim` (the elementwise direct-vs-windowed
+ *     analogue);
+ *   - the OVERSIZED-on-the-carried-axis case (operand exceeds the binding limit)
+ *     resolves to the MULTI-KERNEL partials+combine lowering that already
+ *     exists (`planChunkedFullReduction`) — the existing chunked machinery is
+ *     the REALIZED IMAGE of the declared two-stage skeleton; the walker derives
+ *     it from `fullReductionNeedsChunking`, with the `sum` monoid supplying the
+ *     partial and combine kernels. No `skeleton`/`decompose` field carries it
+ *     (zero-schema-delta on the elementwise `ExecutionDeclaration`).
+ * REJECTED extension: reusing the elementwise `ExecutionDeclaration.skeleton`
+ * array for reductions — a static ALLOC→[UNIFORM]→DISPATCH list cannot express
+ * the structurally-variable reduction command shape (full / dim / two-stage /
+ * +meanDiv), which is DERIVED like elementwise windowing. The monoid + epilogue
+ * are the only genuinely-authored facts, so the reduction declaration is a thin
+ * sibling record, not a `skeleton` reuse.
+ */
+export interface ReductionDeclaration {
+  family: "reduction";
+  monoid: ReduceMonoid;
+  meanEpilogue: boolean;
+  layout: "contiguous-input";
+}
+
+/** Any command-stream declaration (the schema-gate accepts either family). */
+export type AnyDeclaration = ExecutionDeclaration | ReductionDeclaration;
+
+/**
+ * The reduction family declarations, keyed by `LazyIRNode.op`. `sum`/`mean` are
+ * the node-level ops the serializer covers; `max`/`min` appear only as the
+ * `batched-reduction` action's monoid, so they are declared here too and read by
+ * the batched walker via the action's `reduceOp`. Absorbs the per-generator
+ * `reduceOp = "sum"` hardcode (generateFullReduction/generateDimReduction/the
+ * mean sum stage) and the batched action's `op` classification.
+ */
+export const REDUCTION_DECLARATIONS: ReadonlyMap<string, ReductionDeclaration> =
+  new Map<string, ReductionDeclaration>([
+    [
+      "sum",
+      {
+        family: "reduction",
+        monoid: "sum",
+        meanEpilogue: false,
+        layout: "contiguous-input",
+      },
+    ],
+    [
+      "mean",
+      {
+        family: "reduction",
+        monoid: "sum",
+        meanEpilogue: true,
+        layout: "contiguous-input",
+      },
+    ],
+    [
+      "max",
+      {
+        family: "reduction",
+        monoid: "max",
+        meanEpilogue: false,
+        layout: "contiguous-input",
+      },
+    ],
+    [
+      "min",
+      {
+        family: "reduction",
+        monoid: "min",
+        meanEpilogue: false,
+        layout: "contiguous-input",
+      },
+    ],
+  ]);
+
+/** The reduction-family declaration for `op`, or undefined (not this family). */
+export function reductionDeclaration(
+  op: string,
+): ReductionDeclaration | undefined {
+  return REDUCTION_DECLARATIONS.get(op);
+}
+
+/** Whether `op` is a declared reduction-family op. */
+export function isDeclaredReduction(op: string): boolean {
+  return REDUCTION_DECLARATIONS.has(op);
+}
+
+// ============================================================================
 // The schema gate (structural — the "no second owner" enforcement)
 // ============================================================================
 
@@ -283,7 +392,7 @@ export function isDeclaredElementwise(op: string): boolean {
  * because that leaf would be a function and this gate rejects it.
  */
 export function assertNoGeneratorLeaf(
-  decl: ExecutionDeclaration,
+  decl: AnyDeclaration,
   path = "declaration",
 ): void {
   const walk = (value: unknown, p: string): void => {

@@ -15,6 +15,9 @@ import {
   type ExecutionDeclaration,
   elementwiseDeclaration,
   isDeclaredElementwise,
+  isDeclaredReduction,
+  REDUCTION_DECLARATIONS,
+  reductionDeclaration,
 } from "../src/executor/execution-declaration";
 
 describe("execution-declaration schema (P0 elementwise)", () => {
@@ -88,6 +91,37 @@ describe("execution-declaration schema (P0 elementwise)", () => {
       skeleton: [{ op: "dispatch", emit: () => [] }],
     } as unknown as ExecutionDeclaration;
     expect(() => assertNoGeneratorLeaf(smuggled)).toThrow(/function/);
+  });
+
+  it("every reduction declaration is generator-free data", () => {
+    for (const [op, decl] of REDUCTION_DECLARATIONS) {
+      expect(() => assertNoGeneratorLeaf(decl, op)).not.toThrow();
+    }
+  });
+
+  it("reduction monoid + mean-epilogue agree with the op class", () => {
+    expect(reductionDeclaration("sum")?.monoid).toBe("sum");
+    expect(reductionDeclaration("sum")?.meanEpilogue).toBe(false);
+    expect(reductionDeclaration("mean")?.monoid).toBe("sum");
+    expect(reductionDeclaration("mean")?.meanEpilogue).toBe(true);
+    expect(reductionDeclaration("max")?.monoid).toBe("max");
+    expect(reductionDeclaration("min")?.monoid).toBe("min");
+    for (const [, d] of REDUCTION_DECLARATIONS) {
+      expect(d.layout).toBe("contiguous-input");
+    }
+  });
+
+  it("isDeclaredReduction is exact and disjoint from elementwise", () => {
+    expect(isDeclaredReduction("sum")).toBe(true);
+    expect(isDeclaredReduction("mean")).toBe(true);
+    expect(isDeclaredReduction("max")).toBe(true);
+    expect(isDeclaredReduction("min")).toBe(true);
+    expect(isDeclaredReduction("add")).toBe(false);
+    expect(isDeclaredReduction("matmul")).toBe(false);
+    // A reduction op is never an elementwise op (disjoint families).
+    for (const op of REDUCTION_DECLARATIONS.keys()) {
+      expect(isDeclaredElementwise(op)).toBe(false);
+    }
   });
 
   it("the schema gate REJECTS a buffer leaf", () => {
