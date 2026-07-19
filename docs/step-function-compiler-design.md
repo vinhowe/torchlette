@@ -1159,6 +1159,161 @@ refusal deletion (or re-shaping the tools to wrap in `wholeStep`, which changes 
 census measures). The refusal + eager-two-plan path + engine bypass method + the big
 ledger all WAIT for P4b per §5. No sunset fires in Stage 3.
 
+### P4b status — THE SUMMIT DELETION: STAGE 0 LANDED, THE LEDGER STOPS ON PROVEN DECODE-LIVE CONSUMERS (2026-07-19)
+
+The covenant was binding: **NET-NEGATIVE OR REVERT, no re-framing.** P4b renders the
+honest verdict the covenant demands: **the campaign cannot reach net-negative in P4b
+because every substantial ledger deletion has a PROVEN LIVE CONSUMER** — decode (Verdict
+B, now measured), the b66ead78 hazard, or the retained soak-young opt-out / D3 verdict
+tools. Per the RULE ("a STOP on any item with a live consumer is honorable; a forced
+deletion is not"), the ledger STOPS, item by item, each with its consumer's presence
+proved. Nothing is force-deleted.
+
+**Stage 0 — the named precondition: LANDED.** The browser training-trajectory spec
+(`test/browser/lora-training-trajectory.spec.ts`) had failed to import since the GPT-2
+browser stack was extracted to `packages/gpt2-browser` (f8f894bd) — its `GPT2WithLoRA`
+import pointed at the deleted `examples/.../lib/torchlette/gpt2-lora` path. Re-pointed to
+the package source; fixing it surfaced two more clean-checkout resolution gaps (the
+`torchlette/nn` subpath alias missing from the browser vitest config; the example
+trainer's nearest tsconfig extending the gitignored SvelteKit-generated
+`./.svelte-kit/tsconfig.json`). Both fixed (an `nn` alias; a plain tsconfig beside the
+shared trainer lib). **Browser suite GREEN 12/12** (webgpu 9, scope-surface 2,
+lora-trajectory 1; loss descends 0.479→0.355, storage flat) under whole-step DEFAULT-ON.
+The LoRATrainer uses only plain `beginStep`/`markStep` — it NEVER enters the whole-step
+scope (grep-proven: no `wholeStep`/`capture` call), so flag ON is byte-identical to `=0`
+by construction (the scope's sole lever `_deferBackwardForce` requires `_wholeStepDepth>0`,
+never set here). This closes the P4a Stage-2 "one real gap" (the only P4b precondition for
+deleting the opt-out named there). Test-only + example-tsconfig change; NO `src/` change.
+
+**Stage 1 item 1 — observed-liveness (~807 target): STOP. observed-liveness is
+DECODE-LIVE.** The §5 ledger booked `observed-liveness.ts` (807) as guaranteed-deletable
+"training-side over-harvest." The precise training/decode split refutes the whole-file
+claim: **decode uses the per-plan build-from-IR harvest + convergence, which IS
+observed-liveness.** Measured (`tools/t-p4b-decode-edges.ts`, a model-free static-KV
+decode — persistent KV updated in place, read through a `narrow` view — under
+`TORCHLETTE_STEP_TAPE=1`, V100 sivri): a warm decode step yields
+`observed-liveness.convergedTemplates=1` and `crossPlanEdgeStats().producers=1`. Decode
+converges templates and witnesses cross-plan edges through this file. The stage-3 CROSS-
+PLAN RELEASE sub-part (`releasableLastReader` + `diagnoseReleasable` + the
+`everSurvived`/`everReadback`/`everAliased` predicate sets + `lastReader`/`lastReaderStable`/
+`releaseRevoked` + the `executor.ts` ~2200-2313 released-external-claims block, ~228 code
+SLOC) IS provably inert for decode (KV survives → `everSurvived`; logits → `everReadback`;
+its only target class — grads-after-optimizer / forward-casts-after-backward — needs a
+BACKWARD decode never runs). BUT it is NOT a clean training-only delete: (a) its release
+loop shares the compiled-harvest path and its `crossPlanEdgeHasOtherConsumer` gate
+(`executor.ts:2290`) is the DECODE-live released-read UAF guard (empty store in default
+training, real edges under decode); (b) the boundary-dead consumed-only cross-plan release
+is a live MEMORY optimization for the RETAINED two-plan-eager path (the `=0` opt-out and
+the census tools' plain eager loops). Deleting it regresses that supported path's memory
+and risks the ledger-attack/static-kv lifetime gates, and even if landed (~228 SLOC) it
+falls far short of the covenant target. **STOP** — no clean training-only deletion; the
+consumer (decode + two-plan-eager) is present, not absent.
+
+**Stage 1 item 2 — guard-taxonomy runtime reduction / witness apparatus: STOP.
+DECODE-LIVE.** The witness apparatus (the recorder-side `stObserveWitnessRead` /
+`reconcileWitnessReads` / `publishCrossPlanEdges` cross-plan-edge harvest, ~140-160 SLOC in
+`step-tape.ts`) and `cross-plan-edges.ts` (152) ride `STEP_TAPE_RECORD`
+(`TORCHLETTE_STEP_TAPE=1`/`record`), which the SHIPPED decode apps turn on unconditionally
+(`examples/qwen3-steering/src/lib/tape-flag.ts` → `TORCHLETTE_STEP_TAPE:"1"`). The measured
+`producers=1` above IS this store populated by a decode step; its readers on the decode
+compiled path are `observed-liveness.ts:755` (`crossPlanEdgeKeepSet`, the harvest keep) and
+`executor.ts:2290` (the overlay-release UAF guard). Emptying the store on decode (which a
+deletion does) removes a UAF guard — a behavior change on shipped decode, not a no-op. The
+step-tape guards 1-5 (structGen / bucketKey / scalar-coverage / plan-validity / epoch-regime)
+are EACH consulted by decode's replay (`step-tape-replay.ts`) — none is training-tape-only.
+The §3.4 "collapses to input guards" claim holds for TRAINING (the apparatus is dead data
+there) but the apparatus is alive precisely on the path Verdict B preserves. **STOP** —
+the guard taxonomy / witness / cross-plan-edges are decode-live; deletion would break the
+shipped `STEP_TAPE=1` decode configuration.
+
+**Stage 1 item 3 — sunset audit: NONE fired; per-item verdicts (honest, no reaching).**
+- **Census-tools `useCheckpoint` restore — NOT ripe (STOP).** Its condition is "whole-step
+  defaults AND the refusal + eager-two-plan path are deleted." The refusal is now ruled
+  PERMANENT POLICY (below), so the condition is never met; the tools run plain eager loops
+  (no `wholeStep` wrap) → checkpointed-eager → `CHECKPOINT_EAGER_REFUSAL` fires → no
+  compiled tape. Unchanged from P4a Stage-3.
+- **`TORCHLETTE_WHOLE_STEP` opt-out — KEPT with a dated sunset (the honest call the brief
+  sanctions).** The default is days old (2026-07-19 graduation). Stage 0 closed the one
+  named soak gap (browser training-trajectory under whole-step), which ADVANCES readiness,
+  but the soak window (broad real usage) is still young and the opt-out is the eager
+  semantic reference the differential gates compare against. **SUNSET: dies when the eager
+  two-plan path is deleted — which is itself gated on the refusal ceasing to be needed
+  (see next). Re-evaluate once the checkpoint+compiled-forward arena-safety work lands.**
+- **`CHECKPOINT_EAGER_REFUSAL` + eager-two-plan path — RE-RULED PERMANENT POLICY (not a
+  sunset).** The brief's own clause governs: "if deleting the eager-checkpoint-compile
+  capability would re-expose b66ead78 for plain-loop checkpoint users, the refusal becomes
+  PERMANENT POLICY instead." The doc's D3-fallout section already PROVED env-gating the
+  refusal off reproduces the corruption (`t-whole-step-diff CKPT=1 SELECTIVE=1` eager[29]
+  3.012908 → 3.013037, gate FAILs 1.3e-4). So deleting the refusal (and the eager two-plan
+  path it guards) re-exposes a silent-corruption hazard for any plain-loop checkpoint user
+  who opts out of whole-step. **The refusal is PERMANENT POLICY** until the underlying
+  compiled-forward + separate-recompute arena-safety is built (P4/islands checkpoint-arena
+  territory) — NOT force-sunset here. Documented re-ruling per the brief.
+- **Engine `setBufferArenaDisabled` method — KEPT.** Live consumers: `tools/t-d3-remat.ts:93`
+  (the bypass measurement arm) and `tools/t-planner-pin-attribution.ts:123`. The brief's
+  own Gates section MANDATES the "t-d3-remat spot-check," so the D3 verdict tool (and its
+  bypass arm) is a required standing instrument — its arm cannot be retired to delete the
+  method. **STOP** (honest decision: the consumer is required by the campaign itself). The
+  trainer's `setBufferArenaDisabled(true)` CALL + the `TORCHLETTE_CHECKPOINT_ARENA` flag
+  were already deleted in the D3-finish; only the engine method survives, for the tools.
+
+**Stage 4 — the covenant reckoning (weight-norm, plainly).** `src/` code-only SLOC:
+- pre-Everest (`b0b4e7c3`, the design branch base): **65795**
+- pre-season (per the P4b brief): **65651**
+- current (`704d8278`, P4a HEAD = P4b start): **66066**
+- after P4b: **66066** (Stage 0 is test-only + an example tsconfig; NO `src/` change; no
+  ledger deletion landed).
+
+**Campaign net: +271 vs pre-Everest (65795→66066); +415 vs pre-season (65651→66066). Both
+NET-POSITIVE.** Per the covenant's binary ("net-positive → REVERT the additions until it
+doesn't, OR STOP and report which deletion's blocker prevents the covenant — no third
+option"), P4b takes the **STOP-and-report** branch, NOT revert:
+- The Everest additions are the whole-step compiler (P1-P3) — landed, differentially
+  gated, and warranted net-new mechanism (the census's four-force step became a
+  single-force compiled step; checkpointed selective training became compile-eligible; the
+  D3 remat table beats the bypass on speed AND peak). Reverting a validated capability to
+  hit a SLOC number is the re-framing the covenant's "no re-framing" clause forbids, not
+  what it mandates.
+- The promised deletions (§5 ledger, ~3700-4500 SLOC) are blocked by a single structural
+  fact the design under-weighted: **the whole-step compile subsumes the TRAINING half of
+  the runtime-staticness engine, but decode keeps the tape + per-plan compile + observed-
+  liveness + cross-plan-edges (Verdict B, P4a — now MEASURED live at `producers=1`,
+  `convergedTemplates=1`).** The runtime-staticness engine the ledger books for deletion is
+  the SAME machinery decode depends on. It does not fall to a training-only compile.
+
+**The blocker, named once: whole-step is training-shaped; decode is not a training step
+(no backward); and decode runs on exactly the per-plan compile / step-tape / observed-
+liveness / cross-plan-edges substrate the ledger promised to delete.** Until decode is
+independently proven not to need it (the P4a decode-α benchmark: tape-replay vs plain
+per-plan tok/s on a real weighted model — not run here; it needs the qwen3/gemma weights),
+or accepts the substrate surviving decode-scoped (decode-β, which is the honest current
+state), the ledger's ~1826 tape SLOC + the ~807 observed-liveness + the cross-plan-edges
+are NOT deletable, and the covenant cannot be met by P4b.
+
+**The one no-consumer micro-surface (NAMED, deliberately KEPT).** The D5 watcher-cost
+measurement scaffold (`TORCHLETTE_MEASURE_D5` default-off: `diagnoseReleasable` /
+`noteD5Candidate` / `getD5Cost` + the `executor.ts` ~2229-2253 probe block + the
+`tools/t-d5-watcher-cost.ts` instrument, ~59 `src/` SLOC) has no default-path consumer.
+But it is the RE-OPEN-CONDITION instrument for retiring the `everSurvived`/`everReadback`/
+`everAliased` predicates — and this pass's blocker (decode depends on the predicates via
+`prunedHarvest`) is exactly the condition under which that retirement question RE-OPENS:
+once decode-α/β resolves whether decode needs the per-plan harvest, D5 is the cheap
+re-measurement of what the predicates cost. Deleting it now forecloses that measurement at
+the precise moment the design predicts needing it. So it is dormant-until-reopen, not spent
+— KEPT, and at ~59 SLOC it would not move the covenant anyway. `tape-profile.ts` (~18 SLOC,
+`TAPE_PROFILE` default-off telemetry) is dead by default but woven into hot-path call sites
+in four files; a churny ~18-SLOC delete that also does not move the covenant — named, not
+fired. **No partial deletion is force-landed: a net-positive partial deletion is exactly
+the case the covenant STOP covers.**
+
+**Gates (this pass).** Browser suite 12/12 (whole-step default-ON; flag-off byte-identical
+by construction — the trainer never enters the scope). Decode-live proof
+`tools/t-p4b-decode-edges.ts` (`producers=1`, `convergedTemplates=1`). `gate-wall.sh
+--profile training` on the Stage-0 tree (no `src/` change → a non-regression confirmation,
+not a deletion gate). No REAL failure introduced. No `src/` deletion means the heavy
+deletion-differential matrix (the `t-d3-remat` / 124M / witness-harvest cells) has nothing
+new to guard beyond the standing green baseline.
+
 ### Risks (honest)
 
 - **Plan-builder scale** (P0). Bounded, named, amortized once-per-compile — but the

@@ -92,13 +92,18 @@ register_quick() {
 }
 register_training() {
   add_gate "parity-fullstack"       tsx    "npx tsx tools/parity-fullstack-tl.ts"
-  add_gate "tape:fused,no-sched"    tsx    "FUSED=1 SCHED=0 MODEL=$MODEL npx tsx tools/t-train-tape-matrix.ts"
-  add_gate "tape:fused,cosine-lr"   tsx    "FUSED=1 SCHED=1 MODEL=$MODEL npx tsx tools/t-train-tape-matrix.ts"
-  add_gate "tape:foreach,no-sched"  tsx    "FUSED=0 SCHED=0 MODEL=$MODEL npx tsx tools/t-train-tape-matrix.ts"
-  add_gate "tape:foreach,cosine-lr" tsx    "FUSED=0 SCHED=1 MODEL=$MODEL npx tsx tools/t-train-tape-matrix.ts"
+  # The tape-matrix tool reads TORCHLETTE_STEP_TAPE at MODULE LOAD and bails
+  # ("set TORCHLETTE_STEP_TAPE=record") if unset — so the gate must export it in
+  # the command string (env set by the wrapper doesn't reach a fresh `bash -c`
+  # subshell reliably; set it inline, as the step-object/step-edit gates below do).
+  add_gate "tape:fused,no-sched"    tsx    "TORCHLETTE_STEP_TAPE=record FUSED=1 SCHED=0 MODEL=$MODEL npx tsx tools/t-train-tape-matrix.ts"
+  add_gate "tape:fused,cosine-lr"   tsx    "TORCHLETTE_STEP_TAPE=record FUSED=1 SCHED=1 MODEL=$MODEL npx tsx tools/t-train-tape-matrix.ts"
+  add_gate "tape:foreach,no-sched"  tsx    "TORCHLETTE_STEP_TAPE=record FUSED=0 SCHED=0 MODEL=$MODEL npx tsx tools/t-train-tape-matrix.ts"
+  add_gate "tape:foreach,cosine-lr" tsx    "TORCHLETTE_STEP_TAPE=record FUSED=0 SCHED=1 MODEL=$MODEL npx tsx tools/t-train-tape-matrix.ts"
   add_gate "step-object-null"       tsx    "TORCHLETTE_STEP_TAPE=record npx tsx tools/t-step-object-null.ts"
   add_gate "step-edit-null"         tsx    "TORCHLETTE_STEP_TAPE=record npx tsx tools/t-step-edit-null.ts"
-  add_gate "ring-probe"             tsx    "npx tsx tools/t-ring-probe.ts"
+  # t-ring-probe reads TORCHLETTE_STEP_TAPE=1 at module load and bails if unset.
+  add_gate "ring-probe"             tsx    "TORCHLETTE_STEP_TAPE=1 npx tsx tools/t-ring-probe.ts"
   add_gate "ledger-default"         tsx    "npx tsx tools/t-ledger-attack-probe.ts"
   add_gate "124M-regression"        tsx    "npx tsx tools/diloco-regression-check.ts"
   add_gate "refusal-spec"           vitest "npx vitest run --project webgpu test/whole-step-checkpoint-refusal.spec.ts"
