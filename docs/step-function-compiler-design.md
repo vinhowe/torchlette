@@ -800,6 +800,9 @@ convergence:
   This is the load-bearing, non-trivial piece; it is P3/P4 checkpoint-arena territory, not
   part of covering CE. Only with (b) can (a) land and the seq512/medium D3 table be re-run
   on the remat arm to render the speed/peak/traj verdict. Until then the STOP stands.
+  **→ RESOLVED (2026-07-19): both (a) and (b) landed — see "The D3 FINISH" below.
+  Compiled remat beats the bypass on speed AND peak for both selective and full; the
+  STOP is reversed.**
 
 ### The D3 FINISH — CE coverage LANDED behind a SUNSET-BOUND eager-checkpoint refusal (2026-07-19)
 
@@ -831,6 +834,51 @@ lowered by ACCIDENT (uncovered CE-narrow). Gate:
 whole-step remat (merged plan compiles). SUNSET: dies WITH the bypass
 (`setBufferArenaDisabled` + `TORCHLETTE_CHECKPOINT_ARENA`) when whole-step training
 defaults and the eager two-plan path is deleted (P4).
+
+**CE-from-IR coverage LANDED (a) behind the refusal.** `resolveContiguousOperand`'s
+no-storage branch now, for a contiguity-required STRIDED-view operand with no live
+storage, derives the layout purely from IR (`deriveNodeViewMeta` for
+shape/strides/offset + a base-buffer-bytes walk for the allocation size) and feeds the
+SAME `planContigCopy` the live branch uses — closing the
+`fusedCrossEntropy{Forward,Backward}[no-storage]` bail on the CE logits
+`narrow(1,0,vocabSize)`. The 809-node whole-step remat boundary plan reaches
+`fullyCovered` → **compiles** at `buildReach≥2`. With the refusal protecting the eager
+reference, the mother-gate 2×2 passes all four cells: `t-whole-step-diff` compiled==lowered
+2.6e-6, non-checkpoint traced==eager 2.2e-6, CKPT=1 SELECTIVE=1 traced-remat==eager 3.6e-6
+(eager now 3.012908, NOT the pre-refusal corrupted 3.013038). `parity-fullstack` flag-off
+(checkpoint+scaler+clip+autocast) compiled==lowered 8.6e-6/30.
+
+**THE FIRST COMPILED D3 TABLE — the STOP is REVERSED (V100 sivri, device 0, 3 repeats,
+reset-at-9 steady peak; `tools/t-d3-remat.ts`).** The remat arm now COMPILES
+(`hasCompiled=true`); trajectory by the P3 floor-aware method (remat-COMPILED vs the
+same-arm EAGER reference, gated at `max(1e-5, 1.5×compiled-vs-lowered)`):
+
+| config | arm | steadyPeak | ms/step | submits | compiled | verdict |
+|---|---|---|---|---|---|---|
+| distil@512 + selective | bypass | 3933.5 MB | 300.6 | 8.0 | no | — |
+| distil@512 + selective | **remat** | **3712.6 MB (94.4%)** | **91.2 (3.3× faster)** | 9.4 | **yes (1468 cmds)** | **D3-READY** |
+| medium@512 + full | bypass | 12062.6 MB | 1050.7 | 17.0 | no | — |
+| medium@512 + full | **remat** | **10401.1 MB (86.2%)** | **476.9 (2.2× faster)** | 19.4 | **yes (6041 cmds)** | **D3-READY** |
+
+- **distil-selective: D3-READY** — peak −6% (94.4%), speed 3.3× faster, traj(remat-vs-eager)
+  9.3e-6 ≤ gate 1.22e-5.
+- **medium-full: D3-READY** — peak **−14%** (86.2%), speed 2.2× faster, traj 2.2e-4 ≤ gate
+  2.6e-4 (the seq512/medium fp floor; losses match to 4 digits, 1.7618).
+
+**Both configs clear speed + peak + trajectory + hasCompiled.** The doc's earlier STOP
+("remat +9%/+11% slower; full-ckpt-peak +7.9%") was measured on the LOWERED remat plan
+(the boundary plan never compiled — CE was uncovered). CE coverage makes it compile, and
+compiled replay + the memory planner packing the whole-step recompute REVERSES both
+axes: remat now beats the bypass on speed AND peak, for BOTH selective and full
+checkpointing. The ROOT-CAUSE's precondition (b) is met by the refusal, (a) is landed,
+and the reframed lead ("does compiled remat beat the bypass?") is answered: **yes.**
+Census (distil, seq15, `TORCHLETTE_WHOLE_STEP=1`): +checkpoint = 2.00 forces/step (the
+structural mid-step force subsumed), 6.0 submits/step, boundary plan compiled.
+
+**Bypass death is a SEPARATE reviewed pass** (per the campaign — this pass renders the
+verdict, it does not delete). `setBufferArenaDisabled` + `TORCHLETTE_CHECKPOINT_ARENA`
+and the refusal all REMAIN until that reviewed deletion. The refusal's sunset is now
+unblocked: D3-READY on both configs.
 
 - **P4 — Guard reduction + deletion.** Replace the runtime guard taxonomy with input
   guards; then execute the deletion ledger (§5) subsystem by subsystem, each behind
