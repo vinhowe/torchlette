@@ -715,6 +715,92 @@ question, out of scope for a scheduling pass. Until then the STOP stands.
 **VERDICT UNCHANGED: BYPASS RETAINED.** `setBufferArenaDisabled` + `TORCHLETTE_CHECKPOINT_ARENA`
 stay. No src change lands from this follow-on.
 
+### Why the whole-step remat plan never converges to compiled — ROOT-CAUSED (2026-07-19)
+
+The follow-on above left the lead as "a convergence/observed-liveness question." **It is
+neither.** Instrumenting the seq512 remat arm (`TORCHLETTE_DIAG_CUTOVER`, per-plan cutover
+trace + `gen.uncovered` dump) names the exact cause, and it is not what the lead assumed.
+
+**The named cause — an UNCOVERED OP, not re-fingerprinting, not convergence.** The 809-node
+whole-step boundary plan has a **STABLE** fingerprint across every step (fp=0x7b2639fd,
+`buildReach` increments 1→N — structural instability FALSIFIED). It reaches the
+build-from-IR block every step but `gen.fullyCovered` is **false**, so it falls through to
+`executeLoweredPlan` forever. From step 1 on (warmup configs captured), the residual
+uncovered set at seq512 is exactly **two ops**:
+`fusedCrossEntropyForward[no-storage]` and `fusedCrossEntropyBackward[no-storage]`.
+One uncovered op ⇒ not `fullyCovered` ⇒ no `genPlan` ⇒ lowered every step. **The
+`observed-liveness` CUTOVER `converged=2` counts the small readback/bookkeeping plans; the
+809-node plan is never a candidate** — coverage gates the compile, convergence never gets a
+turn. This is **NOT seq512-specific**: the seq64 `t-whole-step-diff` traced arm (fp=0x6adb0757,
+also 809 nodes) carries the identical two CE bails (plus a seq-only `batched-reduction[true-batched]`
+that seq512 covers). So **P3's "COMPILES — templates=4 converged=2" verdict was always
+measuring the small plans; the boundary plan never compiled at any sequence length.**
+
+**The bail, precisely.** CE's logits operand is `flatLogits.narrow(1,0,vocabSize)`
+(`examples/gpt2/model.ts:507-513`) — a **dim-1 strided view** stripping the lm_head's
+tile-alignment vocab padding ([S,50304]→[S,50257]). `stream-generate.ts`
+`resolveContiguousOperand` needs the physical layout (strides/offset/bufferSize) to
+synthesize the contiguous-copy prologue the dispatch layer's `asContiguous` inserts (CE
+logits is declared contiguity-required, `contiguous-operands.ts`). On the build-from-IR
+path **nothing is materialized**, so `storage` is undefined AND `refShapeDtype` /
+`contiguousViewShapeDtype` both reject strided VIEW_OPs → `no-storage`. The live-storage
+branch that *does* synthesize the copy never fires for the whole-step boundary plan (it
+builds without executing).
+
+**The coverage fix works — and is where it STOPS.** Deriving the strided layout from IR via
+`deriveNodeViewMeta` (the single-source view-meta the backend ops use) + a base-buffer-bytes
+walk, then feeding the SAME `planContigCopy` the live branch uses, closes the bail:
+`gen.fullyCovered` becomes true and the seq512 809-node plan **cuts over to compiled**
+(verified: `hasCompiled=true` at `buildReach≥2`; losses bit-match the lowered arm). It is
+numerically correct on the target path — `t-whole-step-diff` **compiled==lowered 1.9e-6**,
+and **non-checkpoint traced==eager 1.9e-6**.
+
+**But it fails the mother gate under checkpointing (1.3e-4), and the reason is structural,
+not a copy bug.** With CE covered, the plan compiles on the EAGER arm too. A clean 2×2
+(distil seq64, CKPT=1 SELECTIVE=1, per-arm loss[29]; the whole-step-remat exact value is
+3.012909, == non-checkpoint):
+
+| config | eager (reference) | traced (remat) | verdict |
+|---|---|---|---|
+| non-CKPT + fix (CE compiles) | 3.012909 | 3.012909 | PASS 1.9e-6 |
+| CKPT + baseline (all lowered) | 3.012907 | 3.012908 | PASS 2.15e-6 |
+| CKPT + fix, **remat** whole-step | — | **3.012909** (==exact) | remat CORRECT |
+| CKPT + fix, **eager** two-plan | **3.013038 (+1.3e-4)** | — | eager CORRUPTED |
+
+The synthesis fires only on the correct CE-forward vocab narrow (same copy in every arm),
+so the copy value is right. The divergence isolates to **CKPT × compiled-forward in the
+legacy two-plan path** — precisely the checkpoint+arena hazard `setBufferArenaDisabled`
+(b66ead78) exists to prevent: a compiled forward plan reclaims activations a *separate*
+checkpoint-recompute plan still needs. The **whole-step remat handles it safely** (one
+merged plan, the planner packs the recompute — traced is exact). The **eager two-plan
+checkpoint path does not**, and before this fix it was kept lowered *by accident* — only
+because CE was uncovered. Global CE coverage removes that accidental safety and unmasks
+the hazard in the eager reference.
+
+**Why it can't be cleanly scoped, and the STOP.** There is no live whole-step signal at the
+boundary-force site: `_wholeStepDepth` is back to 0 by `markStep()` (the scope exits before
+the merged plan executes), so `generateStream` cannot tell "merged remat plan" from "eager
+two-plan forward." A structural self-gate ("cover CE only in a plan that also holds an
+`adamStep`" ⟺ the merged plan, the same self-gate shape the reverted optimizer-batching
+follow-on used) would pass the gate, but it is an overfit condition on a correctness seam,
+not a smallest-honest fix — and the campaign forbids gate-scope games. **So the coverage fix
+does NOT land.** The convergence blocker is now *named and removable*; making its removal
+SAFE requires the checkpoint+compiled-forward mechanism the bypass/whole-step exist for.
+
+**Reframed lead + sizing for a sound future D3.** The prize (does compiled remat beat the
+bypass on speed?) is now one mechanism away, and the mechanism is checkpoint-safety, not
+convergence:
+- **(a) Land CE from-IR contiguity coverage** (~40 SLOC in `stream-generate.ts`:
+  `derivedContigCopyFromIR` + `deriveBaseBufferBytes`, reusing `deriveNodeViewMeta` /
+  `planContigCopy` / the `CONTIGUOUS_OPERANDS` declaration). Correct in isolation; the
+  differential asserts the copy == dispatch `asContiguous`.
+- **(b) Prevent the eager two-plan checkpoint forward from compiling unsafely** — either
+  re-assert the bypass at plan granularity for non-whole-step checkpointed forwards (keep
+  them lowered by design), or make the compiled-forward+separate-recompute path arena-safe.
+  This is the load-bearing, non-trivial piece; it is P3/P4 checkpoint-arena territory, not
+  part of covering CE. Only with (b) can (a) land and the seq512/medium D3 table be re-run
+  on the remat arm to render the speed/peak/traj verdict. Until then the STOP stands.
+
 - **P4 — Guard reduction + deletion.** Replace the runtime guard taxonomy with input
   guards; then execute the deletion ledger (§5) subsystem by subsystem, each behind
   a green parity gate. *The payoff phase.*
