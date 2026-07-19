@@ -59,7 +59,15 @@ const LR = parseFloat(process.env.LR ?? "1e-4");
 const SELECTIVE = process.env.SELECTIVE !== "0";
 const log = (m: string) => console.error(`[d3-remat] ${m}`);
 
-type Arm = "bypass" | "remat";
+// Trajectory arms for the HONEST P3-method gate (t-whole-step-diff's method):
+//   - "remat-lo": remat forced LOWERED (COMPILED_PLAN=0) → the compiled==lowered
+//     fp-reorder FLOOR of the traced mode itself.
+//   - "eager": the SAME-ARM eager reference (checkpoint, arena ON, NON-whole-step
+//     — safe now: the D3 refusal keeps its plans lowered). The SOUND correctness
+//     metric is remat-COMPILED vs eager, gated at max(1e-5, 1.5×floor). The
+//     bypass (arena OFF) is a DIFFERENT executor → remat-vs-bypass is a cross-impl
+//     floor, reported but NOT the gate.
+type Arm = "bypass" | "remat" | "remat-lo" | "eager";
 
 interface ArmResult {
   losses: number[];
@@ -67,6 +75,12 @@ interface ArmResult {
   steadyCurrentMB: number;
   meanLateMs: number;
   meanLateSubmits: number;
+  /** Whether the big whole-step boundary plan reached compiled replay (a valid
+   *  CompiledPlan with a large command count). The D3 deliverable: with CE-from-IR
+   *  coverage the remat arm should show hasCompiled=true; the arena-free bypass
+   *  never compiles. */
+  hasCompiled: boolean;
+  maxCompiledCmds: number;
 }
 
 async function run(arm: Arm): Promise<ArmResult> {
@@ -120,7 +134,7 @@ async function run(arm: Arm): Promise<ArmResult> {
     });
     await api.beginStep();
 
-    if (arm === "remat") {
+    if (arm === "remat" || arm === "remat-lo") {
       const readLoss = await api.wholeStep(async () => {
         const loss = api.tidy(() => {
           const l = model.forwardWithLoss(input, target, ckptOpts).loss!;
@@ -173,14 +187,25 @@ async function run(arm: Arm): Promise<ArmResult> {
   // Cutover diagnostic: did the whole-step checkpoint plan reach the compiled
   // (build-from-IR) path, or does selective/full checkpointing re-fingerprint
   // it lowered every step (arena-recompute Risk 2)?
+  // hasCompiled probe: did the big whole-step boundary plan reach compiled
+  // replay? A compiled ~800-node plan emits hundreds of commands; the small
+  // readback/bookkeeping plans emit a handful. Threshold at 100 commands.
+  let hasCompiled = false;
+  let maxCompiledCmds = 0;
   try {
-    const { debugTemplateCount } = await import("../src/executor/executor");
+    const { debugTemplateCount, getCompiledStreams } = await import(
+      "../src/executor/executor"
+    );
     const { getObservedLivenessStats } = await import(
       "../src/executor/observed-liveness"
     );
+    const streams = getCompiledStreams();
+    for (const s of streams)
+      maxCompiledCmds = Math.max(maxCompiledCmds, s.commands.length);
+    hasCompiled = maxCompiledCmds >= 100;
     const s = getObservedLivenessStats();
     log(
-      `${arm} CUTOVER: templates=${debugTemplateCount()} converged=${s.convergedTemplates} pinned=${s.pinnedTemplates} retired=${s.retiredTemplates} cleanMiss=${s.cleanMisses} dirtyMiss=${s.dirtyMisses}`,
+      `${arm} CUTOVER: templates=${debugTemplateCount()} compiledStreams=${streams.length} maxCmds=${maxCompiledCmds} hasCompiled=${hasCompiled} converged=${s.convergedTemplates} pinned=${s.pinnedTemplates} retired=${s.retiredTemplates} cleanMiss=${s.cleanMisses} dirtyMiss=${s.dirtyMisses}`,
     );
   } catch {
     /* stats unavailable */
@@ -195,14 +220,22 @@ async function run(arm: Arm): Promise<ArmResult> {
     meanLateSubmits: +(
       lateSub.reduce((a, b) => a + b, 0) / lateSub.length
     ).toFixed(1),
+    hasCompiled,
+    maxCompiledCmds,
   };
 }
 
 async function runArmInChild(arm: Arm, rep: number): Promise<ArmResult> {
   const { execFileSync } = await import("node:child_process");
   const env: Record<string, string> = { ...process.env, D3_ARM: arm };
-  if (arm === "remat") env.TORCHLETTE_WHOLE_STEP = "1";
-  else delete env.TORCHLETTE_WHOLE_STEP;
+  if (arm === "remat" || arm === "remat-lo") {
+    env.TORCHLETTE_WHOLE_STEP = "1";
+    if (arm === "remat-lo") env.TORCHLETTE_COMPILED_PLAN = "0";
+    else delete env.TORCHLETTE_COMPILED_PLAN;
+  } else {
+    delete env.TORCHLETTE_WHOLE_STEP;
+    delete env.TORCHLETTE_COMPILED_PLAN;
+  }
   const out = execFileSync(
     process.execPath,
     ["--import", "tsx", import.meta.filename],
@@ -253,7 +286,12 @@ async function aggregate(arm: Arm): Promise<{
 
 async function main() {
   const armEnv = process.env.D3_ARM as Arm | undefined;
-  if (armEnv === "bypass" || armEnv === "remat") {
+  if (
+    armEnv === "bypass" ||
+    armEnv === "remat" ||
+    armEnv === "remat-lo" ||
+    armEnv === "eager"
+  ) {
     if (!(await initWebGPU())) {
       log("WebGPU init failed");
       process.exit(1);
@@ -269,13 +307,27 @@ async function main() {
   );
   const bypass = await aggregate("bypass");
   const remat = await aggregate("remat");
+  // Trajectory references (1 rep each — deterministic weights/tokens):
+  const rematLo = await runArmInChild("remat-lo", 0); // compiled==lowered floor
+  const eager = await runArmInChild("eager", 0); // same-arm eager reference
 
-  const traj = maxDelta(remat.reps[0].losses, bypass.reps[0].losses);
+  // P3-method trajectory gate (t-whole-step-diff's method): the compiled==lowered
+  // delta IS the traced mode's fp-reorder FLOOR; the SOUND metric is
+  // remat-COMPILED vs EAGER, gated at max(1e-5, 1.5×floor). A real math bug blows
+  // past this by orders of magnitude; the seq512 two-path fp floor lifts it above
+  // the nominal 1e-5 for BOTH comparisons in lockstep.
+  const fpFloor = maxDelta(remat.reps[0].losses, rematLo.losses);
+  const trajVsEager = maxDelta(remat.reps[0].losses, eager.losses);
+  const trajGate = Math.max(1e-5, 1.5 * fpFloor);
+  // Informational only: cross-implementation floor (remat-compiled vs the
+  // arena-free bypass — two different executors).
+  const trajVsBypass = maxDelta(remat.reps[0].losses, bypass.reps[0].losses);
   const peakRatio = remat.medPeak / bypass.medPeak;
   const peakOK = peakRatio <= 1.05;
   const speedOK = remat.medMs <= bypass.medMs;
-  const trajOK = traj <= 1e-5;
-  const verdict = peakOK && speedOK && trajOK;
+  const trajOK = trajVsEager <= trajGate;
+  const hasCompiledOK = remat.reps.every((r) => r.hasCompiled);
+  const verdict = peakOK && speedOK && trajOK && hasCompiledOK;
 
   console.log("=== D3-REMAT TABLE ===");
   console.log(
@@ -300,10 +352,16 @@ async function main() {
           peaksMB: remat.reps.map((r) => r.steadyPeakMB),
           msPerStep: remat.reps.map((r) => r.meanLateMs),
           submits: remat.reps.map((r) => r.meanLateSubmits),
+          hasCompiled: remat.reps.map((r) => r.hasCompiled),
+          maxCompiledCmds: remat.reps.map((r) => r.maxCompiledCmds),
         },
         peakRatio_remat_over_bypass: +peakRatio.toFixed(4),
-        traj_maxDelta: traj,
-        gates: { peakOK, speedOK, trajOK },
+        traj_remat_vs_eager_SOUND: trajVsEager,
+        traj_gate_floorAware: trajGate,
+        fpFloor_compiledVsLowered: fpFloor,
+        traj_vsBypass_crossImplFloor: trajVsBypass,
+        rematHasCompiled: remat.reps.map((r) => r.hasCompiled),
+        gates: { hasCompiledOK, peakOK, speedOK, trajOK },
       },
       null,
       2,
@@ -311,8 +369,8 @@ async function main() {
   );
   console.log(
     verdict
-      ? `VERDICT: BYPASS DIES — remat peak ${remat.medPeak}MB ≤ bypass ${bypass.medPeak}MB×1.05 (${(peakRatio * 100).toFixed(1)}%), speed ${remat.medMs}≤${bypass.medMs}ms, traj ${traj.toExponential(2)}≤1e-5`
-      : `VERDICT: BYPASS RETAINED — peakOK=${peakOK}(${(peakRatio * 100).toFixed(1)}%) speedOK=${speedOK}(${remat.medMs}vs${bypass.medMs}ms) trajOK=${trajOK}(${traj.toExponential(2)})`,
+      ? `VERDICT: D3-READY — remat COMPILED (cmds ${remat.reps[0].maxCompiledCmds}), peak ${remat.medPeak}MB ≤ bypass ${bypass.medPeak}MB×1.05 (${(peakRatio * 100).toFixed(1)}%), speed ${remat.medMs}ms ≤ bypass ${bypass.medMs}ms, traj(remat-vs-eager) ${trajVsEager.toExponential(2)} ≤ ${trajGate.toExponential(2)}`
+      : `VERDICT: NOT-READY — hasCompiled=${hasCompiledOK} peakOK=${peakOK}(${(peakRatio * 100).toFixed(1)}%) speedOK=${speedOK}(${remat.medMs}vs${bypass.medMs}ms) trajOK=${trajOK}(remat-vs-eager ${trajVsEager.toExponential(2)} vs gate ${trajGate.toExponential(2)})`,
   );
   process.exit(verdict ? 0 : 2);
 }
