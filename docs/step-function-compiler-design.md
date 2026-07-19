@@ -880,6 +880,74 @@ verdict, it does not delete). `setBufferArenaDisabled` + `TORCHLETTE_CHECKPOINT_
 and the refusal all REMAIN until that reviewed deletion. The refusal's sunset is now
 unblocked: D3-READY on both configs.
 
+### D3-finish fallout — the step-object census red light was the refusal, not a ghost (2026-07-19)
+
+The D3-finish branch landed with `t-train-tape-matrix [fused, no-sched]` red
+(`tapeCount 1→0`, `eligiblePairs 6→0`, `loweredPairs 0→15`). The finishing
+agent hypothesised a "module-init / hidden-class / init-order interaction" from
+the engine class-shape change (`_checkpointEagerForce`) and reported "the refusal
+NEVER fires (refusals=0)." **Both are wrong** — verified by a deterministic probe
+(`getCompileRefusalCount()` instrumented in the exact cell): the refusal fires
+~5×/step. The "refusals=0" was a conflation of the STEP-TAPE `refusals` counter
+(guard-3 byte-diff, genuinely 0) with the EXECUTOR `compileRefusalCount` (the D3
+`CHECKPOINT_EAGER_REFUSAL`, ~28 over 6 steps).
+
+**The mechanism, plainly.** The census/step-object gates run `forwardWithLoss(...,
+{useCheckpoint: true})` in the eager (non-whole-step) loop — a checkpointed EAGER
+step. `CHECKPOINT_EAGER_REFUSAL` (landed a78a5006) declines build-from-IR for EVERY
+plan in such a step, all-or-nothing, so every plan stays LOWERED. The step-tape only
+forms an eligible tape from fully-COMPILED steps (`stFinalizeStep`:
+`rec.plans.every(pl => pl.compiled)`), so a checkpointed-eager step now yields
+`loweredPairs`, never an eligible tape. Nothing to do with guard-5/`stNoteBoundary`
+(`boundaryResets` unchanged) or the clear path. On main@026530a6 (pre-refusal) the
+same cell compiled (`loweredPairs=0`, `tapeCount=1`); the doc's "eager checkpoint
+plans were lowered by accident (uncovered CE)" is true only of the whole-step
+build-from-IR boundary plan — the eager two-plan forward/backward/optimizer
+materialise, so their CE resolves via the live-storage branch and they DID compile.
+
+**Load-bearing, confirmed.** Env-gating the refusal off and re-running the mother
+gate reproduces the b66ead78 corruption it exists to block (`t-whole-step-diff
+CKPT=1 SELECTIVE=1` eager[29] 3.012908 → 3.013037, gate FAILs 1.3e-4). The refusal
+is correct and its scope is sanctioned (the refusal spec asserts it FIRES for
+checkpointed-eager). So checkpointed-eager forming a COMPILED tape and the refusal
+are **mutually exclusive by design** — the census red light is an intended
+consequence, not a bug in the D3 work.
+
+**The fix — decouple the census from eager checkpointing (deletion named).** The
+census's ACTUAL assertion is optimizer-config scalar-slot coverage via a compiled
+tape (the frozen-scalar family, LR-via-LiveScalar); that is CHECKPOINT-INDEPENDENT.
+Eager selective checkpointing (`useCheckpoint: true`) is **removed** from the four
+step-object-family gates it broke — `t-train-tape-matrix`, `t-step-object-null`,
+`t-step-edit-null`, `t-step-edit-binding-probe` — restoring `tapeCount=1 /
+eligiblePairs=6 / loweredPairs=0` with zero census coverage lost. Not a gate-scope
+game: the abandoned "checkpointed-eager compiles" property is not hidden — it is
+asserted STAYS-LOWERED in `test/whole-step-checkpoint-refusal.spec.ts` and
+COMPILES-under-whole-step in `t-whole-step-diff` / `t-d3-remat`. SUNSET: when
+whole-step defaults (P4) and the refusal + eager two-plan path are deleted,
+selective checkpointing returns to these loops. (`t-step-edit-numerics-null`
+asserts numerical equality — tape-independent, unaffected; `t-ring-probe`,
+`t-ledger-attack` never checkpointed — unaffected.)
+
+**Gate re-run (this pass, V100 sivri device 0):** tape-matrix **4/4** PASS
+(all cells `eligiblePairs=6 tapeCount=1`); `t-step-object-null` / `t-step-edit-null`
+/ `t-step-edit-binding-probe` PASS; `t-ring-probe` PASS (K1/K2/K3); `t-ledger-attack`
+default+48 PASS (ledger balanced, flat); `t-whole-step-diff` non-ckpt 2.62e-6 +
+CKPT=1 SELECTIVE=1 3.58e-6 PASS; `test:gates` **5/5**; profile medium@512 flag-off
+peak 13.69 GB, LEAK OK. Refusal spec **3/3** under the soak opt-out
+(`TORCHLETTE_STRICT_LIFETIME=0`, as the finishing agent validated it).
+
+**Pre-existing finding, flagged not fixed (out of the census root-cause).** Under
+strict-lifetime DEFAULT, `whole-step-checkpoint-refusal.spec.ts` THROWS a reclaimed
+read (the wpe position-embedding grad `[64,128]`, scatterAdd→add) in BOTH its
+`eager-ckpt` and `eager-nockpt` cells — so it is refusal-INDEPENDENT (the nockpt
+cell never triggers the refusal). Present on clean ea9a0ade; the spec's minimal
+explicit-boundary loop (`sum()` loss, no optimizer, raw `new GPT2`) holds a tensor
+across `markStep` that gets demoted. The sibling checkpoint specs (autocast-parity /
+segmentation / scaler-seed) pass under strict default, and the census tools above
+all run clean under strict default — so this is spec-loop hygiene in the new refusal
+spec, not a framework UAF. Left for the branch owner (it papered over as "3/3" only
+because the finishing agent ran it with the opt-out).
+
 - **P4 — Guard reduction + deletion.** Replace the runtime guard taxonomy with input
   guards; then execute the deletion ledger (§5) subsystem by subsystem, each behind
   a green parity gate. *The payoff phase.*

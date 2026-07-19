@@ -6,9 +6,28 @@
  *
  *   { fused Adam, foreach Adam } × { no LR schedule, CosineAnnealingLR }
  *
- * each WITH GradScaler + gradient clipping + autocast + selective checkpointing
- * (the canonical fullstack inner step on pretrained distilgpt2), batch varying
- * every step. This is the census enforcement the phase2b falsification proved
+ * each WITH GradScaler + gradient clipping + autocast (the canonical fullstack
+ * inner step on pretrained distilgpt2), batch varying every step.
+ *
+ * [D3 refusal reconciliation — 2026-07-19] Eager SELECTIVE CHECKPOINTING was
+ * REMOVED from this loop. The D3 CHECKPOINT_EAGER_REFUSAL (executor.ts, a typed
+ * SUNSET-BOUND decline) now keeps EVERY plan built during a checkpointed EAGER
+ * (non-whole-step) step LOWERED by design — the b66ead78 checkpoint+arena hazard
+ * that global CE-from-IR coverage unmasks. A lowered step forms NO compiled tape
+ * (stFinalizeStep: `rec.plans.every(pl => pl.compiled)` is false → loweredPairs),
+ * so a checkpointed-eager cell can never satisfy this census's `eligiblePairs>0`
+ * assertion — the two are mutually exclusive under the sanctioned refusal (proven:
+ * with the refusal the checkpointed loop yields loweredPairs=15 / eligiblePairs=0;
+ * disabling it re-introduces the mother-gate corruption, eager[29] 3.0129→3.0130).
+ * The optimizer-scalar coverage this census enforces (the frozen-scalar family,
+ * LR-via-LiveScalar) is CHECKPOINT-INDEPENDENT, so dropping eager checkpointing
+ * loses no census coverage. Checkpoint compile coverage lives where it is honest:
+ * the refusal STAYS-LOWERED property in test/whole-step-checkpoint-refusal.spec.ts,
+ * and the checkpointed-COMPILES property under whole-step remat in t-whole-step-diff
+ * / t-d3-remat. SUNSET: when whole-step training defaults (P4) and the refusal +
+ * eager two-plan path are deleted, selective checkpointing returns to this loop.
+ *
+ * This is the census enforcement the phase2b falsification proved
  * unmet at 556 refusals; inc-1 (batch-representative + dead-payload TAG_UNIFORM
  * coverage) and inc-2a (optimizer-scalars-as-data — LR via the LiveScalar slot)
  * landed the coverage. This gate CONFIRMS full coverage — no cell may silently
@@ -39,7 +58,9 @@ process.env.TORCHLETTE_FUSED_ADAM = FUSED ? "1" : "0";
 
 const { destroyWebGPU, initWebGPU } = await import("../src/backend/webgpu");
 const { Torchlette } = await import("../src/frontend/torchlette");
-const { Adam, CosineAnnealingLR, GradScaler } = await import("../src/optim/index.ts");
+const { Adam, CosineAnnealingLR, GradScaler } = await import(
+  "../src/optim/index.ts"
+);
 const { clipGradNorm_ } = await import("../src/nn/index.ts");
 const { STEP_TAPE_RECORD, stStats } = await import("../src/core/step-tape");
 const { loadPretrainedGPT2 } = await import("../examples/gpt2/loader");
@@ -74,7 +95,11 @@ async function main() {
   );
   model.train(true);
   const params = model.parameters();
-  const opt = new Adam(params, { lr: 1e-4, weightDecay: 0.01, adamW: true }, api);
+  const opt = new Adam(
+    params,
+    { lr: 1e-4, weightDecay: 0.01, adamW: true },
+    api,
+  );
   const sched = SCHED ? new CosineAnnealingLR(opt, STEPS, 1e-5) : null;
   const scaler = new GradScaler(api, { initScale: 1024.0 });
   const V = model.config.vocabSize;
@@ -93,11 +118,19 @@ async function main() {
       inp[i] = rnd() % V;
       tgt[i] = rnd() % V;
     }
-    const input = api.tensorFromArray(Array.from(inp), [BATCH, SEQ], { device: "webgpu" });
-    const target = api.tensorFromArray(Array.from(tgt), [BATCH, SEQ], { device: "webgpu" });
+    const input = api.tensorFromArray(Array.from(inp), [BATCH, SEQ], {
+      device: "webgpu",
+    });
+    const target = api.tensorFromArray(Array.from(tgt), [BATCH, SEQ], {
+      device: "webgpu",
+    });
     const loss = api.tidy(() => {
       const l = api.autocast(
-        () => model.forwardWithLoss(input, target, { useCheckpoint: true }).loss,
+        // useCheckpoint:false — the D3 CHECKPOINT_EAGER_REFUSAL keeps
+        // checkpointed-eager plans lowered, which cannot form a compiled tape
+        // (see the header's D3 refusal reconciliation note).
+        () =>
+          model.forwardWithLoss(input, target, { useCheckpoint: false }).loss,
       );
       api.keep(l);
       return l;
@@ -139,7 +172,9 @@ async function main() {
       2,
     ),
   );
-  console.log(pass ? `PASS [${CELL}]: eligible tape, zero refusals` : `FAIL [${CELL}]`);
+  console.log(
+    pass ? `PASS [${CELL}]: eligible tape, zero refusals` : `FAIL [${CELL}]`,
+  );
   await destroyWebGPU();
   process.exit(pass ? 0 : 1);
 }

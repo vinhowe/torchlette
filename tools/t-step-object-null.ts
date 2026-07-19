@@ -121,7 +121,13 @@ async function main() {
     const loss = api.tidy(() => {
       const l = api.autocast(
         () =>
-          model.forwardWithLoss(input, target, { useCheckpoint: true }).loss,
+          // useCheckpoint:false — the D3 CHECKPOINT_EAGER_REFUSAL (executor.ts,
+          // sunset-bound) keeps checkpointed-eager plans LOWERED by design,
+          // which forms no compiled tape → no witnessed StepObject. The
+          // step-object null/edit properties this gate asserts are
+          // checkpoint-independent; checkpoint-compile coverage lives under
+          // whole-step remat (t-whole-step-diff) + the refusal spec.
+          model.forwardWithLoss(input, target, { useCheckpoint: false }).loss,
       );
       api.keep(l);
       return l;
