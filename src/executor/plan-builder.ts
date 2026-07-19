@@ -3,6 +3,7 @@ import { sizeOf } from "../core/shape";
 import type { ExecutionPlan, LazyIRNode, LazyRef } from "../graph/types";
 import { isFusibleOp } from "../compiler/fusion-detect";
 import { analyzeLifetimes, type TensorLifetime } from "../graph/lifetime-analysis";
+import { NumMinHeap } from "../graph/num-min-heap";
 
 /**
  * Mark a LazyIRNode as a checkpoint boundary.
@@ -64,20 +65,36 @@ export function buildMergedPlan(
   const nodes: LazyIRNode[] = [];
   const visited = new Set<LazyIRNode>();
 
-  const visit = (ref: LazyRef) => {
-    if (ref.kind !== "pending") return;
-    if (skipExecuted && (ref.node.result || ref.node._executed)) return;
-    if (visited.has(ref.node)) return;
-    visited.add(ref.node);
-
-    for (const input of ref.node.inputs) {
-      visit(input);
-    }
-    nodes.push(ref.node);
+  // Iterative DFS postorder (was recursive `visit`): whole-step graphs reach
+  // 5–15k nodes with dependency chains thousands deep, which overflows the JS
+  // call stack. An explicit work-stack of {node, next-input-index} frames emits
+  // each node after all its inputs — byte-identical order to the old recursion
+  // (same input-index traversal, same shared `visited`, same root order).
+  const shouldVisit = (ref: LazyRef): boolean => {
+    if (ref.kind !== "pending") return false;
+    if (skipExecuted && (ref.node.result || ref.node._executed)) return false;
+    return !visited.has(ref.node);
   };
-
+  const stack: Array<{ node: LazyIRNode; i: number }> = [];
   for (const root of roots) {
-    visit({ kind: "pending", node: root });
+    if (!shouldVisit({ kind: "pending", node: root })) continue;
+    visited.add(root);
+    stack.push({ node: root, i: 0 });
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1];
+      if (frame.i < frame.node.inputs.length) {
+        const input = frame.node.inputs[frame.i++];
+        if (shouldVisit(input)) {
+          // input is pending here (shouldVisit gated it).
+          const child = (input as { node: LazyIRNode }).node;
+          visited.add(child);
+          stack.push({ node: child, i: 0 });
+        }
+      } else {
+        nodes.push(frame.node);
+        stack.pop();
+      }
+    }
   }
 
   return { nodes: enforceWriteAfterReadOrder(nodes) };
@@ -159,10 +176,29 @@ export function enforceWriteAfterReadOrder(nodes: LazyIRNode[]): LazyIRNode[] {
   // affinity tie-break otherwise regroups same-op nodes across segments,
   // breaking segment-local execution assumptions: "Input not ready" in
   // checkpoint mode). Constrain every node to its original side.
-  for (let b = 0; b < nodes.length; b++) {
-    if (!nodes[b].isCheckpointBoundary) continue;
-    for (let i = 0; i < b; i++) addEdge(i, b);
-    for (let j = b + 1; j < nodes.length; j++) addEdge(b, j);
+  //
+  // The barrier is encoded with O(n) segment edges, not the old O(B·n)
+  // all-pairs (every node before b → b, b → every node after): each node gets
+  // one edge FROM the previous boundary and one edge TO the boundary ending its
+  // segment. Boundaries chain (prev→next) through this same rule, so the
+  // transitive order is identical to all-pairs — same partial order → same
+  // deterministic Kahn output — at a fraction of the edges.
+  const boundaryIdx: number[] = [];
+  for (let i = 0; i < nodes.length; i++) {
+    if (nodes[i].isCheckpointBoundary) boundaryIdx.push(i);
+  }
+  if (boundaryIdx.length > 0) {
+    let bp = 0; // first boundary at index >= i
+    let prevBoundary = -1; // last boundary at index < i
+    for (let i = 0; i < nodes.length; i++) {
+      while (bp < boundaryIdx.length && boundaryIdx[bp] < i) {
+        prevBoundary = boundaryIdx[bp];
+        bp++;
+      }
+      const endBoundary = bp < boundaryIdx.length ? boundaryIdx[bp] : -1;
+      if (prevBoundary >= 0) addEdge(prevBoundary, i);
+      if (endBoundary >= 0 && endBoundary !== i) addEdge(i, endBoundary);
+    }
   }
   for (let i = 0; i < nodes.length; i++) {
     const dstInputs = IN_PLACE_DST_INPUTS[nodes[i].op];
@@ -187,23 +223,27 @@ export function enforceWriteAfterReadOrder(nodes: LazyIRNode[]): LazyIRNode[] {
   // affinity apply (min-original-index tie-break).
 
   // Kahn with min-original-index tie-break (deterministic, order-preserving
-  // when constraints allow).
-  const heap: number[] = []; // simple sorted insertion; plans are small
+  // when constraints allow). Ready nodes live in a min-heap by index (was a
+  // sorted-array `splice`, O(ready) per op → O(n²) on the whole-step graph's
+  // O(n)-wide frontier: the backward/optimizer fan-out puts thousands of nodes
+  // ready at once). A per-op min-heap serves the affinity tie-break in O(log n)
+  // instead of the old O(ready) scan; both share an `emitted` flag for lazy
+  // deletion of stale tops.
+  const globalHeap = new NumMinHeap();
+  const opHeaps = new Map<string, NumMinHeap>();
+  const emitted = new Uint8Array(nodes.length);
   const pushReady = (i: number) => {
-    let lo = 0;
-    let hi = heap.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (heap[mid] < i) lo = mid + 1;
-      else hi = mid;
-    }
-    heap.splice(lo, 0, i);
+    globalHeap.push(i);
+    const op = nodes[i].op;
+    let oh = opHeaps.get(op);
+    if (!oh) opHeaps.set(op, (oh = new NumMinHeap()));
+    oh.push(i);
   };
   for (let i = 0; i < nodes.length; i++) if (indeg[i] === 0) pushReady(i);
   const order: LazyIRNode[] = [];
   let lastOp: string | null = null;
   let lastOpAffine = false;
-  while (heap.length > 0) {
+  while (order.length < nodes.length) {
     // AFFINITY tie-break (generic same-op batching): when the last emitted
     // node is a NON-FUSIBLE op (sequential dispatch — adamStep, scatters,
     // unscaleGrad, ...) and another ready node has the same op, continue the
@@ -213,16 +253,20 @@ export function enforceWriteAfterReadOrder(nodes: LazyIRNode[]): LazyIRNode[] {
     // works for any op. Fusible ops keep strict original order: their
     // adjacency IS the fusion-reorder's chain layout, which must not be
     // perturbed. Deterministic: first (min-index) same-op ready node wins.
-    let pick = 0;
-    if (lastOpAffine && heap.length > 1) {
-      for (let h = 0; h < heap.length; h++) {
-        if (nodes[heap[h]].op === lastOp) {
-          pick = h;
-          break;
-        }
+    let i = -1;
+    if (lastOpAffine) {
+      const oh = opHeaps.get(lastOp as string);
+      if (oh) {
+        while (oh.size > 0 && emitted[oh.peek()]) oh.pop();
+        if (oh.size > 0) i = oh.pop();
       }
     }
-    const i = heap.splice(pick, 1)[0];
+    if (i === -1) {
+      while (globalHeap.size > 0 && emitted[globalHeap.peek()]) globalHeap.pop();
+      if (globalHeap.size === 0) break; // cycle — caught by length check below
+      i = globalHeap.pop();
+    }
+    emitted[i] = 1;
     order.push(nodes[i]);
     lastOp = nodes[i].op;
     lastOpAffine = !isFusibleOp(lastOp);

@@ -20,6 +20,7 @@ import type {
 } from "../backend/webgpu/fusion-types";
 import { shapesEqual } from "../core/shape";
 import type { LazyIRNode, LazyRef } from "../graph/types";
+import { NumMinHeap } from "../graph/num-min-heap";
 import { OP_REGISTRY } from "../ops/registry";
 
 /**
@@ -129,22 +130,27 @@ function processCandidate(
   subIndices: number[],
   subNodeIds: Set<number>,
   internalDeps: number[][],
-  allPlanNodes: LazyIRNode[],
+  consumersById: Map<number, number[]>,
   externalNodeIds: Set<number> | undefined,
   enableMultiOutput: boolean,
   maxBuffers: number,
   outGroups: FusionGroup[],
 ): void {
-  // Find intermediate nodes referenced from outside the group
+  // Find intermediate nodes referenced from outside the group. Was an
+  // O(subNodes·allPlanNodes) rescan of the entire plan per intermediate — the
+  // dominant whole-step-graph O(n²) (a big island × every plan node). Now a
+  // per-producer consumer map (built once in detectFusionGroups) makes it
+  // O(consumers) per intermediate → O(edges) total. Byte-identical: k is marked
+  // iff some consumer of subNodes[k] lies outside subNodeIds.
   const externallyReferenced = new Set<number>(); // positions within subNodes
   for (let k = 0; k < subNodes.length - 1; k++) {
     const intermediateId = subNodes[k].id;
-    // Check if any node outside the group references this intermediate
-    for (const node of allPlanNodes) {
-      if (subNodeIds.has(node.id)) continue;
-      for (const input of node.inputs) {
-        if (input.kind === "pending" && input.node.id === intermediateId) {
+    const cons = consumersById.get(intermediateId);
+    if (cons) {
+      for (const cid of cons) {
+        if (!subNodeIds.has(cid)) {
           externallyReferenced.add(k);
+          break;
         }
       }
     }
@@ -347,7 +353,7 @@ function proposeCandidateIslands(
  */
 function splitCandidatesByComponent(
   candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }>,
-  nodes: LazyIRNode[],
+  consumersById: Map<number, number[]>,
   externalNodeIds: Set<number> | undefined,
   enableMultiOutput: boolean,
   maxBuffers: number,
@@ -425,7 +431,7 @@ function splitCandidatesByComponent(
         subIndices,
         subNodeIds,
         internalDeps,
-        nodes,
+        consumersById,
         externalNodeIds,
         enableMultiOutput,
         maxBuffers,
@@ -570,7 +576,11 @@ function batchGlobalSingletons(
       const batchNodeIds = new Set<number>();
       const seenInputs = new Set<string>();
       let batchMaxPos = -1;
-      let batchMinPos = Infinity;
+      // Running min of earliestConsumer over the batch members (Infinity when a
+      // member has no consumer). The ordering check below is exactly "some
+      // member's earliest consumer is at or before candidateMaxPos" — a running
+      // min makes it O(1) instead of an O(batch) rescan (was O(batch²)/batch).
+      let batchMinEC = Infinity;
       let endJ = batchStart;
 
       for (let j = batchStart; j < sameBucket.length; j++) {
@@ -579,38 +589,16 @@ function batchGlobalSingletons(
         const node = entry.node;
 
         const candidateMaxPos = Math.max(batchMaxPos, entry.planIndex);
-        const candidateMinPos = Math.min(batchMinPos, entry.planIndex);
 
-        let orderingSafe = true;
-        for (const prev of batchEntries) {
-          const ec = earliestConsumer.get(prev.node.id);
-          if (ec !== undefined && ec <= candidateMaxPos) {
-            orderingSafe = false;
-            break;
-          }
-        }
-        if (orderingSafe) {
-          const ec = earliestConsumer.get(entry.node.id);
-          if (ec !== undefined && ec <= candidateMaxPos) {
-            orderingSafe = false;
-          }
-        }
-        if (orderingSafe && batchEntries.length > 0) {
-          for (let g = candidateMinPos + 1; g < candidateMaxPos; g++) {
-            const gapNode = nodes[g];
-            if (!gapNode) continue;
-            for (const input of gapNode.inputs) {
-              if (
-                input.kind === "pending" &&
-                (batchNodeIds.has(input.node.id) || input.node.id === node.id)
-              ) {
-                orderingSafe = false;
-                break;
-              }
-            }
-            if (!orderingSafe) break;
-          }
-        }
+        // Ordering-safety: no batch member (existing or the new candidate) may
+        // have a consumer at or before candidateMaxPos, else a node between the
+        // batch's extremes would read a batched output before the batch runs.
+        // Because every member's earliest consumer is strictly after
+        // candidateMaxPos when this passes, no gap node in (minPos, maxPos) can
+        // consume a member — so the former O(maxPos−minPos) gap rescan was
+        // provably a no-op and is gone.
+        const ecEntry = earliestConsumer.get(entry.node.id) ?? Infinity;
+        let orderingSafe = batchMinEC > candidateMaxPos && ecEntry > candidateMaxPos;
         if (!orderingSafe) break;
 
         addInputKeys(node, seenInputs);
@@ -624,7 +612,7 @@ function batchGlobalSingletons(
         batchEntries.push(entry);
         batchNodeIds.add(node.id);
         batchMaxPos = candidateMaxPos;
-        batchMinPos = candidateMinPos;
+        if (ecEntry < batchMinEC) batchMinEC = ecEntry;
       }
 
       if (batchEntries.length < 2) {
@@ -719,10 +707,25 @@ export function detectFusionGroups(
     excludedIds,
   );
 
+  // Per-producer consumer map (node id → consumer node ids), built once and
+  // shared by the component split's external-reference check — replaces a
+  // per-intermediate full-plan rescan (O(n²) at whole-step scale).
+  const consumersById = new Map<number, number[]>();
+  for (const node of nodes) {
+    for (const input of node.inputs) {
+      if (input.kind === "pending") {
+        const pid = input.node.id;
+        let l = consumersById.get(pid);
+        if (!l) consumersById.set(pid, (l = []));
+        l.push(node.id);
+      }
+    }
+  }
+
   // Phase 2: Split into connected components, process each, batch singletons
   const groups = splitCandidatesByComponent(
     candidates,
-    nodes,
+    consumersById,
     externalNodeIds,
     enableMultiOutput,
     maxBuffers,
@@ -1267,6 +1270,16 @@ export function segmentPlanForExecution(
     return indexToGroup.has(idx);
   }
 
+  // Ancestor-walk visited set, SHARED across all gap nodes (was per-gap-node,
+  // making the walk O(gapNodes·chainDepth) = O(n²) on long sequential runs).
+  // Sound to share: the walk flushes every un-emitted group it reaches, and
+  // groups only ever transition un-emitted → emitted, so once a node's subtree
+  // has been walked its group-deps are all flushed and it never needs
+  // re-walking. The FIRST gap node reaching an un-emitted group still flushes
+  // it at the same point (a later gap node only reaches it through an
+  // already-walked node, whose first walker already flushed it) → the segment
+  // split sequence is byte-identical.
+  const walkVisited = new Set<number>();
   let i = 0;
   while (i < nodes.length) {
     const group = indexToGroup.get(i);
@@ -1289,7 +1302,7 @@ export function segmentPlanForExecution(
         const node = nodes[i];
         // Check if this gap node (or any ancestor) depends on a
         // not-yet-emitted fusion group. Walk the dependency chain.
-        const visited = new Set<number>();
+        const visited = walkVisited;
         const stack = [node];
         while (stack.length > 0) {
           const cur = stack.pop()!;
@@ -1467,119 +1480,101 @@ function hasPendingInputIn(node: LazyIRNode, nodeIdSet: Set<number>): boolean {
 }
 
 /**
-/**
- * Priority selection for Kahn's algorithm:
- * P0 = fusible node continuing current chain (has pending input in chain),
- * P1 = fusible node (new chain),
- * P2 = non-fusible.
- * Ties broken by original DFS position (determinism).
- */
-function selectBestForFusion(
-  ready: Set<number>,
-  chainNodeIds: Set<number>,
-  nodeById: Map<number, LazyIRNode>,
-  originalPos: Map<number, number>,
-): number {
-  let bestId = -1;
-  let bestPriority = 3;
-  let bestPos = Infinity;
-
-  for (const id of ready) {
-    const node = nodeById.get(id) as LazyIRNode;
-    const fusible = isFusibleOp(node.op);
-    let priority: number;
-
-    if (
-      fusible &&
-      chainNodeIds.size > 0 &&
-      hasPendingInputIn(node, chainNodeIds)
-    ) {
-      priority = 0; // Chain continuation
-    } else if (fusible) {
-      priority = 1; // New chain
-    } else {
-      priority = 2; // Non-fusible
-    }
-
-    const pos = originalPos.get(id) as number;
-    if (
-      priority < bestPriority ||
-      (priority === bestPriority && pos < bestPos)
-    ) {
-      bestId = id;
-      bestPriority = priority;
-      bestPos = pos;
-    }
-  }
-  return bestId;
-}
-
-/**
  * Reorder a lazy execution plan to cluster fusible dependency chains together.
  * Uses Kahn's algorithm (topological sort) with a priority function that
  * prefers emitting fusible nodes adjacent to each other.
  *
  * This is a pure optimization — the output is always a valid topological order,
  * so all existing downstream code works unchanged.
+ *
+ * Selection (min over (priority, original-position)) is unchanged from the old
+ * `selectBestForFusion` full-ready-set scan, but realized with per-priority
+ * min-heaps instead of an O(ready) rescan per emit — the whole-step backward
+ * frontier is O(n) wide, so the scan was the compile-path's second O(n²) spot.
+ * Priorities: P0 = fusible continuing the current chain, P1 = fusible new
+ * chain, P2 = non-fusible. A ready node's P0-ness is fixed when it becomes
+ * ready (its inputs are all emitted by then; the chain never re-adds an
+ * already-emitted node) and only DECAYS on a chain reset — tracked by an epoch
+ * stamp so a stale P0 entry is lazily skipped and falls back to its P1 slot.
  */
 export function reorderPlanForFusion(nodes: LazyIRNode[]): LazyIRNode[] {
   if (nodes.length <= 2) return nodes;
 
-  // 1. Build maps: nodeById, originalPosition (for deterministic tie-breaking)
-  const nodeById = new Map<number, LazyIRNode>();
-  const originalPos = new Map<number, number>();
-  for (let i = 0; i < nodes.length; i++) {
-    nodeById.set(nodes[i].id, nodes[i]);
-    originalPos.set(nodes[i].id, i);
-  }
+  const n = nodes.length;
+  // Index-based structures (position i ↔ nodes[i]); id maps only for edges.
+  const posById = new Map<number, number>();
+  for (let i = 0; i < n; i++) posById.set(nodes[i].id, i);
 
-  // 2. Compute in-degree + successor lists (only edges within the plan)
-  const inDegree = new Map<number, number>();
-  const successors = new Map<number, number[]>();
-  for (const node of nodes) {
-    inDegree.set(node.id, 0);
-    successors.set(node.id, []);
-  }
-  for (const node of nodes) {
-    for (const input of node.inputs) {
-      if (input.kind === "pending" && nodeById.has(input.node.id)) {
-        inDegree.set(node.id, (inDegree.get(node.id) as number) + 1);
-        successors.get(input.node.id)?.push(node.id);
+  const inDegree = new Int32Array(n);
+  const successors: number[][] = Array.from({ length: n }, () => []);
+  for (let i = 0; i < n; i++) {
+    for (const input of nodes[i].inputs) {
+      if (input.kind === "pending") {
+        const pi = posById.get(input.node.id);
+        if (pi !== undefined) {
+          inDegree[i]++;
+          successors[pi].push(i);
+        }
       }
     }
   }
 
-  // 3. Initialize ready set with in-degree 0 nodes
-  const ready = new Set<number>();
-  for (const node of nodes) {
-    if (inDegree.get(node.id) === 0) ready.add(node.id);
-  }
+  const fusible = new Uint8Array(n);
+  for (let i = 0; i < n; i++) fusible[i] = isFusibleOp(nodes[i].op) ? 1 : 0;
 
-  // 4. Kahn's with fusion-aware priority
-  const result: LazyIRNode[] = [];
-  // Track the set of fusible node IDs that form the "current chain"
-  let chainNodeIds = new Set<number>();
+  const emitted = new Uint8Array(n);
+  const p0epoch = new Int32Array(n).fill(-1);
+  const p0Heap = new NumMinHeap(); // fusible ready, currently chain-continuing
+  const fusHeap = new NumMinHeap(); // all fusible ready (P0 ∪ P1)
+  const nfHeap = new NumMinHeap(); // non-fusible ready
+  const chainNodeIds = new Set<number>();
+  let epoch = 0;
 
-  while (ready.size > 0) {
-    const best = selectBestForFusion(
-      ready,
-      chainNodeIds,
-      nodeById,
-      originalPos,
-    );
-    ready.delete(best);
-    const bestNode = nodeById.get(best) as LazyIRNode;
-    result.push(bestNode);
-    if (isFusibleOp(bestNode.op)) {
-      chainNodeIds.add(best);
+  const classifyReady = (i: number): void => {
+    if (fusible[i]) {
+      fusHeap.push(i);
+      if (chainNodeIds.size > 0 && hasPendingInputIn(nodes[i], chainNodeIds)) {
+        p0epoch[i] = epoch;
+        p0Heap.push(i);
+      }
     } else {
-      chainNodeIds = new Set();
+      nfHeap.push(i);
     }
+  };
+  for (let i = 0; i < n; i++) if (inDegree[i] === 0) classifyReady(i);
 
-    for (const succId of successors.get(best) as number[]) {
-      const newDeg = (inDegree.get(succId) as number) - 1;
-      inDegree.set(succId, newDeg);
-      if (newDeg === 0) ready.add(succId);
+  const result: LazyIRNode[] = [];
+  let remaining = n;
+  while (remaining > 0) {
+    // P0: min-position fusible ready that still continues the current chain.
+    while (p0Heap.size > 0) {
+      const t = p0Heap.peek();
+      if (emitted[t] || p0epoch[t] !== epoch) p0Heap.pop();
+      else break;
+    }
+    let picked: number;
+    if (p0Heap.size > 0) {
+      picked = p0Heap.pop();
+    } else {
+      while (fusHeap.size > 0 && emitted[fusHeap.peek()]) fusHeap.pop();
+      if (fusHeap.size > 0) {
+        picked = fusHeap.pop();
+      } else {
+        while (nfHeap.size > 0 && emitted[nfHeap.peek()]) nfHeap.pop();
+        picked = nfHeap.pop();
+      }
+    }
+    emitted[picked] = 1;
+    remaining--;
+    result.push(nodes[picked]);
+    if (fusible[picked]) {
+      chainNodeIds.add(nodes[picked].id);
+    } else {
+      chainNodeIds.clear();
+      epoch++; // chain reset — all prior P0 stamps go stale
+    }
+    for (const j of successors[picked]) {
+      if (--inDegree[j] === 0) classifyReady(j);
     }
   }
 
