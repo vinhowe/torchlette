@@ -7,6 +7,7 @@ const GPU_TEST_FILES = [
   "test/webgpu/*.spec.ts",
   "test/webgpu.spec.ts",
   "test/amp-speed-verification.spec.ts",
+  "test/argmax-strided-view.spec.ts",
   "test/autograd-scope-lifetime.spec.ts",
   "test/batch-execution-test.spec.ts",
   "test/capture.spec.ts",

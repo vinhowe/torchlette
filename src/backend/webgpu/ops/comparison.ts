@@ -30,6 +30,7 @@ import {
 import { realizeArgReduceWgsl as argReduceWGSL } from "../../../schedule/reduction-skeleton";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import { comparisonWGSL } from "./ops-tile-ir";
+import { contiguous } from "./views";
 
 function comparisonOp(
   wgslOp: string,
@@ -116,7 +117,33 @@ function argReduceOp(
   options: ArgReduceOptions,
 ): BackendTensor {
   const ctx = requireContext();
-  const tensor = asGPUTensor(a);
+  let tensor = asGPUTensor(a);
+
+  // Materialize non-raw-bindable inputs: the arg-reduce kernel derives its
+  // input addressing from `contiguousStrides(inputShape)` and binds the buffer
+  // flat from element 0 — so a STRIDED view (narrow) or an OFFSET view (a
+  // last-position row out of a multi-token logits tensor) would be indexed with
+  // the wrong strides AND from the wrong base, silently returning the wrong
+  // index (measured on decode: argmax over a doubly-narrowed logits row gave 40
+  // vs the correct 995). Mirror the sum/max reduction guard (reductions.ts,
+  // task #58): force contiguous so the kernel's contiguous-stride assumption is
+  // TRUE. Cheap — a decode reduction row is a single vector.
+  let contiguousCopy: ReturnType<typeof asGPUTensor> | null = null;
+  if (!tensor.isContiguous || (tensor.offset ?? 0) !== 0) {
+    tensor = asGPUTensor(contiguous(tensor));
+    contiguousCopy = tensor;
+  }
+  // Seam assertion (single source of truth): the kernel assumes a contiguous,
+  // offset-0 reduction row. Assert it here rather than let a future non-raw-
+  // bindable input mis-index silently (the exact failure this op just fixed).
+  if (!tensor.isContiguous || (tensor.offset ?? 0) !== 0) {
+    throw new Error(
+      `${opName}: reduction input must be contiguous with offset 0 at the ` +
+        `dispatch seam (kernel derives addressing from contiguousStrides); got ` +
+        `isContiguous=${tensor.isContiguous}, offset=${tensor.offset ?? 0}.`,
+    );
+  }
+
   const inputShape = tensor.shape;
   const rank = inputShape.length;
 
@@ -198,6 +225,7 @@ function argReduceOp(
   dispatchComputePass(pipeline, bindGroup, Math.ceil(outSize / WORKGROUP_SIZE));
 
   releaseParamsBuffer(paramsBuffer);
+  if (contiguousCopy) contiguousCopy.destroy();
 
   return createTensor(outShape, outBuffer);
 }
