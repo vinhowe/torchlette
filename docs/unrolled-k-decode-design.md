@@ -349,13 +349,18 @@ every new flag is born with a sunset.
   (not CE/`op:max`): the block's `argmax` feedback op is the single build-from-IR
   uncovered op, and it is P2's precise coverage input.
 
-- **P2 — Compile + replay the block; measure the real multiplier.** Route `S_dec`
-  through the whole-step build-from-IR compiler + global memory planner (it is a static
-  single-force graph — the compiler's native diet). Gate: the block reaches compiled
-  replay within a bucket (template converges, unlike growing-KV Probe 2), memory flat,
-  and the compiled ms/tok beats the 30.8 ms lowered floor. Re-measure the economics
-  (Probe 3/4 arms) compiled + **in-browser** (the real target). *First honest speed
-  win beyond the 1.6× host-tax amortization.*
+- **P2 — Compile + replay the block; measure the real multiplier. PARTIAL — see
+  "P2 STATUS" below.** Route `S_dec` through the whole-step build-from-IR compiler.
+  **Landed:** three single-sourced generators (arg-reduce, max/min routing,
+  fusedRMSNormForward) that shrink the block's runtime census from a *reasoned*
+  `{arg-reduce}` (P1, optimistic) to a *measured* **`{fusedRoPE}`** — the block is now
+  ONE generator from full coverage. **Measured multiplier:** the host-tax amortization
+  is **~1.8× (host/block-low, N=64 A100)**, re-confirmed at scale. **Not yet realized:**
+  compiled *forward* replay — `fusedRoPE`'s per-position offset is a per-replay-varying
+  uniform that must flow as DATA (a volatile config repack), so today build-from-IR is
+  net-negative on the block (wasted failed-coverage attempts) and decode runs best
+  lowered. *The compiled win the design projected is gated on the bounded RoPE-offset-
+  as-data follow-on, NOT on arg-reduce.*
 
 - **P3 — Stochastic sampling on-device (Gumbel-max + seed-as-data).** Add the
   categorical prologue (§3.5) and small-top-k; thread the per-block seed as data.
@@ -605,6 +610,132 @@ op is what lets the block reach compiled replay (P2's gate).
 green; decode paths unchanged when the flag is off (block branch compile-time-guarded);
 strict-lifetime default. Weight-norm: `src` SLOC unchanged for the product surface (it
 lives in `packages/`); the argmax fix adds ~20 code lines to `src/backend/webgpu/ops/comparison.ts`.
+
+---
+
+## P2 STATUS — compiling the block: generators, the corrected census, the real multiplier (2026-07-19)
+
+*Worktree off `main@4334bf9d` (P1 HEAD). Staged commits, no push. dw-2-1 (A100),
+random-init Qwen3 (packages/qwen3-browser, the static-KV `forwardStatic` path),
+node v22 + Dawn/Vulkan vk-shim. Reproduce: `eval "$(tools/pick-gpu.sh)";
+LD_LIBRARY_PATH=tools/vk-shim:$LD_LIBRARY_PATH npx tsx tools/t-uk-multiplier.ts`
+(the multiplier), `… tools/t-uk-generators-parity.ts` (generator compiled-parity),
+`… tools/t-uk-block-diff.ts` (the mother gate + compiled arm).*
+
+### The corrected census — P1's `{arg-reduce}` was optimistic; the truth is `{fusedRoPE}`
+
+P1's census was a *reasoned* claim from the generator table, not a runtime capture,
+and it was wrong: it assumed "the base static-KV decode forward already compiles"
+and so named `arg-reduce` as the block's ONLY uncovered op. The **runtime** census
+(`TORCHLETTE_DEBUG_CENSUS=1`, gated at the build-from-IR `generateStream` seam) on
+the real K=8 block — a single **~1049-node** plan (the whole unrolled block, one
+force) — shows the decode forward leaves **five** classes uncovered on first sight
+and, after warmup (config buffers populated), **three** that persist:
+
+| uncovered op (steady) | per-step | why | P2 action |
+|---|---|---|---|
+| `argmax` (arg-reduce feedback) | 1 | `generateSequential` had no arg-reduce case | **generator added** ✓ |
+| `op:max` (softmax max-subtract) | 2 | routing only sent `sum`/`mean` to the monoid-generic serializer | **routed max/min** ✓ |
+| `fusedRMSNormForward` | 9 | no generator (Qwen3 is RMSNorm, not LayerNorm) | **generator added** ✓ |
+| `fusedRoPE` | 4 | **per-position offset is a per-replay-varying uniform** | **the lone residual — see below** |
+
+(`op:sum[config-missing]` and `fused[no-input-pattern]` are FIRST-EXECUTION artifacts
+— the tile plan's config buffer / external-input pattern is captured by
+`populateCapturesFromIR` on the first run and covered on the 2nd+; they are NOT
+steady uncovered ops.) After the three P2 generators, coverage on the block is
+**972/1004 actions**, uncovered = **`{fusedRoPE}` only**.
+
+### What landed — three build-from-IR generators, all single-sourced
+
+1. **arg-reduce** (`generateArgReduce`, +`planArgReduceDispatch` single-sourced with
+   `argReduceOp`): ALLOC(indices) + one dispatch `[input, output, params(outSize,
+   dimSize, dimStride)]`, WGSL from the shared `argReduceWGSL`. Inherits the P1
+   contiguity seam (`argmax`/`argmin` → `[0]` in `CONTIGUOUS_OPERANDS`).
+2. **max/min reduction routing**: extended `generateSequential`'s reduction guard from
+   `sum|mean` to `sum|mean|max|min` — the serializer was already monoid-generic
+   (`planFull/DimReductionDispatch` take `decl.monoid`); max/min differ only in the
+   declared monoid. No new codegen.
+3. **fusedRMSNormForward** (`generateRMSNormForward`, +`planRMSNormForwardDispatch`
+   single-sourced with `dispatchRMSNormForward` via the shared `rmsNormFwdSpec`):
+   structurally identical to the proven `generateLayerNormForward` (two inputs, no
+   bias). `fusedRMSNormForward` → `[0,1]` contiguity-required.
+
+**Single-source argument:** every generator consumes the SAME plan helper / kernel
+spec the imperative dispatcher uses (the `planGatherDirect` pattern), so a divergence
+is a build-time DIVERGE, never a silent wrong stream. **Guardian:**
+`tools/t-uk-generators-parity.ts` builds a fully-covering graph
+`argmax(exp(rmsnorm(x,w) − max(rmsnorm(x,w))))`, runs it past the cutover threshold,
+and asserts the COMPILED ids are byte-identical to the lowered path AND that a
+template containing all three ops reached compiled replay (CLAUDE.md Corollary 2 — the
+differential crosses the activation threshold). **PASS.**
+
+### The one remaining blocker — `fusedRoPE`'s per-position offset
+
+RoPE's cos/sin are **narrow row-slices of a persistent `[maxSeqLen, D/2]` table**;
+the fused kernel folds the view's **element offset** (= position × D/2) into its
+config uniform (`model.ts` "folds the view's element offset", `rope-kernel.ts`
+`cos_offset`/`sin_offset`). That offset is **per-position**, so across the K unrolled
+steps AND across replayed blocks it VARIES. A build-from-IR generator that bakes the
+record-time offset would replay every block at the wrong position → wrong logits (the
+frozen-uniform class CLAUDE.md warns silently corrupted training twice). Covering RoPE
+correctly therefore requires the offset to flow as **DATA — a volatile `TAG_UNIFORM`
+that re-derives `cos_offset`/`sin_offset` from the current node per replay**
+(`directInputOffset`/`deriveNodeOffset` already exist; the missing piece is a
+volatile-config repack for the RoPE tile-kernel, analogous to `setAdamConfigUniforms`).
+That is a bounded, named follow-on — NOT a new-op generator — and it is the single
+gate between the block and full compiled replay.
+
+### THE REAL MULTIPLIER (measured, honest — random-init Qwen3 8L/512d, N=64, 3 repeats, medians)
+
+| K | block-low ms/tok | subs | block-def ms/tok | subs | host/low | host/def | low/def |
+|---|---|---|---|---|---|---|---|
+| 4 | 59.40 | 144 | 73.84 | 144 | **1.72×** | 1.39× | 0.80× |
+| 8 | 57.42 | 120 | 75.16 | 120 | **1.78×** | 1.36× | 0.76× |
+| 16 | 57.00 | 112 | 74.21 | 112 | **1.80×** | 1.38× | 0.77× |
+
+*host per-token loop: 102.31 ms/tok, 192 submits (K-independent).*
+
+- **block-low** = the unrolled K-block with build-from-IR DISABLED
+  (`TORCHLETTE_COMPILED_PLAN=0`) — pure lowered replay. **host/low ≈ 1.8×**: the
+  host-tax amortization (one fence per K instead of per token), ~1.7× fewer submits.
+  **This is the measured decode win today** — the same class P1 saw (~2.7× ms/tok on
+  the small config), re-confirmed at scale.
+- **block-def** = build-from-IR ENABLED (default) is **SLOWER** (low/def ≈ 0.77×):
+  because the block does **not** reach compiled replay (RoPE uncovered), every block
+  wastes a failed `generateStream` attempt on the ~1049-node template. **So today the
+  honest recommendation is: decode runs best LOWERED** (or with build-from-IR skipped
+  for a known-uncovered decode template); the compiled-forward win is **gated on the
+  RoPE generator**, not on arg-reduce.
+- **The design's P2 projection ("the full win is here, compiled") is NOT yet realized**
+  — it is one bounded generator (RoPE-offset-as-data) away. What IS realized and
+  measured: the host-tax amortization (~1.8× on A100, a strict lower bound for the
+  browser, where the fence is a larger share of the per-token wall).
+
+### Gates run
+
+`tools/gate-wall.sh --profile training` (green); `test/argmax-strided-view.spec.ts`
+(argmax op, green); `tools/t-uk-generators-parity.ts` (the P2 generator compiled-parity
+gate, PASS — argmax + max/min + RMSNorm compiled == lowered, cutover engaged);
+`tools/t-uk-block-diff.ts` (mother gate + the new **compiled arm**: build-from-IR
+ENABLED == DISABLED == host across the P1 matrix — partial coverage is faithful, all
+PASS); `tools/t-uk-feedback.ts` re-run green; decode paths byte-unchanged when
+`TORCHLETTE_UNROLLED_K` is off (block branch compile-time-guarded); strict-lifetime
+default. **Weight-norm delta:** `src` SLOC +~150 (the three generators +
+`planArgReduceDispatch`/`planRMSNormForwardDispatch` + the max/min routing), +1 debug
+flag (`TORCHLETTE_DEBUG_CENSUS`, the census diagnostic — a `DEBUG_*` category flag,
+mirroring `DEBUG_COMPILED`).
+
+### What P3 (Gumbel sampling) needs from RNG-as-data — unchanged, restated
+
+P3's on-device categorical is `argmax(logits/temp + gumbel)`, `gumbel = −log(−log(U))`,
+`U = randF32(seed_as_data, offset)` (§3.5). The arg-reduce generator this pass lands is
+**exactly the terminal op** of that expression, so P3's selection already compiles; its
+net-new need is the **seed/counter as a graph-threaded DATA uniform** so a replayed
+block advances RNG deterministically (the same scalars-as-data pattern as Adam's
+`step_size`). Notably, that need is the **same shape** as the RoPE-offset-as-data
+blocker above — both are per-replay-varying uniforms that must flow as data, not baked
+into the recording. Closing the RoPE volatile-config repack builds the exact mechanism
+P3's seed-as-data reuses.
 
 ---
 
