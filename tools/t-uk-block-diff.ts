@@ -241,6 +241,45 @@ async function main() {
     );
   }
 
+  // --- P2 COMPILED ARM: build-from-IR ENABLED vs DISABLED, both == host ---
+  // The K-block runs through the whole-step build-from-IR compiler by default.
+  // The P2 generators (arg-reduce + max/min + RMSNorm) now cover their nodes; the
+  // block does not YET reach full compiled replay (fusedRoPE is the lone residual
+  // uncovered op — see the P2 census; its generated-stream parity is gated
+  // separately by tools/t-uk-generators-parity.ts on a fully-covering graph). The
+  // load-bearing invariant here: the build-from-IR-ENABLED path (default) must be
+  // byte-identical to the pure-lowered path (COMPILED_PLAN=0) AND to the host
+  // reference — the partial coverage must never corrupt the block.
+  {
+    const p = prompts[0];
+    const N = 24;
+    const K = 8;
+    const ref = await hostLoop(api, model, p.ids, N);
+    await api.markStep();
+
+    const prev = process.env.TORCHLETTE_COMPILED_PLAN;
+    // arm A: build-from-IR ENABLED (default).
+    delete process.env.TORCHLETTE_COMPILED_PLAN;
+    const blkOn = await blockLoop(api, model, p.ids, N, K);
+    await api.markStep();
+    // arm B: build-from-IR DISABLED (pure lowered).
+    process.env.TORCHLETTE_COMPILED_PLAN = "0";
+    const blkOff = await blockLoop(api, model, p.ids, N, K);
+    await api.markStep();
+    if (prev === undefined) delete process.env.TORCHLETTE_COMPILED_PLAN;
+    else process.env.TORCHLETTE_COMPILED_PLAN = prev;
+
+    const eqOnHost =
+      ref.length === blkOn.length && ref.every((t, i) => t === blkOn[i]);
+    const eqOffHost =
+      ref.length === blkOff.length && ref.every((t, i) => t === blkOff[i]);
+    const eqOnOff =
+      blkOn.length === blkOff.length && blkOn.every((t, i) => t === blkOff[i]);
+    ok(eqOnHost, "compiled-arm: build-from-IR ENABLED block == host ids");
+    ok(eqOffHost, "compiled-arm: build-from-IR DISABLED block == host ids");
+    ok(eqOnOff, "compiled-arm: ENABLED == DISABLED (partial coverage is faithful)");
+  }
+
   // --- submits + ms/tok: block vs loop over N tokens ---
   {
     const p = prompts[0];
