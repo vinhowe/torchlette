@@ -31,6 +31,7 @@ import {
   resetCompileRefusalCount,
 } from "../src/executor/executor";
 import { Torchlette } from "../src/frontend/torchlette";
+import { Adam } from "../src/optim/index";
 import {
   resetNodeIdCounter,
   resetStorageIdCounter,
@@ -67,6 +68,17 @@ async function measureRefusals(mode: Mode): Promise<number> {
   });
   const model = new GPT2(api, CONFIG, { device: "webgpu" });
   model.train();
+  const params = model.parameters();
+  // An optimizer that consumes + zeroes the grads each step. Without it the
+  // param grads (graph-derived, NOT in the step snapshot — e.g. the wpe
+  // position-embedding grad, scatterAdd→add) persist across markStep, get
+  // demoted, and are read by the NEXT step's accumulation → a strict-lifetime
+  // RECLAIMED throw that is refusal-INDEPENDENT (it fires in every eager cell).
+  // The census tools run strict-clean because they step+zeroGrad every step;
+  // mirror their loop shape here. The optimizer is orthogonal to the refusal
+  // (which is set at the checkpoint FORWARD site) — it only supplies boundary
+  // discipline for the grads.
+  const opt = new Adam(params, { lr: 1e-4 }, api);
   const useCheckpoint = mode !== "eager-nockpt";
   const ckptOpts = { useCheckpoint, selectiveCheckpoint: false };
 
@@ -85,6 +97,8 @@ async function measureRefusals(mode: Mode): Promise<number> {
       const loss = out.sum();
       if (typeof loss === "number") throw new Error("expected tensor");
       await loss.backward();
+      opt.step();
+      opt.zeroGrad();
       loss.dispose();
     };
     if (mode === "remat-ckpt") {
