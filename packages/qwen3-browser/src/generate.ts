@@ -8,8 +8,8 @@
 
 import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
 import { stStats } from "torchlette";
-import type { Qwen3, ResidualHook } from "./model";
-import { kvBucketLen } from "./model";
+import type { Qwen3, ResidualHook, StaticKV } from "./model";
+import { KV_BUCKET, kvBucketLen } from "./model";
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
@@ -78,6 +78,128 @@ export type GenerateStats = {
 export const QWEN3_STOP_TOKENS = new Set([
   151645 /* <|im_end|> */, 151643 /* <|endoftext|> */,
 ]);
+
+// ============================================================================
+// Unrolled-K greedy decode block (CRYSTAL-1 P1) — the static-KV product surface
+// ============================================================================
+//
+// FLAG: TORCHLETTE_UNROLLED_K = <K> (integer). Unset / <2 → OFF (per-token host
+// loop, the existing decode). K>=2 → generateChat decodes K greedy tokens per
+// GPU-boundary readback via decodeBlock() (greedy only; any sampler falls back
+// to the per-token loop — the §4 typed boundary).
+//
+// SUNSET: born 2026-07-19. Soak behind the opt-in flag → default-on (P4 cutover,
+// byte-identical stream gate) → the K=1 host loop is removed for greedy and the
+// flag/knob dies. A flag that outlives P6 is debt (house policy).
+//
+// Browser-safe env read: process may be absent; globalThis.__TORCHLETTE_ENV__ is
+// the browser hook (mirrors src/core/env.ts).
+export function unrolledKFromEnv(): number {
+  const env: Record<string, string | undefined> =
+    typeof process !== "undefined" && process.env
+      ? (process.env as Record<string, string | undefined>)
+      : {};
+  const g = globalThis as { __TORCHLETTE_ENV__?: Record<string, string> };
+  const raw =
+    g.__TORCHLETTE_ENV__?.TORCHLETTE_UNROLLED_K ?? env.TORCHLETTE_UNROLLED_K;
+  const k = Number(raw ?? "0");
+  return Number.isFinite(k) && k >= 2 ? Math.floor(k) : 0;
+}
+
+/**
+ * Clip a requested block size K to the largest count that keeps every step in
+ * ONE static-KV template: all K forwards must share a bucket length (§3.4). The
+ * K forwards write cache positions len..len+K-1; kvBucketLen(len+1) must equal
+ * kvBucketLen(len+K). Also clipped so the last write stays inside maxSeqLen.
+ */
+export function clipBlockToBucket(
+  len: number,
+  K: number,
+  maxSeqLen: number,
+): number {
+  const nextBoundary = Math.ceil((len + 1) / KV_BUCKET) * KV_BUCKET;
+  const roomInBucket = nextBoundary - len; // forwards until the bucket edge
+  const roomInSeq = maxSeqLen - len; // last write at len+K-1 <= maxSeqLen-1
+  return Math.max(1, Math.min(K, roomInBucket, roomInSeq));
+}
+
+/** Minimal static-KV model surface decodeBlock needs (Qwen3 / Gemma2 satisfy). */
+export interface StaticDecodeModel {
+  forward(
+    idx: Tensor,
+    options: { staticKV: StaticKV; residualHook?: ResidualHook },
+  ): { logits: Tensor };
+  config: { vocabSize: number; maxSeqLen: number };
+}
+
+/**
+ * UNROLLED-K GREEDY DECODE BLOCK (S_dec) on the static-KV path.
+ *
+ * Runs `K` greedy decode steps as ONE lazy graph whose per-token sampling
+ * feedback closes ON-DEVICE: each step's `argmax(logits)` is a token-id TENSOR
+ * fed straight into the next step's embedding gather — no host readback between
+ * tokens. The KV cache scatters at static positions (advanced host-side at graph
+ * BUILD time, so the per-step rope/scatter/mask upload tensors carry the right
+ * positions as DATA). K is clipped to the bucket edge so the block is a single
+ * stable template. Exactly ONE readback of the K ids happens at the boundary;
+ * the host truncates on the first stop token (§3.3 — compute all K, truncate at
+ * readback). Greedy only (P3 adds on-device sampling).
+ *
+ * `lastTok` is the token fed into the FIRST step (a host value, exactly like the
+ * per-token loop's `nextTok`); the returned `ids` are the K greedy tokens it
+ * produces. `staticKV.len` advances by the clipped K.
+ *
+ * Forces the block with a SINGLE readback — the caller owns step boundaries
+ * (markStep) and the KV lifetime, as in generateChat.
+ */
+export async function decodeBlock(
+  api: Torchlette,
+  model: StaticDecodeModel,
+  staticKV: StaticKV,
+  lastTok: number,
+  K: number,
+  opts?: { residualHook?: ResidualHook; stopTokens?: Set<number> },
+): Promise<{ ids: number[]; stopIndex: number }> {
+  const maxSeq = model.config.maxSeqLen;
+  const Kc = clipBlockToBucket(staticKV.len, K, maxSeq);
+  const residualHook = opts?.residualHook;
+
+  const idTensors: Tensor[] = [];
+  // First input is the host token; every subsequent input is the on-device
+  // argmax id tensor (the argmax output IS the next gather index).
+  let idx: Tensor = api.tensorFromArray([lastTok], [1, 1]);
+  for (let j = 0; j < Kc; j++) {
+    const logits = api.noGrad(
+      () => model.forward(idx, { staticKV, residualHook }).logits,
+    ); // [1,1,vocab] — the decode row is contiguous
+    const id = api.noGrad(() =>
+      api.argmax(logits, { dim: -1, keepdim: false }),
+    ); // [1,1] LAZY f32 token id
+    idTensors.push(id);
+    idx = api.reshape(id, [1, 1]); // feed on-device into the next gather
+  }
+  // ONE readback of the whole block: cat the K ids and force once.
+  const stacked = api.cat(
+    idTensors.map((t) => api.reshape(t, [1, 1])),
+    1,
+  ); // [1,Kc]
+  const rawIds = await api.cpu(stacked);
+  const ids: number[] = [];
+  for (let i = 0; i < Kc; i++) ids.push(Math.round(rawIds[i]));
+
+  // Host truncation: index of the first stop token (or Kc if none).
+  const stopSet = opts?.stopTokens;
+  let stopIndex = Kc;
+  if (stopSet) {
+    for (let i = 0; i < Kc; i++) {
+      if (stopSet.has(ids[i])) {
+        stopIndex = i;
+        break;
+      }
+    }
+  }
+  return { ids, stopIndex };
+}
 
 /** Qwen3 chat format, thinking disabled (empty think block, per the official template). */
 export function buildChatPrompt(messages: ChatMessage[]): string {
@@ -202,6 +324,12 @@ export async function generateChat(
   );
   const isAborted = options?.isAborted ?? (() => false);
   const { temperature, topK, topP, residualHook } = options ?? {};
+  // Unrolled-K greedy block decode (TORCHLETTE_UNROLLED_K>=K). Greedy ONLY
+  // (temperature===0): any stochastic sampler stays on the per-token host loop
+  // (the §4 typed boundary — sampling moves on-device in P3). When blockK<2 the
+  // per-token path below is byte-identical to before.
+  const greedy = temperature === 0;
+  const blockK = greedy ? unrolledKFromEnv() : 0;
 
   const genIds: number[] = [];
   let prevText = "";
@@ -262,13 +390,9 @@ export async function generateChat(
         length: vocab,
       });
       logits.dispose();
-      nextTok = sampleFromTopK(
-        top.values,
-        top.indices,
-        temperature,
-        topK,
-        topP,
-      );
+      nextTok = greedy
+        ? top.indices[0] // greedy = argmax = top-K index 0 (bit-identical)
+        : sampleFromTopK(top.values, top.indices, temperature, topK, topP);
       await api.markStep();
     }
     const prefillMs = Date.now() - t0;
@@ -295,55 +419,102 @@ export async function generateChat(
     // one structural discriminator the arg surface can't express, so it is the
     // key's discriminator. When TORCHLETTE_STEP_TAPE is off the CapturedFn is a
     // transparent pass-through (identical behavior to before).
-    const decode = api.capture(
-      (idx: Tensor) =>
-        api.noGrad(() => model.forward(idx, { staticKV, residualHook }).logits),
-      // The modifier key is a STRUCTURAL discriminator like the bucket
-      // length: a model whose attention modifiers differ must never replay
-      // this model's tape ("" for the null modifier — key byte-stable).
-      {
-        key: () =>
-          `kv:bkt${kvBucketLen(staticKV.len + 1, maxSeq)}${
-            model.attnModKey ? `:mod${model.attnModKey}` : ""
-          }`,
-      },
-    );
-    while (count < maxNew && !QWEN3_STOP_TOKENS.has(nextTok) && !isAborted()) {
+    // decode CapturedFn is a per-token-path construct; null on the block path.
+    let decode: ReturnType<Torchlette["capture"]> | null = null;
+    if (blockK >= 2) {
+      // UNROLLED-K GREEDY BLOCK PATH (TORCHLETTE_UNROLLED_K). Emit the prefill
+      // token once, then decode K greedy tokens per GPU-boundary readback via
+      // decodeBlock (on-device argmax->gather feedback, one readback/block,
+      // bucket-clipped). Streaming granularity is K (§3.3); host truncation on
+      // the first stop token.
       emit(nextTok);
       count++;
-      const t0 = performance.now();
-      const logits = (await decode(
-        api.tensorFromArray([nextTok], [1, 1]),
-      )) as Tensor;
-      const t1 = performance.now();
-      // readTopK's synchronous prefix is the plan/lower/encode JS; the await is
-      // the GPU fence + the 512B top-K readback.
-      const readback = api.readTopK(logits, K_PREFILTER, { length: vocab });
-      const t2 = performance.now();
-      const top = await readback;
-      const t3 = performance.now();
-      logits.dispose();
-      nextTok = sampleFromTopK(
-        top.values,
-        top.indices,
-        temperature,
-        topK,
-        topP,
+      while (
+        count < maxNew &&
+        !QWEN3_STOP_TOKENS.has(nextTok) &&
+        !isAborted()
+      ) {
+        const t0 = performance.now();
+        const { ids, stopIndex } = await decodeBlock(
+          api,
+          model,
+          staticKV,
+          nextTok,
+          blockK,
+          { residualHook, stopTokens: QWEN3_STOP_TOKENS },
+        );
+        const t1 = performance.now();
+        await api.markStep();
+        const t2 = performance.now();
+        let brk = false;
+        for (let i = 0; i < ids.length; i++) {
+          if (i === stopIndex || count >= maxNew) {
+            brk = true;
+            break;
+          }
+          emit(ids[i]);
+          count++;
+        }
+        // Feed the LAST produced id into the next block (its KV is written
+        // there); it was already emitted this iteration, so no double-emit.
+        nextTok = ids[ids.length - 1];
+        tBuild += t1 - t0;
+        tStep += t2 - t1;
+        if (brk) break;
+      }
+    } else {
+      decode = api.capture(
+        (idx: Tensor) =>
+          api.noGrad(
+            () => model.forward(idx, { staticKV, residualHook }).logits,
+          ),
+        // The modifier key is a STRUCTURAL discriminator like the bucket
+        // length: a model whose attention modifiers differ must never replay
+        // this model's tape ("" for the null modifier — key byte-stable).
+        {
+          key: () =>
+            `kv:bkt${kvBucketLen(staticKV.len + 1, maxSeq)}${
+              model.attnModKey ? `:mod${model.attnModKey}` : ""
+            }`,
+        },
       );
-      const t4 = performance.now();
-      // markStep alone is the boundary: under setStepScopedCleanup its
-      // end-snapshot handles reclamation, and the tape's guard-5 treats an
-      // explicit endStep() as a REGIME PERTURBATION (comparator reset) — a
-      // per-token endStep here kept the tape permanently ineligible in the
-      // browser (the ceremony remnant f651365 missed; found via the
-      // boundary-reason counters: {"endStep": 80}).
-      await api.markStep();
-      const t5 = performance.now();
-      tBuild += t1 - t0;
-      tLower += t2 - t1;
-      tFence += t3 - t2;
-      tSample += t4 - t3;
-      tStep += t5 - t4;
+      while (count < maxNew && !QWEN3_STOP_TOKENS.has(nextTok) && !isAborted()) {
+        emit(nextTok);
+        count++;
+        const t0 = performance.now();
+        const logits = (await decode(
+          api.tensorFromArray([nextTok], [1, 1]),
+        )) as Tensor;
+        const t1 = performance.now();
+        // readTopK's synchronous prefix is the plan/lower/encode JS; the await
+        // is the GPU fence + the 512B top-K readback.
+        const readback = api.readTopK(logits, K_PREFILTER, { length: vocab });
+        const t2 = performance.now();
+        const top = await readback;
+        const t3 = performance.now();
+        logits.dispose();
+        nextTok = sampleFromTopK(
+          top.values,
+          top.indices,
+          temperature,
+          topK,
+          topP,
+        );
+        const t4 = performance.now();
+        // markStep alone is the boundary: under setStepScopedCleanup its
+        // end-snapshot handles reclamation, and the tape's guard-5 treats an
+        // explicit endStep() as a REGIME PERTURBATION (comparator reset) — a
+        // per-token endStep here kept the tape permanently ineligible in the
+        // browser (the ceremony remnant f651365 missed; found via the
+        // boundary-reason counters: {"endStep": 80}).
+        await api.markStep();
+        const t5 = performance.now();
+        tBuild += t1 - t0;
+        tLower += t2 - t1;
+        tFence += t3 - t2;
+        tSample += t4 - t3;
+        tStep += t5 - t4;
+      }
     }
     // End the per-generation KV lifetime DETERMINISTICALLY (task #79). The KV
     // slots are baseline-persistent (§6 static KV: root-scoped for the
@@ -371,6 +542,7 @@ export async function generateChat(
         (count / Math.max(seconds - prefillMs / 1000, 0.001)).toFixed(1),
       ),
       tape: (() => {
+        if (!decode) return undefined; // block path: no per-token CapturedFn
         const c = decode.stats();
         const r = stStats();
         return {
