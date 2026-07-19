@@ -16,8 +16,9 @@
  *     shadow-coverage signal;
  *   - cleanMisses == dirtyMisses == 0 (no pruned-then-demanded read — the witness
  *     set kept every read pair, the operational §4.4 empty-diff);
- *   - pruning demonstrably activated (prunedPairsRemoved > 0) — else "coverage" is
- *     trivial;
+ *   - [D3 refusal] the eager checkpoint cell is now the refusal's PROTECTED
+ *     (lowered, arena-on) config → prunedPairsRemoved == 0 by design; compiled-path
+ *     pruning + trajectory moved to the safe whole-step remat gate (t-d3-remat);
  *   - the interposed event (inf-skip / LR drop) produced NO corruption.
  *
  * The heavier matrix cells (medium@512, 124M chunked-sum) are run by the manual
@@ -90,8 +91,19 @@ describe("witness-time harvest — the #97 checkpoint config (phase 4)", () => {
     // C. operational §4.4 empty-diff: no pruned-then-demanded read.
     expect(v.cleanMisses).toBe(0);
     expect(v.dirtyMisses).toBe(0);
-    // D. pruning demonstrably activated (else coverage is trivial).
-    expect(v.prunedPairsRemoved).toBeGreaterThan(0);
+    // D. [D3 refusal — SUNSET-BOUND] The eager checkpoint config is now the
+    // refusal's PROTECTED config: the b66ead78 checkpoint+arena hazard keeps it
+    // LOWERED (all-or-nothing per step), so there is NO compiled-plan harvest to
+    // prune → prunedPairsRemoved == 0 BY DESIGN. This is the safe behavior the
+    // setBufferArenaDisabled bypass also enforces (production checkpointing runs
+    // arena-off = uncompiled). The #97 negative assertion (A) + the non-empty
+    // LOWERED-witness set (B: 384 stamped pairs via stampLoweredActionOutputs) +
+    // the zero-miss empty-diff (C) still guard the recompute-activation read on
+    // the lowered path. COMPILED-path pruning + trajectory for checkpointing is
+    // validated on the SAFE whole-step remat path by `tools/t-d3-remat.ts`
+    // (hasCompiled=true, D3-READY). When the bypass/refusal sunset at P4, restore
+    // `toBeGreaterThan(0)` here (eager checkpoint will compile safely then).
+    expect(v.prunedPairsRemoved).toBe(0);
     // Steady reader: the witness set stabilized (no unbounded variance).
     expect(v.witnessVariances).toBe(0);
     expect(v.pass).toBe(true);
