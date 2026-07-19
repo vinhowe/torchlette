@@ -40,6 +40,7 @@ import { shapesEqual, sizeOf } from "../core/shape";
 import {
   STEP_TAPE_RECORD,
   STEP_TAPE_REPLAY,
+  WHOLE_STEP_TRACE,
   stEndStep,
   stNoteBoundary,
   stStats,
@@ -164,6 +165,60 @@ export class Torchlette {
     onUpload: (shape: number[], values: Float32Array) => void;
     onWrap?: (t: Tensor) => void;
   } | null = null;
+
+  /** [whole-step trace, P1] Depth of the active whole-step-trace scope. When
+   *  > 0 (and TORCHLETTE_WHOLE_STEP=1), backward DEFERS its grad-write force to
+   *  the step boundary (see `_deferBackwardForce`) so forward + backward +
+   *  optimizer accumulate into ONE plan forced once at markStep. Scoped (not
+   *  global) so ordinary backward calls outside a training step still
+   *  materialize grads eagerly. Depth-counted for symmetry, though whole-step
+   *  scopes never nest in a training loop. */
+  private _wholeStepDepth = 0;
+
+  /** True iff a backward running now should DEFER its grad-write force to the
+   *  step boundary (whole-step trace acquisition, P1). Queried by
+   *  `backwardImpl`. Reads are still correct if a grad is consumed before the
+   *  boundary — the lazy value force-materializes on demand — deferral only
+   *  changes WHEN the force happens, never the result. */
+  _deferBackwardForce(): boolean {
+    return WHOLE_STEP_TRACE && this._wholeStepDepth > 0;
+  }
+
+  /** Enter/exit the whole-step-trace scope. Internal seams used by
+   *  `wholeStep()` and the `{training:true}` capture body. */
+  _enterWholeStep(): void {
+    this._wholeStepDepth += 1;
+  }
+  _exitWholeStep(): void {
+    if (this._wholeStepDepth > 0) this._wholeStepDepth -= 1;
+  }
+
+  /** [whole-step trace, P1] Boundary-deferred cleanup queue. When backward
+   *  defers its grad-write force (`_deferBackwardForce`), it must ALSO defer
+   *  the teardown that assumes forcing already happened — releasing the
+   *  saved-for-backward retention rcs, disposing the forward intermediates +
+   *  backward grad-chain, running `destroyUnreachable`. Those inputs are still
+   *  needed by the un-forced whole-step plan; disposing them in backward would
+   *  reclaim their buffers before the boundary force consumes them (the
+   *  `[lifetime] reading RECLAIMED` class). Instead backward pushes the
+   *  teardown here and the step boundary drains it AFTER its single
+   *  `forceAllPending` has consumed everything — deterministic, no GC-timing
+   *  reliance. */
+  private _boundaryDeferred: Array<() => void> = [];
+  _deferToBoundary(fn: () => void): void {
+    this._boundaryDeferred.push(fn);
+  }
+  /** Drain the boundary-deferred cleanup. MUST be called right after the
+   *  boundary `forceAllPending` (which consumes the whole-step plan) and
+   *  BEFORE the step-scoped demotion sweep (`releaseStepTemps`) so the retained
+   *  buffers are disposed cleanly (rc→0) rather than demoted with a live rc
+   *  (the pool double-release class). A no-op off the whole-step path. */
+  _drainBoundaryDeferred(): void {
+    if (this._boundaryDeferred.length === 0) return;
+    const q = this._boundaryDeferred;
+    this._boundaryDeferred = [];
+    for (const fn of q) fn();
+  }
 
   constructor(backendName?: DeviceKind, options?: TorchletteOptions) {
     // Configure memory limit if provided (applies to GPU memory tracker)
@@ -2038,6 +2093,8 @@ export class Torchlette {
     }
     await this.runtime.markStep();
     await this.runtime.forceAllPending();
+    // [whole-step trace, P1] Drain deferred backward teardown after the force.
+    this._drainBoundaryDeferred();
     // QUIESCE BEFORE DESTROYING — order differs from explicit markStep
     // deliberately. The force above may encode passes for the closing
     // step's optimizer chain; a fence issued AFTER the demotion sweep
@@ -2125,6 +2182,9 @@ export class Torchlette {
     // (it only reclaims ≤ gen tensors; later steps stamped > gen are untouched).
     this.runtime.endStep();
     await this.runtime.forceAllPending();
+    // [whole-step trace, P1] Drain deferred backward teardown after the force,
+    // before the snapshot/sweep.
+    this._drainBoundaryDeferred();
     this.runtime.resetCumulativeFusionStats();
     storageTracker.snapshotForStep(gen);
     await this.runtime.beginStep();
@@ -2231,6 +2291,11 @@ export class Torchlette {
     // Step 2: Force all pending tensors to materialize
     await this.runtime.forceAllPending();
 
+    // Step 2.5: [whole-step trace, P1] Drain backward's boundary-deferred
+    // teardown now that the single force consumed the whole-step plan — BEFORE
+    // the step-scoped demotion below, so the retained buffers free cleanly.
+    this._drainBoundaryDeferred();
+
     // Step 3: Destroy all storages with rc <= 0.
     storageTracker.destroyUnreachable();
 
@@ -2279,6 +2344,31 @@ export class Torchlette {
       // became eligible (two consecutive structurally-identical compiled
       // steps under one appKey).
       if (STEP_TAPE_REPLAY) stPromoteEligibleSkeleton();
+    }
+  }
+
+  /**
+   * [whole-step trace, P1] Run one training step body under the whole-step
+   * trace scope (docs/step-function-compiler-design.md §3.1). The body should
+   * perform the full step — forward, `await loss.backward()`, optimizer.step()
+   * — and MUST NOT read the loss mid-step (read it AFTER the following
+   * `markStep()`, or ride the capture ring). Under `TORCHLETTE_WHOLE_STEP=1`
+   * the body's backward defers its grad-write force, so forward + backward +
+   * optimizer stay ONE lazy graph that the caller's `endStep()/markStep()`
+   * forces exactly once — the merged whole-step plan.
+   *
+   * Flag OFF: a transparent pass-through (`fn()` runs with eager backward
+   * forcing), so callers can toggle traced-vs-eager with one env var. The
+   * caller still owns the step boundary (`beginStep`/`endStep`/`markStep` or
+   * the implied boundary) — this only governs WHEN the forces inside the body
+   * happen, never the boundary itself.
+   */
+  async wholeStep<T>(fn: () => Promise<T> | T): Promise<T> {
+    this._enterWholeStep();
+    try {
+      return await fn();
+    } finally {
+      this._exitWholeStep();
     }
   }
 
@@ -2541,6 +2631,9 @@ export class Torchlette {
     // storages exist before the snapshot. Without this, lazy model-init tensors
     // would materialize during the step and be treated as step-scoped.
     await this.runtime.forceAllPending();
+    // [whole-step trace, P1] Drain any backward teardown deferred to this
+    // boundary (safety: a step that ends on beginStep rather than markStep).
+    this._drainBoundaryDeferred();
     storageTracker.snapshotForStep();
     await this.runtime.beginStep();
     // [step-tape 1b] explicit ceremony is a different boundary regime than

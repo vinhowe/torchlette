@@ -173,6 +173,7 @@ function cleanupAutogradGraph(
   torch: Torchlette,
   ordered: AutogradNode[],
   gradMap: Map<Tensor, RuntimeTensor>,
+  deferForce = false,
 ): void {
   // Build set of autograd node outputs - these are forward pass intermediates
   // that are safe to dispose.
@@ -220,9 +221,18 @@ function cleanupAutogradGraph(
     for (const slot of node.savedSlots) {
       // Release the graph-owned retention rc (symmetric with save time). This
       // is the SAME machinery as the compiled-plan harvest view-base retains —
-      // every retain needs a release on every graph-teardown path.
+      // every retain needs a release on every graph-teardown path. Under
+      // whole-step trace the saved value still feeds the un-forced plan, so
+      // defer the release to the boundary (after the single force).
       if (slot.retained && !slot.retained.disposed) {
-        slot.retained.dispose();
+        const retained = slot.retained;
+        if (deferForce) {
+          torch._deferToBoundary(() => {
+            if (!retained.disposed) retained.dispose();
+          });
+        } else {
+          retained.dispose();
+        }
       }
       const savedTensor = slot.packed as Tensor;
       if (savedTensor && typeof savedTensor.dispose === "function") {
@@ -250,10 +260,23 @@ function cleanupAutogradGraph(
     processNode(node);
   }
 
-  // Dispose all collected tensors
-  for (const tensor of toDispose) {
-    if (!tensor.disposed) {
-      tensor.dispose();
+  // Dispose all collected tensors — the forward intermediates + saved tensors.
+  // Under whole-step trace these are inputs to the un-forced whole-step plan;
+  // defer their disposal to the boundary drain (after the single force
+  // consumes them). The autograd node structure was already torn down above,
+  // so this only postpones freeing the tensor handles, not graph teardown.
+  if (deferForce) {
+    const deferred = [...toDispose];
+    torch._deferToBoundary(() => {
+      for (const tensor of deferred) {
+        if (!tensor.disposed) tensor.dispose();
+      }
+    });
+  } else {
+    for (const tensor of toDispose) {
+      if (!tensor.disposed) {
+        tensor.dispose();
+      }
     }
   }
 }
@@ -271,6 +294,11 @@ export async function backwardImpl(
     }
   }
 
+  // [whole-step trace, P1] When active, this backward DEFERS its grad-write
+  // force AND all teardown that assumes forcing happened, to the step boundary
+  // (docs/step-function-compiler-design.md §3.1). Computed once, in scope for
+  // the outer finally.
+  const deferForce = torch._deferBackwardForce();
   return torch._runEntryPoint(async () => {
     // TidyDispatchMode tracks all RuntimeTensors created during backward
     // and auto-disposes non-escaped ones at scope exit. Leaf/retained
@@ -394,9 +422,15 @@ export async function backwardImpl(
             survivorSet.add(gradRt);
           }
         }
-        for (const [, gradRt] of gradMap) {
-          if (!survivorSet.has(gradRt) && !gradRt.disposed) {
-            gradRt.dispose();
+        // Under whole-step trace the non-survivor grads are inputs to the
+        // un-forced optimizer plan — disposing them now reclaims their buffers
+        // before the boundary force reads them. Keep them; the boundary sweep
+        // reclaims the whole step's temporaries after the single force.
+        if (!deferForce) {
+          for (const [, gradRt] of gradMap) {
+            if (!survivorSet.has(gradRt) && !gradRt.disposed) {
+              gradRt.dispose();
+            }
           }
         }
 
@@ -425,15 +459,33 @@ export async function backwardImpl(
           survivorSet.add(summed);
         }
 
-        // Force the surviving gradients in one merged plan.
-        const allGrads = [...survivorSet].filter(
-          (g) => !g.isMaterialized() && !g.disposed,
-        );
-        if (allGrads.length > 0) {
-          await torch.runtime.forceAllMerged(...allGrads);
-        }
+        // Force the surviving gradients in one merged plan — UNLESS the
+        // whole-step trace scope is active (P1,
+        // docs/step-function-compiler-design.md §3.1). Deferring this force
+        // leaves the grads lazy so the optimizer builds its update graph on
+        // top of them and the step boundary (endStep/markStep forceAllPending,
+        // or the capture ring's `_deferBoundaryCommit`) forces forward +
+        // backward + optimizer as ONE plan — the census's DEFERRED-LOSS config
+        // taken one force further (grads no longer force separately from the
+        // optimizer). The saved-for-backward inputs of these un-forced grad
+        // nodes stay alive by graph edge exactly as the forward activations
+        // already do in the deferred-loss (merged fwd+bwd) plan — this simply
+        // extends that same edge-liveness one segment further, to the boundary.
+        // The post-force `destroyUnreachable` is deferred with it: the boundary
+        // sweep reclaims the whole step's temporaries. Reads of a grad before
+        // the boundary still materialize on demand (correctness-preserving);
+        // deferral changes only WHEN the force happens.
+        if (!deferForce) {
+          // Force the surviving gradients in one merged plan.
+          const allGrads = [...survivorSet].filter(
+            (g) => !g.isMaterialized() && !g.disposed,
+          );
+          if (allGrads.length > 0) {
+            await torch.runtime.forceAllMerged(...allGrads);
+          }
 
-        storageTracker.destroyUnreachable();
+          storageTracker.destroyUnreachable();
+        }
 
         // Store final gradients on leaf tensors and retained non-leaf tensors
         // Mark these tensors as "kept" so they survive async scope cleanup
@@ -446,11 +498,16 @@ export async function backwardImpl(
           }
         }
 
-        cleanupAutogradGraph(torch, ordered, gradMap);
+        cleanupAutogradGraph(torch, ordered, gradMap, deferForce);
 
         // Dispose the gradient seed if we created it. Like TF.js, don't rely
         // on tidy to catch it — explicitly dispose consumed intermediates.
-        if (ownsSeed) seed.dispose();
+        // Under whole-step trace the seed feeds the un-forced backward plan;
+        // defer its disposal to the boundary.
+        if (ownsSeed) {
+          if (deferForce) torch._deferToBoundary(() => seed.dispose());
+          else seed.dispose();
+        }
         } finally {
           // Symmetric release of graph-owned retention rcs on EVERY exit,
           // including an error thrown before cleanupAutogradGraph. On the
@@ -468,8 +525,20 @@ export async function backwardImpl(
       });
     } finally {
       torch.runtime.popDispatchMode();
-      tidyMode.disposeNonEscaped();
-      storageTracker.destroyUnreachable();
+      // Under whole-step trace the backward grad-chain intermediates (tracked,
+      // non-escaped, in `tidyMode`) are inputs to the un-forced optimizer plan;
+      // disposing them here reclaims their buffers before the boundary force.
+      // Defer the sweep to the boundary drain (after the single force). On the
+      // eager path this stays exactly as before.
+      if (deferForce) {
+        torch._deferToBoundary(() => {
+          tidyMode.disposeNonEscaped();
+          storageTracker.destroyUnreachable();
+        });
+      } else {
+        tidyMode.disposeNonEscaped();
+        storageTracker.destroyUnreachable();
+      }
     }
   });
 }

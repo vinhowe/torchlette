@@ -75,7 +75,7 @@ const tokens = [2514, 307, 393, 407, 284, 307, 11, 326, 318, 262, 1808, 13, 2514
 
 async function runConfig(opts: {
   name: string; checkpoint: boolean; scaler: boolean; useForwardWithLoss: boolean;
-  deferLoss?: boolean;
+  deferLoss?: boolean; wholeStep?: boolean;
 }) {
   events.length = 0;
   const api = new Torchlette("webgpu", {
@@ -95,6 +95,11 @@ async function runConfig(opts: {
     if (scaler) await scaler.resolveDeferred();
     await api.beginStep();
     optimizer.zeroGrad();
+    // [whole-step trace, P1] Enter the trace scope so backward DEFERS its
+    // grad-write force into the boundary force — forward+backward+optimizer
+    // become ONE forced plan (loss must be deferred too, which wholeStep
+    // configs imply). Requires TORCHLETTE_WHOLE_STEP=1 to actually defer.
+    if (opts.wholeStep) api._enterWholeStep();
 
     PHASE = "forward+item";
     let loss;
@@ -107,7 +112,7 @@ async function runConfig(opts: {
       loss = crossEntropy(logits.reshape([B * S, V]), target.reshape([B * S]));
     }
     let lossVal = -1;
-    if (!opts.deferLoss) lossVal = await loss.item();
+    if (!opts.deferLoss && !opts.wholeStep) lossVal = await loss.item();
 
     PHASE = "backward";
     if (scaler) {
@@ -126,6 +131,7 @@ async function runConfig(opts: {
       optimizer.step();
     }
 
+    if (opts.wholeStep) api._exitWholeStep();
     PHASE = "markStep";
     api.endStep();
     await api.markStep();
@@ -153,6 +159,13 @@ async function main() {
   await runConfig({ name: "checkpoint (no scaler)", checkpoint: true, scaler: false, useForwardWithLoss: true });
   await runConfig({ name: "scaler+checkpoint (AMP inf-skip)", checkpoint: true, scaler: true, useForwardWithLoss: true });
   await runConfig({ name: "DEFERRED-LOSS (no mid-step item, no ckpt)", checkpoint: false, scaler: false, useForwardWithLoss: true, deferLoss: true });
+  // [P1] Whole-step trace: DEFERRED-LOSS + backward grad-write force deferred
+  // into the boundary → forward+backward+optimizer is ONE forced plan. Needs
+  // TORCHLETTE_WHOLE_STEP=1 (else this equals DEFERRED-LOSS). Minimal (no ckpt,
+  // no scaler): the P1 target of 1-2 mid-step forces.
+  await runConfig({ name: "WHOLE-STEP-TRACE (P1: no ckpt, no scaler)", checkpoint: false, scaler: false, useForwardWithLoss: true, wholeStep: true });
+  await runConfig({ name: "WHOLE-STEP-TRACE +scaler", checkpoint: false, scaler: true, useForwardWithLoss: true, wholeStep: true });
+  await runConfig({ name: "WHOLE-STEP-TRACE +checkpoint (structural force stays, P3)", checkpoint: true, scaler: false, useForwardWithLoss: true, wholeStep: true });
   process.exit(0);
 }
 main().catch((e) => { console.error(e); process.exit(1); });

@@ -82,6 +82,19 @@ export const STEP_TAPE_VERIFY_N: number = (() => {
  *  CI paranoia mode (§2.4 guard 6). SUNSET: rides TORCHLETTE_STEP_TAPE. */
 export const STEP_TAPE_STRICT: boolean = ENV.TORCHLETTE_STRICT_TAPE === "1";
 
+/** `TORCHLETTE_WHOLE_STEP=1` — P1 whole-step trace acquisition
+ *  (docs/step-function-compiler-design.md §3.1, §4 P1). When on, a training
+ *  step run inside `api.wholeStep(...)` (or a `{training:true}` capture body)
+ *  DEFERS its backward grad-write force (autograd.ts:433) to the step
+ *  boundary, so forward + backward + optimizer accumulate as ONE lazy graph
+ *  forced exactly once at markStep — the census's DEFERRED-LOSS config
+ *  productized (4->1 mid-step forces, checkpoint off). Eager (flag off)
+ *  remains the semantic reference; the checkpoint-recompute force
+ *  (autograd.ts:355) is structural and stays — P3's remat pass, NOT eroded
+ *  here. SUNSET: the step-function-compiler campaign flag — soak (P1) ->
+ *  default (P2 whole-step compile cutover) -> opt-out dies (§4). */
+export const WHOLE_STEP_TRACE: boolean = ENV.TORCHLETTE_WHOLE_STEP === "1";
+
 // ---------------------------------------------------------------------------
 // Tape schema (§2.1 as amended by §8.4: 4th DynamicSlot source `scalar`)
 // ---------------------------------------------------------------------------

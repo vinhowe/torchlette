@@ -427,8 +427,20 @@ export class CapturedFn {
     // structure, never replayed (the driver re-executes them for real).
     this.api._markCaptureBodyBegin();
     // TRACE / MISS: run the whole body for real (state advances exactly once).
+    // Under TORCHLETTE_WHOLE_STEP the body runs inside the whole-step trace
+    // scope so its backward defers the grad-write force to the ring's boundary
+    // commit — forward+backward+optimizer become ONE forced plan (P1,
+    // docs/step-function-compiler-design.md §3.1). No-op when the flag is off
+    // (the scope only gates deferral). A HIT never enters here (body un-run).
     const { result, uploads } = await this.runIntercepted(
-      () => this.fn(...(args as never[])),
+      async () => {
+        this.api._enterWholeStep();
+        try {
+          return await this.fn(...(args as never[]));
+        } finally {
+          this.api._exitWholeStep();
+        }
+      },
       Number.MAX_SAFE_INTEGER,
       false,
     );
