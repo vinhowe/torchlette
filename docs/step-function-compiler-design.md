@@ -372,6 +372,72 @@ lowered bit-for-bit. `probe/census.ts` numbers unchanged (630-node DEFERRED-LOSS
   census re-run shows 4→1 mid-step forces (checkpoint off). *This is the probe's
   DEFERRED-LOSS config, productized.*
 
+### P1 status — landed (2026-07-19), behind `TORCHLETTE_WHOLE_STEP`
+
+The trace surface. Under `TORCHLETTE_WHOLE_STEP=1`, a training step run inside
+`api.wholeStep(fn)` (the plain-driver surface) or a `{training:true}`
+`api.capture` body (the ring surface, which already defers loss + the boundary)
+additionally **defers backward's grad-write force** (`autograd.ts:433`) to the
+step boundary. Forward + backward + optimizer then accumulate as ONE lazy graph
+that the boundary `forceAllPending` materializes exactly once — the whole-step
+trace, run eager-lowered.
+
+**What defers, what stays** (the census reading, realized):
+- *Erodible → eroded.* `loss.item()` rides the ring (already existed); the
+  backward grad-write force now merges into the boundary force. Its teardown
+  (non-survivor grad dispose, saved-tensor / `slot.retained` release,
+  `tidyMode.disposeNonEscaped`, `destroyUnreachable`) is **deferred with it** to
+  a boundary-drained queue (`_deferToBoundary` → `_drainBoundaryDeferred`, run
+  right after the single `forceAllPending`, before the step-scoped demotion
+  sweep) — those values still feed the un-forced plan; disposing them in
+  backward reclaimed their buffers early (the `[lifetime] reading RECLAIMED`
+  class). The drain frees at rc-0, never demotes-with-live-rc (no pool
+  double-release).
+- *The boundary.* Already one `forceAllPending` on the ring path
+  (`_deferBoundaryCommit`); the plain `markStep` path is the caller's single
+  boundary force.
+- *Structural — NAMED, NOT eroded.* The checkpoint-recompute force
+  (`autograd.ts:355`) stays. **P1 covers NON-checkpoint configs**; recompute is
+  P3's remat pass. Documented in code (the flag's doc-comment) and here.
+
+**Census re-run** (distil, seq15, forces/step before → after, flag on):
+
+| Config | before | after | note |
+|---|---|---|---|
+| minimal (no ckpt/scaler) | 4 | **2** | whole step = ONE 703-node plan at the single boundary force; the 2nd count is the empty `beginStep` bookkeeping call (0 pending) |
+| +scaler | 6 | **3** | scaler's deferred-scale flush stays — erodible D0, not P1 |
+| +checkpoint | 5 | **4** | recompute force STAYS (structural, P3) |
+| DEFERRED-LOSS | 3 | 3 | unchanged — the pre-P1 config P1 productizes |
+
+The `forward+item` force and the separate backward grad force are both gone from
+the minimal config; the whole 703-node step is one merged plan.
+
+**The differential (the mother gate)** — `tools/t-whole-step-diff.ts`, distil,
+30 steps, both directions: traced == eager **2.86e-6**, compiled == lowered
+(within traced) **3.34e-6**, both ≤ 1e-5. Deferral changes only *when* forces
+happen, never the math (step-0 loss is bit-identical: `2.802013…` on every arm).
+
+**Headline measured — NO submit win at P1 (a P2 deliverable).** At distil@512
+the traced step runs *eager-lowered* at **11.5 submits** vs eager's 7.5 (302 ms
+vs 172 ms). Forced eager-lowered, the combined ~727-node plan segments into MORE
+barriers than three separate forces (the optimizer's in-place `adamStep`
+interleaved with backward adds WAW segment boundaries). The submit/speed win is
+exactly what **P2's whole-step COMPILE** (one `CompiledPlan` + one global memory
+plan) delivers — P1 acquires the trace; P2 optimizes its execution. Honest
+negative, and it re-scopes the "reduce submits" expectation to P2 where the
+design already places "submits/step drops."
+
+**What idles (observed, not deleted — the ledger executes at P4).** On the
+`TORCHLETTE_WHOLE_STEP` path the mid-step backward-force segment vanishes, so the
+tape's per-segment eligibility diffing has one fewer boundary to witness on
+traced steps. Not yet load-bearing (the flag is soak-only; the default path
+still forces backward separately), so nothing is removed. Flag OFF is
+byte-identical to today (`_deferBackwardForce()` is false → every original
+branch taken; the drain is a no-op on an empty queue; the scope is a depth
+counter) — verified: `t-ring-probe` all-zero deltas (K a pure knob), ledger
+balanced, `parity-fullstack` compiled==lowered 7.6e-6, `test:gates` 5/5,
+`profile-training` distil@512 leak-OK at ~48 ms/step.
+
 - **P2 — Compile the whole-step graph.** Lift build-from-IR from per-plan to
   per-step: one `CompiledPlan` for `S`, one global memory plan (planner over the
   whole graph). Gate: the parity gate + memory flat + submits/step drops. *First
