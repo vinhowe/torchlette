@@ -144,7 +144,9 @@ describe("D3 checkpoint-arena compile refusal", { timeout: 300000 }, () => {
 
   // The remat merged plan is safe (one plan, planner packs the recompute) and
   // must compile — the refusal must NOT fire. Needs the whole-step scope active
-  // (TORCHLETTE_WHOLE_STEP=1, a module-load const); skipped otherwise.
+  // (WHOLE_STEP_TRACE, a module-load const). DEFAULT-ON since P4a Stage 2, so
+  // this runs in the plain suite; skipped only under the opt-out
+  // (TORCHLETTE_WHOLE_STEP=0).
   it.skipIf(!WHOLE_STEP_TRACE)(
     "does NOT fire for a whole-step remat step (merged plan must compile)",
     async () => {

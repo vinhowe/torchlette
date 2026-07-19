@@ -197,8 +197,10 @@ async function run(arm: Arm): Promise<ArmResult> {
 async function runArmInChild(arm: Arm): Promise<ArmResult> {
   const { execFileSync } = await import("node:child_process");
   const env: Record<string, string> = { ...process.env, WSD_ARM: arm };
+  // WHOLE_STEP is DEFAULT-ON since P4a Stage 2 — the eager arm must OPT OUT
+  // explicitly (=0), not merely leave it unset (unset == on now).
   if (arm === "traced" || arm === "traced-lowered") env.TORCHLETTE_WHOLE_STEP = "1";
-  else delete env.TORCHLETTE_WHOLE_STEP;
+  else env.TORCHLETTE_WHOLE_STEP = "0";
   if (arm === "traced-lowered") env.TORCHLETTE_COMPILED_PLAN = "0";
   const out = execFileSync(process.execPath, ["--import", "tsx", import.meta.filename], {
     env,

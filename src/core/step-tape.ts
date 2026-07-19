@@ -82,18 +82,25 @@ export const STEP_TAPE_VERIFY_N: number = (() => {
  *  CI paranoia mode (§2.4 guard 6). SUNSET: rides TORCHLETTE_STEP_TAPE. */
 export const STEP_TAPE_STRICT: boolean = ENV.TORCHLETTE_STRICT_TAPE === "1";
 
-/** `TORCHLETTE_WHOLE_STEP=1` — P1 whole-step trace acquisition
- *  (docs/step-function-compiler-design.md §3.1, §4 P1). When on, a training
- *  step run inside `api.wholeStep(...)` (or a `{training:true}` capture body)
- *  DEFERS its backward grad-write force (autograd.ts:433) to the step
- *  boundary, so forward + backward + optimizer accumulate as ONE lazy graph
- *  forced exactly once at markStep — the census's DEFERRED-LOSS config
- *  productized (4->1 mid-step forces, checkpoint off). Eager (flag off)
- *  remains the semantic reference; the checkpoint-recompute force
- *  (autograd.ts:355) is structural and stays — P3's remat pass, NOT eroded
- *  here. SUNSET: the step-function-compiler campaign flag — soak (P1) ->
- *  default (P2 whole-step compile cutover) -> opt-out dies (§4). */
-export const WHOLE_STEP_TRACE: boolean = ENV.TORCHLETTE_WHOLE_STEP === "1";
+/** `TORCHLETTE_WHOLE_STEP` — whole-step trace acquisition
+ *  (docs/step-function-compiler-design.md §3.1, §4 P1). **DEFAULT-ON since P4a
+ *  (2026-07-19, Stage-2 graduation); opt out with `TORCHLETTE_WHOLE_STEP=0`.**
+ *  When on, a training step run inside `api.wholeStep(...)` (or a
+ *  `{training:true}` capture body) DEFERS its backward grad-write force
+ *  (autograd.ts) to the step boundary, so forward + backward + optimizer
+ *  accumulate as ONE lazy graph forced exactly once at markStep — the census's
+ *  DEFERRED-LOSS config productized (4->1 mid-step forces, checkpoint off), and
+ *  under checkpointing the P3 remat rewrite (recompute stays lazy into the
+ *  boundary force). The scope only gates DEFERRAL: a plain training loop that
+ *  never enters `wholeStep`/capture is untouched (the eager reference, still
+ *  reachable everywhere via `=0`). DECODE is a `noGrad` forward — no backward,
+ *  so the scope is a structural no-op there (P4a decode discriminator, VERDICT
+ *  B): `=0` vs default is byte-identical for inference.
+ *
+ *  Eager (`=0`) remains the semantic reference. SUNSET: the
+ *  step-function-compiler campaign flag — soak (P1/P2/P3) -> DEFAULT (P4a
+ *  Stage 2, here) -> opt-out dies in P4b with the eager two-plan path (§4). */
+export const WHOLE_STEP_TRACE: boolean = ENV.TORCHLETTE_WHOLE_STEP !== "0";
 
 // ---------------------------------------------------------------------------
 // Tape schema (§2.1 as amended by §8.4: 4th DynamicSlot source `scalar`)
