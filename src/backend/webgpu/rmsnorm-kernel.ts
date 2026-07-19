@@ -323,6 +323,27 @@ onTeardown(resetRMSNormKernelState);
  * Dispatch fused RMSNorm forward kernel.
  * x [N, D] + weight [D] → output [N, D]
  */
+/**
+ * Geometry + pipeline for ONE RMSNorm-forward dispatch, the SINGLE SOURCE both
+ * the imperative dispatcher (`dispatchRMSNormForward`) and the stream generator
+ * (`stream-generate.ts` `generateRMSNormForward`) derive from — mirroring
+ * `planLayerNormForwardDispatch`. x [N,D] + weight [D] → output [N,D].
+ */
+export function planRMSNormForwardDispatch(
+  numRows: number,
+  featureDim: number,
+  eps: number,
+): { plan: import("./tile-dispatch").TileKernelPlan; outputBytes: number } {
+  return {
+    plan: fwdTileKernel.plan({
+      num_rows: numRows,
+      feature_dim: featureDim,
+      eps,
+    }),
+    outputBytes: numRows * featureDim * 4, // f32
+  };
+}
+
 export function dispatchRMSNormForward(
   xBuffer: GPUBuffer,
   weightBuffer: GPUBuffer,
@@ -330,14 +351,16 @@ export function dispatchRMSNormForward(
   featureDim: number,
   eps: number,
 ): GPUBuffer {
-  const outputSizeBytes = numRows * featureDim * 4; // f32
-  const outBuffer = allocateOutputBuffer(outputSizeBytes);
-
+  // Single-source with planRMSNormForwardDispatch (the generator's helper): the
+  // dispatcher's own `.dispatch()` and `.plan()` both derive pipeline/binding/
+  // grid from the SAME rmsNormFwdSpec (tile-dispatch.ts), so the generated
+  // command stream matches this dispatch (the t-stream-generate differential is
+  // the guardian).
+  const outBuffer = allocateOutputBuffer(numRows * featureDim * 4);
   fwdTileKernel.dispatch(
     { x: xBuffer, weight: weightBuffer, output: outBuffer },
     { num_rows: numRows, feature_dim: featureDim, eps },
   );
-
   return outBuffer;
 }
 

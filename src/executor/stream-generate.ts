@@ -45,10 +45,12 @@ import {
   planLayerNormBackwardGradXDispatch,
   planLayerNormForwardDispatch,
 } from "../backend/webgpu/layernorm-kernel";
+import { planRMSNormForwardDispatch } from "../backend/webgpu/rmsnorm-kernel";
 import {
   lookupKSplitTempBuffer,
   planTiledMatmul,
 } from "../backend/webgpu/matmul/dispatch";
+import { planArgReduceDispatch } from "../backend/webgpu/ops/comparison";
 import {
   planGatherDirect,
   planScatterAddDirect,
@@ -1028,7 +1030,18 @@ function generateSequential(
   // Reduction family (sum/mean): the ReductionDeclaration is the SINGLE SOURCE
   // for the monoid + mean epilogue; the walker derives the command stream.
   const reduceDecl = reductionDeclaration(node.op);
-  if (reduceDecl && (node.op === "sum" || node.op === "mean")) {
+  if (
+    reduceDecl &&
+    (node.op === "sum" ||
+      node.op === "mean" ||
+      node.op === "max" ||
+      node.op === "min")
+  ) {
+    // The serializer is monoid-generic (planFull/DimReductionDispatch take
+    // decl.monoid); sum/mean/max/min differ only in the declared monoid + the
+    // mean epilogue. max/min are the decode softmax's max-subtract reduction
+    // (decomposed attention) — the last non-arg-reduce uncovered reduction the
+    // K-block hits.
     return serializeReduction(
       reduceDecl,
       node,
@@ -1044,6 +1057,10 @@ function generateSequential(
     return generateScatterCopyDMA(node, resolveRefSlot, bufferSlot);
   if (node.op === "fusedLayerNormForward")
     return generateLayerNormForward(node, slots, resolveRefSlot, bufferSlot);
+  if (node.op === "fusedRMSNormForward")
+    return generateRMSNormForward(node, slots, resolveRefSlot, bufferSlot);
+  if (node.op === "argmax" || node.op === "argmin")
+    return generateArgReduce(node, slots, resolveRefSlot);
   if (node.op === "gather") return generateGather(node, slots, resolveRefSlot);
   if (node.op === "cat") return generateCat(node, slots, resolveRefSlot);
   if (node.op === "scatterAdd")
@@ -2330,6 +2347,83 @@ function generateScatterAdd(
 /** gather: ALLOC(out, kind 0, [a,index]) + DISPATCH [a,index,out,params].
  *  Geometry from a.shape + index.shape/dtype + payload {dim}. Single output,
  *  no copy. Chunked (table > maxBindingSize) bails. */
+/**
+ * arg-reduce (argmax/argmin over a dim) — the unrolled-K decode feedback
+ * selection, and the sole build-from-IR uncovered op the K-block adds (P1
+ * census). Mirrors serializeReduction's shape: it consumes the SAME
+ * geometry+WGSL the dispatch path uses (`planArgReduceDispatch`, comparison.ts —
+ * single source; the block-compiled differential is the guardian) and inherits
+ * the P1 contiguity seam via `resolveContiguousInto` (argmax/argmin declare
+ * `[0]` contiguity-required in CONTIGUOUS_OPERANDS, so a strided/offset input
+ * gets the byte-identical contiguous-copy prologue the op's argReduceOp inserts;
+ * a decode logits row is contiguous by construction, so the prologue is empty).
+ *
+ * ALLOC(indices [outShape], kind 0 — the index output aliases-safe like gather)
+ * + one dispatch [input, output, params] where params = (outSize, dimSize,
+ * dimStride). The index is a u32 stored as f32 (the kernel's convention) — the
+ * exact tensor the next iteration's embedding gather reads as its index.
+ */
+function generateArgReduce(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 1) return "arity";
+  const payload = node.payload as
+    | { dim?: number; keepdim?: boolean }
+    | undefined;
+  if (!payload || payload.dim == null) return "payload";
+  const ref = node.inputs[0];
+  const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
+  if (!sd) return "no-shape";
+  const rank = sd.shape.length;
+  const dim = payload.dim < 0 ? payload.dim + rank : payload.dim;
+  if (dim < 0 || dim >= rank) return "dim-range";
+  const prologue: GpuCommand[] = [];
+  const inSlot = resolveContiguousInto(
+    node.op,
+    0,
+    ref,
+    resolveRefSlot,
+    slots,
+    prologue,
+  );
+  if (typeof inSlot === "string") return inSlot;
+  const compareOp = node.op === "argmax" ? ">" : "<";
+  const plan = planArgReduceDispatch(
+    compareOp,
+    sd.shape,
+    dim,
+    payload.keepdim ?? false,
+  );
+  const pipeline = getPipeline(requireContext(), plan.key, plan.shader);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const paramsSlot = slots.length;
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData.slice() });
+  return {
+    commands: [
+      ...prologue,
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: plan.outputBytes,
+        allocKind: 0,
+        inputSlots: [inSlot],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline,
+        bindings: [inSlot, outSlot, paramsSlot],
+        gx: plan.dispatchX,
+        gy: plan.dispatchY,
+        gz: 1,
+      },
+    ],
+    outSlot,
+  };
+}
+
 function generateGather(
   node: LazyIRNode,
   slots: SlotSource[],
@@ -2745,6 +2839,82 @@ function generateLayerNormForward(
   if (!bindings) return "config-missing";
   return {
     commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: planned.outputBytes,
+        allocKind: 1,
+        inputSlots: [],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: planned.plan.pipeline,
+        bindings,
+        gx: planned.plan.grid[0],
+        gy: planned.plan.grid[1],
+        gz: planned.plan.grid[2],
+      },
+    ],
+    outSlot,
+  };
+}
+
+/** fusedRMSNormForward: ALLOC(output, kind 1) + one tile dispatch [x, weight,
+ *  output, config]. Two inputs (no bias, unlike LayerNorm), both declared
+ *  contiguity-required ([0,1] in CONTIGUOUS_OPERANDS) — the decode residual +
+ *  persistent norm weight are contiguous by construction, so the prologue is
+ *  empty. Geometry from planRMSNormForwardDispatch (single-sourced with the
+ *  dispatcher's rmsNormFwdSpec). One of the two Qwen3/Gemma2 decode-forward ops
+ *  the K-block adds to the build-from-IR coverage (the other is fusedRoPE — see
+ *  the P2 census; RoPE's per-position offset is the remaining blocker). */
+function generateRMSNormForward(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 2) return "arity";
+  const cfg = node.payload as
+    | { numRows?: number; featureDim?: number; eps?: number }
+    | undefined;
+  if (!cfg || cfg.numRows == null || cfg.featureDim == null || cfg.eps == null) {
+    return "payload";
+  }
+  const prologue: GpuCommand[] = [];
+  const xSlot = resolveContiguousInto(
+    node.op,
+    0,
+    node.inputs[0],
+    resolveRefSlot,
+    slots,
+    prologue,
+  );
+  if (typeof xSlot === "string") return xSlot;
+  const weightSlot = resolveContiguousInto(
+    node.op,
+    1,
+    node.inputs[1],
+    resolveRefSlot,
+    slots,
+    prologue,
+  );
+  if (typeof weightSlot === "string") return weightSlot;
+  const planned = planRMSNormForwardDispatch(
+    cfg.numRows,
+    cfg.featureDim,
+    cfg.eps,
+  );
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const bindings = tilePlanBindings(
+    planned.plan,
+    { x: xSlot, weight: weightSlot, output: outSlot },
+    bufferSlot,
+  );
+  if (!bindings) return "config-missing";
+  return {
+    commands: [
+      ...prologue,
       {
         tag: TAG_ALLOC,
         slot: outSlot,

@@ -110,6 +110,79 @@ const argReduce =
 export const argmax = argReduce("argmax", ">");
 export const argmin = argReduce("argmin", "<");
 
+/**
+ * Geometry + WGSL for ONE arg-reduce dispatch (argmax/argmin over a dim), the
+ * SINGLE SOURCE both the imperative dispatcher (`argReduceOp`) and the stream
+ * generator (`stream-generate.ts` `generateArgReduce`) derive from — mirroring
+ * `planGatherDirect` / `planDimReductionDispatch`. Callers pass the CONTIGUOUS,
+ * offset-0 input shape (the kernel derives its addressing from
+ * `contiguousStrides(inputShape)` and binds flat from element 0; the contiguity
+ * is enforced at the seam by each caller). The pipeline cache key IS the WGSL
+ * text (`argReduceWGSL` bakes strides/outShape/inputToOutDim in, so a structural
+ * key would drift — single-source-at-seams). `dim` must be normalized
+ * non-negative.
+ */
+export function planArgReduceDispatch(
+  compareOp: ">" | "<",
+  inputShape: readonly number[],
+  dim: number,
+  keepdim: boolean,
+): {
+  key: string;
+  shader: string;
+  paramsData: Uint32Array;
+  dispatchX: number;
+  dispatchY: number;
+  outShape: number[];
+  outputBytes: number;
+} {
+  const rank = inputShape.length;
+  const outShape: number[] = [];
+  for (let i = 0; i < rank; i++) {
+    if (i === dim) {
+      if (keepdim) outShape.push(1);
+    } else {
+      outShape.push(inputShape[i]);
+    }
+  }
+  const outSize = sizeOf(outShape) || 1;
+  const inputStrides = contiguousStrides([...inputShape]);
+  const dimSize = inputShape[dim];
+  const dimStride = inputStrides[dim];
+  const inputToOutDim: number[] = [];
+  let outDimIdx = 0;
+  for (let i = 0; i < rank; i++) {
+    if (i === dim) {
+      if (keepdim) {
+        inputToOutDim.push(outDimIdx);
+        outDimIdx++;
+      } else {
+        inputToOutDim.push(-1);
+      }
+    } else {
+      inputToOutDim.push(outDimIdx);
+      outDimIdx++;
+    }
+  }
+  const code = argReduceWGSL(
+    compareOp,
+    [...inputShape],
+    inputStrides,
+    outShape,
+    dim,
+    inputToOutDim,
+  );
+  return {
+    key: code,
+    shader: code,
+    paramsData: params(outSize, dimSize, dimStride),
+    dispatchX: Math.ceil(outSize / WORKGROUP_SIZE),
+    dispatchY: 1,
+    outShape,
+    outputBytes: outSize * F32_BYTES,
+  };
+}
+
 function argReduceOp(
   opName: string,
   compareOp: ">" | "<",
@@ -155,66 +228,23 @@ function argReduceOp(
   }
   const keepdim = options.keepdim ?? false;
 
-  const outShape: number[] = [];
-  for (let i = 0; i < rank; i++) {
-    if (i === dim) {
-      if (keepdim) {
-        outShape.push(1);
-      }
-    } else {
-      outShape.push(inputShape[i]);
-    }
-  }
+  // SINGLE SOURCE for geometry + WGSL (shared with the stream generator's
+  // generateArgReduce). Key IS the WGSL (argReduceWGSL bakes strides/outShape/
+  // inputToOutDim in, so a non-contiguous input with the same shape/dim/keepdim
+  // would collide on a stale pipeline — single-source-at-seams).
+  const plan = planArgReduceDispatch(compareOp, inputShape, dim, keepdim);
 
-  const outSize = sizeOf(outShape) || 1;
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: plan.outputBytes,
     usage:
       GPUBufferUsage.STORAGE |
       GPUBufferUsage.COPY_SRC |
       GPUBufferUsage.COPY_DST,
   });
 
-  const inputStrides = contiguousStrides(inputShape);
+  const pipeline = getPipeline(ctx, plan.key, plan.shader);
 
-  const dimSize = inputShape[dim];
-  const dimStride = inputStrides[dim];
-
-  const inputToOutDim: number[] = [];
-  let outDimIdx = 0;
-  for (let i = 0; i < rank; i++) {
-    if (i === dim) {
-      if (keepdim) {
-        inputToOutDim.push(outDimIdx);
-        outDimIdx++;
-      } else {
-        inputToOutDim.push(-1);
-      }
-    } else {
-      inputToOutDim.push(outDimIdx);
-      outDimIdx++;
-    }
-  }
-
-  const code = argReduceWGSL(
-    compareOp,
-    inputShape,
-    inputStrides,
-    outShape,
-    dim,
-    inputToOutDim,
-  );
-
-  // Key IS the WGSL: the structural key omitted inputStrides/outShape/
-  // inputToOutDim that argReduceWGSL bakes in, so a non-contiguous input with
-  // the same shape/dim/keepdim would collide on a stale pipeline
-  // (single-source-at-seams).
-  const pipeline = getPipeline(ctx, code, code);
-
-  const paramsBuffer = createParamsBuffer(
-    ctx.device,
-    params(outSize, dimSize, dimStride),
-  );
+  const paramsBuffer = createParamsBuffer(ctx.device, plan.paramsData);
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
     tensor.buffer,
@@ -222,10 +252,10 @@ function argReduceOp(
     paramsBuffer,
   ]);
 
-  dispatchComputePass(pipeline, bindGroup, Math.ceil(outSize / WORKGROUP_SIZE));
+  dispatchComputePass(pipeline, bindGroup, plan.dispatchX, plan.dispatchY);
 
   releaseParamsBuffer(paramsBuffer);
   if (contiguousCopy) contiguousCopy.destroy();
 
-  return createTensor(outShape, outBuffer);
+  return createTensor(plan.outShape, outBuffer);
 }

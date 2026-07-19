@@ -54,8 +54,19 @@ export const CONTIGUOUS_OPERANDS: ReadonlyMap<string, ContiguousOperandSpec> =
     ["mean", [0]],
     ["max", [0]],
     ["min", [0]],
+    // Arg-reduce (argmax/argmin) — the decode feedback selection. The kernel
+    // derives addressing from contiguousStrides(inputShape) and binds flat from
+    // element 0, so a strided/offset input must be materialized contiguous
+    // first (comparison.ts argReduceOp forces it; the generator synthesizes the
+    // same copy prologue).
+    ["argmax", [0]],
+    ["argmin", [0]],
     // unscaleGrad raw-binds grad_in (input 0); the scale operand is read live.
     ["unscaleGrad", [0]],
+    // Fused RMSNorm forward raw-binds x (input 0) and weight (input 1) — both
+    // asContiguous'd at dispatch (fused.ts). The decode residual + persistent
+    // norm weight are contiguous by construction, so the prologue is empty.
+    ["fusedRMSNormForward", [0, 1]],
   ]);
 
 /** Whether input position `idx` of op `op` is declared contiguity-required. */

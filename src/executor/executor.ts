@@ -2153,6 +2153,11 @@ export async function executeLoweredPlan(
       // asserts the stamp at every replay.
       fuseStampedScalarExternals: true,
     });
+    if (ENV.TORCHLETTE_DEBUG_CENSUS && gen && !gen.fullyCovered) {
+      console.log(
+        `[census] nodes=${planNodes.length} covered=${gen.coveredActions}/${gen.actionCount} uncovered={${[...gen.uncovered].join(", ")}}`,
+      );
+    }
     if (gen?.fullyCovered) {
       // [observed-liveness] The conservative full action-output harvest is the
       // safe default (see the proof above); once observation has converged a
