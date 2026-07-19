@@ -165,7 +165,7 @@ async function main() {
   // no scaler): the P1 target of 1-2 mid-step forces.
   await runConfig({ name: "WHOLE-STEP-TRACE (P1: no ckpt, no scaler)", checkpoint: false, scaler: false, useForwardWithLoss: true, wholeStep: true });
   await runConfig({ name: "WHOLE-STEP-TRACE +scaler", checkpoint: false, scaler: true, useForwardWithLoss: true, wholeStep: true });
-  await runConfig({ name: "WHOLE-STEP-TRACE +checkpoint (structural force stays, P3)", checkpoint: true, scaler: false, useForwardWithLoss: true, wholeStep: true });
+  await runConfig({ name: "WHOLE-STEP-TRACE +checkpoint (P3 remat: recompute lazy, structural force subsumed)", checkpoint: true, scaler: false, useForwardWithLoss: true, wholeStep: true });
   process.exit(0);
 }
 main().catch((e) => { console.error(e); process.exit(1); });

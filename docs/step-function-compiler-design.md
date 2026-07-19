@@ -553,6 +553,103 @@ no-op on an empty park list).
   memory ≤ today's checkpointed peak, RNG-identical recompute proven at compile time.
   *Deletes the structural mid-step force.*
 
+### P3 status — landed (2026-07-19): rewrite COMPILES + CORRECT; D3 bypass-death STOPS on SPEED
+
+The rewrite (behind `TORCHLETTE_WHOLE_STEP`). The P1 checkpoint gate
+(`autograd.ts` `if (hasCheckpoints) deferForce = false`) is **LIFTED**: under the
+whole-step scope a checkpointed backward is now **REMAT** — the recompute
+subgraph the unpack hook already builds (re-running `fn(...inputs)`, a duplicate
+of the checkpointed forward reading the segment inputs) stays **LAZY** and flows
+into the single boundary `forceAllPending` alongside forward + backward +
+optimizer. The two mid-backward forces (`forwardToForce` / `savedToForce`) and
+the two-plan split are SKIPPED under remat; `disposeCheckpointIntermediates()` and
+the recompute-scope teardown are **deferred to the boundary drain**
+(`_deferToBoundary`) — symmetric with every other deferForce teardown, so the
+recompute buffers survive until the single force consumes them (no UAF). The
+eager/flag-off path keeps the two-plan force UNTOUCHED — it is the reference. The
+"recompute becomes a compile-time graph rewrite" the charter names is realized by
+the recompute nodes being intra-graph duplicates the memory planner packs, not a
+new pass: laziness *is* the rewrite.
+
+**The one hazard the two-plan split guarded against does NOT bite.** The split
+existed because "mixing unmaterialized forward nodes into the *separate* recompute
+plan produces invalid reshape rewrites." Under remat there is no separate plan —
+the whole-step merged graph is ONE plan, the same non-checkpoint merge P1/P2
+validated. `isCheckpointBoundary` fires under remat (the recompute stays pending
+to the boundary, unlike eager where it is already materialized) but is **inert on
+the fusion/compiled path** (read only by `sequential.ts`'s segmented executor, which
+the fusion path pre-empts) — so it drives no segmentation. **RNG identity is by
+construction, at compile time:** the unpack hook replays the recorded draws at
+graph-BUILD time (`_debug_startCheckpointReplay` bakes recorded draw *values* into
+the recompute nodes when `fn` re-runs), so deferring the force cannot change what
+the recompute computes — the red-team's #97 concern is satisfied structurally, not
+by hope.
+
+**The remat differential (the mother gate).** `t-whole-step-diff` with `CKPT=1
+SELECTIVE=1`, distil seq64 / 30 steps (crosses the K_w compile cutover):
+traced-remat == eager-checkpointed **2.15e-6**, compiled == lowered within
+traced-remat **2.38e-6**, both ≤ 1e-5. Step-0 loss bit-identical across arms.
+Flag-off byte-identical: non-ckpt `t-whole-step-diff` 3.34e-6; the eager checkpoint
+path (checkpoint-autocast-parity / segmentation / scaler-seed /
+distilgpt2-checkpoint-memory specs) 7/7; `parity-fullstack` flag-off
+(checkpoint+scaler+clip+autocast) compiled==lowered 4.77e-6; `test:gates` 5/5.
+
+**The rewrite COMPILES under checkpointing** (arena-recompute Risk 2, refuted). The
+fear that selective/full checkpointing re-fingerprints the plans every step and
+never cuts over is a TWO-PLAN artifact: the whole-step trace is ONE stable graph,
+so the remat plan reaches build-from-IR just like non-checkpoint — distil@512 +
+selective ckpt: **templates=4, converged=2, pinned=0, cleanMiss=0, dirtyMiss=0**
+(the non-checkpoint P2 census, now under checkpointing). This is a genuine P3
+advance: **checkpointed selective training is now compile-eligible**, which the
+two-plan world structurally could not do.
+
+**THE D3 GATE — BYPASS RETAINED (STOP on speed).** `tools/t-d3-remat.ts`
+(traced-remat-compiled vs the arena-free `setBufferArenaDisabled(true)` bypass;
+like-for-like, 3 repeats, reset-at-9 steady peak, A100 device 0, seq512):
+
+| config | arm | steadyPeak | steadyCur | ms/step | submits |
+|---|---|---|---|---|---|
+| distil@512 + selective | bypass | 3933.5 MB | 1798.3 | 299.5 | 8.0 |
+| distil@512 + selective | **remat** | **3977.0 MB (+1.1%)** | 2005.7 | **326.6 (+9%)** | 12.4 |
+| medium@512 + full | bypass | 12062.6 MB | 5788.1 | 1036.7 | 17.0 |
+| medium@512 + full | **remat** | **13020.1 MB (+7.9%)** | 7324.3 | **1148 (+11%)** | 22.4 |
+
+Verdict per config — peak ≤ +5% AND speed ≥ bypass AND traj ≤ 1e-5:
+- **distil-selective: peak PASS (+1.1%), speed FAIL (+9%), traj-vs-bypass 1.07e-5** (the seq512 two-path fp floor; the SOUND gate remat-vs-eager is 2.15e-6).
+- **medium-full: peak FAIL (+7.9%), speed FAIL (+11%), traj 2.19e-4** (same seq512 floor).
+
+**The year-old MEMORY precondition is MET for selective checkpointing** — the thing
+that blocked R3 since 2026-07-16. The two-plan arena-ON compiled path pinned the
+cross-plan checkpoint saves whole-step at **+8.8%** peak (`t-planner-pin-attribution`
+D3 header); the whole-step remat collapses that cross-plan RESULT to an intra-graph
+edge the planner packs → **+1.1%**. But two NEW facts block the deletion:
+1. **SPEED (both models).** Remat is +9%/+11% slower: the merged plan **scatters**
+   each layer's recompute into its own WAW segment (12.4 / 22.4 submits), where the
+   two-plan bypass **batches** all recomputes into `forceAllMerged` (8 / 17 submits).
+   The compiled per-op speedup does not recover the extra submit-sync overhead.
+   Reducing it is the "planner's chosen points" recompute-batching — a scheduling
+   change (islands altitude), out of a correctness-first P3.
+2. **PEAK on full checkpointing (medium).** Selective ckpt saves attention +
+   recomputes MLP → the collapsible cross-plan pin is the MLP only, and remat packs
+   it (+1.1%). Full ckpt recomputes every layer → the whole-step remat holds more
+   recompute activations co-live at the boundary force than the bypass frees
+   per-force → +7.9%. The memory win is **config-dependent**: it lands for
+   selective, not for full.
+
+Per campaign discipline (STOP rather than improvise; no gate-scope games): the
+D3 deletion does **not** land. `setBufferArenaDisabled` + `TORCHLETTE_CHECKPOINT_ARENA`
+are **RETAINED**. The remat rewrite lands as a soak-only flag-on feature (the P1
+gate lifted, the differential green); the bypass-death is re-blocked from MEMORY
+(solved for selective) onto SPEED + full-ckpt-peak. What a sound future D3 needs:
+recompute-batching in the whole-step scheduler (collapse the per-layer recompute
+segments) so submits ≤ the bypass's batched count — a named follow-on, not this pass.
+
+**Census re-run** (distil, seq15, forces/step, flag on): the +checkpoint row goes
+**5 → 2** — the structural recompute force (`autograd.ts:355` in the census) and its
+`disposeCheckpointIntermediates` are subsumed into the single boundary force, exactly
+as the non-checkpoint minimal row (whole step = ONE plan at the boundary; the 2nd
+count is the empty `beginStep` bookkeeping).
+
 - **P4 — Guard reduction + deletion.** Replace the runtime guard taxonomy with input
   guards; then execute the deletion ledger (§5) subsystem by subsystem, each behind
   a green parity gate. *The payoff phase.*

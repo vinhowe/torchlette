@@ -343,18 +343,34 @@ export async function backwardImpl(
         const { unpacked: allUnpackedTensors, hasCheckpoints } =
           collectSavedTensors(torch, ordered);
 
-        // [whole-step trace, P1] Checkpointed backward keeps the eager force:
-        // the recompute force (autograd.ts, the hasCheckpoints branch) and
-        // disposeCheckpointIntermediates() below both assume grads are forced
-        // before teardown. Deferring past them frees recomputed inputs the
-        // un-forced plan still reads (a UAF → GPU crash). Non-checkpoint only.
-        if (hasCheckpoints) deferForce = false;
+        // [whole-step trace, P3 — remat as a pass] Checkpointed backward under
+        // the whole-step scope is REMAT: the recompute subgraph the unpack hook
+        // built (a duplicate of the checkpointed forward, reading the segment
+        // inputs) stays LAZY and flows into the single boundary force alongside
+        // forward + backward + optimizer — no mid-backward recompute force, no
+        // separate two-plan split. The memory planner, seeing the whole step,
+        // packs the original forward activation's short forward-span interval
+        // against the recomputed duplicate's short backward-span interval (the
+        // cross-plan RESULT pin the two-plan world could not split — task #99).
+        // RNG identity is by construction: the unpack hook replayed the recorded
+        // draws at graph-BUILD time (engine `_debug_startCheckpointReplay` bakes
+        // recorded draw values into the recompute nodes when `fn` re-runs), so
+        // deferring the force does not change what the recompute computes.
+        //
+        // EAGER (deferForce already false — flag off, the reference) keeps the
+        // two-plan force below untouched. P1's `if (hasCheckpoints)
+        // deferForce = false` gate is LIFTED here: when deferForce is already
+        // true (whole-step), checkpointing no longer forces it off → remat.
+        const rematActive = deferForce && hasCheckpoints;
 
-        if (hasCheckpoints) {
+        if (hasCheckpoints && !rematActive) {
           // Checkpoint backward needs separate plans: forward tensors first,
           // then recomputed saved tensors. The saved-tensor plan must only
           // contain recomputed nodes — mixing in unmaterialized forward nodes
-          // causes DSL rewrites to produce invalid reshape operations.
+          // causes DSL rewrites to produce invalid reshape operations. (Not a
+          // concern under remat: the whole-step merged plan is one plan — the
+          // same non-checkpoint whole-step merge that P1/P2 validated — so there
+          // is no separate recompute plan for a forward node to contaminate.)
           const forwardToForce: RuntimeTensor[] = [];
           // Do NOT force-materialize the grad seed (`full([],1.0)`) in this
           // separate forward-tensors plan. The seed is a LEAF CONSTANT (no
@@ -417,7 +433,16 @@ export async function backwardImpl(
         // Dispose checkpoint-recomputed intermediates. The checkpoint owns
         // this — it tracked which tensors were recomputed (pending at capture
         // time) vs which were model weight references (already materialized).
-        disposeCheckpointIntermediates();
+        // Under remat (whole-step + checkpoint) the recomputed intermediates are
+        // still LAZY inputs to the un-forced whole-step plan; disposing them here
+        // frees their buffers before the boundary force reads them (a UAF).
+        // Defer to the boundary drain — after the single force has consumed the
+        // whole step (symmetric with every other deferForce teardown below).
+        if (deferForce) {
+          torch._deferToBoundary(() => disposeCheckpointIntermediates());
+        } else {
+          disposeCheckpointIntermediates();
+        }
         allUnpackedTensors.clear();
 
         // Drop non-leaf, non-retained grads from gradMap before force.

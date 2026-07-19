@@ -43,6 +43,14 @@ const SEQ = parseInt(process.env.SEQ_LEN ?? "64", 10);
 const STEPS = parseInt(process.env.STEPS ?? "30", 10);
 const LR = parseFloat(process.env.LR ?? "1e-4");
 const USE_SCALER = process.env.SCALER === "1";
+// [P3 remat differential] CKPT=1 turns on gradient checkpointing in BOTH arms:
+// the eager arm runs the unpack-hook two-plan recompute (the reference); the
+// traced arm runs REMAT (recompute stays lazy, flows into the boundary force).
+// SELECTIVE=1 checkpoints only the MLP (the #97 selective config). This is the
+// remat mother gate: traced-remat == eager-checkpointed ≤ 1e-5 over 30 steps,
+// crossing the compile-cutover threshold, compiled == lowered within traced.
+const USE_CKPT = process.env.CKPT === "1";
+const SELECTIVE = process.env.SELECTIVE === "1";
 const log = (m: string) => console.error(`[whole-step-diff] ${m}`);
 
 type Arm = "eager" | "traced" | "traced-lowered";
@@ -109,7 +117,7 @@ async function run(arm: Arm): Promise<ArmResult> {
       // graph teardown + the merged plan replay).
       readLoss = await api.wholeStep(async () => {
         const loss = api.tidy(() => {
-          const l = model.forwardWithLoss(input, target, { useCheckpoint: false }).loss!;
+          const l = model.forwardWithLoss(input, target, { useCheckpoint: USE_CKPT, selectiveCheckpoint: SELECTIVE }).loss!;
           api.keep(l);
           return l;
         });
@@ -139,7 +147,7 @@ async function run(arm: Arm): Promise<ArmResult> {
     } else {
       // EAGER reference: normal loop, loss.item() mid-step, eager backward.
       const loss = api.tidy(() => {
-        const l = model.forwardWithLoss(input, target, { useCheckpoint: false }).loss!;
+        const l = model.forwardWithLoss(input, target, { useCheckpoint: USE_CKPT, selectiveCheckpoint: SELECTIVE }).loss!;
         api.keep(l);
         return l;
       });
