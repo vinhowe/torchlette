@@ -679,6 +679,20 @@ class StorageTracker {
     return owners[0];
   }
 
+  /** [P2 whole-step] Is a live owner of this storage REGISTERED STATE (REG /
+   *  `registerState` — the gen-independent durable-persist signal, doc §3)?
+   *  A registerState'd harvested result (the whole-step deferred loss) whose
+   *  buffer is a compiled-plan result entry must survive plan invalidation for
+   *  its post-boundary read; the compiled-plan teardown consults this to PARK
+   *  such a buffer rather than destroy it. Merely-alive step-scoped results
+   *  (the default path) are NOT registered, so parking stays whole-step-only. */
+  isRegisteredStorage(storageId: number): boolean {
+    for (const w of this._liveOwners(storageId)) {
+      if (this._registeredState.has(w)) return true;
+    }
+    return false;
+  }
+
   /**
    * Release tensor refs for step-scoped temporaries — driven by the DERIVED
    * classification (task #70 D2 authoritative). For each tracked storage the

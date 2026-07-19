@@ -212,6 +212,15 @@ export function setSteadyBoundaryTrimmer(fn: () => void): void {
   steadyBoundaryTrimmer = fn;
 }
 
+/** [P2 whole-step] Reclaim parked result buffers whose reader storages have
+ *  died. Called at EVERY step boundary (not just steady): a persistent
+ *  whole-step result buffer is parked on plan invalidation and freed here
+ *  once the value is disposed. Backend-agnostic via this callback. */
+let parkedBufferReclaimer: (() => void) | undefined;
+export function setParkedBufferReclaimer(fn: () => void): void {
+  parkedBufferReclaimer = fn;
+}
+
 export function setObservedLivenessEnabled(on: boolean): void {
   enabled = on;
 }
@@ -597,6 +606,10 @@ export function guardMiss(nodeId: number, oi: number): boolean {
  *  + releaseStepTemps). Records survivors, advances hysteresis, converges
  *  templates, and clears step-scoped state. */
 export function observeStepBoundary(): void {
+  // Reclaim parked whole-step result buffers whose readers have died —
+  // independent of observed-liveness being enabled (a compiled plan can park
+  // buffers whenever build-from-IR is active).
+  parkedBufferReclaimer?.();
   if (!enabled) return;
   // Survival: a stamped result whose storage survived reclamation is needed.
   // Attribution: "s" = the handle itself survived; "b" = only its view BASE

@@ -30,6 +30,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
+import { getGPUMemoryStats } from "../src/backend/webgpu/memory-tracker";
 import { getSubmitCount, resetSubmitCount } from "../src/backend/webgpu/webgpu-state";
 import { Torchlette } from "../src/frontend/torchlette";
 import { Adam, GradScaler } from "../src/optim/index.ts";
@@ -51,6 +52,8 @@ interface ArmResult {
   vocab: number;
   meanLateMs: number;
   meanLateSubmits: number;
+  peakMB: number;
+  currentMB: number;
 }
 
 async function run(arm: Arm): Promise<ArmResult> {
@@ -177,7 +180,10 @@ async function run(arm: Arm): Promise<ArmResult> {
   const lateSub = stepSubmits.slice(half);
   const meanLateMs = lateMs.reduce((a, b) => a + b, 0) / lateMs.length;
   const meanLateSubmits = lateSub.reduce((a, b) => a + b, 0) / lateSub.length;
-  return { losses, vocab: V, meanLateMs, meanLateSubmits };
+  const mem = getGPUMemoryStats();
+  const peakMB = (mem?.peakBytes ?? 0) / 1024 / 1024;
+  const currentMB = (mem?.currentBytes ?? 0) / 1024 / 1024;
+  return { losses, vocab: V, meanLateMs, meanLateSubmits, peakMB, currentMB };
 }
 
 async function runArmInChild(arm: Arm): Promise<ArmResult> {
@@ -225,7 +231,8 @@ async function main() {
   log(`traced  losses[0..4]: ${traced.losses.slice(0, 5).map((l) => l.toFixed(6)).join(", ")} ... [${STEPS - 1}]=${traced.losses[STEPS - 1]?.toFixed(6)}`);
   const tracedLo = await runArmInChild("traced-lowered");
   log(`tracedLo losses[0..4]: ${tracedLo.losses.slice(0, 5).map((l) => l.toFixed(6)).join(", ")} ... [${STEPS - 1}]=${tracedLo.losses[STEPS - 1]?.toFixed(6)}`);
-  log(`STEADY-STATE (late ${STEPS - Math.floor(STEPS / 2)} steps): eager ${eager.meanLateMs.toFixed(1)}ms / ${eager.meanLateSubmits.toFixed(1)} submits  |  traced ${traced.meanLateMs.toFixed(1)}ms / ${traced.meanLateSubmits.toFixed(1)} submits`);
+  log(`STEADY-STATE (late ${STEPS - Math.floor(STEPS / 2)} steps): eager ${eager.meanLateMs.toFixed(1)}ms / ${eager.meanLateSubmits.toFixed(1)} submits  |  traced ${traced.meanLateMs.toFixed(1)}ms / ${traced.meanLateSubmits.toFixed(1)} submits  |  tracedLo ${tracedLo.meanLateMs.toFixed(1)}ms / ${tracedLo.meanLateSubmits.toFixed(1)} submits`);
+  log(`MEMORY (peak/current MB): eager ${eager.peakMB.toFixed(0)}/${eager.currentMB.toFixed(0)}  |  traced ${traced.peakMB.toFixed(0)}/${traced.currentMB.toFixed(0)}  |  tracedLo ${tracedLo.peakMB.toFixed(0)}/${tracedLo.currentMB.toFixed(0)}`);
 
   const dTracedEager = maxDelta(traced.losses, eager.losses);
   const dCompiledLowered = maxDelta(traced.losses, tracedLo.losses);

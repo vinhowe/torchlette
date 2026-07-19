@@ -117,6 +117,7 @@ import {
   type NodeResult,
   plannerEntryBytes,
   plannerEntryClaimable,
+  reclaimParkedLiveBuffers,
   resetPlannerRegistry,
 } from "./compiled-plan";
 import {
@@ -140,6 +141,7 @@ import {
   resetObservedLiveness,
   resultEntryFor,
   setObservedLivenessEnabled,
+  setParkedBufferReclaimer,
   setTemplateCompiledInvalidator,
   setTemplateIdleRetirer,
   stampResult,
@@ -766,6 +768,12 @@ setTemplateIdleRetirer((fp: number) => {
   t!.loweredPlan!.compiledPlan = undefined;
   clearResultEntries(fp);
   return "retired";
+});
+// [P2 whole-step] Reclaim parked result buffers (a persistent whole-step
+// result — the deferred loss — read after the boundary keeps its buffer alive
+// past plan invalidation; freed here once disposed). Runs every boundary.
+setParkedBufferReclaimer(() => {
+  reclaimParkedLiveBuffers();
 });
 
 /**

@@ -605,11 +605,66 @@ export function dbgIsDestroyed(buf: GPUBuffer): boolean {
   return _dbgDestroyed.has(buf);
 }
 
+/** [P2 whole-step] Result-entry buffers that a HARVESTED storage still reads
+ *  when their plan was invalidated/evicted. A whole-step compiled plan can
+ *  produce a PERSISTENT result (registerState'd — the deferred loss) whose
+ *  read happens AFTER the step boundary, so its buffer must outlive the plan.
+ *  Destroying it at invalidation poisons that post-boundary read's submit
+ *  ("used in submit while destroyed" → the value reads a stale 0). Such
+ *  buffers are PARKED here (kept pinned, detached from the registry so a
+ *  rebuilt plan materializes a fresh one) and reclaimed at a later boundary
+ *  once every reader storage is destroyed. This is the idle-retirer's
+ *  live-harvest check applied PER BUFFER, so convergence still proceeds. */
+let parkedLiveBuffers: Array<{ buf: GPUBuffer; ids: number[] }> = [];
+
+/** Storage ids in `harvestIds` that are STILL ALIVE, REGISTERED STATE, and
+ *  back `buf` (identity on the current backing buffer). Empty when no such
+ *  storage reads it. The REGISTERED gate keeps parking whole-step-only: only a
+ *  `registerState`'d result read after the boundary (the deferred loss) needs
+ *  its result-entry buffer to outlive plan invalidation. Merely-alive
+ *  step-scoped results (every default-path harvest) are excluded, so the
+ *  default path's buffer teardown is byte-identical (ledger-flat). */
+function liveHarvestIdsForBuffer(
+  buf: GPUBuffer,
+  harvestIds: number[] | undefined,
+): number[] {
+  if (!harvestIds || harvestIds.length === 0) return [];
+  const ids: number[] = [];
+  for (const id of harvestIds) {
+    if (storageTracker.isDestroyed(id)) continue;
+    if (!storageTracker.isRegisteredStorage(id)) continue;
+    const sh = storageTracker.getStorage(id);
+    if (sh && gpuBuffer(sh.backendTensor) === buf) ids.push(id);
+  }
+  return ids;
+}
+
+/** Reclaim parked result buffers whose reader storages have all been
+ *  destroyed (fence-gated destroy). Called at every step boundary. */
+export function reclaimParkedLiveBuffers(): void {
+  if (parkedLiveBuffers.length === 0) return;
+  const keep: Array<{ buf: GPUBuffer; ids: number[] }> = [];
+  for (const p of parkedLiveBuffers) {
+    const live = p.ids.filter((id) => !storageTracker.isDestroyed(id));
+    if (live.length > 0) {
+      p.ids = live;
+      keep.push(p);
+    } else {
+      pinnedBufferSet.delete(p.buf);
+      bufferPool.deferredDestroy(p.buf, (p.buf as { size?: number }).size ?? 0);
+    }
+  }
+  parkedLiveBuffers = keep;
+}
+
 /**
  * Release a plan's planner-registry entries. Called when the compiled plan
  * is invalidated or its template evicted.
  */
 export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
+  // Reclaim any previously-parked buffers whose readers have since died,
+  // before parking more this pass.
+  reclaimParkedLiveBuffers();
   // [step-tape 1b] guard-4 stub: every compiled-plan invalidation path
   // funnels through here — cascade to tapes referencing this template.
   if (STEP_TAPE_RECORD && compiled.tapeFp !== undefined) {
@@ -636,14 +691,26 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
         e.owners.delete(compiled);
         if (e.owners.size === 0) {
           if (e.buffer) {
-            pinnedBufferSet.delete(e.buffer);
-            // DEFERRED destruction, never immediate: teardown fires MID-STEP
-            // (staleness gates, eviction) while the step encoder holds
-            // encoded passes binding these buffers.
-            bufferPool.deferredDestroy(
+            // [P2 whole-step] A persistent harvested result (the deferred
+            // loss) may still read this buffer AFTER the step boundary.
+            // Park it (kept pinned) rather than destroy — destroying now
+            // drops that read's submit. Reclaimed once its readers die.
+            const liveIds = liveHarvestIdsForBuffer(
               e.buffer,
-              (e.buffer as { size?: number }).size ?? 0,
+              compiled._lastHarvestIds,
             );
+            if (liveIds.length > 0) {
+              parkedLiveBuffers.push({ buf: e.buffer, ids: liveIds });
+            } else {
+              pinnedBufferSet.delete(e.buffer);
+              // DEFERRED destruction, never immediate: teardown fires MID-STEP
+              // (staleness gates, eviction) while the step encoder holds
+              // encoded passes binding these buffers.
+              bufferPool.deferredDestroy(
+                e.buffer,
+                (e.buffer as { size?: number }).size ?? 0,
+              );
+            }
             e.buffer = undefined;
           }
           plannerRegistry.relist(idx);

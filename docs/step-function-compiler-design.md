@@ -454,6 +454,100 @@ balanced, `parity-fullstack` compiled==lowered 7.6e-6, `test:gates` 5/5,
   point the deletion ledger starts paying out (observed-liveness convergence can be
   bypassed for compiled steps).*
 
+### P2 status — landed (2026-07-19), compile-in-the-loop
+
+Under `TORCHLETTE_WHOLE_STEP=1` the single traced whole-step graph goes through
+the **normal K_w record-then-cutover lifecycle** and compiles — first exec
+lowered (the reference), then generated build-from-IR, then cutover. The
+existing compiler substrate (`generateStream` + `buildCompiledPlanFromGenerated`
++ `planMemory` + the K_w=2 cutover) **mostly just worked** on the merged graph
+(P0 had already scaled the passes). One class needed a named fix.
+
+**What just-worked.** The merged ~700-node graph builds, plans, cuts over, and
+replays through the unchanged substrate. The whole-step **uncovered census is
+EMPTY** for non-checkpoint distil: at seq512 the trace compiles into **4
+templates (upload / embed / attn-block / fwd-bwd-opt), ALL `BUILD-FROM-IR` with
+NO lowered execution** — zero plans stranded lowered. Convergence then prunes
+each (21 / 189 / 2 harvest pairs). The step is *not* literally one
+`CompiledPlan`: the executor's plan builder still segments the graph at WAW /
+barrier boundaries (the in-place `adamStep` interleaved with backward is a real
+barrier), so "one global memory plan" is per-segment-global, not one-plan-global.
+The submit win is the honest consequence — fewer force-points, not one submit.
+
+**What needed fixing — the #97 class, named: `park-live-registered-result`.**
+The compiled whole-step plan corrupted at the **convergence step** (a one-time
+event, then self-heals): the loss read a stale `0` and Dawn reported *"used in
+submit while destroyed."* Root cause: a whole-step compiled plan produces a
+PERSISTENT result — the `registerState`'d deferred loss, read AFTER the boundary
+via `item()` — whose buffer is a **non-owning pinned planner RESULT ENTRY**
+(`createTensor(..., ownsBuffer = !base && !pinnedBufferSet.has(buf))` → false, so
+it can't be flipped to owning). At convergence the plan is invalidated and
+`destroyCompiledPlanBuffers` deferred-destroys its result entries; the
+post-boundary `item()` copy then submits against a destroyed buffer → the submit
+drops → loss reads `0`. (Training is unaffected — only the readback submit drops;
+the eager-side losses match to the fp floor either side of the corrupted step.
+The gate's floor-relative tolerance had been MASKING it: the corrupted
+compiled-vs-lowered floor inflated the tolerance that hid the corrupted
+traced-vs-eager delta — a false PASS.) Fix (`compiled-plan.ts` +
+`observed-liveness.ts` + `storage-tracker.ts`): at teardown, a result-entry
+buffer still read by a live **REGISTERED-STATE** harvested storage is **PARKED**
+(kept pinned, detached from the registry so a rebuilt plan materializes a fresh
+buffer) instead of destroyed, and reclaimed at a later boundary once every reader
+storage dies (`reclaimParkedLiveBuffers`, run every `observeStepBoundary`). This
+is the idle-retirer's live-harvest check applied PER BUFFER, so **convergence
+still proceeds** (only the one persistent buffer is spared). The `REGISTERED`
+narrowing (`storageTracker.isRegisteredStorage`) keeps parking **whole-step-only**
+— a merely-alive step-scoped result (every default-path harvest) is excluded, so
+the default (flag-off) path's buffer teardown is byte-identical (proven:
+`t-ledger-attack` default+48 reach/total drift 0, same as baseline; a broader
+"any alive" gate perturbed it to drift 100).
+
+**The differential (the mother gate), now with compilation in the loop.**
+`t-whole-step-diff` distil seq64 / 30 steps: traced == eager **2.62e-6**,
+compiled == lowered (within traced) **2.62e-6**, both ≤ 1e-5, **no
+tolerance-masking** (the honest pass). At seq512 the compiled-vs-lowered floor is
+**6.4e-6** (byte-clean — P2's actual deliverable); the traced-vs-eager 2.7e-4 at
+seq512 is entirely P1's DEFERRAL fp-reorder (eager-vs-tracedLowered is also
+2.7e-4, both lowered), pre-existing and independent of the compile.
+
+**The headline (A100 dw-2-1, steady-state late-step).** Traced-compiled beats
+BOTH the eager baseline (fewer submits, ≥ speed) and P1's traced-lowered (much
+faster):
+
+| config | eager (per-plan compiled) | traced-compiled (P2) | P1 traced-lowered |
+|---|---|---|---|
+| distil@512 | 160.2 ms / 7.5 submits / 5545 MB | **154.8 ms / 6.5 submits / 5545 MB** | 283 ms / 7.0 / 3805 MB |
+| medium@512 | 536.1 ms / 14.5 submits / 17795 MB | **536.2 ms / 13.5 submits / 17795 MB** | 870.5 ms / 14.0 / 12399 MB |
+
+Submits drop **−1/step** both models; speed is at-or-better (distil −3%, medium
+parity); memory is **equal to eager** (both compiled paths pin result entries to
+the same footprint). The design's promise — "fewer submits, at-or-better speed,
+at-or-better memory" — lands as: submits ↓, speed ≥, memory =. The dramatic
+"submits collapse" the charter hoped for is modest (the optimizer barrier
+prevents a single plan); reported honestly.
+
+**Registry / ab-oracle movement.** `t-planner-pin-attribution` (flag-off,
+distil) attributes planner-registry 4073 MB total / 828.7 MB result across 498
+entries — the cross-plan RESULT footprint. The whole-step compile does NOT shrink
+this at the default path (unchanged); the traced-LOWERED arm uses ~1.5 GB less
+(3805 vs 5545 distil, 12399 vs 17795 medium) precisely because it does not pin
+result entries — a speed↔memory tradeoff the compiled path resolves toward speed.
+The `t-checkpoint-ab-oracle` **memory side did NOT close as a side effect** (D3
+precondition still unmet: arena-ON steadyPeak 5040 MB > arena-free+5% = 4130 MB) —
+the whole-step compile touches force-points and result liveness, not the
+checkpoint arena footprint, so the D3-blocking gap is unchanged. Not chased.
+
+**What idles further (observed, not deleted — the ledger executes at P4).** The
+whole-step plan changes the ledger's SHAPE on traced configs — the mid-step
+backward-force segment is gone, so the tape's per-segment eligibility diffing has
+one fewer boundary to witness, and the observed-liveness over-harvest the
+convergence machinery corrects is now a per-step-once event on the single trace
+rather than per-force. The tape/witness on traced configs still run (tape-matrix
+4/4, witness 2 cells pass); nothing is removed (the flag is soak-only; the
+default path still forces backward separately). Flag OFF remains byte-identical
+(`park` is REGISTERED-gated → never fires on the default path; the reclaimer is a
+no-op on an empty park list).
+
 - **P3 — Remat as a pass.** Move checkpointing from unpack-hook forces to
   scheduled recompute in the whole-step stream. Gate: parity with checkpoint on,
   memory ≤ today's checkpointed peak, RNG-identical recompute proven at compile time.
