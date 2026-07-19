@@ -997,6 +997,81 @@ because the finishing agent ran it with the opt-out).
 Each phase names its deletions in the commit (house policy). Every new flag is born
 with a sunset (soak → default → opt-out dies).
 
+### P4a status — THE DECODE DISCRIMINATOR — VERDICT B (2026-07-19)
+
+Everest (P1–P3) validated whole-step for TRAINING only. The step tape's other live
+consumer is DECODE (phase-1's ~14.55 ms/token demo). P4a's load-bearing question:
+**does a decode step run under `TORCHLETTE_WHOLE_STEP` as a whole-step-COMPILED
+function** — such that the whole-step compiler could subsume the tape's decode
+consumer and P4b could delete `step-tape*.ts` wholesale?
+
+**VERDICT B — decode BLOCKS; whole-step is a structural NO-OP for decode.** The
+tape survives DECODE-SCOPED in P4b.
+
+*The structural cause (from code, not measurement).* The whole-step scope's ENTIRE
+mechanism is `_deferBackwardForce()` (`WHOLE_STEP_TRACE && _wholeStepDepth > 0`),
+whose only consumers are the backward-path force/teardown sites (`autograd.ts` lines
+230/270/306/442/545/571) and the checkpoint unpack hook (`nn/checkpoint.ts:157`). A
+decode step is a `noGrad` forward — no backward runs, so NONE of these fire.
+`api.wholeStep(fn)` around a forward-only body reduces to
+`_enterWholeStep(); fn(); _exitWholeStep()` — a depth counter with no consumer.
+There is no fwd+bwd+opt multi-force to collapse: decode is ALREADY a single-force
+forward, and the per-token logits readback IS its boundary.
+
+*The measurement (`tools/t-decode-whole-step.ts`, distilgpt2 KV-decode, 16 steps,
+V100 sivri device 0, two isolated-child arms — the flag is a module-load const).*
+A real `forwardCached` KV-decode loop, each decode forward wrapped in `api.wholeStep`
+under `TORCHLETTE_WHOLE_STEP=1` (arm `whole-step`) vs unset (arm `plain`):
+
+| arm | templates (prefill→decode) | steady growth | ms/tok | tok/s |
+|---|---|---|---|---|
+| plain | 1 → 2 | 0 | 58.67 | 17.0 |
+| whole-step | 1 → 2 | 0 | 55.45 | 18.0 |
+
+Tokens **byte-identical**; template count **identical** (2 == 2 — the decode step
+does NOT become a distinct whole-step-compiled function, it runs the SAME per-plan
+compiled template); steady growth identical (0); tok/s ratio 1.058 (within
+16-step measurement noise, no whole-step effect). Whole-step neither traces nor
+compiles decode as its own function.
+
+*The named blocking causes (Verdict-B characterization, per §6).*
+1. **No backward ⇒ the mechanism is inapplicable.** whole-step's sole lever
+   (deferring the backward grad-write force to merge fwd+bwd+opt into one boundary
+   graph) has nothing to act on in a `noGrad` forward. Decode is structurally a
+   single-force step already.
+2. **Readback-per-token is definitional, not deferrable.** Each decode step reads
+   its logits to choose the next token, and that VALUE is the next step's input. The
+   loop is data-dependent on the readback; there is no boundary to defer past (unlike
+   training's loss, which rides the ring and feeds nothing downstream in-step).
+3. **The tape's decode consumer is a DIFFERENT mechanism.** Decode's acceleration is
+   the per-plan template compiler (`#71` offset-is-data: steady template growth 0,
+   BUILD-FROM-IR) and, when enabled, the step-tape REPLAY skeleton re-dress
+   (`step-tape-replay.ts`, keyed by `bucketKey`, serving per-token uploads). Neither
+   is touched or subsumed by whole-step's fwd+bwd+opt merge.
+
+*The verdict-adjusted P4b ledger (§5), stated honestly.* The "static whole-step
+graph makes the runtime-staticness engine unnecessary" thesis holds for the TRAINING
+half of the ledger (observed-liveness / the training-side tape record+diff / the
+guard taxonomy on training steps). It does **NOT** reach the decode half: whole-step
+cannot delete `step-tape.ts` (820) / `step-tape-replay.ts` (680) / `step-object.ts`
+(156) / `cross-plan-edges.ts` (152) / `tape-profile.ts` (18) — ~1826 SLOC — on the
+grounds that "whole-step subsumes decode." Two honest paths remain for P4b to shrink
+the decode half, each needing its OWN proof (NOT whole-step):
+- **(P4b-decode-α)** prove the per-plan template compiler ALONE suffices for the
+  decode demo (this pass already shows plain per-plan decode at steady growth 0 and
+  17 tok/s WITHOUT the step tape) — if the tape adds no measurable decode value over
+  per-plan compile, it is deletable on THOSE grounds (per-plan compile survives the
+  ledger as "the flat command-stream builder + slot table"). This is a decode
+  benchmark P4b must run (tape-replay vs plain per-plan tok/s on a real weighted
+  model), not assumed.
+- **(P4b-decode-β)** if the tape DOES beat per-plan compile for decode, it survives
+  **decode-scoped** — the training-side deletions still land, but `step-tape*.ts`
+  stays as the decode replay path. The ledger shrinks honestly by the training half,
+  not the full ~2633 outright.
+
+The verdict is the deliverable (no forcing): whole-step is training-shaped; decode is
+not a training step; the two do not meet.
+
 ### Risks (honest)
 
 - **Plan-builder scale** (P0). Bounded, named, amortized once-per-compile — but the
