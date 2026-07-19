@@ -331,6 +331,12 @@ For each mechanism: what it is TODAY, what FACET it becomes, what gets DELETED
 
 ### 3.5 The checkpoint bypass → the `recompute` facet (the bypass dies)
 
+> **LANDED — the bypass is DEAD (2026-07-19).** Not via the arena-serves-recompute
+> mechanism this section sketched, but via whole-step remat (see the Phase 3 CLOSED
+> block above and `step-function-compiler-design.md` "The D3 FINISH"). The trainer's
+> `setBufferArenaDisabled(true)` call + `TORCHLETTE_CHECKPOINT_ARENA` flag are DELETED;
+> `WebGPUGPT2Trainer` wraps its checkpointed inner step in `api.wholeStep`.
+
 > **CROSS-REF (task #99, `docs/arena-recompute-design.md`):** the bypass-death
 > mechanism — how the planner SERVES recompute segments so checkpointed steps run
 > compiled AND low-memory — is designed there. MEASURED attribution of §6 Phase
@@ -659,6 +665,45 @@ plus the runahead ring (K=2 default).
 - **Deletes:** nothing (the fallback stays; deletions are later dividends).
 
 ### Phase 3 — Checkpointing first-class; the bypass dies
+
+> **CLOSED — the bypass is DEAD (2026-07-19). It died by a DIFFERENT mechanism than
+> the five STOP-and-re-scope records below anticipated.** Those records awaited "the
+> arena SERVES recompute segments" (a P4 arena-surgery campaign: per-position liveness
+> keyed to the recompute boundary). The death came instead from the STEP-FUNCTION
+> COMPILER's P3 remat pass (`docs/step-function-compiler-design.md` "The D3 FINISH"):
+> the WHOLE inner step runs under `api.wholeStep`, so the checkpointed forward + the
+> backward recompute duplicate + the optimizer merge into ONE lazy graph forced once;
+> the memory planner packs each forward activation's short forward-span interval
+> against its recomputed duplicate's short backward-span interval — the arena stays
+> ON and the step COMPILES at a LOWER STEADY peak than the arena-free bypass
+> (D3 table: distil@512+selective 94.4% peak / 3.3× faster; medium@512+full 86.2%
+> peak / 2.2× faster). The two-gate conflict below dissolves because remat satisfies
+> BOTH: compiled (phase-4 witness gate fires) AND low steady peak (the recompute
+> duplicate is short-lived, not a pinned forward position). CE-from-IR contiguity
+> coverage made the 809-node boundary plan compile; a typed SUNSET-BOUND
+> `CHECKPOINT_EAGER_REFUSAL` (executor.ts) protects the residual EAGER (flag-off)
+> checkpoint step — arena ON but plans lowered — from the b66ead78 two-plan hazard.
+>
+> **The history line (five re-scopes → death):** (1) STOPPED 2026-07-15 at the bypass
+> deletion, two-gate conflict; (2) D3 UPDATE 2026-07-16, peak-parity re-frame did not
+> rescue it; (3) reframed lead 2026-07-19 ("does compiled remat beat the bypass?");
+> (4) D3 FINISH 2026-07-19, CE coverage → the remat arm COMPILES and beats the bypass
+> on speed AND steady peak, both configs D3-READY; (5) THE BYPASS DEATH 2026-07-19
+> (this pass) — `WebGPUGPT2Trainer` moves its checkpointed step to `api.wholeStep`
+> remat; the `setBufferArenaDisabled(true)` call + its ~40-line WHY comment + the
+> `TORCHLETTE_CHECKPOINT_ARENA` flag are DELETED. **Deaths named:** the trainer's
+> bypass call + WHY comment (~40 SLOC of comment, 5 SLOC of call) and 1 env flag
+> (`TORCHLETTE_CHECKPOINT_ARENA`). The engine method `setBufferArenaDisabled` SURVIVES
+> (the D3 tool's `bypass` measurement arm still uses it); the refusal + its
+> flag-independent scope survive until P4 deletes the eager two-plan path.
+>
+> **124M proof (the production trainer, this pass, V100 sivri):** trajectory EXACT to
+> baselines {9.81, 5.92, 5.15, 4.64} in BOTH modes (remat all-time peak 3908.6 MB,
+> 3× faster/round; flag-off eager+refusal 2462.3 MB, same speed). The remat all-time
+> peak is HIGHER than the old bypass's 2087.6 MB at THIS config (batch8/seq256) — the
+> recompute-coresidency cost is batch-driven; the D3 steady-peak WIN holds at
+> batch1/seq512. Characterized, not a silent regression: peak is budget-independent
+> (identical at 4000 & 2200 MB pool budgets) and flat round-over-round (zero leak).
 
 > **CROSS-REF (task #99):** the two-gate conflict below is RESOLVED in design by
 > `docs/arena-recompute-design.md` (the "arena serves recompute segments"

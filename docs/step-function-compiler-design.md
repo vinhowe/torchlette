@@ -880,6 +880,48 @@ verdict, it does not delete). `setBufferArenaDisabled` + `TORCHLETTE_CHECKPOINT_
 and the refusal all REMAIN until that reviewed deletion. The refusal's sunset is now
 unblocked: D3-READY on both configs.
 
+### THE BYPASS DEATH — LANDED (2026-07-19, the reviewed pass D3-READY earned)
+
+The reviewed deletion pass. `WebGPUGPT2Trainer.singleInnerStep` now wraps its checkpointed
+inner step in `api.wholeStep` (deferring the per-micro-batch loss read to a detached scalar
+copy read AFTER `markStep`, so the merge is not force-split mid-step); `initialize()` no
+longer disables the arena. **Deaths named:** the trainer's `setBufferArenaDisabled(true)`
+call + its ~40-line WHY comment (task #98 phase-3 STOP narrative) and the
+`TORCHLETTE_CHECKPOINT_ARENA` env flag — DELETED. **Survives (P4 deletions):** the ENGINE
+method `RuntimeEngine.setBufferArenaDisabled` (the D3 tool's `bypass` measurement arm +
+`t-planner-pin-attribution` still drive it) and the `CHECKPOINT_EAGER_REFUSAL` (guards the
+residual flag-off eager checkpoint step, arena-ON/lowered). Net src SLOC: ~−45 (comment +
+call + flag read); +~40 in the new wholeStep-wrapping trainer body (deferred-loss/live-upload
+bookkeeping); +1 death of an env flag.
+
+**Spec fix (owed, landed here).** `test/whole-step-checkpoint-refusal.spec.ts` threw a
+strict-lifetime `[lifetime] reading RECLAIMED` (the wpe position-embedding grad, scatterAdd→add)
+in BOTH its eager cells under strict-DEFAULT — refusal-INDEPENDENT spec-loop hygiene: the
+minimal loop had no optimizer, so param grads (graph-derived, not in the snapshot) persisted
+across `markStep`, were demoted, then read by the next step's accumulation. Fixed by mirroring
+the census tools' loop shape — an `Adam` + `step()`/`zeroGrad()` each step supplies the boundary
+discipline. Now **3/3 under strict DEFAULT** (no `TORCHLETTE_STRICT_LIFETIME=0` opt-out), with
+`TORCHLETTE_WHOLE_STEP=1` to un-skip the remat cell.
+
+**The 124M proof (production trainer, V100 sivri device 0).** Trajectory EXACT to baselines
+{9.81, 5.92, 5.15, 4.64} in BOTH modes — remat 9.809/5.922/5.154/4.641, flag-off eager+refusal
+9.809/5.922/5.154/4.641 — no shift, memory flat (zero leak). Speed/peak:
+
+| mode | peak (all-time) | ms/round | note |
+|---|---|---|---|
+| remat (`TORCHLETTE_WHOLE_STEP=1`) | 3908.6 MB | ~1.7 s | 3× faster; peak budget-independent (4000 & 2200 MB pool → identical) |
+| flag-off eager + refusal (default) | 2462.3 MB | ~5.3 s | arena-ON/lowered; the refusal keeps it sound (no +209% blowup) |
+| (old bypass, deleted) | 2087.6 MB | ~5.3 s | arena-free/lowered — the reference |
+
+Characterized (not a silent regression): at THIS production config (batch8/seq256) the remat
+all-time peak (3908.6 MB) is HIGHER than the bypass's 2087.6 MB — the recompute-coresidency
+cost is BATCH-driven (the whole-step merged plan co-locates forward + recompute + optimizer
+buffers; at batch8 that is 8× the per-position activation). The D3 STEADY-peak WIN (94.4% /
+86.2%) holds at batch1/seq512, where the D3 table measured it. The flag-off default rises
++18% vs the bypass (arena now ON), well short of the STOP's feared +209% current blowup — the
+refusal-lowered path is well-behaved. The trajectory-exactness (the STOP condition) is met, so
+the death lands; the memory shape is reported, not re-baselined.
+
 ### D3-finish fallout — the step-object census red light was the refusal, not a ghost (2026-07-19)
 
 The D3-finish branch landed with `t-train-tape-matrix [fused, no-sched]` red

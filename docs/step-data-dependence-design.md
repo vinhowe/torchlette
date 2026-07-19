@@ -536,7 +536,33 @@ deterministic evidence recorded here so the next attempt doesn't re-walk it:
   `TORCHLETTE_CHECKPOINT_ARENA`; the step-object §6 Phase 3 STOP narrative; (named follow-on) the
   dead segmented executor.
 
-**STATUS 2026-07-16 — D3 STOPPED at Stage 1; the peak-parity precondition FAILED; bypass RETAINED.**
+**STATUS 2026-07-19 — DONE; the re-open condition was MET by whole-step remat; the bypass is DEAD.**
+The 2026-07-16 STOP's re-open condition (below) was: "a future mechanism that lowers arena-ON steady
+peak below arena-free steady peak +5% on distil." That mechanism arrived — NOT the D2b post-witness
+re-planning this doc anticipated, but the STEP-FUNCTION COMPILER's P3 whole-step REMAT pass
+(`docs/step-function-compiler-design.md` "The D3 FINISH"). Remat is a THIRD mode distinct from the
+arena-ON EAGER two-plan config the STOP measured: the whole inner step runs under `api.wholeStep`,
+merging forward + backward recompute + optimizer into ONE compiled boundary plan, and the memory
+planner packs the short-lived recompute duplicate against the short-lived forward activation. The D3
+FINISH table (V100 sivri, 3 repeats, reset-at-9 steady peak) shows remat steady peak BELOW arena-free:
+
+| config | bypass (arena-free) steadyPeak | remat (whole-step) steadyPeak | remat vs bypass | ms/step |
+|--------|-------------------------------|-------------------------------|-----------------|---------|
+| distil@512 + selective | 3933.5 MB | 3712.6 MB | **94.4% (−6%)** | 3.3× faster |
+| medium@512 + full | 12062.6 MB | 10401.1 MB | **86.2% (−14%)** | 2.2× faster |
+
+The precondition (arena-ON steady peak ≤ arena-free) HOLDS for remat on BOTH configs — the STOP's
+distil +8.8% failure was specific to the EAGER two-plan config, which remat supersedes. The trainer's
+`setBufferArenaDisabled(true)` call + `TORCHLETTE_CHECKPOINT_ARENA` flag are DELETED (2026-07-19). The
+124M production A/B (through `WebGPUGPT2Trainer`) is trajectory-EXACT to baselines in both modes (see
+`step-object-design.md §6 Phase 3 CLOSED` for the 124M peak characterization — at batch8/seq256 the
+remat all-time peak is higher than the bypass, the batch-driven recompute-coresidency cost, but the
+steady-peak WIN above holds at batch1/seq512). The engine method `setBufferArenaDisabled` + the
+`CHECKPOINT_EAGER_REFUSAL` survive to P4 (D3 tool's bypass arm + flag-off safety).
+
+---
+
+**HISTORICAL (pre-death) — STATUS 2026-07-16 — D3 STOPPED at Stage 1; the peak-parity precondition FAILED; bypass RETAINED.**
 The ratified ruling gated bypass-deletion on a re-framed memory oracle: arena-ON PEAK ≤ arena-free
 PEAK + 5% (steady CURRENT reported-not-gated), justified by a cited inversion "arena-ON peak
 4278.5 < arena-free 4790." Stage 1 re-measured the peak matrix fresh, like-for-like, on ONE clean

@@ -501,7 +501,32 @@ weaken strict/`[lifetime]`), R2 STOPS here with this repro.
 
 ### Phase R3 — the bypass dies (ruling 3 + 5 of the step-object campaign)
 
-**STATUS 2026-07-16 — R3 STILL BLOCKED; D3's peak-parity re-frame did NOT unblock it.**
+**STATUS 2026-07-19 — DONE (the production bypass is DEAD), by whole-step remat, not by
+this doc's arena-serves-recompute surgery.** R3's precondition (arena-ON checkpointing at
+steady peak ≤ arena-free) was met NOT by the D2b post-witness re-planning this section
+awaited, but by the STEP-FUNCTION COMPILER's P3 remat pass
+(`docs/step-function-compiler-design.md` "The D3 FINISH"): the whole inner step runs under
+`api.wholeStep`, merging the checkpointed forward + backward recompute + optimizer into one
+compiled boundary plan whose planner packs the short-lived recompute duplicate against the
+short-lived forward activation — arena-ON steady peak DROPS below arena-free (D3 table:
+distil@512+selective 94.4%, medium@512+full 86.2%). `WebGPUGPT2Trainer` now wraps its
+checkpointed step in `api.wholeStep`; the `setBufferArenaDisabled(true)` CALL + the
+`TORCHLETTE_CHECKPOINT_ARENA` flag are DELETED (2026-07-19, THE BYPASS DEATH pass). 124M
+production proof: trajectory EXACT to baselines in both modes.
+
+**Scope note — what SURVIVES this deletion (vs the R3 "Deletes" list below).** The ENGINE
+method `RuntimeEngine.setBufferArenaDisabled` + `bufferArenaDisabled` field + the
+`arenaDisabled` threading SURVIVE: the D3 measurement tool (`tools/t-d3-remat.ts`) still
+drives an arena-free `bypass` arm through the method to measure remat's win against it, and
+`tools/t-planner-pin-attribution.ts` uses it too. The residual EAGER (flag-off) checkpoint
+step is guarded by the typed SUNSET-BOUND `CHECKPOINT_EAGER_REFUSAL` (executor.ts, arena ON
+but plans lowered). Both the engine method and the refusal are P4 deletions (with the eager
+two-plan path), not this pass. The `executePlanSegmented` / `enableCheckpointSegmentation`
+follow-on and the `TORCHLETTE_ARENA_LIVENESS=0` sunset remain future cleanups.
+
+---
+
+**HISTORICAL (pre-death) — STATUS 2026-07-16 — R3 STILL BLOCKED; D3's peak-parity re-frame did NOT unblock it.**
 The step-data-dependence D3 campaign re-framed the memory gate from steady-current-parity to
 PEAK-parity (arena-ON peak ≤ arena-free peak + 5%) to unblock this deletion. Stage-1 fresh
 like-for-like measurement (see `docs/step-data-dependence-design.md §D3` STATUS table and
