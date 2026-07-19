@@ -398,7 +398,12 @@ trace, run eager-lowered.
   boundary force.
 - *Structural — NAMED, NOT eroded.* The checkpoint-recompute force
   (`autograd.ts:355`) stays. **P1 covers NON-checkpoint configs**; recompute is
-  P3's remat pass. Documented in code (the flag's doc-comment) and here.
+  P3's remat pass. A checkpointed backward **gates the deferral OFF entirely**
+  (`deferForce = false` when `hasCheckpoints`) — deferring past the recompute
+  force + `disposeCheckpointIntermediates()` frees recomputed inputs the
+  un-forced plan still reads (a UAF/GPU-crash). So under checkpointing the
+  whole-step scope is a no-op: the step runs exactly the eager path. Named in
+  code (the flag doc-comment + the `hasCheckpoints` gate) and here.
 
 **Census re-run** (distil, seq15, forces/step before → after, flag on):
 
@@ -406,8 +411,13 @@ trace, run eager-lowered.
 |---|---|---|---|
 | minimal (no ckpt/scaler) | 4 | **2** | whole step = ONE 703-node plan at the single boundary force; the 2nd count is the empty `beginStep` bookkeeping call (0 pending) |
 | +scaler | 6 | **3** | scaler's deferred-scale flush stays — erodible D0, not P1 |
-| +checkpoint | 5 | **4** | recompute force STAYS (structural, P3) |
+| +checkpoint | 5 | 5 | **no-op** — deferral gated off under checkpointing (eager fallback); recompute is P3 |
 | DEFERRED-LOSS | 3 | 3 | unchanged — the pre-P1 config P1 productizes |
+
+(The minimal/+scaler rows were measured with `TORCHLETTE_WHOLE_STEP=1` before
+the checkpoint gate landed; the gate touches only the checkpoint path, so those
+non-checkpoint numbers are unchanged by construction. The +checkpoint row is
+`5→5` by the gate — the whole-step scope no-ops to the eager checkpoint path.)
 
 The `forward+item` force and the separate backward grad force are both gone from
 the minimal config; the whole 703-node step is one merged plan.
