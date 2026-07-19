@@ -650,6 +650,71 @@ segments) so submits ≤ the bypass's batched count — a named follow-on, not t
 as the non-checkpoint minimal row (whole step = ONE plan at the boundary; the 2nd
 count is the empty `beginStep` bookkeeping).
 
+### Recompute/optimizer-batching follow-on — BUILT, PROVEN SOUND, MEASURED NET-NEGATIVE, REVERTED (2026-07-19)
+
+The named follow-on above ("recompute-batching … so submits ≤ the bypass's batched
+count") was attempted and **reverted**. What it found reframes the STOP.
+
+**The segment split, named precisely.** The 12.4-vs-8.0 submit gap is NOT per-layer
+recompute segments — it is the **optimizer shattering**. Under the whole-step merge,
+each param's `adamStep` becomes Kahn-ready the instant its gradient finishes, so the
+frontier interleaves adamSteps with the still-running tail of backward
+(`fusedLayerNormBackwardGradWeightBias`, and the weight-grad `transpose`/`matmul`/`sum`
+runs). The consecutive-run `adam-batch` action (lowered-plan.ts) then splits into **3–4
+batches** (observed op-order gaps: adamStep runs at plan positions ~601, ~604, ~616–641,
+~762+, separated by 14 layernorm-grad nodes and a 120-node transpose/matmul/sum block).
+Each `adam-batch` action pays an unconditional pre-flush (`executor.ts` ~2786:
+`flushSharedEncoder`+`flushBufferPool` for pool safety) plus the kernel's internal
+flush → ~2 submits/batch. The two-plan bypass runs the optimizer as a SEPARATE plan
+(all grads already materialized ⇒ all adamSteps immediately ready ⇒ one consecutive run
+⇒ one batch), which is the entire submit delta. The per-layer recompute subgraphs
+themselves do NOT each open a submit (checkpoint boundaries are inert on the fusion/
+lowered path; `DEFAULT_RECLAIM_INTERVAL=10000` fires zero reclaims on the ~800-node
+plan).
+
+**The fix + why Kahn-legal.** A tie-break change in `enforceWriteAfterReadOrder`
+(plan-builder.ts): a second `deferredHeap` for `adamStep`, drained only when the
+non-adam frontier empties, self-gated to plans that hold BOTH an `adamStep` AND a
+`matmul` (⟺ the whole-step merged plan; the flag-off pure-optimizer and pure-backward
+plans lack one of the two, so it is a structural no-op there). Legal because adamStep's
+in-place param/m/v writes are read by nothing else in the step (next step = different
+plan) and its readers are already pinned before it by the existing WAR edges — so
+deferring it as late as the frontier allows never violates a dependency. Result:
+**one** adam batch, submits **12.3 → 8.4** (bypass 8.0 — parity). Numerically sound:
+`t-whole-step-diff CKPT=1 SELECTIVE=1` traced==eager **3.10e-6**, compiled==lowered
+**2.62e-6** (both ≤ 1e-5).
+
+**Why it was reverted — submit-count is NOT the speed bottleneck (falsified).** Full
+D3 table, distil@512 selective, 3 repeats, with the fix:
+
+| metric | bypass | remat+fix | doc-baseline remat | verdict |
+|---|---|---|---|---|
+| steadyPeak | 3933.5 MB | **4149 MB (+5.5%)** | 3977 (+1.1%) | peak REGRESSED, now FAILS ≤+5% |
+| ms/step | 298.2 | **314.3 (+5.4%)** | 326.6 (+9%) | speed still FAILS |
+| submits | 8.0 | **8.4** | 12.4 | parity reached |
+| traj vs bypass | — | **3.72e-5** | 1.07e-5 | FAILS 1e-5 (cross-impl fp floor, not a bug) |
+
+Collapsing 4 batches → 1 removed ~4 submits but recovered only ~12 ms of the ~28 ms
+(9%) gap — i.e. **submit-sync was ~3% of the 9%, not the driver.** The design's premise
+("the compiled per-op speedup does not recover the extra submit-sync overhead") is
+**falsified**: at submit-parity the remat step is still +5.4% slower AND now +5.5% peak
+(the deferral holds every gradient co-live to the boundary, the memory cost of one
+batch — the tradeoff the P3 note anticipated). Net-negative on the seq512 gate; reverted
+per complexity budget (matching the reverted gap-spanning fusion detector precedent).
+
+**The residual gap, and the real lead.** Both arms run **lowered**; the whole-step remat
+plan does NOT reach compiled steady-state execution (steady submits stay at 12.4 — a
+compiled ~800-node plan would show ~2; the trace is `executeLoweredPlan` every step, and
+the CUTOVER `converged=2` counts the tiny readback/bookkeeping plans, not the big
+whole-step boundary plan). So the "compiled per-op speedup" the speed premise rests on
+**is not active in the measured regime.** A sound future D3 is therefore NOT recompute-
+batching (measured null for speed, negative for peak/traj) but **getting the whole-step
+remat boundary plan to converge and replay compiled** — a convergence/observed-liveness
+question, out of scope for a scheduling pass. Until then the STOP stands.
+
+**VERDICT UNCHANGED: BYPASS RETAINED.** `setBufferArenaDisabled` + `TORCHLETTE_CHECKPOINT_ARENA`
+stay. No src change lands from this follow-on.
+
 - **P4 — Guard reduction + deletion.** Replace the runtime guard taxonomy with input
   guards; then execute the deletion ledger (§5) subsystem by subsystem, each behind
   a green parity gate. *The payoff phase.*
