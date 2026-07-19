@@ -62,6 +62,7 @@ import {
 } from "../backend/webgpu/ops/reductions";
 import {
   deriveNodeOffset,
+  deriveNodeViewMeta,
   type MetaNodeLike,
   VIEW_META_OPS,
   type ViewMeta,
@@ -80,7 +81,7 @@ import type {
   TileKernelPlan,
 } from "../backend/webgpu/tile-dispatch";
 import { planUnscaleGradDispatch } from "../backend/webgpu/unscale-kernel";
-import { sizeOf } from "../core/shape";
+import { checkContiguous, sizeOf } from "../core/shape";
 import type { LazyIRNode, StorageHandle } from "../graph/types";
 import {
   lookupPackedBuffers,
@@ -2404,6 +2405,73 @@ function generateGather(
  * declaration is load-bearing, so an undeclared-but-forced operand is a
  * coverage gap the differential surfaces rather than a silent wrong copy.
  */
+/** Base-buffer byte size for a strided-view producer whose result is NOT live
+ *  (build-from-IR path): walk the VIEW_META_OPS chain to the non-view base node
+ *  and size its contiguous allocation. Single-sourced with deriveNodeViewMeta's
+ *  walk (same VIEW_META_OPS set, same input[0]/oi-0 rule). Returns undefined
+ *  when the chain bottoms out on a materialized/released/scalar base (not
+ *  IR-derivable) — the caller then keeps its historical no-storage bail. */
+function deriveBaseBufferBytes(node: LazyIRNode): number | undefined {
+  let n: LazyIRNode = node;
+  for (let guard = 0; guard < 64 && VIEW_META_OPS.has(n.op); guard++) {
+    const inp = n.inputs[0];
+    if (!inp || inp.kind !== "pending" || (inp.outputIndex ?? 0) !== 0) {
+      return undefined;
+    }
+    n = inp.node;
+  }
+  if (VIEW_META_OPS.has(n.op)) return undefined; // never bottomed out
+  return sizeOf(n.shape) * dtypeBytes(n.dtype);
+}
+
+/** [D3 CE-from-IR coverage] Synthesize the contiguous-copy prologue for a
+ *  contiguity-required operand that is a STRIDED VIEW with NO live storage (the
+ *  build-from-IR path — nothing is materialized, so resolveContiguousOperand's
+ *  live-layout branch never fires). Derives the view's {shape,strides,offset}
+ *  purely from IR via deriveNodeViewMeta (the single-source view-meta the
+ *  backend ops use) + a base-buffer-bytes walk, then feeds the SAME
+ *  planContigCopy the live branch uses — so the copy is byte-identical to the
+ *  dispatch layer's asContiguous (the t-stream-generate differential asserts
+ *  agreement at the recording seam). Closes the `fusedCrossEntropy{Forward,
+ *  Backward}[no-storage]` bail on the CE logits `narrow(1,0,vocabSize)`
+ *  (model.ts) — the last two uncovered ops in the whole-step remat boundary
+ *  plan. Returns {slot,prologue}, a bail string, or undefined when the layout
+ *  is not IR-derivable (caller keeps its no-storage bail). */
+function derivedContigCopyFromIR(
+  ref: LazyIRNode["inputs"][number],
+  inSlot: Slot,
+  slots: SlotSource[],
+): { slot: Slot; prologue: GpuCommand[] } | string | undefined {
+  if (ref.kind !== "pending" || (ref.outputIndex ?? 0) !== 0) return undefined;
+  const node = ref.node;
+  const vm = deriveNodeViewMeta(
+    node as unknown as MetaNodeLike,
+    refLiveMeta,
+  );
+  if (!vm) return undefined; // not IR-derivable → keep the historical bail.
+  // Already contiguous & offset 0 → flat-bindable, no copy. (Rarely reached:
+  // refShapeDtype/contiguousViewShapeDtype would have derived it upstream.)
+  if (checkContiguous(vm.shape, vm.strides) && vm.offset === 0) {
+    return { slot: inSlot, prologue: [] };
+  }
+  const bufferBytes = deriveBaseBufferBytes(node);
+  if (bufferBytes === undefined) return undefined;
+  const cc = planContigCopy(
+    {
+      contiguous: false,
+      shape: vm.shape,
+      strides: vm.strides,
+      offset: vm.offset,
+      dtype: node.dtype,
+      bufferSize: bufferBytes,
+    },
+    inSlot,
+    slots,
+  );
+  if (typeof cc === "string") return cc;
+  return { slot: cc.outSlot, prologue: cc.commands };
+}
+
 function resolveContiguousOperand(
   op: string,
   operandIndex: number,
@@ -2448,6 +2516,14 @@ function resolveContiguousOperand(
       return { slot: cc.outSlot, prologue: cc.commands };
     }
   } else if (!(refShapeDtype(ref) ?? contiguousViewShapeDtype(ref))) {
+    // No live storage AND not a flat-bindable producer (a STRIDED view on the
+    // build-from-IR path). [D3 CE-from-IR] If the operand is contiguity-required
+    // and its strided layout is IR-derivable, synthesize the contiguous copy
+    // from IR (same planContigCopy the live branch uses) instead of bailing.
+    if (operandRequiresContiguous(op, operandIndex)) {
+      const derived = derivedContigCopyFromIR(ref, slot, slots);
+      if (derived !== undefined) return derived;
+    }
     return "no-storage";
   }
   return { slot, prologue: [] };
