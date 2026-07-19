@@ -345,6 +345,9 @@ every new flag is born with a sunset.
   not capture here — expect it EMPTY or the named CE/`op:max` residue, and close any
   bail like P2 closed the CE strided-view bail). Carries the strided-argmax contiguity
   assertion at the gather seam. *Productizes Probe 1 on the compile-eligible path.*
+  **LANDED 2026-07-19** — see "P1 STATUS" below. The census came back **{ arg-reduce }**
+  (not CE/`op:max`): the block's `argmax` feedback op is the single build-from-IR
+  uncovered op, and it is P2's precise coverage input.
 
 - **P2 — Compile + replay the block; measure the real multiplier.** Route `S_dec`
   through the whole-step build-from-IR compiler + global memory planner (it is a static
@@ -499,6 +502,109 @@ that reads the full distribution on the host mid-stream — it is a block-bounda
 declaration and runs at K=1; everything else is a node in the K-block graph or a guard
 on its inputs, and the block is the compiled function that lets decode join the
 whole-step world and the P4b ledger execute.*
+
+---
+
+## P1 STATUS — the static-KV unrolled-K block, landed 2026-07-19
+
+*Worktree off `main@559c99eb`. Staged commits, no push. dw-2-1 (A100), random-init
+Qwen3, node v22 + Dawn/Vulkan vk-shim. Reproduce the gate:
+`eval "$(tools/pick-gpu.sh)"; VULKAN_DEVICE_INDEX=$VULKAN_DEVICE_INDEX
+LD_LIBRARY_PATH=tools/vk-shim:$LD_LIBRARY_PATH npx tsx tools/t-uk-block-diff.ts`.*
+
+### The sharp edge, fixed on the main path (unconditional)
+
+The arg-reduce-over-strided-view bug (§2 Probe 1: **40 vs 995**) was a standing
+framework correctness bug: the WebGPU arg-reduce kernel derives its input addressing
+from `contiguousStrides(inputShape)` and binds the buffer flat from element 0, so a
+narrow **offset** view (a last-position row) or a multi-dim **strided** view was
+indexed from the wrong base with the wrong strides — silently returning the wrong
+index. **Fix** (`src/backend/webgpu/ops/comparison.ts`): `argReduceOp` materializes the
+input contiguous (offset 0) when `!isContiguous || offset!=0`, mirroring the sum/max
+reduction guard (`reductions.ts`, task #58), plus a **seam assertion** that the kernel's
+contiguous-stride assumption holds (single source of truth at the seam). Cheap — a
+decode reduction row is one vector. **Failing-first spec:** `test/argmax-strided-view.spec.ts`
+(webgpu) — pre-fix returns row-0's index (2 vs 7, 1 vs 3); passes with the guard. Landed
+independent of unrolled-K.
+
+### The surface as landed (`packages/qwen3-browser/src/generate.ts`)
+
+Proven in a package before `src/` (admission pressure). Greedy only (P3 adds sampling).
+- **`decodeBlock(api, model, kv, lastTok, K, {residualHook, stopTokens})`** → `{ ids, stopIndex }`.
+  K greedy steps as ONE lazy graph: each step's `argmax(logits)` id-tensor feeds the next
+  step's embedding gather **on-device**; the KV scatters at static positions (advanced
+  host-side at graph BUILD time → per-step rope/scatter/mask carry positions as DATA);
+  **one** readback of the K ids at the boundary; host truncation on the first stop token
+  (compute-all-K, truncate-at-readback — §3.3).
+- **`clipBlockToBucket(len, K, maxSeq)`** — clips K to the 128-bucket edge / maxSeq so
+  every block is a single stable template (§3.4).
+- **`unrolledKFromEnv()`** — browser-safe read of `TORCHLETTE_UNROLLED_K`.
+- **`StaticDecodeModel`** — the minimal `forward({staticKV})` interface; Qwen3 and Gemma2
+  both satisfy it (gemma2 wiring is a mechanical port, deferred to P4 cutover).
+- **`generateChat` wiring:** greedy (`temperature===0`) **and** `TORCHLETTE_UNROLLED_K>=K`
+  decodes in K-blocks; **every** other case (all sampling, flag off) takes the per-token
+  host loop **unchanged** — the block branch is compile-time-guarded, so decode paths are
+  byte-identical when the flag is off.
+
+### The flag's sunset
+
+`TORCHLETTE_UNROLLED_K` (integer K; unset/<2 = off) is born 2026-07-19 with a sunset
+(house policy): **soak** (opt-in) → **default-on** (P4 cutover, byte-identical stream
+gate) → the K=1 host loop is removed for greedy and the flag/knob **dies** (P6). A flag
+outliving P6 is debt.
+
+### The mother gate — the differential (`tools/t-uk-block-diff.ts`)
+
+Block ids **byte-identical** to the per-token host-loop reference across **3 prompts ×
+K∈{1,4,8,16} × a 128-bucket crossing** (all PASS); the EOS contract (compute-all-K, the
+`stopIndex` is the first-occurrence of the stop, host truncation keeps exactly the
+pre-stop tokens, no-stop ⇒ no truncation); and the bucket-clip unit checks. Economics
+(N=16, K=8, **uncompiled/lowered**):
+
+| arm | submits | ms/tok |
+|---|---|---|
+| host per-token loop | 48 | ~100 |
+| **unrolled block** | **15** | **~37** |
+
+**~3.2× fewer submits, ~2.7× faster ms/tok** — the ~1.6×-class host-tax amortization,
+measured honestly. The full multiplier is P2's (the block compiling + replaying) and the
+browser's (a larger per-token host tax). *(A natural mid-block EOS is unreachable here —
+random-init greedy collapses to a constant token; Probe 1's real pretrained distilgpt2
+emitted EOS mid-stream, and the truncation **contract** is gated above against the actual
+static-KV stream regardless of degeneracy.)*
+
+### The build-from-IR uncovered census (P1's first census → P2's input)
+
+Grounded in the generator table (`src/executor/stream-generate.ts` `generateSequential`),
+which routes **sum/mean** reductions, elementwise, **gather**, **scatterAdd**, **cat**,
+layernorm, and cross-entropy — and hits `miss(label)` (→ uncovered, keeps record/replay)
+for any op with no generator. The base static-KV decode forward already compiles and
+replays (Probe 2 / `t-decode-template-count`: steady template-growth 0). The unrolled
+block adds exactly **one new-to-decode uncovered op:**
+
+| op the block adds | build-from-IR generator? | consequence |
+|---|---|---|
+| `argmax` (arg-reduce — the feedback selection) | **NO** (`generateSequential` has no arg-reduce case; only sum/mean) | the block plan is not `fullyCovered` → stays record/replay (lowered) |
+| `reshape` (feedback view) | n/a (metadata view, no action) | — |
+| `cat` (K-boundary id concat) | yes (`generateCat`) | covered |
+| embedding `gather` (on-device feedback) | yes (`generateGather`) | covered |
+
+So the census is **{ arg-reduce (`argmax`/`argmin`) }** — NOT the CE/`op:max` residue the
+design hedged for (CE is training-only; softmax's max-subtract is inside the fused decode
+kernel, already covered). This is **correct and expected for P1** (P1 is the lowered
+block; §5 P1 explicitly ships uncompiled). **P2's coverage input is precise:** add an
+arg-reduce build-from-IR generator mirroring `serializeReduction` (the sum/mean
+single-source realizer already exists in `schedule/reduction-skeleton.ts` — `argReduceWGSL`
+is the byte-differential kernel; P2 wires its command-stream generator). Closing that one
+op is what lets the block reach compiled replay (P2's gate).
+
+### Gates run
+
+`tools/gate-wall.sh --profile training` (green); `test/argmax-strided-view.spec.ts` +
+`tools/t-uk-block-diff.ts` (the differential, green); `tools/t-uk-feedback.ts` re-run
+green; decode paths unchanged when the flag is off (block branch compile-time-guarded);
+strict-lifetime default. Weight-norm: `src` SLOC unchanged for the product surface (it
+lives in `packages/`); the argmax fix adds ~20 code lines to `src/backend/webgpu/ops/comparison.ts`.
 
 ---
 
