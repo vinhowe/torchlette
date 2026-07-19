@@ -297,8 +297,13 @@ export async function backwardImpl(
   // [whole-step trace, P1] When active, this backward DEFERS its grad-write
   // force AND all teardown that assumes forcing happened, to the step boundary
   // (docs/step-function-compiler-design.md §3.1). Computed once, in scope for
-  // the outer finally.
-  const deferForce = torch._deferBackwardForce();
+  // the outer finally. GATED OFF for checkpointed backward below: P1 covers
+  // NON-CHECKPOINT configs only — the structural recompute force + its
+  // intermediate disposal (disposeCheckpointIntermediates) assume the grads
+  // were already forced; deferring past them is a UAF. Checkpoint remat is
+  // P3's pass (§3.3). `let` because hasCheckpoints is only known after
+  // collectSavedTensors runs.
+  let deferForce = torch._deferBackwardForce();
   return torch._runEntryPoint(async () => {
     // TidyDispatchMode tracks all RuntimeTensors created during backward
     // and auto-disposes non-escaped ones at scope exit. Leaf/retained
@@ -337,6 +342,13 @@ export async function backwardImpl(
         // Collect saved tensors (triggers checkpoint recomputation if any).
         const { unpacked: allUnpackedTensors, hasCheckpoints } =
           collectSavedTensors(torch, ordered);
+
+        // [whole-step trace, P1] Checkpointed backward keeps the eager force:
+        // the recompute force (autograd.ts, the hasCheckpoints branch) and
+        // disposeCheckpointIntermediates() below both assume grads are forced
+        // before teardown. Deferring past them frees recomputed inputs the
+        // un-forced plan still reads (a UAF → GPU crash). Non-checkpoint only.
+        if (hasCheckpoints) deferForce = false;
 
         if (hasCheckpoints) {
           // Checkpoint backward needs separate plans: forward tensors first,
