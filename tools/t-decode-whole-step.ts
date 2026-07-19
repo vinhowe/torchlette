@@ -121,9 +121,12 @@ async function run(arm: Arm): Promise<ArmResult> {
 
 async function runArmInChild(arm: Arm): Promise<ArmResult> {
   const { execFileSync } = await import("node:child_process");
+  // WHOLE_STEP is DEFAULT-ON since P4a Stage 2. BOTH arms inherit the default —
+  // the ONLY variable is the `api.wholeStep(...)` WRAP around the decode
+  // forward (arm `whole-step`) vs a bare decode forward (arm `plain`). The flag
+  // value is irrelevant to `plain` (no scope entered ⇒ nothing to defer), so
+  // isolating the wrap is the honest discriminator under the graduated default.
   const env: Record<string, string> = { ...process.env, DWS_ARM: arm };
-  if (arm === "whole-step") env.TORCHLETTE_WHOLE_STEP = "1";
-  else delete env.TORCHLETTE_WHOLE_STEP;
   const out = execFileSync(process.execPath, ["--import", "tsx", import.meta.filename], {
     env,
     encoding: "utf8",
