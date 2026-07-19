@@ -1072,6 +1072,93 @@ the decode half, each needing its OWN proof (NOT whole-step):
 The verdict is the deliverable (no forcing): whole-step is training-shaped; decode is
 not a training step; the two do not meet.
 
+### P4a Stage 2 — GRADUATION TO DEFAULT-FOR-TRAINING (2026-07-19)
+
+`WHOLE_STEP_TRACE` flips from opt-IN (`=== "1"`) to opt-OUT (`!== "0"`) in
+`src/core/step-tape.ts` — whole-step is now the **DEFAULT** wherever a training
+step enters the scope (the capture ring body, which always enters; the trainer's
+checkpointed inner step; any `api.wholeStep(...)`). A plain training loop that never
+enters the scope is untouched (the eager reference, reachable via `=0` everywhere).
+DECODE is unaffected by construction (Verdict B: the scope is a no-op without a
+backward). The flag is **sunset-listed for P4b** (dies with the eager two-plan path).
+
+*Eager-vs-traced seams fixed for the inverted default* (unset now means ON): the
+differential tools' eager/bypass arms set `TORCHLETTE_WHOLE_STEP=0` explicitly
+(`t-whole-step-diff`, `t-d3-remat`) rather than unsetting; the refusal spec's remat
+cell (`it.skipIf(!WHOLE_STEP_TRACE)`) now **runs by default** (skipped only under
+`=0`).
+
+**The gate matrix — default-ON, V100 sivri device 1, strict-lifetime DEFAULT
+(no opt-out).** All green; the eager arm is `=0` (true opt-out), so every
+traced-vs-eager comparison measures the graduation:
+- **Mother differential** (`t-whole-step-diff`): non-ckpt traced==eager **2.62e-6**;
+  CKPT=1 SELECTIVE=1 traced-remat==eager **3.10e-6**; step-0 loss bit-identical. Both
+  ≤ 1e-5.
+- **`parity-fullstack-tl`** (autocast+checkpoint+scaler+clip, 30 steps): compiled==
+  lowered **6.68e-6**.
+- **`test:gates`** (`compiled-plan-parity`): **5/5**.
+- **Refusal spec** (`whole-step-checkpoint-refusal`, strict DEFAULT): **3/3** — the
+  remat cell un-skips and passes (refusals=0), eager-ckpt FIRES (6), eager-nockpt 0.
+  Under `=0` the remat cell SKIPS (2 pass / 1 skip) — the opt-out cleanly restores
+  the pre-graduation path.
+- **Checkpoint specs**: `checkpoint-autocast-parity`, `checkpoint-segmentation`,
+  `checkpoint-scaler-seed-lifetime`, `distilgpt2-checkpoint-memory`,
+  `gpt2-checkpoint-amp` — all pass; `implied-step-boundary` **6/6**.
+- **Tape apparatus**: `t-train-tape-matrix` **4/4** (fused/foreach × no-sched/cosine-lr,
+  eligiblePairs=6 tapeCount=1 zero refusals); `t-ring-probe` PASS (K1/K2/K3 bit-identical
+  — ring depth a pure knob); `t-step-object-null` / `t-step-edit-null` /
+  `t-step-edit-binding-probe` / `t-step-edit-numerics-null` all null-clean
+  (≤1e-5/24-step). `t-ledger-attack-probe` default (24 steps) flat (reachDrift=0,
+  totalDrift=0, no double-release); the STEPS=48 stress shows drift **identical under
+  `=0`** (pre-existing config artifact, NOT whole-step-attributable).
+- **cpu-FULL suite** default-ON: **1401 passed**, 37 failed — every failure is a
+  `torch`-oracle test (`ModuleNotFoundError: No module named 'torch'`, this box lacks
+  PyTorch) plus one distributed `websocket-relay` flake. **Zero whole-step-attributable
+  failures.**
+- **BROWSER suite** (Playwright chromium under `xvfb-run`, WebGPU via
+  `--enable-unsafe-webgpu`, whole-step DEFAULT-ON — the browser reads flags as
+  undefined ⇒ `!== "0"` ⇒ ON, the never-before-run case): `webgpu.spec` **9/9**,
+  `scope-surface.spec` **2/2** = **11 pass**. The browser WebGPU substrate runs clean
+  under whole-step default-ON.
+- **profile distil@512** default-ON: **LEAK OK, +0.0 MB/step** (flat).
+
+**Honestly un-run / named gaps** (the soak continues — the opt-out survives P4a, so
+these complete before P4b deletes it):
+1. **Browser TRAINING-trajectory under whole-step** — `lora-training-trajectory.spec.ts`
+   fails to import (`examples/gpt2-lora-trainer/src/lib/torchlette/gpt2-lora` is
+   **absent from the repo entirely** — only `trainer.ts` exists). Pre-existing and
+   **flag-independent** (an import error at collect time, before any flag is read; it
+   fails identically at `=0`). The browser DEFERRAL path is the capture ring
+   (`capture.ts`, backend-agnostic — the exact code node validates), but a
+   browser-native training trajectory under whole-step remains UNVALIDATED until this
+   spec's missing module is restored. **This is the one real gap and a P4b precondition
+   for deleting the opt-out.**
+2. **Full 114-file webgpu suite** — impractical serially on this box (~1–3 min/file via
+   the Dawn/Vulkan vk-shim). Validated the whole-step-SENSITIVE subset (above) instead;
+   the whole-step-insensitive backend specs (matmul/elementwise/reduction) don't enter a
+   training scope and are deferral-agnostic by construction.
+3. **medium@512 profile / 124M trajectory** — profile-training does NOT enter the
+   whole-step scope (plain begin/markStep, no `wholeStep` wrap), so default-ON is
+   identical to `=0` for it (eager-checkpoint via the refusal); the whole-step remat
+   path at scale is already gated by `t-d3-remat` (D3 table) + the 124M proof (D3-finish,
+   both modes exact to baselines). Re-running them is a measurement, not a new-risk gate.
+
+### P4a Stage 3 — SUNSETS: NONE RIPE (verified, not reached)
+
+The only Stage-2-adjacent sunset candidate is restoring `useCheckpoint: true` in the
+four census tools (`t-train-tape-matrix`, `t-step-object-null`, `t-step-edit-null`,
+`t-step-edit-binding-probe`) that removed it (D3-finish fallout). **Verified NOT ripe.**
+The doc's sunset condition is "whole-step defaults **AND** the refusal + eager two-plan
+path are deleted"; Stage 2 meets only the first. The census tools run **plain eager
+loops** (no `wholeStep` wrap) — default-ON does NOT route them through the scope, so a
+checkpointed cell is still eager-checkpoint → `CHECKPOINT_EAGER_REFUSAL` fires (verified:
+the refusal is gated on `!_deferBackwardForce()`, true at depth 0 REGARDLESS of the flag)
+→ plans stay lowered → no compiled tape → the census assertion (`eligiblePairs=6
+tapeCount=1`) would break exactly as before. Restoring `useCheckpoint` here needs P4b's
+refusal deletion (or re-shaping the tools to wrap in `wholeStep`, which changes what the
+census measures). The refusal + eager-two-plan path + engine bypass method + the big
+ledger all WAIT for P4b per §5. No sunset fires in Stage 3.
+
 ### Risks (honest)
 
 - **Plan-builder scale** (P0). Bounded, named, amortized once-per-compile — but the
@@ -1111,6 +1198,23 @@ deletion ledger in the project's history — by a wide margin.**
 The witness apparatus (`K_w=2`), the K_w per-producer keep-sets, and the tape-side
 guard taxonomy live *inside* `step-tape.ts` / `step-tape-replay.ts` / the deleted
 `cross-plan-edges.ts` — they go with those files, not double-counted.
+
+**⚠ VERDICT-ADJUSTED by P4a (2026-07-19) — the decode half of this table is NOT
+whole-step-deletable.** The "Deleted outright" total assumed the whole-step graph
+subsumes BOTH tape consumers (training AND decode). The P4a decode discriminator
+(VERDICT B) refutes the decode half: whole-step is a training-only mechanism (it
+defers the backward force; decode has no backward), so it cannot delete
+`step-tape.ts` (820) / `step-tape-replay.ts` (680) / `step-object.ts` (156) /
+`cross-plan-edges.ts` (152) / `tape-profile.ts` (18) — ~1826 SLOC — on
+"whole-step subsumes decode" grounds. The **~807 SLOC** `observed-liveness.ts`
+(training-side over-harvest/convergence) still falls to the whole-step compile; the
+tape files fall ONLY if P4b independently proves either (α) the per-plan template
+compiler alone suffices for the decode demo (a decode benchmark, tape-replay vs plain
+per-plan on a weighted model), or (β) accepts them surviving DECODE-SCOPED. Revised
+outright deletion under whole-step alone: **~807 SLOC guaranteed** (observed-liveness)
++ the partial-deletion training-side reductions below; the ~1826 SLOC tape subsystem
+is **gated on the P4b decode proof, not on the whole-step compile.** See the P4a
+status section for the discriminator evidence.
 
 ### Deleted partially (~1100–1900 SLOC) — files survive as static representation / plain allocator
 

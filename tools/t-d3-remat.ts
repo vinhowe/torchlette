@@ -233,7 +233,9 @@ async function runArmInChild(arm: Arm, rep: number): Promise<ArmResult> {
     if (arm === "remat-lo") env.TORCHLETTE_COMPILED_PLAN = "0";
     else delete env.TORCHLETTE_COMPILED_PLAN;
   } else {
-    delete env.TORCHLETTE_WHOLE_STEP;
+    // The `bypass` arm is the eager reference — WHOLE_STEP is DEFAULT-ON since
+    // P4a Stage 2, so opt out explicitly (=0), don't merely unset.
+    env.TORCHLETTE_WHOLE_STEP = "0";
     delete env.TORCHLETTE_COMPILED_PLAN;
   }
   const out = execFileSync(
