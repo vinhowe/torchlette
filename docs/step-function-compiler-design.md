@@ -801,6 +801,30 @@ convergence:
   part of covering CE. Only with (b) can (a) land and the seq512/medium D3 table be re-run
   on the remat arm to render the speed/peak/traj verdict. Until then the STOP stands.
 
+### The D3 FINISH — CE coverage LANDED behind a SUNSET-BOUND eager-checkpoint refusal (2026-07-19)
+
+Vin's ruling on the hazard: (b) is NOT "make the compiled-forward+separate-recompute
+path arena-safe" (P4 work). It is a TYPED, SUNSET-BOUND compilation **refusal** — the
+transition scaffolding that lets (a) land NOW and protects the gate matrix during the
+soak (D3 arms, witness checkpoint cells, memory-stability specs all run
+checkpoint+arena-ON+eager; global CE coverage un-masks the b66ead78 corruption there).
+
+**The refusal (landed FIRST, safety before coverage).** A build-from-IR-eligible plan
+built while a checkpointed **EAGER (two-plan)** backward force is in flight declines
+compilation and stays lowered — reason string `checkpoint-eager-two-plan-force`
+(`executor.ts` `CHECKPOINT_EAGER_REFUSAL`). Scoped to the hazard class PRECISELY by a
+**live per-force engine signal** (`RuntimeEngine._checkpointEagerForce`, set by
+`autograd.ts` around the two-plan forward/recompute/grad forces, cleared in the backward
+finally), NOT node flags and NOT "anything checkpoint-flavored": the whole-step remat
+merged plan is forced at the boundary drain (never under this signal), so it still
+compiles. This restores "eager checkpoint plans stay lowered" AS A DECLARATION — before
+CE coverage they were lowered by ACCIDENT (uncovered CE-narrow). Gate:
+`test/whole-step-checkpoint-refusal.spec.ts` — FIRES on the eager two-plan checkpoint
+config (refusals > 0), does NOT fire on non-checkpoint (P2 reference untouched) or on
+whole-step remat (merged plan compiles). SUNSET: dies WITH the bypass
+(`setBufferArenaDisabled` + `TORCHLETTE_CHECKPOINT_ARENA`) when whole-step training
+defaults and the eager two-plan path is deleted (P4).
+
 - **P4 — Guard reduction + deletion.** Replace the runtime guard taxonomy with input
   guards; then execute the deletion ledger (§5) subsystem by subsystem, each behind
   a green parity gate. *The payoff phase.*

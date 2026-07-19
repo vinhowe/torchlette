@@ -43,6 +43,7 @@ const GPU_TEST_FILES = [
   "test/quant-compiled-plan-parity.spec.ts",
   "test/topk-kernel.spec.ts",
   "test/true-segmentation-benchmark.spec.ts",
+  "test/whole-step-checkpoint-refusal.spec.ts",
   "test/witness-harvest.spec.ts",
 ];
 

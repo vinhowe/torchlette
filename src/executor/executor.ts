@@ -205,6 +205,14 @@ interface OptimizedExecutionOptions {
    * the engine for checkpointed training (see RuntimeEngine.setBufferArenaDisabled).
    */
   arenaDisabled?: boolean;
+  /**
+   * [D3 refusal — SUNSET-BOUND] Set by the engine while a checkpointed EAGER
+   * (two-plan) backward force is in flight. Declines build-from-IR compilation
+   * for every plan built during that window (the b66ead78 checkpoint+arena
+   * hazard). NOT set for the whole-step remat boundary force, so the merged
+   * remat plan still compiles. See CHECKPOINT_EAGER_REFUSAL.
+   */
+  refuseCompileHazard?: boolean;
 }
 
 /**
@@ -712,6 +720,35 @@ function buildFromIRActive(): boolean {
 // variants (reach 1). Gates constFill coverage so a transient plan's `full`
 // never triggers a compile that leaks its plan-owned buffer.
 const buildReaches = new Map<number, number>();
+
+// [D3 checkpoint-arena compile refusal — TRANSITION SCAFFOLDING, SUNSET-BOUND]
+// The single typed reason a build-from-IR-ELIGIBLE plan is nonetheless kept
+// lowered by design. It fires ONLY for plans built during a checkpointed EAGER
+// (two-plan) backward force — the b66ead78 hazard `setBufferArenaDisabled`
+// exists to prevent: a compiled forward plan (arena-on) reclaims activations a
+// SEPARATE checkpoint-recompute plan still needs → silent corruption
+// (docs/step-function-compiler-design.md P3 "ROOT-CAUSED"). Before CE-from-IR
+// coverage these plans stayed lowered by ACCIDENT (their CE-narrow operand was
+// uncovered); covering CE removes that accidental safety and unmasks the hazard
+// in the eager reference. The refusal restores "eager checkpoint plans stay
+// lowered" AS A DECLARATION rather than a coverage side effect. Scoped to the
+// hazard class precisely via a live per-force engine signal (NOT node flags,
+// NOT "anything checkpoint-flavored"): the WHOLE-STEP remat merged plan — one
+// plan the planner packs the recompute into — is NOT built under this signal,
+// so it compiles. SUNSET: dies WITH the bypass (`setBufferArenaDisabled` +
+// TORCHLETTE_CHECKPOINT_ARENA) when whole-step training defaults and the
+// two-plan eager checkpoint path is deleted (P4).
+export const CHECKPOINT_EAGER_REFUSAL = "checkpoint-eager-two-plan-force";
+let compileRefusalCount = 0;
+/** Test/diag: number of build-from-IR-eligible plans declined by the D3
+ *  checkpoint-arena refusal since the last reset. */
+export function getCompileRefusalCount(): number {
+  return compileRefusalCount;
+}
+/** Test/diag: reset the refusal counter (spec isolation between phases). */
+export function resetCompileRefusalCount(): void {
+  compileRefusalCount = 0;
+}
 
 // Per-fp count of CONSECUTIVE executions that ran LOWERED with no valid compiled
 // plan (the "converged-to-lowered" witness criterion,
@@ -1886,6 +1923,9 @@ export async function executeLoweredPlan(
      *  belongs to. Stamped on any compiled plan built here so the harvest can
      *  tag results with their cross-plan identity. */
     templateFp?: number;
+    /** [D3 refusal] When set, decline build-from-IR compilation for this plan
+     *  (checkpoint-eager-two-plan hazard). Kept lowered by design. */
+    refuseCompileHazard?: boolean;
   } = {},
 ): Promise<OptimizedExecutionResult> {
   // Validate plan node count matches
@@ -2054,14 +2094,31 @@ export async function executeLoweredPlan(
   // through to the lowered path with zero residue — so the opt-out behaviour
   // and the fallback are byte-identical to the unmodified normal path, and an
   // uncovered plan simply runs lowered every execution.
-  if (
+  const buildFromIREligible =
     !scalarAdaptPending &&
     buildFromIRActive() &&
     backend.name === "webgpu" &&
     useTopLevelSharedEncoder &&
-    options.bufferArena &&
+    !!options.bufferArena &&
     !loweredPlan.compiledPlan &&
-    (!arenaLivenessEnabled() || compiledPlannedEnabled())
+    (!arenaLivenessEnabled() || compiledPlannedEnabled());
+  // [D3 checkpoint-arena refusal — SUNSET-BOUND] Decline compilation for EVERY
+  // plan built during a checkpointed EAGER step (forward+loss + backward +
+  // optimizer) — the b66ead78 hazard. It must be ALL-OR-NOTHING per step: a
+  // partial mix (a lowered checkpoint forward/backward feeding a COMPILED
+  // optimizer plan) breaks the grad/planner handoff and freezes training. So
+  // when the window is active, skip the build-from-IR block entirely and run
+  // lowered — matching the setBufferArenaDisabled bypass (which disables the
+  // arena for the whole checkpointed step). The whole-step remat merged plan is
+  // NOT under this signal (its force is the boundary drain, not the eager step),
+  // so it still compiles. See CHECKPOINT_EAGER_REFUSAL.
+  if (buildFromIREligible && options.refuseCompileHazard) {
+    compileRefusalCount++;
+  }
+  if (
+    buildFromIREligible &&
+    !options.refuseCompileHazard &&
+    options.bufferArena
   ) {
     await ensureFusionImports();
     const { reset } = populateCapturesFromIR(
@@ -3733,6 +3790,7 @@ export async function executePlanOptimized(
     const r = await executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
       bufferArena,
       templateFp: fingerprint.primary,
+      refuseCompileHazard: options.refuseCompileHazard,
     });
     // [observed-liveness] Tag any compiled plan built this call with its
     // template fp so future replays stamp harvested results with their
@@ -3757,6 +3815,7 @@ export async function executePlanOptimized(
     const r = await executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
       bufferArena,
       templateFp: fingerprint.primary,
+      refuseCompileHazard: options.refuseCompileHazard,
     });
     if (loweredPlan.compiledPlan) {
       loweredPlan.compiledPlan.tapeFp = fingerprint.primary;

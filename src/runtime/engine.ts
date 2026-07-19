@@ -401,6 +401,13 @@ export class RuntimeEngine {
    * resident, defeating checkpointing's memory savings.
    */
   private bufferArenaDisabled = false;
+  // [D3 refusal — SUNSET-BOUND] True only while a checkpointed EAGER (two-plan)
+  // backward force is in flight (set by autograd around the forward/recompute/
+  // grad forces). Threaded into executePlanOptimized so those plans decline
+  // build-from-IR compilation — the b66ead78 checkpoint+arena hazard. Never set
+  // for the whole-step remat boundary force (rematActive skips the two-plan
+  // path), so the merged remat plan still compiles. Dies with the bypass at P4.
+  private _checkpointEagerForce = false;
   private checkpointSegmentationEnabled = false;
   private _rngCounter = 0;
   private trueSegmentationEnabled = false;
@@ -557,6 +564,19 @@ export class RuntimeEngine {
    */
   setBufferArenaDisabled(disabled: boolean): void {
     this.bufferArenaDisabled = disabled;
+  }
+
+  /**
+   * [D3 refusal — SUNSET-BOUND] Mark that a checkpointed EAGER (two-plan)
+   * backward force is in flight. Plans built during this window decline
+   * build-from-IR compilation (the b66ead78 checkpoint+arena hazard: a compiled
+   * forward plan reclaims activations a separate recompute plan still needs).
+   * Set/cleared by autograd's checkpointed backward; a no-op for the whole-step
+   * remat path (which never enters the eager two-plan force). Assumes sequential
+   * backward passes (training loops are single-threaded).
+   */
+  _setCheckpointEagerForce(active: boolean): void {
+    this._checkpointEagerForce = active;
   }
 
   /**
@@ -892,6 +912,7 @@ export class RuntimeEngine {
         enableVectorization: this.vectorizationEnabled,
         enableEarlyRelease: this.earlyReleaseEnabled,
         arenaDisabled: this.bufferArenaDisabled,
+        refuseCompileHazard: this._checkpointEagerForce,
       });
       this.lastFusionStats = optimizedResult.stats;
       this.accumulateFusionStats(optimizedResult.stats);
@@ -994,6 +1015,7 @@ export class RuntimeEngine {
         enableVectorization: this.vectorizationEnabled,
         enableEarlyRelease: this.earlyReleaseEnabled,
         arenaDisabled: this.bufferArenaDisabled,
+        refuseCompileHazard: this._checkpointEagerForce,
       });
       this.lastFusionStats = optimizedResult.stats;
       this.accumulateFusionStats(optimizedResult.stats);
@@ -1032,6 +1054,16 @@ export class RuntimeEngine {
     // is complete and no pending nodes reference these buffers. Uses the full
     // destroyUnreachable which also scans WeakRefs for GC'd tensors.
     storageTracker.destroyUnreachable();
+
+    // [D3 refusal — SUNSET-BOUND] The boundary force just ran the whole step's
+    // remaining plans — INCLUDING the optimizer. Clear the eager-checkpoint
+    // window here (AFTER the force) so it spanned the ENTIRE checkpointed step:
+    // forward+loss + backward + optimizer all kept lowered (the all-or-nothing
+    // the setBufferArenaDisabled bypass enforces — a lowered checkpoint
+    // forward/backward feeding a compiled optimizer breaks the grad handoff).
+    // The next checkpointed step re-marks at its forward checkpoint site;
+    // beginStep is the step-start backstop. A no-op when the flag was never set.
+    this._checkpointEagerForce = false;
   }
 
   tensorFromArray(
@@ -1953,6 +1985,11 @@ export class RuntimeEngine {
   }
 
   async beginStep(): Promise<void> {
+    // [D3 refusal — SUNSET-BOUND] Safety net: clear the eager-checkpoint compile
+    // window at every step start so a checkpointed step with no backward (eval)
+    // cannot poison the next step's compilation. Normal training also clears it
+    // in the backward finally (so the optimizer plan compiles). No-op otherwise.
+    this._checkpointEagerForce = false;
     await this.getBackend().beginStep?.();
   }
   endStep(): void {

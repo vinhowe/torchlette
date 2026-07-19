@@ -140,6 +140,24 @@ function checkpointNonReentrant<T extends Tensor>(
   // Get the underlying runtime for checkpoint primitives
   const engine = api.runtime;
 
+  // [D3 refusal — SUNSET-BOUND] A checkpointed EAGER step (NOT whole-step remat)
+  // is the b66ead78 checkpoint+arena hazard: its compiled forward+loss plan
+  // (forced at loss.item, BEFORE backward — outside the backward force window)
+  // would reclaim activations the backward recompute plan still needs → silent
+  // corruption. Mark the step at the FORWARD checkpoint site so every plan built
+  // during it — forward+loss AND backward AND optimizer — declines build-from-IR
+  // and stays lowered ALL-OR-NOTHING (a lowered checkpoint forward/backward
+  // feeding a COMPILED optimizer breaks the grad handoff → frozen training; the
+  // setBufferArenaDisabled bypass keeps the whole step lowered too, but this
+  // keeps the arena ON so the remat arm can show its memory win). Cleared at the
+  // step boundary force (forceAllPending, after the optimizer) and at the next
+  // beginStep. Under whole-step remat the merged plan is safe (one plan, the
+  // planner packs the recompute) → do NOT mark (the forward runs inside the
+  // wholeStep scope, so _deferBackwardForce is true).
+  if (!api._deferBackwardForce()) {
+    engine._setCheckpointEagerForce(true);
+  }
+
   // Keep inputs alive for recomputation.
   // Also register them for disposal after backward — they're only needed
   // for recomputation and shouldn't survive beyond the backward pass.
