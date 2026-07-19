@@ -38,7 +38,12 @@ import {
   syncWebGPU,
   Torchlette,
 } from "../../src/browser";
-import { GPT2WithLoRA } from "../../examples/gpt2-lora-trainer/src/lib/torchlette/gpt2-lora";
+// GPT2WithLoRA was extracted to the shared `gpt2-browser` package (commit
+// f8f894bd, "extract shared GPT-2 browser stack"); the old
+// examples/.../lib/torchlette/gpt2-lora path no longer exists. Re-point at the
+// real source. `trainer.ts` imports the same class as a type-only import
+// (erased), so only this value import needs the live path.
+import { GPT2WithLoRA } from "../../packages/gpt2-browser/src/gpt2-lora";
 import { LoRATrainer } from "../../examples/gpt2-lora-trainer/src/lib/torchlette/trainer";
 
 /** Byte-level tokenizer stub: avoids the BPE vocab/merges download. Maps each

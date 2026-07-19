@@ -1,0 +1,11 @@
+{
+  "//": "Plain tsconfig for the shared torchlette LoRA-trainer lib. The example's root tsconfig extends the SvelteKit-generated ./.svelte-kit/tsconfig.json, which is gitignored (only exists after `svelte-kit sync`) — so on a fresh checkout / CI, any tool that resolves the nearest tsconfig for these files (e.g. the vitest browser suite importing trainer.ts) fails on the unresolvable `extends` chain. This nearer tsconfig wins the walk-up and keeps trainer.ts transformable without the SvelteKit context (it imports only torchlette + gpt2-browser types).",
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}
