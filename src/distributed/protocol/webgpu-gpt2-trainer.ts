@@ -11,7 +11,6 @@
  * HuggingFace dataset; tests can supply a stub.
  */
 
-import { ENV } from "../../core/env.ts";
 import { clipGradNorm_ } from "../../nn/index.ts";
 import { normal_ } from "../../nn/init.ts";
 import { Adam, GradScaler } from "../../optim/index.ts";
@@ -145,43 +144,24 @@ export class WebGPUGPT2Trainer implements Trainer {
    */
   async initialize(): Promise<void> {
     if (this.initialized) return;
-    // Checkpointing trades compute for memory; tie the buffer arena to it.
-    // The per-step arena retains every forward activation across steps (for
-    // bind-group stability + compiled replay), which keeps ALL of them resident
-    // and defeats checkpointing — so when checkpointing, run arena-free and let
-    // the liveness early-release free activations as soon as they're consumed
-    // (measured 124M/seq256: steady 6.6GB->2.6GB, peak 7.8->7.66GB; loss
-    // identical — checkpointing is numerically transparent). Opt back into the
-    // arena (e.g. to compare) with TORCHLETTE_CHECKPOINT_ARENA=1.
+    // Checkpointed training runs the WHOLE inner step under `api.wholeStep`
+    // (P3 remat — see singleInnerStep). The checkpointed forward, its backward
+    // recompute duplicate, and the optimizer merge into ONE lazy graph the
+    // boundary force materializes once; the memory planner packs each forward
+    // activation's short forward-span interval against its recomputed
+    // duplicate's short backward-span interval, so the arena stays ON and the
+    // step still COMPILES at a LOWER peak than the old arena-free bypass
+    // (V100 D3 FINISH: distil@512+selective 94.4% peak / 3.3× faster,
+    // medium@512+full 86.2% peak / 2.2× faster — docs/step-function-compiler-
+    // design.md "The D3 FINISH — CE coverage LANDED"). This REPLACES the former
+    // `setBufferArenaDisabled(true)` bypass + its checkpoint-arena opt-out env
+    // flag (both DELETED here, 2026-07-19): the bypass disabled the arena to
+    // free activations but ran lowered forever; remat gets the same memory win
+    // compiled and faster. When whole-step is OFF (flag off), a checkpointed
+    // step runs eager and the SUNSET-BOUND `CHECKPOINT_EAGER_REFUSAL`
+    // (executor.ts) keeps its plans lowered so the arena-ON eager path stays
+    // sound (the b66ead78 two-plan hazard). Both die at P4 with the eager path.
     //
-    // WHY THIS BYPASS STILL EXISTS (task #98 phase 3 STOP, 2026-07-15):
-    // Phase 3 attempted to make checkpointing first-class — kill this bypass and
-    // run the full arena+compiled stack. It hit a HARD CONFLICT between two
-    // required gates, unsolvable within the current arena mechanism:
-    //   (1) MEMORY gate — the arena pins one buffer per dispatch position across
-    //       steps, INCLUDING the forward activations checkpointing drops for
-    //       recompute. Arena-ON checkpointing therefore holds them resident:
-    //       distil@512+ckpt peak 5397MB / current 5233MB vs arena-free 4893MB /
-    //       1695MB (+10.3% peak, +209% current — the original bug returns).
-    //   (2) PHASE-4 WITNESS gate — the witness-harvest prune/witness mechanism
-    //       (observed-liveness) only engages on the COMPILED path. Running
-    //       checkpointed steps arena-free reverts them to LOWERED, so the
-    //       mechanism goes inert (t-witness-harvest-matrix CELL=checkpoint:
-    //       witnessedTemplates 4->0, prunedPairsRemoved 22->0 = FAIL(B)).
-    // No config gives compiled+low-memory for checkpointed steps: that IS the
-    // "arena serves recompute segments with per-segment liveness" full
-    // unification (step-object-design §3.5), which is its own campaign — the
-    // arena must learn to FREE recompute-scoped activations while STAYING
-    // compiled. Until then the bypass is the correct behaviour: checkpointing
-    // runs arena-free/lowered (sound: the lowered path materializes everything,
-    // zero Input-not-ready), meeting the memory gate. See
-    // docs/step-object-design.md §6 Phase 3 STOP note for the repro.
-    if (this.opts.checkpointing && ENV.TORCHLETTE_CHECKPOINT_ARENA !== "1") {
-      this.api._runtime().setBufferArenaDisabled(true);
-      this.opts.log(
-        "checkpointing on → buffer arena disabled (frees forward activations)",
-      );
-    }
     // Use the plain (non-LoRA) GPT-2 model. The trainer drives full
     // fine-tuning from random init, so the LoRA-wrapped version would only
     // add a structurally dead branch (loraA/loraB stay at zero through
@@ -358,51 +338,88 @@ export class WebGPUGPT2Trainer implements Trainer {
     // in one beginStep means .grad never crosses a markStep, so no cross-step
     // grad persistence is needed; each backward() materializes the running
     // .grad, so the lazy graph doesn't grow across micro-steps.
+    //
+    // Under checkpointing the whole inner step runs inside `api.wholeStep` so
+    // the checkpointed forward + backward recompute + optimizer merge into ONE
+    // lazy graph the boundary force materializes once (P3 remat — replaces the
+    // former arena-disable bypass, see initialize()). Reading the loss mid-step
+    // would force that graph early and break the merge, so we detach a scalar
+    // loss copy per micro-batch (registered as persistent state so it survives
+    // the markStep demotion) and read them all AFTER markStep. The input/target
+    // upload tensors also feed the un-forced whole-step plan, so they must live
+    // past the boundary force too — disposed after markStep. Flag OFF, wholeStep
+    // is a transparent pass-through and this runs exactly the old eager path.
+    const rematStep = this.opts.checkpointing;
+    const deferredLoss: Tensor[] = [];
+    const liveUploads: Tensor[] = [];
+    const runInner = async (): Promise<void> => {
+      for (let acc = 0; acc < opts.accumSteps; acc++) {
+        const batch = innerStepBatches[acc]!;
+        const input = api.tensorFromArray(
+          batch.input,
+          [opts.batchSize, opts.seqLen],
+          { device: "webgpu" },
+        );
+        const target = api.tensorFromArray(
+          batch.target,
+          [opts.batchSize, opts.seqLen],
+          { device: "webgpu" },
+        );
+        const loss = api.tidy(() => {
+          const fwd = () =>
+            this.model.forwardWithLoss(input, target, {
+              useCheckpoint: this.opts.checkpointing,
+            }).loss;
+          const l = this.opts.useAutocast ? api.autocast(fwd) : fwd();
+          api.keep(l);
+          return l;
+        });
+        if (rematStep) {
+          // Deferred read: a detached scalar copy, registered persistent so it
+          // survives the step-scoped demotion at markStep; read after the force.
+          const lossOut = api.noGrad(() => api.mul(loss, 1));
+          api.registerState(lossOut);
+          deferredLoss.push(lossOut);
+          liveUploads.push(input, target);
+        } else {
+          totalLoss += await loss.item();
+        }
+        // Average the gradient over micro-batches by scaling each micro-loss by
+        // 1/accumSteps before backward (accumSteps=1 skips the extra op).
+        const microLoss =
+          opts.accumSteps === 1 ? loss : api.mul(loss, 1 / opts.accumSteps);
+        const backwardTarget = scaler ? scaler.scale(microLoss) : microLoss;
+        await backwardTarget.backward();
+        if (!rematStep) {
+          input.dispose();
+          target.dispose();
+        }
+      }
+      if (scaler) scaler.unscale_(this.innerOpt);
+      if (this.opts.gradClipNorm > 0) {
+        clipGradNorm_(api, this.params, this.opts.gradClipNorm);
+      }
+      if (scaler) {
+        scaler.step(this.innerOpt);
+        scaler.update();
+      } else {
+        this.innerOpt.step();
+      }
+      this.innerOpt.zeroGrad();
+    };
+
     await api.beginStep();
-    for (let acc = 0; acc < opts.accumSteps; acc++) {
-      const batch = innerStepBatches[acc]!;
-      const input = api.tensorFromArray(
-        batch.input,
-        [opts.batchSize, opts.seqLen],
-        { device: "webgpu" },
-      );
-      const target = api.tensorFromArray(
-        batch.target,
-        [opts.batchSize, opts.seqLen],
-        { device: "webgpu" },
-      );
-      const loss = api.tidy(() => {
-        const fwd = () =>
-          this.model.forwardWithLoss(input, target, {
-            useCheckpoint: this.opts.checkpointing,
-          }).loss;
-        const l = this.opts.useAutocast ? api.autocast(fwd) : fwd();
-        api.keep(l);
-        return l;
-      });
-      totalLoss += await loss.item();
-      // Average the gradient over micro-batches by scaling each micro-loss by
-      // 1/accumSteps before backward (accumSteps=1 skips the extra op).
-      const microLoss =
-        opts.accumSteps === 1 ? loss : api.mul(loss, 1 / opts.accumSteps);
-      const backwardTarget = scaler ? scaler.scale(microLoss) : microLoss;
-      await backwardTarget.backward();
-      input.dispose();
-      target.dispose();
-    }
-    if (scaler) scaler.unscale_(this.innerOpt);
-    if (this.opts.gradClipNorm > 0) {
-      clipGradNorm_(api, this.params, this.opts.gradClipNorm);
-    }
-    if (scaler) {
-      scaler.step(this.innerOpt);
-      scaler.update();
-    } else {
-      this.innerOpt.step();
-    }
-    this.innerOpt.zeroGrad();
+    if (rematStep) await api.wholeStep(runInner);
+    else await runInner();
     api.endStep();
     await api.markStep();
+
+    // Deferred loss reads happen AFTER the single boundary force (whole-step).
+    for (const lo of deferredLoss) {
+      totalLoss += await lo.item();
+      lo.dispose();
+    }
+    for (const up of liveUploads) up.dispose();
 
     return totalLoss / opts.accumSteps;
   }

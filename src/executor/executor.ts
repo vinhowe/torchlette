@@ -735,9 +735,14 @@ const buildReaches = new Map<number, number>();
 // hazard class precisely via a live per-force engine signal (NOT node flags,
 // NOT "anything checkpoint-flavored"): the WHOLE-STEP remat merged plan — one
 // plan the planner packs the recompute into — is NOT built under this signal,
-// so it compiles. SUNSET: dies WITH the bypass (`setBufferArenaDisabled` +
-// TORCHLETTE_CHECKPOINT_ARENA) when whole-step training defaults and the
-// two-plan eager checkpoint path is deleted (P4).
+// so it compiles. The production trainer's arena bypass (the
+// `setBufferArenaDisabled(true)` call + its opt-out env flag) is already DELETED
+// (2026-07-19, THE BYPASS DEATH pass) — `WebGPUGPT2Trainer` runs its checkpointed
+// step under whole-step remat; this refusal is what makes the residual EAGER
+// (flag-off) checkpoint step sound (arena ON, plans lowered). SUNSET: this refusal
+// + the engine's `setBufferArenaDisabled` method (still driven by the D3
+// measurement tool's `bypass` arm) die together when whole-step training defaults
+// and the two-plan eager checkpoint path is deleted (P4).
 export const CHECKPOINT_EAGER_REFUSAL = "checkpoint-eager-two-plan-force";
 let compileRefusalCount = 0;
 /** Test/diag: number of build-from-IR-eligible plans declined by the D3
