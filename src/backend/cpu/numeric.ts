@@ -5,6 +5,8 @@ import {
   inferReshapeStrides,
   sizeOf,
 } from "../../core/shape";
+import { BINARY_DEFS, UNARY_DEFS } from "../../ops/semantic/catalog";
+import { compileBinary, compileUnary } from "../../ops/semantic/interpret";
 import type { DType } from "../types";
 import { type GeluOptions, normalizeDim as normalizeDimBase } from "../types";
 
@@ -453,35 +455,26 @@ function applyBinaryOp(
 // Table-driven elementwise ops
 // ============================================================================
 
-/** Unary CPU implementations: op name → scalar function. */
-const UNARY_OPS: Record<string, (x: number) => number> = {
-  sqrt: Math.sqrt,
-  exp: Math.exp,
-  log: Math.log,
-  neg: (x) => -x,
-  abs: Math.abs,
-  tanh: Math.tanh,
-  sigmoid: (x) => 1.0 / (1.0 + Math.exp(-x)),
-  silu: (x) => x / (1.0 + Math.exp(-x)),
-  sin: Math.sin,
-  cos: Math.cos,
-  rsqrt: (x) => 1.0 / Math.sqrt(x),
-  floor: Math.floor,
-  ceil: Math.ceil,
-  round: Math.round,
-  sign: Math.sign,
-  isfinite: (x) => (Number.isFinite(x) ? 1.0 : 0.0),
-  relu: (x) => (x > 0 ? x : 0),
-};
+// Unary/binary CPU scalar bodies are DERIVED from the semantic definitions —
+// the ONE source (src/ops/semantic). The hand-written `UNARY_OPS`/`BINARY_OPS`
+// object literals were a redundant copy of those formulas; `compileUnary`/
+// `compileBinary` interpret each definition term into a closure ONCE. Byte-exact
+// vs the old bodies (test/semantic-derivation.spec.ts S1; design §4.3 S1).
+/** Unary CPU implementations: op name → scalar function (derived). */
+const UNARY_OPS: Record<string, (x: number) => number> = Object.fromEntries(
+  UNARY_DEFS.map((d) => [d.name, compileUnary(d.expr)]),
+);
 
-/** Binary CPU implementations: op name → scalar function. */
-const BINARY_OPS: Record<string, (x: number, y: number) => number> = {
-  add: (x, y) => x + y,
-  mul: (x, y) => x * y,
-  pow: Math.pow,
-  minimum: Math.min,
-  maximum: Math.max,
-};
+/** Binary CPU implementations: op name → scalar function (derived). sub/div
+ *  carry option (alpha / round-mode) logic and keep their own bodies below. */
+const CPU_BODY_BINARY = new Set(["add", "mul", "pow", "minimum", "maximum"]);
+const BINARY_OPS: Record<string, (x: number, y: number) => number> =
+  Object.fromEntries(
+    BINARY_DEFS.filter((d) => CPU_BODY_BINARY.has(d.name)).map((d) => [
+      d.name,
+      compileBinary(d.expr),
+    ]),
+  );
 
 // Generate exports from tables
 export function add(a: Tensor, b: Tensor): Tensor {
