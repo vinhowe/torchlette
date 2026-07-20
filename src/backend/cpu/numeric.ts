@@ -7,6 +7,19 @@ import {
 } from "../../core/shape";
 import { BINARY_DEFS, UNARY_DEFS } from "../../ops/semantic/catalog";
 import { compileBinary, compileUnary } from "../../ops/semantic/interpret";
+import {
+  ARGMAX_DEF,
+  ARGMIN_DEF,
+  compileArgBetter,
+  compileReduceCombine,
+  compileReduceEpilogue,
+  MAX_DEF,
+  MEAN_DEF,
+  MIN_DEF,
+  type ReductionDef,
+  reduceIdentity,
+  SUM_DEF,
+} from "../../ops/semantic/reduction";
 import type { DType } from "../types";
 import { type GeluOptions, normalizeDim as normalizeDimBase } from "../types";
 
@@ -995,53 +1008,51 @@ export function scatterAdd(
   return new Tensor(a.shape, out);
 }
 
-function sumAll(a: Tensor): number {
-  let total = 0;
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    total += readAtLinear(a, i, shapeStrides);
-  }
-  return total;
-}
+/**
+ * The ONE strided monoid-reduce engine — full and dim reductions over ANY
+ * reduction definition (semantic-derivation P1). The strided LOOP is the kernel
+ * that STAYS (design §6 P1); the per-op facts it reads — the accumulator seed
+ * (`reduceIdentity`), the fold (`compileReduceCombine`), the post-reduction
+ * epilogue (`compileReduceEpilogue`, mean's ÷count) — DERIVE from the ONE monoid
+ * definition. This single loop replaces the four byte-identical hand copies
+ * (`sumAll`/`maxAll`/`minAll` + the sum/max/min/mean strided loops), each of
+ * which independently re-spelled `+=` / `if (val > best)` / `if (val < best)`
+ * and the mean divide.
+ */
+function reduceByMonoid(
+  a: Tensor,
+  def: ReductionDef,
+  dim: number | number[] | null | undefined,
+  keepdim: boolean,
+  dimName: string,
+): Tensor {
+  const identity = reduceIdentity(def);
+  const combine = compileReduceCombine(def);
+  const epilogue = compileReduceEpilogue(def);
+  const inShapeStrides = computeStrides(a.shape);
 
-function normalizeDims(dim: number | number[], rank: number): number[] {
-  const dims = Array.isArray(dim) ? dim.slice() : [dim];
-  const normalized = dims.map((value) => normalizeDimBase(value, rank));
-  const unique = new Set<number>();
-  for (const value of normalized) {
-    if (value < 0 || value >= rank) {
-      throw new Error(`sum dim out of range: ${value}`);
+  // Full reduction → a 0-d tensor. The whole tensor is one fold.
+  if (dim == null) {
+    let acc = identity;
+    for (let i = 0; i < a.size; i += 1) {
+      acc = combine(acc, readAtLinear(a, i, inShapeStrides));
     }
-    if (unique.has(value)) {
-      throw new Error(`sum dim repeated: ${value}`);
-    }
-    unique.add(value);
-  }
-  return Array.from(unique).sort((a, b) => a - b);
-}
-
-export function sum(a: Tensor, options?: SumOptions): Tensor {
-  if (!options || options.dim == null) {
-    // Full reduction - return 0-d tensor
-    return new Tensor([], new Float32Array([sumAll(a)]));
-  }
-
-  if (options.dtype != null) {
-    throw new Error("sum dtype option is not supported yet");
+    if (epilogue) acc = epilogue(acc, a.size);
+    return new Tensor([], new Float32Array([acc]));
   }
 
   const rank = a.shape.length;
-  const dims = normalizeDims(options.dim, rank);
-  const keepdim = options.keepdim ?? false;
+  const dims = normalizeDimsForReduce(dim, rank, dimName);
   const reduceSet = new Set(dims);
+  const reduceCount = dims.reduce((acc, d) => acc * a.shape[d], 1);
 
   const outShape = keepdim
-    ? a.shape.map((dim, index) => (reduceSet.has(index) ? 1 : dim))
+    ? a.shape.map((d, index) => (reduceSet.has(index) ? 1 : d))
     : a.shape.filter((_, index) => !reduceSet.has(index));
 
-  const outSize = outShape.reduce((acc, dim) => acc * dim, 1) || 1;
+  const outSize = outShape.reduce((acc, d) => acc * d, 1) || 1;
   const out = new Float32Array(outSize);
-  const inShapeStrides = computeStrides(a.shape);
+  out.fill(identity);
   const outStrides = computeStrides(outShape);
 
   for (let linear = 0; linear < a.size; linear += 1) {
@@ -1049,168 +1060,70 @@ export function sum(a: Tensor, options?: SumOptions): Tensor {
     let outOffset = 0;
 
     if (keepdim) {
-      for (let dim = 0; dim < rank; dim += 1) {
-        const stride = inShapeStrides[dim];
+      for (let d = 0; d < rank; d += 1) {
+        const stride = inShapeStrides[d];
         const coord = Math.floor(remainder / stride);
         remainder -= coord * stride;
-        if (!reduceSet.has(dim)) {
-          outOffset += coord * outStrides[dim];
+        if (!reduceSet.has(d)) {
+          outOffset += coord * outStrides[d];
         }
       }
     } else {
       let outDim = 0;
-      for (let dim = 0; dim < rank; dim += 1) {
-        const stride = inShapeStrides[dim];
+      for (let d = 0; d < rank; d += 1) {
+        const stride = inShapeStrides[d];
         const coord = Math.floor(remainder / stride);
         remainder -= coord * stride;
-        if (!reduceSet.has(dim)) {
+        if (!reduceSet.has(d)) {
           outOffset += coord * outStrides[outDim];
           outDim += 1;
         }
       }
     }
 
-    out[outOffset] += readAtLinear(a, linear, inShapeStrides);
+    out[outOffset] = combine(out[outOffset], readAtLinear(a, linear, inShapeStrides));
+  }
+
+  if (epilogue) {
+    for (let i = 0; i < out.length; i += 1) out[i] = epilogue(out[i], reduceCount);
   }
 
   return new Tensor(outShape, out);
 }
 
-function maxAll(a: Tensor): number {
-  let maxVal = -Infinity;
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    const val = readAtLinear(a, i, shapeStrides);
-    if (val > maxVal) {
-      maxVal = val;
-    }
+export function sum(a: Tensor, options?: SumOptions): Tensor {
+  if (options?.dtype != null) {
+    throw new Error("sum dtype option is not supported yet");
   }
-  return maxVal;
+  return reduceByMonoid(
+    a,
+    SUM_DEF,
+    options?.dim,
+    options?.keepdim ?? false,
+    "sum",
+  );
 }
 
 export type MaxOptions = { dim?: number | number[] | null; keepdim?: boolean };
 
 export function max(a: Tensor, options?: MaxOptions): Tensor {
-  if (!options || options.dim == null) {
-    // Full reduction - return 0-d tensor
-    return new Tensor([], new Float32Array([maxAll(a)]));
-  }
-
-  const rank = a.shape.length;
-  const dims = normalizeDimsForReduce(options.dim, rank, "max");
-  const keepdim = options.keepdim ?? false;
-  const reduceSet = new Set(dims);
-
-  const outShape = keepdim
-    ? a.shape.map((dim, index) => (reduceSet.has(index) ? 1 : dim))
-    : a.shape.filter((_, index) => !reduceSet.has(index));
-
-  const outSize = outShape.reduce((acc, dim) => acc * dim, 1) || 1;
-  const out = new Float32Array(outSize);
-  out.fill(-Infinity);
-  const inShapeStrides = computeStrides(a.shape);
-  const outStrides = computeStrides(outShape);
-
-  for (let linear = 0; linear < a.size; linear += 1) {
-    let remainder = linear;
-    let outOffset = 0;
-
-    if (keepdim) {
-      for (let dim = 0; dim < rank; dim += 1) {
-        const stride = inShapeStrides[dim];
-        const coord = Math.floor(remainder / stride);
-        remainder -= coord * stride;
-        if (!reduceSet.has(dim)) {
-          outOffset += coord * outStrides[dim];
-        }
-      }
-    } else {
-      let outDim = 0;
-      for (let dim = 0; dim < rank; dim += 1) {
-        const stride = inShapeStrides[dim];
-        const coord = Math.floor(remainder / stride);
-        remainder -= coord * stride;
-        if (!reduceSet.has(dim)) {
-          outOffset += coord * outStrides[outDim];
-          outDim += 1;
-        }
-      }
-    }
-
-    const val = readAtLinear(a, linear, inShapeStrides);
-    if (val > out[outOffset]) {
-      out[outOffset] = val;
-    }
-  }
-
-  return new Tensor(outShape, out);
-}
-
-function minAll(a: Tensor): number {
-  let minVal = Infinity;
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    const val = readAtLinear(a, i, shapeStrides);
-    if (val < minVal) {
-      minVal = val;
-    }
-  }
-  return minVal;
+  return reduceByMonoid(
+    a,
+    MAX_DEF,
+    options?.dim,
+    options?.keepdim ?? false,
+    "max",
+  );
 }
 
 export function min(a: Tensor, options?: MaxOptions): Tensor {
-  if (!options || options.dim == null) {
-    return new Tensor([], new Float32Array([minAll(a)]));
-  }
-
-  const rank = a.shape.length;
-  const dims = normalizeDimsForReduce(options.dim, rank, "min");
-  const keepdim = options.keepdim ?? false;
-  const reduceSet = new Set(dims);
-
-  const outShape = keepdim
-    ? a.shape.map((dim, index) => (reduceSet.has(index) ? 1 : dim))
-    : a.shape.filter((_, index) => !reduceSet.has(index));
-
-  const outSize = outShape.reduce((acc, dim) => acc * dim, 1) || 1;
-  const out = new Float32Array(outSize);
-  out.fill(Infinity);
-  const inShapeStrides = computeStrides(a.shape);
-  const outStrides = computeStrides(outShape);
-
-  for (let linear = 0; linear < a.size; linear += 1) {
-    let remainder = linear;
-    let outOffset = 0;
-
-    if (keepdim) {
-      for (let dim = 0; dim < rank; dim += 1) {
-        const stride = inShapeStrides[dim];
-        const coord = Math.floor(remainder / stride);
-        remainder -= coord * stride;
-        if (!reduceSet.has(dim)) {
-          outOffset += coord * outStrides[dim];
-        }
-      }
-    } else {
-      let outDim = 0;
-      for (let dim = 0; dim < rank; dim += 1) {
-        const stride = inShapeStrides[dim];
-        const coord = Math.floor(remainder / stride);
-        remainder -= coord * stride;
-        if (!reduceSet.has(dim)) {
-          outOffset += coord * outStrides[outDim];
-          outDim += 1;
-        }
-      }
-    }
-
-    const val = readAtLinear(a, linear, inShapeStrides);
-    if (val < out[outOffset]) {
-      out[outOffset] = val;
-    }
-  }
-
-  return new Tensor(outShape, out);
+  return reduceByMonoid(
+    a,
+    MIN_DEF,
+    options?.dim,
+    options?.keepdim ?? false,
+    "min",
+  );
 }
 
 function normalizeDimsForReduce(
@@ -1235,14 +1148,20 @@ function normalizeDimsForReduce(
 
 export type ArgReduceOptions = { dim: number; keepdim?: boolean };
 
-/** Shared argmax/argmin implementation parameterized by comparison direction. */
+/**
+ * Shared argmax/argmin — an INDEXED monoid (design §4.1). The value monoid seeds
+ * the running best (`reduceIdentity`) and the strictly-better predicate DERIVES
+ * from the value combine (`compileArgBetter`); the (bestVal, bestIndex) state
+ * machine below is the realizer's (the index tracking), not the definition's.
+ */
 function argReduce(
   a: Tensor,
   opName: string,
   options: ArgReduceOptions,
-  initVal: number,
-  isBetter: (val: number, best: number) => boolean,
+  def: ReductionDef,
 ): Tensor {
+  const initVal = reduceIdentity(def);
+  const isBetter = compileArgBetter(def);
   const rank = a.shape.length;
   const dim = options.dim < 0 ? options.dim + rank : options.dim;
   if (dim < 0 || dim >= rank) {
@@ -1306,11 +1225,11 @@ function argReduce(
 }
 
 export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
-  return argReduce(a, "argmax", options, -Infinity, (v, b) => v > b);
+  return argReduce(a, "argmax", options, ARGMAX_DEF);
 }
 
 export function argmin(a: Tensor, options: ArgReduceOptions): Tensor {
-  return argReduce(a, "argmin", options, Infinity, (v, b) => v < b);
+  return argReduce(a, "argmin", options, ARGMIN_DEF);
 }
 
 // ============================================================================
@@ -1476,63 +1395,17 @@ export function stridedScatterAdd(
 }
 
 export function mean(a: Tensor, options?: MeanOptions): Tensor {
-  if (!options || options.dim == null) {
-    // Full reduction - return 0-d tensor
-    return new Tensor([], new Float32Array([sumAll(a) / a.size]));
-  }
-
-  if (options.dtype != null) {
+  if (options?.dtype != null) {
     throw new Error("mean dtype option is not supported yet");
   }
-
-  const rank = a.shape.length;
-  const dims = normalizeDims(options.dim, rank);
-  const keepdim = options.keepdim ?? false;
-  const reduceSet = new Set(dims);
-  const reduceCount = dims.reduce((acc, dim) => acc * a.shape[dim], 1);
-
-  const outShape = keepdim
-    ? a.shape.map((dim, index) => (reduceSet.has(index) ? 1 : dim))
-    : a.shape.filter((_, index) => !reduceSet.has(index));
-
-  const outSize = outShape.reduce((acc, dim) => acc * dim, 1) || 1;
-  const out = new Float32Array(outSize);
-  const inShapeStrides = computeStrides(a.shape);
-  const outStrides = computeStrides(outShape);
-
-  for (let linear = 0; linear < a.size; linear += 1) {
-    let remainder = linear;
-    let outOffset = 0;
-
-    if (keepdim) {
-      for (let dim = 0; dim < rank; dim += 1) {
-        const stride = inShapeStrides[dim];
-        const coord = Math.floor(remainder / stride);
-        remainder -= coord * stride;
-        if (!reduceSet.has(dim)) {
-          outOffset += coord * outStrides[dim];
-        }
-      }
-    } else {
-      let outDim = 0;
-      for (let dim = 0; dim < rank; dim += 1) {
-        const stride = inShapeStrides[dim];
-        const coord = Math.floor(remainder / stride);
-        remainder -= coord * stride;
-        if (!reduceSet.has(dim)) {
-          outOffset += coord * outStrides[outDim];
-          outDim += 1;
-        }
-      }
-    }
-
-    out[outOffset] += readAtLinear(a, linear, inShapeStrides);
-  }
-
-  const denom = reduceCount || 0;
-  for (let i = 0; i < out.length; i += 1) {
-    out[i] = out[i] / denom;
-  }
-
-  return new Tensor(outShape, out);
+  // mean = reduce(sum) ∘ ÷count — MEAN_DEF carries the sum monoid + the ÷count
+  // epilogue; the shared engine applies both (design §6 P1). dim errors report as
+  // "sum ..." (the historical mean message, preserved via dimName).
+  return reduceByMonoid(
+    a,
+    MEAN_DEF,
+    options?.dim,
+    options?.keepdim ?? false,
+    "sum",
+  );
 }
