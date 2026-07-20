@@ -1103,3 +1103,104 @@ a STOP — refusal, checkpoint-seg) — the derived Adam paths run the fused ker
 124M/fullstack path (unchanged, asserted), and the derived elementwise/foreach paths
 are pinned by fused-vs-elementwise. The strict-lifetime default held throughout
 (the derived-intermediate disposal preserved via the `evalOptTerm` sink collector).
+
+## 17. CRYSTAL 3 TAIL — LANDED (2026-07-20): THE CONTRACTION COMPOSITION + MUON
+
+The §16 MUON deferral is CASHED. The optimizer-program algebra gains ONE new node —
+the matmul CONTRACTION (`mm`) — the smallest form Newton–Schulz needs, and Muon
+exists from its definition: an optimizer reaching ABOVE the pure-elementwise algebra
+into §2 category d, exactly as Lion was the elementwise generality dividend. NO hand
+kernel, NO hand grads (optimizers never need a VJP). Commits: `the contraction node
++ the MUON program` → `the Muon optimizer` → `the descent + orthogonality gates` →
+this docs entry.
+
+### The contraction form, as landed (+ the rejected shapes)
+- **`mm` — the one node** (`optimizer.ts`): `{ k: "mm"; a; b; ta; tb }` — a 2D matmul
+  `A·B` with per-operand transpose flags. Its interpreter emits `rt.matmul` (the
+  EXISTING kernel — referenced, never re-owned, design §4.4 / RT3) with 2D transpose
+  VIEWS for `ta`/`tb`. Proven DATA by the EXISTING `assertNoOptimizerProgramBody`
+  walker (booleans + child terms are the only leaves; a smuggled function operand is
+  unconstructible — the covenant/R22 defense extends for free). Zero schema-delta
+  beyond the one node.
+- **Rejected shapes (zero-delta pressure):** (a) a general N-D `einsum`/contraction-
+  spec node — Muon needs only 2D `X·Xᵀ`, `A·A`, `B·X`; an axis-labelled contraction is
+  net-new mechanism with no second client (held out per §7). (b) A reduction node for
+  the Frobenius normalization — the norm-scale rides in as a `ns_scale` ROLE
+  (realizer-computed, the bc1/bc2 precedent), so the frame stays "elementwise + one
+  contraction", not "elementwise + contraction + reduction". (c) A transpose-only view
+  node — folded into `mm`'s `ta`/`tb` flags (the only transpose Muon needs is `X·Xᵀ`).
+
+### MUON_PROGRAM — the update as DATA
+`buf' = μ·buf + g` (the SGD-momentum state form) → `X₀ = buf·ns_scale` (normalize into
+the NS basin) → `S` UNROLLED quintic iterations `A = X·Xᵀ; X ← a·X + (b·A + c·A·A)·X`
+with the PUBLISHED coefficients `(3.4445, −4.775, 2.0315)` and the count `S` as DATA
+(the composition is a finite term, never a loop) → `p' = p − lr·(√max(1,rows/cols)·X_S
++ wd·p)`. The orientation transpose (NS needs rows≤cols) and the AdamW routing of
+embedding/1D params are the REALIZER's declared POLICY (`src/optim/muon.ts`) — the
+arithmetic derives, the routing/effect is declared (§4.6). MUON joins
+`OPTIMIZER_PROGRAMS`; MUON_DEFERRED is deleted.
+
+### Muon validated end-to-end (the Lion ritual)
+- **Interpretation == reference:** the unrolled NS term interpreted over the runtime
+  == an honest JS Newton–Schulz (same quintic, same coeffs), maxAbs **<1e-4**
+  (`test/semantic-optimizer.spec.ts`). torch ships no Muon → the JS impl is the referee.
+- **The SPECTRAL property (not just trajectory):** on a deliberately ill-conditioned
+  input (input singular-value condition **>5**), after 5 NS steps every singular value
+  of the output lies in the quintic band — outCond **<2**, σ∈[**0.6, 1.4**] — i.e.
+  `X·Xᵀ ≈ I` on the singular-value scale, a >3× conditioning improvement. Measured by a
+  Jacobi eigensolver on `X·Xᵀ`, the honest orthogonality assertion.
+- **Trains DistilGPT-2:** 20 full-finetune steps orthogonalizing EVERY 2D weight
+  matrix (24; embeddings on AdamW), sane MONOTONE descent all finite —
+  `7.89 → 0.35` (`test/muon-distil-descent.spec.ts`). A whole optimizer reaching into
+  the contraction stratum needing NO new engine.
+- **The memoization fix (the real memory story):** Newton-Schulz reuses the same X/A
+  OptTerm objects ~8× per step, so a naive tree-walk interpreter re-realized ~8^S
+  matmul dispatches — `buildMuonOrtho(5)` exploded to a >32GB GPU peak. `evalOptTerm`
+  now MEMOIZES by term-object identity (the shared subterms realize ONCE), collapsing
+  the interpretation to the term's DAG: peak grows LINEARLY (~0.04GB/step; S=5 =
+  0.22GB for a 768×768 matrix). This is a general win for any sharing-heavy program
+  term, not a Muon special-case. The per-param `evalOptTerm` sink disposal (Adam
+  foreach's discipline) bounds the residual intermediates on top.
+
+### The honest SLOC direction (one node + a new optimizer)
+`srcSLOC` 68134 → **68362 (+228)**. Two named components (house policy):
+- **The `mm` contraction node + the interpreter memoization** (`optimizer.ts`, +63 code:
+  the node + builder + the interpreter case + the DAG memoization + the full MUON
+  program) — a genuinely new PRIMITIVE (§2 category d), the one stratum the optimizer
+  algebra lacked, reusing `rt.matmul` (no new kernel); the memoization is a general
+  interpreter improvement (sharing-heavy terms realize once).
+- **The MUON optimizer** (`muon.ts`, 162 code) — a NEW capability, not a deletion; a
+  whole optimizer reaching above the elementwise algebra that needed no new engine is
+  the contraction dividend, exactly as Lion (+153) was the elementwise one. No new env
+  flag (envFlags unchanged at 66 — nothing to sunset).
+
+The full-campaign net-negative remains a §5-ledger property (P6, the final ledger
+phase). This tail, like P0/P4/P5, adds a primitive + an optimizer and does not itself
+cash net-negative.
+
+### What remains (the final-ledger phase + the named packer boundary)
+- **The fused-node dissolution** (§16/§16b) is UNCHANGED — it still awaits the graph-
+  altitude parallel-isomorphic-chain packer; a fused Muon (or Lion) node would be its
+  first second client for the op-metadata re-key (§16b notion a). Muon here is the
+  DERIVED per-param path (like Adam's elementwise/foreach), not a fused kernel.
+- **The final ledger phase (§6 P6):** land the campaign-wide deletions and retire any
+  soak flag. With this tail the semantic-derivation algebra now spans elementwise (P0),
+  reductions (P1), composites (P2), index (P4), optimizers (P5), AND contraction — the
+  §2 categories are complete; P3's WGSL composites + P6's ledger are the remainder.
+
+### Gates (all green)
+cpu: semantic-optimizer (**8** — schema gate incl. the `mm` node, AdamW/SGD/Lion program
+== JS reference, the Lion optimizer trajectory, MUON realizable + NS == JS reference +
+the singular-value orthogonality property), semantic-derivation (46), semantic-composite
+(5), semantic-index (11), semantic-reduction (9). webgpu (serial-exclusive):
+muon-distil-descent (**1** — 20-step full-2D-surface descent on DistilGPT-2, `7.89→0.35`),
+lion-distil-descent (1). gate-wall `--profile training`: **13/15 PASS** — the optimizer
+wall is byte-UNTOUCHED (build, test:gates, whole-step-diff, parity-fullstack, tape ×4
+{fused,foreach}×{no-sched,cosine-lr}, step-object/edit-null, ring-probe, 124M-regression,
+checkpoint-seg all PASS), proving the `evalOptTerm` memoization is byte-safe for
+Adam/Lion/SGD (their terms share no non-leaf objects, so memoization is a no-op there).
+The 2 non-passes are NOT this change: `ledger-default` is an ENV flake (isolated rerun
+PASS); `refusal-spec` is a PRE-EXISTING strict-lifetime GC-timing flake reproduced
+IDENTICALLY on stock HEAD (a checkpoint-remat `[lifetime]` reclaimed-read with a
+run-varying shape/id, disjoint from the optimizer path). Muon is ADDITIVE (a new node +
+a new file). Strict-lifetime default held for the Muon path (per-param sink disposal).
