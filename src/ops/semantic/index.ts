@@ -11,5 +11,6 @@ export * from "./composite";
 export * from "./emit-rt";
 export * from "./erf";
 export * from "./expr";
+export * from "./index-map";
 export * from "./interpret";
 export * from "./reduction";
