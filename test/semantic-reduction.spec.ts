@@ -128,7 +128,7 @@ describe("Semantic reduction — the monoid is the single source", () => {
     expect(() =>
       assertNoReductionDefinitionBody({
         ...SUM_DEF,
-        // biome-ignore lint: intentional bad leaf for the negative test
+        // A smuggled JS combine (function leaf) must be rejected by the gate.
         combine: { k: "add", a: { k: "x" }, b: ((v: number) => v) as never },
       }),
     ).toThrow(/schema gate/);

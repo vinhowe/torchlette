@@ -1063,7 +1063,9 @@ export class Torchlette {
     // factor derives here.
     const gradKind = REDUCTION_DEF_BY_NAME.get(opName)?.gradKind;
     if (gradKind === undefined) {
-      throw new Error(`_dispatchReduction: no reduction definition for "${opName}".`);
+      throw new Error(
+        `_dispatchReduction: no reduction definition for "${opName}".`,
+      );
     }
     if (gradKind === "none") {
       return this._wrap(result);

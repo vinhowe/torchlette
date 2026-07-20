@@ -552,3 +552,109 @@ differential + a declared per-primitive ULP tolerance at the CPU↔GPU seam.
 - The broadcast-adjoint trap (§8.1) stays OUT of scope until P4: P1 is the
   reduction monoid, not the broadcast-VJP (a reduction is the transpose of a
   broadcast — that machinery is P4's index algebra).
+
+## 13. Phase 1 — LANDED (2026-07-20)
+
+The reduction monoid stratum is in `src/ops/semantic/reduction.ts`. A reduction's
+meaning is its MONOID — an identity element + an associative combiner, both
+first-class `Expr` DATA — the single source from which the CPU reduce body
+derives, the reduction gradient's class derives, and the `ReductionDeclaration`'s
+monoid label is a projection. Commits: `the reduction monoid definitions` →
+`derive the CPU reduction bodies` → `derive the reduction VJP class` → `the
+declaration monoid derives` → this docs entry.
+
+### The reduction schema, as landed
+- **The monoid as data.** `ReductionDef` carries `identity` (the accumulator
+  seed), `combine` (the associative fold over `x`=accumulator, `y`=element), and
+  an optional `epilogue` (`x`=reduced, `y`=count) — all `Expr` terms, proven DATA
+  by `assertNoReductionDefinitionBody` (the P0 schema-gate analogue, extended to
+  the monoid frame). The 6 reduction ops (§2 category b): `sum`/`max`/`min`
+  monoids, `mean` (the `sum` monoid + a `div(reduced, count)` epilogue — a
+  COMPOSITION, not a 4th monoid), and `argmax`/`argmin` (INDEXED monoids — the
+  value monoid combines, the index follows).
+- **Derived facts, not stored labels.** `reduceMonoidOf(def)` PROJECTS the
+  monoid label (`"sum"`/`"max"`/`"min"`) from the combine's root op — there is no
+  separately-authored label to disagree. `compileArgBetter(def)` DERIVES the
+  arg-reduce strictly-better predicate from the value combine (no separate
+  comparison). `isStreamableMonoid` is the two-stage-form fact that REFERENCES
+  `planChunkedFullReduction` + `computeChunkGeometry` as its realized image
+  (composed, never re-owned — design §4.4).
+
+### The tie-policy finding (the P1 analogue of P0's log-guard)
+The `max`/`min` combiners are `where(cmp(elem, acc), elem, acc)` — **LEFT-BIASED
+on ties/NaN**, exactly as the hand `if (val > best)` reduce loop was — NOT a bare
+`max(x,y)` primitive, which diverges on ±0 ordering (`Math.max(-0,+0)=+0` but the
+first-seen if-loop keeps `-0`) and on NaN. So the reduction family's combiner is
+its OWN term; the elementwise `maximum` binary (which uses `Math.max`) is a
+DIFFERENT op — the two are not forced to share a spelling. This is the byte-exact
+bar that a naive "reuse the lattice op" would have silently failed.
+
+### Deletions cashed, and the honest SLOC direction (the crossover BENDS)
+Named deletions (house policy):
+- `numeric.ts`: `sumAll`/`maxAll`/`minAll` (3 full-reduction helpers) + the four
+  byte-identical `sum`/`max`/`min`/`mean` strided loops + the `normalizeDims`
+  duplicate → ONE `reduceByMonoid` engine that reads (identity, combine,
+  epilogue) from the definition (the strided LOOP stays a kernel, design §6 P1;
+  only the monoid derives). `argReduce`'s `(initVal, isBetter)` params → derived.
+- `torchlette.ts`: the `_dispatchReduction` op-name gradient branching
+  (`opName === "max"||"min"`; `opName === "mean"`) → `def.gradKind` reads.
+- `execution-declaration.ts`: the four hand-spelled monoid/meanEpilogue
+  declaration literals → one `reductionDeclOf(def)` projection.
+
+**P1 is +16 srcSLOC (66455→67238 was P0's +783; P1: 67238→67254).** This is the
+crossover trajectory BENDING exactly as §5 predicted: P0 paid for the reusable
+algebra ENGINE (+783); P1 adds only a thin per-op catalog (the reduction
+definitions) and cashes nearly all of it back against the deduplicated reduction
+loops. The engine is amortized — P1 neither re-pays it nor yet cashes
+net-negative; it lands essentially FLAT (+16, ~50× smaller than P0's step), and the
+net-negative remains a full-campaign property that P2 (the erf/GELU triplication),
+P4 (index transposes), and P5 (optimizers) cash harder against this same algebra.
+
+### HONEST SCOPE — the broadcast-VJP stays P4 (§8.1 honored)
+The reduction GRADIENT is the broadcast-transpose (`sum`→broadcast,
+`mean`→broadcast÷count; a reduction is the transpose of a broadcast). That
+transpose is P4's index-algebra machinery (`_expandGrad`) and STAYS hand — P1 did
+NOT ship a broadcast-VJP (the §8.1 trap). What P1 owns is the per-monoid LOCAL
+factor + differentiability (`gradKind`: `sum`→unit `broadcast`, `mean`→`broadcast-scaled`
+by 1/count, `max`/`min`/`arg`→`none`), single-sourced from the definition and
+read by `_dispatchReduction` instead of hardcoded op-name strings. The `max`/`min`
+mask-scatter VJP is likewise P4, not shipped here.
+
+### The reduction WGSL seam (S3) — DEFERRED with rationale (as in P0)
+Not landed. The GPU reduce identity/combine (`reduction-tile-ir.ts` `reduceOp`,
+`makeReductionSpec`) is the realizer's, untouched. The CPU↔GPU monoid tie-break
+already differs (the GPU `wgReduce` uses WGSL `max()` while the CPU loop is
+left-biased) — a pre-existing ULP/tie seam, exactly the §4.5 CPU↔GPU boundary the
+design encodes, not a P1 regression. Reduction WGSL derivation lands with the
+composite S3 (P2) behind the existing schedule-state differential + a declared
+per-primitive tolerance.
+
+### Gates (all green)
+cpu: full project **113 files, 1489 pass, 1 skip, 0 fail**, incl. gradcheck (35),
+oracle op-conformance + autograd (reductions + their grads == PyTorch),
+semantic-reduction (9 — schema gate, monoid projection, derived reduce ==
+independent hand loop byte-exact, indexed isBetter == the arg comparison),
+reduction-ops (11), execution-declaration (13). webgpu (per-device,
+serial-exclusive): topk-kernel (6), compiled-plan-parity / test:gates (5),
+conformance (69). gate-wall `--profile training` (build, test:gates,
+whole-step-diff, fullstack/tape parity matrix, step-object/edit-null, ring-probe,
+ledger-default, **124M-regression**) — the reduction paths are untouched on GPU
+(only `numeric.ts` CPU bodies, the frontend grad classification, and the
+declaration VALUES changed; the GPU reduce kernels + `REDUCTION_DECLARATIONS`
+shape are byte-identical).
+
+### P2 (composites) preconditions
+- Author `softmax`/`log_softmax`/`cross_entropy`/`layernorm`/`rmsnorm`/`attention`/
+  `rope` as `Composition` terms; wire each as the schedule-state
+  `SemanticRegionUid`'s region (§4.4). **The P1 reduction monoids are the
+  composite reduction sub-terms**: softmax = `exp∘(x−reduce(max))∘÷reduce(sum)`
+  reuses the `max` and `sum` monoids; layernorm/rmsnorm use `mean` (the Welford
+  variance pair-merge stays the realizer's admitted lemma, `reduction-skeleton.ts`
+  `WELFORD_LEMMA` — referenced, not re-derived).
+- **The erf/GELU triplication payoff** (the S3 deletion deferred from P0): the
+  Abramowitz–Stegun `erf` polynomial written 3× and the GELU-tanh constants
+  written 3× (§1) collapse to one source when the composite's WGSL emits from the
+  composition; delete the GELU custom backwards (compositional → derived, §6 P2).
+- **Gate:** each composite's fused kernel == its composition reference via the
+  EXISTING schedule-state per-move differential (not a new mechanism); CPU
+  reference == composition (Probe 4 shape); CPU↔GPU at declared ULP tolerance.

@@ -1081,11 +1081,15 @@ function reduceByMonoid(
       }
     }
 
-    out[outOffset] = combine(out[outOffset], readAtLinear(a, linear, inShapeStrides));
+    out[outOffset] = combine(
+      out[outOffset],
+      readAtLinear(a, linear, inShapeStrides),
+    );
   }
 
   if (epilogue) {
-    for (let i = 0; i < out.length; i += 1) out[i] = epilogue(out[i], reduceCount);
+    for (let i = 0; i < out.length; i += 1)
+      out[i] = epilogue(out[i], reduceCount);
   }
 
   return new Tensor(outShape, out);
