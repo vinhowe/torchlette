@@ -186,4 +186,9 @@ async function main() {
   console.log("\nDone!");
 }
 
-main().catch(console.error);
+main()
+  .then(() => process.exit(0)) // Dawn holds background threads; Node won't exit on its own.
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
