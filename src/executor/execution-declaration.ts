@@ -43,6 +43,15 @@
  * differential passing.
  */
 
+import {
+  MAX_DEF,
+  MEAN_DEF,
+  MIN_DEF,
+  type ReductionDef,
+  reduceMonoidOf,
+  SUM_DEF,
+} from "../ops/semantic/reduction";
+
 // ============================================================================
 // The schema
 // ============================================================================
@@ -280,6 +289,11 @@ export function isDeclaredElementwise(op: string): boolean {
  * The reduction MONOID — the associative combiner over the reduced axis (a
  * schedule-state monoid fact). `sum`/`max`/`min`. `mean` is NOT a monoid: it is
  * a `sum` reduction followed by a div-by-count epilogue (`meanEpilogue`).
+ *
+ * This label is now a PROJECTION of the semantic-derivation reduction monoid
+ * (`reduceMonoidOf`, ops/semantic/reduction.ts) — the declaration below reads it
+ * from the ONE definition rather than re-authoring the string (design §4 P1
+ * unification). It matches the semantic `ReduceMonoidName` by construction.
  */
 export type ReduceMonoid = "sum" | "max" | "min";
 
@@ -425,45 +439,33 @@ export type AnyDeclaration =
  * `reduceOp = "sum"` hardcode (generateFullReduction/generateDimReduction/the
  * mean sum stage) and the batched action's `op` classification.
  */
+/**
+ * Build a reduction declaration from its semantic definition — the P1
+ * unification (design §4). The two genuinely-authored facts DERIVE from the ONE
+ * monoid definition rather than being re-spelled here:
+ *   - `monoid`       = `reduceMonoidOf(def)` (projected from the combine's root);
+ *   - `meanEpilogue` = `def.epilogue !== null` (mean carries the ÷count epilogue).
+ * `layout` stays authored: it is a REALIZER fact (the reduce kernels read their
+ * operand flat-from-element-0), not a semantic one. Zero-schema-delta on the
+ * `ReductionDeclaration` interface — only the VALUES now single-source with the
+ * definition, so the declaration and the definition cannot silently disagree on
+ * the monoid label.
+ */
+function reductionDeclOf(def: ReductionDef): ReductionDeclaration {
+  return {
+    family: "reduction",
+    monoid: reduceMonoidOf(def),
+    meanEpilogue: def.epilogue !== null,
+    layout: "contiguous-input",
+  };
+}
+
 export const REDUCTION_DECLARATIONS: ReadonlyMap<string, ReductionDeclaration> =
-  new Map<string, ReductionDeclaration>([
-    [
-      "sum",
-      {
-        family: "reduction",
-        monoid: "sum",
-        meanEpilogue: false,
-        layout: "contiguous-input",
-      },
-    ],
-    [
-      "mean",
-      {
-        family: "reduction",
-        monoid: "sum",
-        meanEpilogue: true,
-        layout: "contiguous-input",
-      },
-    ],
-    [
-      "max",
-      {
-        family: "reduction",
-        monoid: "max",
-        meanEpilogue: false,
-        layout: "contiguous-input",
-      },
-    ],
-    [
-      "min",
-      {
-        family: "reduction",
-        monoid: "min",
-        meanEpilogue: false,
-        layout: "contiguous-input",
-      },
-    ],
-  ]);
+  new Map<string, ReductionDeclaration>(
+    [SUM_DEF, MEAN_DEF, MAX_DEF, MIN_DEF].map(
+      (def) => [def.name, reductionDeclOf(def)] as const,
+    ),
+  );
 
 /** The reduction-family declaration for `op`, or undefined (not this family). */
 export function reductionDeclaration(
