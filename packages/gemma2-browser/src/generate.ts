@@ -111,13 +111,6 @@ export function unrolledKFromEnv(): number {
   const k = Number(raw);
   return Number.isFinite(k) && k >= 2 ? Math.floor(k) : 0;
 }
-/** Greedy block is default-on; the Gumbel sampled block is opt-IN (explicit
- *  flag) pending the pre-existing sampled-path transient fix (see qwen3
- *  generate.ts unrolledKExplicit for the full rationale). */
-export function unrolledKExplicit(): boolean {
-  return unrolledKRaw() !== undefined;
-}
-
 /** Clip K so all K forwards share one static-KV bucket template (§3.4). */
 export function clipBlockToBucket(
   len: number,
@@ -346,12 +339,12 @@ export async function generateChat(
   const greedy = temperature === 0;
   const topKActive = topK !== undefined && topK < vocab;
   const topPActive = topP !== undefined && topP < 1;
+  // Gumbel sampled block is DEFAULT-eligible (2026-07-20, see qwen3 generate.ts):
+  // the sampled-path external-destroy transient is fixed, so pure-temperature
+  // sampling routes through the on-device Gumbel block by default (still under
+  // the global opt-out TORCHLETTE_UNROLLED_K=0/1).
   const gumbelEligible =
-    !greedy &&
-    (temperature ?? 0) > 0 &&
-    !topKActive &&
-    !topPActive &&
-    unrolledKExplicit(); // sampled block opt-in (pre-existing transient)
+    !greedy && (temperature ?? 0) > 0 && !topKActive && !topPActive;
   const flagK = unrolledKFromEnv();
   const useBlock = flagK >= 2 && (greedy || gumbelEligible);
   const blockK = useBlock ? flagK : 0;
@@ -359,7 +352,7 @@ export async function generateChat(
     useBlock && gumbelEligible
       ? {
           temperature: temperature as number,
-          seed: options?.seed ?? ((Math.random() * 0x7fffffff) >>> 0),
+          seed: options?.seed ?? (Math.random() * 0x7fffffff) >>> 0,
         }
       : undefined;
 
@@ -391,10 +384,16 @@ export async function generateChat(
         model.forward(idx, { staticKV, residualHook }),
       );
       if (blockSample) {
-        nextTok = await gumbelPrefillToken(api, logits, promptIds.length - 1, vocab, {
-          temperature: blockSample.temperature,
-          seed: blockSample.seed + promptIds.length - 1,
-        });
+        nextTok = await gumbelPrefillToken(
+          api,
+          logits,
+          promptIds.length - 1,
+          vocab,
+          {
+            temperature: blockSample.temperature,
+            seed: blockSample.seed + promptIds.length - 1,
+          },
+        );
         logits.dispose();
       } else {
         const top = await api.readTopK(logits, K_PREFILTER, {
@@ -402,7 +401,13 @@ export async function generateChat(
           length: vocab,
         });
         logits.dispose();
-        nextTok = sampleFromTopK(top.values, top.indices, temperature, topK, topP);
+        nextTok = sampleFromTopK(
+          top.values,
+          top.indices,
+          temperature,
+          topK,
+          topP,
+        );
       }
       await api.markStep();
     }
@@ -461,13 +466,19 @@ export async function generateChat(
       // attnModKey guards cross-model tape replay.
       decode = api.capture(
         (idx: Tensor) =>
-          api.noGrad(() => model.forward(idx, { staticKV, residualHook }).logits),
+          api.noGrad(
+            () => model.forward(idx, { staticKV, residualHook }).logits,
+          ),
         {
           key: () =>
             `kv:bkt${kvBucketLen(staticKV.len + 1, maxSeq)}:mod${model.attnModKey}`,
         },
       );
-      while (count < maxNew && !GEMMA2_STOP_TOKENS.has(nextTok) && !isAborted()) {
+      while (
+        count < maxNew &&
+        !GEMMA2_STOP_TOKENS.has(nextTok) &&
+        !isAborted()
+      ) {
         emit(nextTok);
         count++;
         const tb0 = performance.now();
@@ -480,7 +491,13 @@ export async function generateChat(
         const top = await readback;
         const tb3 = performance.now();
         logits.dispose();
-        nextTok = sampleFromTopK(top.values, top.indices, temperature, topK, topP);
+        nextTok = sampleFromTopK(
+          top.values,
+          top.indices,
+          temperature,
+          topK,
+          topP,
+        );
         const tb4 = performance.now();
         await api.markStep();
         const tb5 = performance.now();

@@ -97,16 +97,16 @@ export const QWEN3_STOP_TOKENS = new Set([
 //   - "0" or "1" → OFF (opt out to the per-token host loop, the pre-cutover
 //     decode) — the soak escape hatch.
 //   - ">=2" → the block with that explicit K.
-// generateChat routes GREEDY (argmax) decode through the block by DEFAULT. The
-// on-device GUMBEL sampled block (pure-temperature, §4) is opt-IN via an
-// explicit flag (unrolledKExplicit) — NOT default-on: the sampled path carries a
-// pre-existing dropped-submit transient (see unrolledKExplicit). The typed
-// residue that STAYS on the per-token host loop: any top-k / top-p / nucleus
-// (§4 — a full-distribution host read the block cannot express), default
-// (unflagged) temperature sampling, and any non-static-KV path. So the shipped
-// top-k+top-p demo samplers are the residue; the block is byte-identical to the
-// host loop for the covered samplers (the mother gate) with the steering hook
-// composed (t-uk-steering-diff).
+// generateChat routes GREEDY (argmax) AND pure-temperature (on-device
+// GUMBEL-max, §4) decode through the block by DEFAULT (2026-07-20: the sampled
+// path's external-destroy transient that gated it opt-in at P4 is FIXED — the
+// compiled-plan teardown parks any plan-owned buffer a live storage still
+// aliases). The typed residue that STAYS on the per-token host loop: any top-k /
+// top-p / nucleus (§4 — a full-distribution host read the block cannot express)
+// and any non-static-KV path. So the shipped top-k+top-p demo samplers are the
+// residue (their host loop is byte-unchanged); the block is byte-identical to
+// the host loop for the covered samplers (the mother gate) with the steering
+// hook composed (t-uk-steering-diff).
 //
 // K DEFAULT = 4. The measured multiplier (design §P3'): K=4 gives the best
 // compiled win (host/def 1.43×, low/def 2.55×) AND the finest streaming
@@ -137,23 +137,6 @@ export function unrolledKFromEnv(): number {
   const k = Number(raw);
   return Number.isFinite(k) && k >= 2 ? Math.floor(k) : 0; // "0"/"1" → off
 }
-/**
- * Was TORCHLETTE_UNROLLED_K set EXPLICITLY (≥2)? The GREEDY block is default-on
- * (opt-out); the on-device GUMBEL sampled block is default-OFF, opt-IN via an
- * explicit flag. Reason (P4-discovered, 2026-07-20): the sampled block path
- * carries a PRE-EXISTING dropped-submit transient (a materialized first-token
- * upload whose registry buffer is destroyed without parking — `_lastHarvestIds`
- * tracks harvest RESULTS, not external-input uploads; visible as "used in submit
- * while destroyed" in t-uk-gumbel-parity, which never asserted zero GPU errors).
- * It sometimes corrupts (t-uk-steering-diff surfaced it). Greedy is unaffected
- * (its idx feed IS a harvest result → parked, block-diff STRICT_GPU-clean). So
- * we do NOT ship the sampled block default-on; it activates only when a caller
- * explicitly opts in with the flag, pending the transient fix (named blocker).
- */
-export function unrolledKExplicit(): boolean {
-  return unrolledKRaw() !== undefined;
-}
-
 /**
  * Clip a requested block size K to the largest count that keeps every step in
  * ONE static-KV template: all K forwards must share a bucket length (§3.4). The
@@ -468,15 +451,15 @@ export async function generateChat(
   const greedy = temperature === 0;
   const topKActive = topK !== undefined && topK < vocab;
   const topPActive = topP !== undefined && topP < 1;
-  // Gumbel sampled block is opt-IN (explicit flag) — the sampled path's
-  // pre-existing dropped-submit transient (see unrolledKExplicit) is not shipped
-  // default-on. Greedy is default-on.
+  // Gumbel sampled block is DEFAULT-eligible (2026-07-20): the sampled-path
+  // external-destroy transient that gated it opt-in at P4 is FIXED (the
+  // compiled-plan teardown now parks any plan-owned buffer a live storage still
+  // aliases — src/executor/compiled-plan.ts; gates: t-uk-gumbel-parity /
+  // t-uk-steering-diff sampled arm STRICT_GPU-clean). Pure-temperature sampling
+  // (no top-k/top-p) now routes through the on-device Gumbel block by default,
+  // still under the global opt-out (TORCHLETTE_UNROLLED_K=0/1 → host loop).
   const gumbelEligible =
-    !greedy &&
-    (temperature ?? 0) > 0 &&
-    !topKActive &&
-    !topPActive &&
-    unrolledKExplicit();
+    !greedy && (temperature ?? 0) > 0 && !topKActive && !topPActive;
   const flagK = unrolledKFromEnv(); // 0 ⇒ opt-out; else the block size
   const useBlock = flagK >= 2 && (greedy || gumbelEligible);
   const blockK = useBlock ? flagK : 0;
@@ -488,7 +471,7 @@ export async function generateChat(
     useBlock && gumbelEligible
       ? {
           temperature: temperature as number,
-          seed: options?.seed ?? ((Math.random() * 0x7fffffff) >>> 0),
+          seed: options?.seed ?? (Math.random() * 0x7fffffff) >>> 0,
         }
       : undefined;
 
@@ -551,10 +534,16 @@ export async function generateChat(
         // stream stays on-device-consistent + deterministic. Seeded at the last
         // prompt position (promptIds.length-1); decodeBlock's ids[j] then draw
         // seed+promptIds.length+j — a clean monotonic per-position seed sequence.
-        nextTok = await gumbelPrefillToken(api, logits, promptIds.length - 1, vocab, {
-          temperature: blockSample.temperature,
-          seed: blockSample.seed + promptIds.length - 1,
-        });
+        nextTok = await gumbelPrefillToken(
+          api,
+          logits,
+          promptIds.length - 1,
+          vocab,
+          {
+            temperature: blockSample.temperature,
+            seed: blockSample.seed + promptIds.length - 1,
+          },
+        );
         logits.dispose();
       } else {
         const top = await api.readTopK(logits, K_PREFILTER, {

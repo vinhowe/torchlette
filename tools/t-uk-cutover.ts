@@ -12,12 +12,16 @@
  *        LD_LIBRARY_PATH=tools/vk-shim:$LD_LIBRARY_PATH npx tsx tools/t-uk-cutover.ts
  */
 import {
-  generateChat,
   type GenerateOptions,
+  generateChat,
 } from "../packages/qwen3-browser/src/generate";
 import type { Qwen3Config } from "../packages/qwen3-browser/src/model";
 import { Qwen3 } from "../packages/qwen3-browser/src/model";
-import { getGpuUncapturedErrorCount, getWebGPUInitError, initWebGPU } from "../src/backend/webgpu";
+import {
+  getGpuUncapturedErrorCount,
+  getWebGPUInitError,
+  initWebGPU,
+} from "../src/backend/webgpu";
 import { Torchlette } from "../src/frontend/torchlette";
 
 const CONFIG: Qwen3Config = {
@@ -44,7 +48,8 @@ const ok = (cond: boolean, msg: string) => {
 const PROMPT_IDS = [3, 14, 15, 92, 65, 35];
 const tokenizer = {
   encode: (_t: string) => [...PROMPT_IDS],
-  decode: (ids: number[], _o?: { skip_special_tokens?: boolean }) => ids.join(","),
+  decode: (ids: number[], _o?: { skip_special_tokens?: boolean }) =>
+    ids.join(","),
 };
 
 async function run(
@@ -94,16 +99,28 @@ async function main() {
 
   // (1) GREEDY default (flag unset) routes through the BLOCK (no CapturedFn).
   setFlag(undefined);
-  const gDefault = await run(api, model, { temperature: 0, maxNewTokens: MAXNEW });
+  const gDefault = await run(api, model, {
+    temperature: 0,
+    maxNewTokens: MAXNEW,
+  });
   await api.markStep();
-  ok(!gDefault.tapeDefined, "greedy DEFAULT routes through the block (tape undefined)");
-  ok(gDefault.ids.length > 0, `greedy DEFAULT produced ${gDefault.ids.length} tokens`);
+  ok(
+    !gDefault.tapeDefined,
+    "greedy DEFAULT routes through the block (tape undefined)",
+  );
+  ok(
+    gDefault.ids.length > 0,
+    `greedy DEFAULT produced ${gDefault.ids.length} tokens`,
+  );
 
   // (2) GREEDY opt-out (flag=0) restores the per-token HOST loop (CapturedFn).
   setFlag("0");
   const gHost = await run(api, model, { temperature: 0, maxNewTokens: MAXNEW });
   await api.markStep();
-  ok(gHost.tapeDefined, "greedy OPT-OUT (flag=0) routes through the host loop (tape defined)");
+  ok(
+    gHost.tapeDefined,
+    "greedy OPT-OUT (flag=0) routes through the host loop (tape defined)",
+  );
 
   // (3) BYTE-IDENTICAL cutover: block-default greedy == host opt-out greedy.
   ok(
@@ -118,8 +135,14 @@ async function main() {
   setFlag("8");
   const gK8 = await run(api, model, { temperature: 0, maxNewTokens: MAXNEW });
   await api.markStep();
-  ok(!gK8.tapeDefined, "greedy flag=8 routes through the block (tape undefined)");
-  ok(eq(gK8.ids, gDefault.ids), "greedy flag=8 == greedy default (block K is streaming granularity only)");
+  ok(
+    !gK8.tapeDefined,
+    "greedy flag=8 routes through the block (tape undefined)",
+  );
+  ok(
+    eq(gK8.ids, gDefault.ids),
+    "greedy flag=8 == greedy default (block K is streaming granularity only)",
+  );
 
   // (5) The top-k+top-p sampler (the shipped demo config) is the §4 HOST residue
   //     on BOTH the default and opt-out — routing is unchanged for it.
@@ -131,17 +154,51 @@ async function main() {
     maxNewTokens: MAXNEW,
   });
   await api.markStep();
-  ok(sDefault.tapeDefined, "top-k+top-p sampler is the host residue on DEFAULT (tape defined)");
+  ok(
+    sDefault.tapeDefined,
+    "top-k+top-p sampler is the host residue on DEFAULT (tape defined)",
+  );
+
+  // (5b) PURE-TEMPERATURE sampling (no top-k/top-p) now routes through the
+  //      on-device GUMBEL block by DEFAULT (2026-07-20 flip — the sampled-path
+  //      external-destroy transient is fixed). Tape UNDEFINED ⇔ block path.
+  setFlag(undefined);
+  const sTempDefault = await run(api, model, {
+    temperature: 0.7,
+    seed: 4242,
+    maxNewTokens: MAXNEW,
+  });
+  await api.markStep();
+  ok(
+    !sTempDefault.tapeDefined,
+    "pure-temperature sampler routes through the block by DEFAULT (tape undefined)",
+  );
+
+  // (5c) The global opt-out still forces it back to the per-token host loop.
+  setFlag("0");
+  const sTempOptOut = await run(api, model, {
+    temperature: 0.7,
+    seed: 4242,
+    maxNewTokens: MAXNEW,
+  });
+  await api.markStep();
+  ok(
+    sTempOptOut.tapeDefined,
+    "pure-temperature OPT-OUT (flag=0) routes through the host loop (tape defined)",
+  );
 
   // (6) zero uncaptured GPU errors across the greedy cutover.
   const uncaptured = getGpuUncapturedErrorCount();
-  ok(uncaptured === 0, `zero uncaptured GPU errors across the cutover run — got ${uncaptured}`);
+  ok(
+    uncaptured === 0,
+    `zero uncaptured GPU errors across the cutover run — got ${uncaptured}`,
+  );
 
   setFlag(undefined);
   console.log(
     `\n=== VERDICT: ${
       FAIL === 0
-        ? "PASS — greedy cutover routes to the block by default, byte-identical, residue on host"
+        ? "PASS — greedy + pure-temperature route to the block by default, byte-identical, top-k/top-p residue on host"
         : `FAIL (${FAIL} checks)`
     } ===`,
   );
