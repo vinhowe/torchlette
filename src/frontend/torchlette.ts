@@ -36,7 +36,7 @@ import {
   createAutocastContext,
 } from "../compiler/amp";
 import { currentEpoch } from "../core/epoch";
-import { shapesEqual, sizeOf } from "../core/shape";
+import { sizeOf } from "../core/shape";
 import {
   STEP_TAPE_RECORD,
   STEP_TAPE_REPLAY,
@@ -111,6 +111,12 @@ import {
 } from "../ops/registry";
 import { GELU_ERF_DEF, GELU_TANH_DEF } from "../ops/semantic/composite";
 import { makeUnaryGrad } from "../ops/semantic/emit-rt";
+import {
+  backwardOfIndexMap,
+  broadcastOverDims,
+  type IndexMap,
+  reduceToShape,
+} from "../ops/semantic/index-map";
 import { REDUCTION_DEF_BY_NAME } from "../ops/semantic/reduction";
 
 // GELU backward is DERIVED (design §6 P2): the adjoint of the GELU composition,
@@ -1034,8 +1040,12 @@ export class Torchlette {
     this._assertUsable(a);
     const aShape = a.shape;
     const inner = this.runtime.expand(a._unwrap(), shape);
+    // Adjoint: broadcast is many-to-one; its transpose REDUCES (sums the grad
+    // over the broadcast dims back to the input shape) — the broadcast⇄reduce
+    // duality, single-sourced in the index algebra (§8.1).
+    const map: IndexMap = { k: "broadcast", inShape: aShape, outShape: shape };
     return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [
-      this._sumToShape(grad, aShape),
+      backwardOfIndexMap(this.runtime, map, grad) as RuntimeTensor,
     ]);
   }
 
@@ -1067,9 +1077,10 @@ export class Torchlette {
     //   - "broadcast"        → sum: the upstream grad broadcast unchanged.
     //   - "broadcast-scaled" → mean: the ÷count epilogue scales the broadcast by
     //     1/count.
-    // The broadcast TRANSPOSE itself (`_expandGrad`) stays hand — it is P4's index
-    // algebra (design §8.1), which this composes with; only the per-monoid local
-    // factor derives here.
+    // The broadcast TRANSPOSE itself is now the index algebra's `broadcastOverDims`
+    // (P4, design §8.1): a reduction is the transpose of a broadcast, so its grad
+    // broadcasts the upstream back over the reduced dims. The per-monoid local
+    // factor (unit for sum, 1/count for mean) is P1's derived `gradKind`.
     const gradKind = REDUCTION_DEF_BY_NAME.get(opName)?.gradKind;
     if (gradKind === undefined) {
       throw new Error(
@@ -1083,7 +1094,13 @@ export class Torchlette {
     const dims = this._normalizeDims(options?.dim ?? null, aShape.length);
     const keepdim = options?.keepdim ?? false;
     return this._wrapWithGrad(result, [a], (grad, _getSaved) => {
-      const expanded = this._expandGrad(grad, aShape, dims, keepdim);
+      const expanded = broadcastOverDims(
+        this.runtime,
+        grad,
+        aShape,
+        dims,
+        keepdim,
+      );
       if (gradKind === "broadcast-scaled") {
         const reduceCount =
           dims.length === 0 ? 1 : dims.reduce((acc, d) => acc * aShape[d], 1);
@@ -1370,10 +1387,14 @@ export class Torchlette {
     const inner = this.runtime.gather(a._unwrap(), index._unwrap(), options);
     const aShape = a.shape;
     const indexInner = index._unwrap();
-    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => {
-      const z = this.runtime.zeros(aShape);
-      return [this.runtime.scatterAdd(z, indexInner, grad, options)];
-    });
+    // Adjoint: gather's transpose is scatterAdd into zeros (the gather⇄scatter
+    // duality — one fact, single-sourced in the index algebra).
+    const map: IndexMap = { k: "gather", dim: options.dim, inShape: aShape };
+    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [
+      backwardOfIndexMap(this.runtime, map, grad, {
+        index: indexInner,
+      }) as RuntimeTensor,
+    ]);
   }
 
   scatterAdd(
@@ -1390,11 +1411,17 @@ export class Torchlette {
       options,
     );
     const indexInner = index._unwrap();
-    return this._wrapWithGrad(inner, [a, src], (grad, _getSaved) => {
-      const grad_a = grad;
-      const grad_src = this.runtime.gather(grad, indexInner, options);
-      return [grad_a, grad_src];
-    });
+    // Adjoint: scatterAdd's transpose passes grad through to `a` and GATHERS the
+    // grad for `src` (scatter⇄gather duality — the same fact, transposed).
+    const map: IndexMap = { k: "scatterAdd", dim: options.dim };
+    return this._wrapWithGrad(
+      inner,
+      [a, src],
+      (grad, _getSaved) =>
+        backwardOfIndexMap(this.runtime, map, grad, {
+          index: indexInner,
+        }) as RuntimeTensor[],
+    );
   }
 
   where(condition: Tensor, x: Tensor, y: Tensor): Tensor {
@@ -1430,8 +1457,11 @@ export class Torchlette {
     this._assertUsable(a);
     const aShape = a.shape;
     const inner = this.runtime.reshape(a._unwrap(), shape);
+    // The index algebra derives the adjoint: reshape is a flat-identity
+    // bijection, so its transpose reshapes the grad back to the input shape.
+    const map: IndexMap = { k: "reshape", inShape: aShape, outShape: shape };
     return this._wrapWithGrad(inner, [a], (grad) => [
-      this.runtime.reshape(grad, aShape),
+      backwardOfIndexMap(this.runtime, map, grad) as RuntimeTensor,
     ]);
   }
 
@@ -1450,8 +1480,9 @@ export class Torchlette {
     }
     if (newShape.length === aShape.length) return a;
     const inner = this.runtime.reshape(a._unwrap(), newShape);
+    const map: IndexMap = { k: "reshape", inShape: aShape, outShape: newShape };
     return this._wrapWithGrad(inner, [a], (grad) => [
-      this.runtime.reshape(grad, aShape),
+      backwardOfIndexMap(this.runtime, map, grad) as RuntimeTensor,
     ]);
   }
 
@@ -1461,26 +1492,34 @@ export class Torchlette {
     const d = dim < 0 ? dim + aShape.length + 1 : dim;
     const newShape = [...aShape.slice(0, d), 1, ...aShape.slice(d)];
     const inner = this.runtime.reshape(a._unwrap(), newShape);
+    const map: IndexMap = { k: "reshape", inShape: aShape, outShape: newShape };
     return this._wrapWithGrad(inner, [a], (grad) => [
-      this.runtime.reshape(grad, aShape),
+      backwardOfIndexMap(this.runtime, map, grad) as RuntimeTensor,
     ]);
   }
 
   transpose(a: Tensor, options: TransposeOptions): Tensor {
     this._assertUsable(a);
     const inner = this.runtime.transpose(a._unwrap(), options);
+    // Adjoint: a 2-axis transpose is its own inverse (involution).
+    const map: IndexMap = {
+      k: "transpose",
+      dim0: options.dim0,
+      dim1: options.dim1,
+    };
     return this._wrapWithGrad(inner, [a], (grad) => [
-      this.runtime.transpose(grad, options),
+      backwardOfIndexMap(this.runtime, map, grad) as RuntimeTensor,
     ]);
   }
 
   permute(a: Tensor, dims: number[]): Tensor {
     this._assertUsable(a);
     const inner = this.runtime.permute(a._unwrap(), dims);
-    const inverseDims = new Array<number>(dims.length);
-    for (let i = 0; i < dims.length; i++) inverseDims[dims[i]] = i;
+    // Adjoint: the transpose of a permutation is its INVERSE permutation —
+    // derived by the index algebra (was the hand `inverseDims` loop).
+    const map: IndexMap = { k: "permute", perm: dims };
     return this._wrapWithGrad(inner, [a], (grad) => [
-      this.runtime.permute(grad, inverseDims),
+      backwardOfIndexMap(this.runtime, map, grad) as RuntimeTensor,
     ]);
   }
 
@@ -1494,8 +1533,17 @@ export class Torchlette {
     this._assertUsable(a);
     const originalLength = a.shape[dim];
     const inner = this.runtime.narrow(a._unwrap(), dim, start, length);
+    // Adjoint: narrow is an injection out⊂in; its transpose PADS the grad —
+    // scatters it into a zero-filled input at the offset (was narrowBackward).
+    const map: IndexMap = {
+      k: "narrow",
+      dim,
+      start,
+      length,
+      inLen: originalLength,
+    };
     return this._wrapWithGrad(inner, [a], (grad) => [
-      this.runtime.narrowBackward(grad, dim, start, originalLength),
+      backwardOfIndexMap(this.runtime, map, grad) as RuntimeTensor,
     ]);
   }
 
@@ -1558,15 +1606,15 @@ export class Torchlette {
       tensors.map((t) => t._unwrap()),
       { dim: d },
     );
-    return this._wrapWithGrad(inner, tensors, (grad, _getSaved) => {
-      const grads: ReturnType<typeof this.runtime.narrow>[] = [];
-      let offset = 0;
-      for (const size of sizes) {
-        grads.push(this.runtime.narrow(grad, d, offset, size));
-        offset += size;
-      }
-      return grads;
-    });
+    // Adjoint: cat is a disjoint union; its transpose SPLITS the grad — narrows
+    // it at each recorded per-input offset (derived by the index algebra).
+    const map: IndexMap = { k: "cat", dim: d, sizes };
+    return this._wrapWithGrad(
+      inner,
+      tensors,
+      (grad, _getSaved) =>
+        backwardOfIndexMap(this.runtime, map, grad) as RuntimeTensor[],
+    );
   }
 
   stack(tensors: Tensor[], dim = 0): Tensor {
@@ -1706,65 +1754,14 @@ export class Torchlette {
     };
   }
 
+  /**
+   * The implicit-broadcast VJP: sum `grad` down to `shape`. This is the index
+   * algebra's broadcast transpose (`reduceToShape`) — the SAME movement as
+   * expand's adjoint, single-sourced (P4, §8.1). `_expandGrad` (the reduction
+   * VJP) likewise moved to the index algebra's `broadcastOverDims`.
+   */
   _sumToShape(grad: RuntimeTensor, shape: number[]): RuntimeTensor {
-    if (shapesEqual(grad.shape, shape)) {
-      return grad;
-    }
-    const gradRank = grad.shape.length;
-    const targetRank = shape.length;
-    const pad = Math.max(0, gradRank - targetRank);
-    const paddedTarget = new Array(pad).fill(1).concat(shape);
-    // Sum dims where target is 1 but grad is not (broadcast reduction),
-    // AND all leading padded dims (rank reduction — target has fewer dims).
-    // Summing a size-1 dim with keepdim=false is a no-op that drops the dim.
-    const dims: number[] = [];
-    for (let axis = 0; axis < gradRank; axis += 1) {
-      if (axis < pad) {
-        // Padded leading dim — always include (drops it from output)
-        dims.push(axis);
-      } else if (paddedTarget[axis] === 1 && grad.shape[axis] !== 1) {
-        dims.push(axis);
-      }
-    }
-    let reduced = grad;
-    if (dims.length > 0) {
-      const summed = this.runtime.sum(reduced, { dim: dims, keepdim: false });
-      if (typeof summed === "number") {
-        reduced = this.runtime.full([], summed, grad.device);
-      } else {
-        reduced = summed;
-      }
-    }
-    // Reshape only for rare cases (e.g., target has explicit 1-dims)
-    if (!shapesEqual(reduced.shape, shape)) {
-      reduced = this.runtime.reshape(reduced, shape);
-    }
-    return reduced;
-  }
-
-  _expandGrad(
-    grad: RuntimeTensor,
-    inputShape: number[],
-    dims: number[],
-    keepdim: boolean,
-  ): RuntimeTensor {
-    let expanded = grad;
-    if (!keepdim && dims.length > 0) {
-      const rank = inputShape.length;
-      const reduceSet = new Set(dims);
-      const nextShape = new Array<number>(rank);
-      let gradAxis = 0;
-      for (let axis = 0; axis < rank; axis += 1) {
-        if (reduceSet.has(axis)) {
-          nextShape[axis] = 1;
-        } else {
-          nextShape[axis] = grad.shape[gradAxis];
-          gradAxis += 1;
-        }
-      }
-      expanded = this.runtime.reshape(expanded, nextShape);
-    }
-    return this.runtime.expand(expanded, inputShape);
+    return reduceToShape(this.runtime, grad, shape);
   }
 
   _normalizeDims(dim: number | number[] | null, rank: number): number[] {
@@ -2093,7 +2090,9 @@ export class Torchlette {
    * step (else stepsObserved collapses to 1 and no tape forms). The default
    * (false) matches backward()'s implied-boundary commit (stNoteBoundary).
    */
-  async commitStepBoundaryIfPending(finalizeRecorderStep = false): Promise<boolean> {
+  async commitStepBoundaryIfPending(
+    finalizeRecorderStep = false,
+  ): Promise<boolean> {
     if (this._pendingStepBoundary === null) return false;
     await this._commitPendingStepBoundary(finalizeRecorderStep);
     return true;
@@ -2545,8 +2544,9 @@ export class Torchlette {
     if (!STEP_TAPE_REPLAY) return;
     const nodes: LazyIRNode[] = [];
     for (const t of results) {
-      const ref = (t._unwrap() as unknown as { lazyRef?: unknown })
-        .lazyRef as { kind?: string; node?: LazyIRNode } | undefined;
+      const ref = (t._unwrap() as unknown as { lazyRef?: unknown }).lazyRef as
+        | { kind?: string; node?: LazyIRNode }
+        | undefined;
       if (ref?.kind === "pending" && ref.node) nodes.push(ref.node);
     }
     stDeclareOutputNodes(nodes);
