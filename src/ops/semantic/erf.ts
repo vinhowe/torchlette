@@ -8,9 +8,8 @@
  *     character-for-character in `numeric.ts` `erf()`, `tile-ir.ts`
  *     `BlockExpr.erf()`, `fusion-tile-ir.ts` gelu_erf, and
  *     `custom-backward.ts` `geluErfBackward`;
- *   - the GELU-tanh constants (`GELU_SQRT_2_OVER_PI`, `GELU_TANH_C`,
- *     `GELU_TANH_DC`), written in the CPU `gelu()`, the WGSL activation switch,
- *     and `geluTanhBackward`.
+ *   - the GELU-tanh constants (`GELU_SQRT_2_OVER_PI`, `GELU_TANH_C`), written in
+ *     the CPU `gelu()`, the WGSL activation switch, and `geluTanhBackward`.
  *
  * `erf` is admitted as an ALGEBRA PRIMITIVE (like `exp`/`tanh`): its *realization*
  * is an approximation (the A-S poly, `erfApprox` / the WGSL emit), single-sourced
@@ -38,11 +37,6 @@ export const GELU_SQRT_2_OVER_PI = 0.7978845608;
 
 /** The GELU-tanh cubic coefficient (`x + c·x³`). */
 export const GELU_TANH_C = 0.044715;
-
-/** The GELU-tanh backward's inner-derivative coefficient = 3·`GELU_TANH_C`
- *  (`d/dx (x + c·x³) = 1 + 3c·x²`). Single-sourced from `GELU_TANH_C` so the
- *  0.134145 that lived by hand in `geluTanhBackward` stops being a 3rd owner. */
-export const GELU_TANH_DC = 3 * GELU_TANH_C;
 
 /**
  * The A-S erf realization as an f64 scalar — the SINGLE source the CPU reference

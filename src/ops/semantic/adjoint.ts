@@ -9,12 +9,12 @@
  *   - `div.dB` sign-of-zero  → the CONSERVATIVE normalizer (`0·u→0`, `u·1→u`,
  *     `0−u→neg u`) — exact IEEE folds that never perturb rounding, so the other
  *     19 stay byte-exact.
- *   - `log`/`sqrt` grad       → the epsilon is a NUMERICAL GUARD (policy, not
- *     meaning): a `denomEps` annotation the derivation injects at the gradient
- *     denominator (§4.5). PyTorch (the oracle) computes the UNGUARDED adjoint
- *     `g/x`, `g·0.5/√x`; the table's `+1e-8` biases the grad near 0 (log: 870
- *     ulp @ x≈1e-4). The guard is preserved for behavior-parity and made
- *     explicit/reviewable, not inherited silently.
+ *   - `log`/`sqrt` grad       → the derived adjoint is UNGUARDED (`g/x`,
+ *     `g·0.5/√x`), matching the torch oracle. The old hand table carried a
+ *     `+1e-8` denomEps that BIASED the grad near 0 (log: 870 ulp @ x≈1e-4); the
+ *     §18 final ruling DROPPED it (the guard was inert in real training — every
+ *     consumer's argument is bounded away from 0 by a composite's own eps — and
+ *     torch guards neither), deleting the guard vocabulary with it.
  */
 
 import { TWO_OVER_SQRT_PI } from "./erf";
@@ -281,138 +281,12 @@ export function normalize(e: Expr): Expr {
 }
 
 // ----------------------------------------------------------------------------
-// Numerical guards (design §4.5) — a policy annotation, never the formula.
-// Fixed vocabulary (Q1 recommendation: rule-of-three; only `denomEps` observed).
-// ----------------------------------------------------------------------------
-
-export interface GradGuard {
-  /** Add this epsilon to the gradient's reciprocal/division denominator. */
-  denomEps: number;
-}
-
-/**
- * Canonicalize a guarded grad's division form so `denomEps` lands on the exact
- * atom the hand table guards (design §4.5). Applied ONLY to guarded ops (log,
- * sqrt) — pure ops never see these rounding-changing rewrites.
- *   mul(a, div(1, b))         → div(a, b)                (log: g·(1/x) → g/x)
- *   div(p, k·u) / div(p, u·k) → div(p/k, u)              (sqrt: 1/(2√x) → 0.5/√x)
- */
-function canonicalizeDivForm(e: Expr): Expr {
-  const rec = (n: Expr): Expr => {
-    switch (n.k) {
-      case "mul": {
-        const a = rec(n.a);
-        const b = rec(n.b);
-        if (b.k === "div" && isConst(b.a, 1)) return div(a, b.b);
-        if (a.k === "div" && isConst(a.a, 1)) return div(b, a.b);
-        return mul(a, b);
-      }
-      case "div": {
-        const a = rec(n.a);
-        const b = rec(n.b);
-        if (a.k === "c" && b.k === "mul") {
-          if (b.a.k === "c" && b.a.v !== 0) return div(c(a.v / b.a.v), b.b);
-          if (b.b.k === "c" && b.b.v !== 0) return div(c(a.v / b.b.v), b.a);
-        }
-        return div(a, b);
-      }
-      case "neg":
-      case "exp":
-      case "log":
-      case "sqrt":
-      case "sin":
-      case "cos":
-      case "tanh":
-      case "abs":
-      case "sign":
-      case "recip":
-      case "floor":
-      case "ceil":
-      case "round":
-      case "isfinite":
-        return { k: n.k, a: rec(n.a) };
-      case "add":
-      case "sub":
-      case "pow":
-      case "min":
-      case "max":
-      case "mod":
-      case "gt":
-      case "ge":
-      case "lt":
-      case "le":
-      case "eq":
-      case "ne":
-        return { k: n.k, a: rec(n.a), b: rec(n.b) } as Expr;
-      case "where":
-        return where(rec(n.c), rec(n.a), rec(n.b));
-      default:
-        return n;
-    }
-  };
-  return rec(e);
-}
-
-/** Add `eps` to the denominator of the first div/recip in pre-order. */
-function applyDenomEps(e: Expr, eps: number): Expr {
-  let applied = false;
-  const rec = (n: Expr): Expr => {
-    if (applied) return n;
-    switch (n.k) {
-      case "div":
-        applied = true;
-        return div(n.a, add(n.b, c(eps)));
-      case "recip":
-        applied = true;
-        return recip(add(n.a, c(eps)));
-      case "neg":
-      case "exp":
-      case "log":
-      case "sqrt":
-      case "sin":
-      case "cos":
-      case "tanh":
-      case "abs":
-      case "sign":
-      case "floor":
-      case "ceil":
-      case "round":
-      case "isfinite":
-        return { k: n.k, a: rec(n.a) };
-      case "mul":
-      case "add":
-      case "sub":
-      case "pow":
-      case "min":
-      case "max":
-      case "mod":
-      case "gt":
-      case "ge":
-      case "lt":
-      case "le":
-      case "eq":
-      case "ne":
-        return { k: n.k, a: rec(n.a), b: rec(n.b) } as Expr;
-      case "where":
-        return where(rec(n.c), rec(n.a), rec(n.b));
-      default:
-        return n;
-    }
-  };
-  return rec(e);
-}
-
-// ----------------------------------------------------------------------------
 // The public VJP builders — the derived gradient graph as a term.
 // ----------------------------------------------------------------------------
 
-/** g · d(def)/dx, normalized (+ guard applied when annotated). */
-export function vjpUnary(def: Expr, guard?: GradGuard): Expr {
-  let vjp = normalize(mul({ k: "g" }, deriv(def, "x")));
-  if (guard) {
-    vjp = normalize(applyDenomEps(canonicalizeDivForm(vjp), guard.denomEps));
-  }
-  return vjp;
+/** g · d(def)/dx, normalized. */
+export function vjpUnary(def: Expr): Expr {
+  return normalize(mul({ k: "g" }, deriv(def, "x")));
 }
 
 /** [g · d/dx, g · d/dy] for a binary op, normalized. */

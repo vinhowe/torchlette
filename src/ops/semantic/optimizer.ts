@@ -65,11 +65,8 @@ const bin = (op: OptBinary, a: OptTerm, b: OptTerm): OptTerm => ({
   a,
   b,
 });
-export const oNeg = (a: OptTerm) => u("neg", a);
 export const oSqrt = (a: OptTerm) => u("sqrt", a);
 export const oSign = (a: OptTerm) => u("sign", a);
-export const oAbs = (a: OptTerm) => u("abs", a);
-export const oExp = (a: OptTerm) => u("exp", a);
 export const oAdd = (a: OptTerm, b: OptTerm) => bin("add", a, b);
 export const oSub = (a: OptTerm, b: OptTerm) => bin("sub", a, b);
 export const oMul = (a: OptTerm, b: OptTerm) => bin("mul", a, b);

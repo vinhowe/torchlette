@@ -64,15 +64,6 @@ export const GELU_ERF_DEF: ElementwiseDef = {
   gradPolicy: "derive",
 };
 
-/** The composite elementwise family (design §2 category e, elementwise subset). */
-export const COMPOSITE_UNARY_DEFS: readonly ElementwiseDef[] = [
-  GELU_TANH_DEF,
-  GELU_ERF_DEF,
-];
-
-export const COMPOSITE_DEF_BY_NAME: ReadonlyMap<string, ElementwiseDef> =
-  new Map(COMPOSITE_UNARY_DEFS.map((d) => [d.name, d] as const));
-
 // ===========================================================================
 // The reduction-composites (design §2 category e, §4.4): softmax / log_softmax
 // / rmsnorm / layernorm as `Composition` DATA over the primitive algebra + the

@@ -96,7 +96,6 @@ export const div = (a: Expr, b: Expr): Expr => ({ k: "div", a, b });
 export const powE = (a: Expr, b: Expr): Expr => ({ k: "pow", a, b });
 export const minE = (a: Expr, b: Expr): Expr => ({ k: "min", a, b });
 export const maxE = (a: Expr, b: Expr): Expr => ({ k: "max", a, b });
-export const modE = (a: Expr, b: Expr): Expr => ({ k: "mod", a, b });
 
 export const gt = (a: Expr, b: Expr): Expr => ({ k: "gt", a, b });
 export const ge = (a: Expr, b: Expr): Expr => ({ k: "ge", a, b });

@@ -7,10 +7,12 @@
  *
  * S1 (reference): the derived CPU body (interpret of the definition) reproduces
  *   the hand `numeric.ts` bodies byte-for-byte.
- * S2 (adjoint):   the derived VJP (adjoint of the definition, normalized, with
- *   guards) reproduces the hand `registry.ts` grad table byte-for-byte — the 3
- *   probe divergences RESOLVED (div.dB via the conservative normalizer; log/sqrt
- *   via the explicit denomEps guard).
+ * S2 (adjoint):   the derived VJP (adjoint of the definition, normalized)
+ *   reproduces the grad table byte-for-byte — div.dB resolved via the
+ *   conservative normalizer; log/sqrt are the UNGUARDED adjoint (`g/x`,
+ *   `g·0.5/√x`), the §18 final ruling that dropped the old table's +1e-8 denomEps
+ *   (an inert-in-training bias; torch guards neither) and deleted the guard
+ *   vocabulary with it.
  * Schema gate:    every definition is DATA (no smuggled op body).
  *
  * The hand surfaces below are transcribed INDEPENDENTLY (as functions / Exprs),
@@ -112,8 +114,8 @@ const HAND_UNARY_GRAD: Record<string, Expr> = {
   neg: neg(g),
   abs: mul(g, sign(x)),
   exp: mul(g, exp(x)),
-  log: div(g, add(x, c(1e-8))), // note the epsilon guard
-  sqrt: mul(g, div(c(0.5), add(sqrt(x), c(1e-8)))), // note the epsilon guard
+  log: div(g, x), // UNGUARDED — the §18 ruling dropped the +1e-8 (matches torch)
+  sqrt: mul(g, div(c(0.5), sqrt(x))), // UNGUARDED — the §18 ruling (matches torch)
   rsqrt: mul(
     g,
     mul(c(-0.5), mul(recip(sqrt(x)), mul(recip(sqrt(x)), recip(sqrt(x))))),
@@ -181,7 +183,7 @@ describe("Semantic derivation — the definition is the single source", () => {
       const hand = HAND_UNARY_GRAD[d.name];
       if (!hand) continue;
       it(`${d.name} grad`, () => {
-        const vjp = vjpUnary(d.expr, d.gradGuard);
+        const vjp = vjpUnary(d.expr);
         for (const xv of UNARY_SAMPLES) {
           if (posDomain(d.name) && xv <= 0) continue;
           for (const gv of GRAD_UPSTREAM) {
@@ -278,8 +280,8 @@ describe("Semantic derivation — P2 composites (GELU / erf)", () => {
   });
 
   it("S2: the derived GELU adjoints are the true derivative of the derived forward", () => {
-    const tanhVjp = vjpUnary(GELU_TANH_DEF.expr, GELU_TANH_DEF.gradGuard);
-    const erfVjp = vjpUnary(GELU_ERF_DEF.expr, GELU_ERF_DEF.gradGuard);
+    const tanhVjp = vjpUnary(GELU_TANH_DEF.expr);
+    const erfVjp = vjpUnary(GELU_ERF_DEF.expr);
     const tanhBody = compileUnary(GELU_TANH_DEF.expr);
     for (const v of GELU_SAMPLES) {
       // tanh-gelu: fully analytic — adjoint matches fd of its own forward.

@@ -14,7 +14,6 @@
  *               pure-elementwise adjoint scope, design §2).
  */
 
-import type { GradGuard } from "./adjoint";
 import {
   abs,
   add,
@@ -53,11 +52,7 @@ export interface ElementwiseDef {
   /** The forward formula — the single source. */
   expr: Expr;
   gradPolicy: GradPolicy;
-  /** Numerical guard on the derived gradient (design §4.5). log/sqrt only. */
-  gradGuard?: GradGuard;
 }
-
-const EPS = 1e-8;
 
 /**
  * Unary elementwise definitions — EXACTLY the `numeric.ts` UNARY_OPS formulas.
@@ -68,16 +63,16 @@ export const UNARY_DEFS: readonly ElementwiseDef[] = [
     name: "sqrt",
     arity: 1,
     expr: sqrt(x),
+    // grad DERIVED unguarded — matches the torch oracle (design §18 ruling).
     gradPolicy: "derive",
-    gradGuard: { denomEps: EPS },
   },
   { name: "exp", arity: 1, expr: exp(x), gradPolicy: "derive" },
   {
     name: "log",
     arity: 1,
     expr: log(x),
+    // grad DERIVED unguarded — matches the torch oracle (design §18 ruling).
     gradPolicy: "derive",
-    gradGuard: { denomEps: EPS },
   },
   { name: "neg", arity: 1, expr: neg(x), gradPolicy: "derive" },
   { name: "abs", arity: 1, expr: abs(x), gradPolicy: "derive" },
@@ -131,7 +126,3 @@ export const BINARY_DEFS: readonly ElementwiseDef[] = [
   { name: "minimum", arity: 2, expr: minE(x, y), gradPolicy: "derive" },
   { name: "maximum", arity: 2, expr: maxE(x, y), gradPolicy: "derive" },
 ];
-
-export const DEF_BY_NAME: ReadonlyMap<string, ElementwiseDef> = new Map(
-  [...UNARY_DEFS, ...BINARY_DEFS].map((d) => [d.name, d] as const),
-);

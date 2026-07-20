@@ -15,7 +15,7 @@
 import type { RuntimeEngine } from "../../runtime/engine";
 import type { Tensor as RuntimeTensor } from "../../runtime/tensor";
 import type { BinaryTTGradFn, UnaryGradFn } from "../registry";
-import { type GradGuard, vjpBinary, vjpUnary } from "./adjoint";
+import { vjpBinary, vjpUnary } from "./adjoint";
 import type { ElementwiseDef } from "./catalog";
 import type { CompNode, CompositeDef } from "./composite";
 import { ERF_A, ERF_P } from "./erf";
@@ -190,7 +190,7 @@ function emitErf(u: RuntimeTensor, rt: RuntimeEngine): RuntimeTensor {
 
 /** Derive a `UnaryGradFn` from a definition (design S2). */
 export function makeUnaryGrad(def: ElementwiseDef): UnaryGradFn {
-  const vjp: Expr = vjpUnary(def.expr, def.gradGuard as GradGuard | undefined);
+  const vjp: Expr = vjpUnary(def.expr);
   return (rt, g, s) =>
     asTensor(
       emit(vjp, rt, {
