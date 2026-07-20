@@ -22,11 +22,12 @@
  * the optimizer frame; the covenant/R22 defense that keeps the byte differential
  * un-gameable).
  *
- * SGD (+momentum) and LION are SIBLING definitions (the generality proof): Lion
- * is sign-based and derives ~for free from the same algebra — no hand kernel, no
- * hand grads (optimizers never need a VJP; §4.6). MUON is declared-but-DEFERRED:
- * its Newton–Schulz orthogonalization needs a matmul-CONTRACTION composition the
- * pure-elementwise optimizer frame lacks (design §2 category d) — honest scope.
+ * SGD (+momentum), LION, and MUON are SIBLING definitions (the generality
+ * proof): Lion is sign-based, ~free from the elementwise algebra; MUON adds the
+ * ONE contraction node (`mm`) the frame lacked and orthogonalizes via unrolled
+ * Newton–Schulz — an optimizer from its definition, no hand kernel, no hand
+ * grads (optimizers never need a VJP; §4.6). The `mm` node emits the existing
+ * `rt.matmul` (referenced, not re-owned — §4.4, category d).
  */
 
 import type { RuntimeEngine } from "../../runtime/engine";
@@ -45,7 +46,14 @@ export type OptTerm =
   | { k: "role"; name: string } // a named state/hyperparameter input
   | { k: "c"; v: number } // a constant
   | { k: "u"; op: OptUnary; a: OptTerm }
-  | { k: "b"; op: OptBinary; a: OptTerm; b: OptTerm };
+  | { k: "b"; op: OptBinary; a: OptTerm; b: OptTerm }
+  // The CONTRACTION node (Crystal 3 tail): a 2D matmul `A·B` with per-operand
+  // transpose flags — the smallest contraction form Newton–Schulz needs
+  // (`X·Xᵀ`, `A·A`, `B·X`). The interpreter emits `rt.matmul` (the existing
+  // kernel, REFERENCED not re-owned — design §4.4, category d). This is the ONE
+  // node the pure-elementwise optimizer frame lacked (the P3 contraction the
+  // §16 MUON deferral named); every leaf stays DATA (booleans + child terms).
+  | { k: "mm"; a: OptTerm; b: OptTerm; ta: boolean; tb: boolean };
 
 // Builders (data, never closures).
 export const role = (name: string): OptTerm => ({ k: "role", name });
@@ -66,6 +74,17 @@ export const oAdd = (a: OptTerm, b: OptTerm) => bin("add", a, b);
 export const oSub = (a: OptTerm, b: OptTerm) => bin("sub", a, b);
 export const oMul = (a: OptTerm, b: OptTerm) => bin("mul", a, b);
 export const oDiv = (a: OptTerm, b: OptTerm) => bin("div", a, b);
+/**
+ * The 2D contraction builder `A·B` with optional per-operand transpose. The
+ * ONLY non-elementwise primitive; `oMatmul(X, X, { tb: true })` is `X·Xᵀ`, the
+ * Newton–Schulz kernel of Muon. Data in, data out — the interpreter realizes it
+ * as `rt.matmul` over the runtime.
+ */
+export const oMatmul = (
+  a: OptTerm,
+  b: OptTerm,
+  opts?: { ta?: boolean; tb?: boolean },
+): OptTerm => ({ k: "mm", a, b, ta: opts?.ta ?? false, tb: opts?.tb ?? false });
 
 // ----------------------------------------------------------------------------
 // The program schema — a set of in-place state updates + the param update, each
@@ -103,7 +122,7 @@ export interface OptimizerProgram {
 // analogue for the optimizer frame; covenant/R22 defense).
 // ----------------------------------------------------------------------------
 
-const OPT_TERM_KINDS = new Set(["role", "c", "u", "b"]);
+const OPT_TERM_KINDS = new Set(["role", "c", "u", "b", "mm"]);
 const OPT_UNARY = new Set<string>(["neg", "sqrt", "sign", "abs", "exp"]);
 const OPT_BINARY = new Set<string>(["add", "sub", "mul", "div"]);
 
@@ -197,6 +216,28 @@ export function evalOptTerm(
   rt: RuntimeEngine,
   roles: OptRoles,
   sink?: RuntimeTensor[],
+  memo?: Map<OptTerm, OptVal>,
+): OptVal {
+  // Memoize by term-object IDENTITY: a subterm shared by object reuse is
+  // realized ONCE. Muon's Newton-Schulz reuses the same X/A objects ~8× per
+  // step, so a naive tree walk explodes to ~8^S matmul dispatches (a 32GB GPU
+  // blowup at S=5); memoization collapses the interpretation to the term's DAG
+  // size. Sharing an OptTerm object is the authoring signal that its value is
+  // shared; distinct objects (structurally equal or not) still evaluate apart.
+  const cache = memo ?? new Map<OptTerm, OptVal>();
+  const cached = cache.get(t);
+  if (cached !== undefined) return cached;
+  const result = evalOptTermCore(t, rt, roles, sink, cache);
+  cache.set(t, result);
+  return result;
+}
+
+function evalOptTermCore(
+  t: OptTerm,
+  rt: RuntimeEngine,
+  roles: OptRoles,
+  sink: RuntimeTensor[] | undefined,
+  cache: Map<OptTerm, OptVal>,
 ): OptVal {
   const track = (v: OptVal): OptVal => {
     if (sink !== undefined && typeof v !== "number") sink.push(v);
@@ -208,7 +249,7 @@ export function evalOptTerm(
     case "c":
       return t.v;
     case "u": {
-      const a = evalOptTerm(t.a, rt, roles, sink);
+      const a = evalOptTerm(t.a, rt, roles, sink, cache);
       if (typeof a === "number") {
         // Fold pure-scalar unaries in JS.
         switch (t.op) {
@@ -239,8 +280,8 @@ export function evalOptTerm(
       break;
     }
     case "b": {
-      const a = evalOptTerm(t.a, rt, roles, sink);
-      const b = evalOptTerm(t.b, rt, roles, sink);
+      const a = evalOptTerm(t.a, rt, roles, sink, cache);
+      const b = evalOptTerm(t.b, rt, roles, sink, cache);
       if (typeof a === "number" && typeof b === "number") {
         // Fold pure-scalar binaries in JS (keeps `1-β1` a constant).
         switch (t.op) {
@@ -265,6 +306,20 @@ export function evalOptTerm(
           return track(rt.div(a, b));
       }
       break;
+    }
+    case "mm": {
+      // The contraction node — both operands MUST be 2D tensors (no scalar
+      // fold; a matmul over scalars is meaningless). Transposes are 2D views
+      // (dim0↔dim1), REFERENCED into the existing rt.matmul kernel (§4.4).
+      const a = evalOptTerm(t.a, rt, roles, sink, cache);
+      const b = evalOptTerm(t.b, rt, roles, sink, cache);
+      if (typeof a === "number" || typeof b === "number")
+        throw new Error(
+          "evalOptTerm: a contraction (mm) node requires tensor operands, but a leaf folded to a scalar.",
+        );
+      const aM = t.ta ? track(rt.transpose(a, { dim0: 0, dim1: 1 })) : a;
+      const bM = t.tb ? track(rt.transpose(b, { dim0: 0, dim1: 1 })) : b;
+      return track(rt.matmul(aM, bM));
     }
   }
   throw new Error(`evalOptTerm: unhandled term ${JSON.stringify(t)}`);
@@ -425,27 +480,89 @@ export const LION_PROGRAM: OptimizerProgram = {
 };
 
 /**
- * MUON — DECLARED but DEFERRED (honest scope, design §2 category d + §7).
+ * MUON — the CONTRACTION dividend (Crystal 3 tail; design §2 category d, §16
+ * deferral CASHED). Muon's core is Newton–Schulz orthogonalization of the
+ * momentum matrix — a fixed-point of MATMUL CONTRACTIONS — which the pure-
+ * elementwise frame lacked. With the `mm` node it becomes a program, exactly as
+ * Lion did from the elementwise algebra: an optimizer FROM ITS DEFINITION.
  *
- * Muon's core is Newton–Schulz orthogonalization of the momentum matrix: a
- * fixed-point iteration of MATMUL CONTRACTIONS (`X ← 1.5·X − 0.5·X·Xᵀ·X`),
- * NOT a pure-elementwise term. The optimizer-program frame here is the
- * elementwise sub-algebra (§4.6); expressing Muon needs a matmul-composition
- * primitive the frame lacks (the P3 contraction stratum). It is named here so
- * the deferral is explicit, per the admission-pressure rule (§7): held out
- * until the contraction composition exists, not fabricated as an elementwise
- * approximation.
+ *   buf' = μ·buf + g                                    (momentum, SGD-form state)
+ *   X₀   = buf · ns_scale        (ns_scale = 1/(‖buf‖_F+ε), realizer-computed —
+ *                                 normalizes into the NS convergence basin)
+ *   for k in 1..S:   A = X·Xᵀ ;  X ← a·X + (b·A + c·A·A)·X   (quintic, coeffs DATA)
+ *   p'   = p − lr·( rms·X_S + wd·p )    (rms = √max(1,rows/cols); decoupled wd)
+ *
+ * The Newton–Schulz coefficients (Jordan et al., the published quintic) and the
+ * iteration COUNT are DATA; the iteration is a fully UNROLLED composition. The
+ * orientation transpose (run NS with rows≤cols) and the AdamW routing of
+ * embedding/1D params are the REALIZER's declared POLICY (src/optim/muon.ts) —
+ * the arithmetic derives, the routing/effect is declared (§4.6).
  */
-export const MUON_DEFERRED = {
-  name: "muon",
-  reason:
-    "Newton–Schulz orthogonalization is a matmul-contraction fixed-point, not a pure-elementwise term; needs the P3 contraction composition the optimizer frame lacks.",
-} as const;
+// The published Newton–Schulz quintic coefficients (Jordan et al.) — DATA.
+export const MUON_NS_COEFFS = { a: 3.4445, b: -4.775, c: 2.0315 } as const;
+export const MUON_NS_STEPS = 5;
 
-/** The optimizer-program catalog (the DEFINED, non-deferred programs). */
+const NS_SCALE = role("ns_scale"); // 1/(‖buf‖_F + ε) — realizer-computed (bc1 precedent)
+const RMS = role("rms"); // √max(1, rows/cols) — the shape-magnitude match, DATA
+
+/** One quintic Newton–Schulz iteration: X ← a·X + (b·A + c·A·A)·X with A = X·Xᵀ. */
+function nsStep(X: OptTerm): OptTerm {
+  const A = oMatmul(X, X, { tb: true }); // X·Xᵀ  (the Gram contraction)
+  const A2 = oMatmul(A, A); // A·A
+  const B = oAdd(
+    oMul(A, konst(MUON_NS_COEFFS.b)),
+    oMul(A2, konst(MUON_NS_COEFFS.c)),
+  );
+  return oAdd(oMul(X, konst(MUON_NS_COEFFS.a)), oMatmul(B, X)); // a·X + B·X
+}
+
+/**
+ * The orthogonalization term: `steps` quintic iterations over the normalized
+ * momentum `m·ns_scale`. The COUNT is DATA — the composition is fully UNROLLED
+ * (S contractions per step), so a program is a finite term, never a loop body.
+ */
+export function buildMuonOrtho(steps: number = MUON_NS_STEPS): OptTerm {
+  let X: OptTerm = oMul(M, NS_SCALE); // normalize into the NS convergence basin
+  for (let i = 0; i < steps; i++) X = nsStep(X);
+  return X;
+}
+
+/** buf' = μ·buf + g — the momentum buffer (the SGD-momentum state form). */
+export const MUON_M_NEW = oAdd(oMul(M, MU), G);
+/** The default (5-step) orthogonalization of the momentum buffer. */
+export const MUON_ORTHO = buildMuonOrtho();
+/** The magnitude-matched update: rms·orthogonalize(buf). */
+export const MUON_UPDATE = oMul(MUON_ORTHO, RMS);
+const MUON_WD_TERM = oMul(P, oMul(LR, WD));
+/** p' = p − lr·(rms·orthogonalize(buf) + wd·p) — the complete term (the gate source). */
+export const MUON_P_NEW = oSub(P, oAdd(oMul(MUON_UPDATE, LR), MUON_WD_TERM));
+
+/**
+ * The realizer's apply tail: p' from a PRECOMPUTED (back-oriented, rms-scaled)
+ * update `u`. The orientation transpose is a shape POLICY that sits BETWEEN the
+ * orthogonalization and this apply, so muon.ts interprets the two pieces around
+ * the transpose rather than MUON_P_NEW whole — the ADAMW_SCALED-vs-ADAMW_P_NEW
+ * precedent (both are DATA; the full term stays the single reference source).
+ */
+const MUON_U = role("u");
+export const MUON_P_APPLY = oSub(
+  P,
+  oAdd(oMul(MUON_U, LR), MUON_WD_TERM),
+);
+
+export const MUON_PROGRAM: OptimizerProgram = {
+  name: "muon",
+  state: ["m"],
+  stateUpdates: [{ slot: "m", expr: MUON_M_NEW }],
+  paramUpdate: MUON_P_NEW,
+  hyperRoles: ["lr", "wd", "mu", "ns_scale", "rms"],
+};
+
+/** The optimizer-program catalog (the DEFINED programs; MUON now among them). */
 export const OPTIMIZER_PROGRAMS: readonly OptimizerProgram[] = [
   ADAMW_PROGRAM,
   SGD_MOMENTUM_PROGRAM,
   SGD_PROGRAM,
   LION_PROGRAM,
+  MUON_PROGRAM,
 ];
