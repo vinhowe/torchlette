@@ -109,6 +109,7 @@ import {
   OP_REGISTRY,
   UNARY_AUTOGRAD_OPS,
 } from "../ops/registry";
+import { REDUCTION_DEF_BY_NAME } from "../ops/semantic/reduction";
 // Import extracted modules
 import {
   applyAutocastImpl,
@@ -1049,8 +1050,22 @@ export class Torchlette {
             typeof result === "number" ? this.runtime.full([], result) : result,
           );
     }
-    // Non-differentiable reductions (max, min without dim grad)
-    if (opName === "max" || opName === "min") {
+    // The reduction VJP class DERIVES from the semantic definition's gradKind
+    // (semantic-derivation P1), single-sourcing the differentiability + mean-scale
+    // facts the dispatcher formerly hardcoded as op-name strings:
+    //   - "none"             → non-differentiable (max/min; the mask-scatter VJP is
+    //     P4 index-algebra, not shipped here).
+    //   - "broadcast"        → sum: the upstream grad broadcast unchanged.
+    //   - "broadcast-scaled" → mean: the ÷count epilogue scales the broadcast by
+    //     1/count.
+    // The broadcast TRANSPOSE itself (`_expandGrad`) stays hand — it is P4's index
+    // algebra (design §8.1), which this composes with; only the per-monoid local
+    // factor derives here.
+    const gradKind = REDUCTION_DEF_BY_NAME.get(opName)?.gradKind;
+    if (gradKind === undefined) {
+      throw new Error(`_dispatchReduction: no reduction definition for "${opName}".`);
+    }
+    if (gradKind === "none") {
       return this._wrap(result);
     }
     const aShape = a.shape;
@@ -1058,7 +1073,7 @@ export class Torchlette {
     const keepdim = options?.keepdim ?? false;
     return this._wrapWithGrad(result, [a], (grad, _getSaved) => {
       const expanded = this._expandGrad(grad, aShape, dims, keepdim);
-      if (opName === "mean") {
+      if (gradKind === "broadcast-scaled") {
         const reduceCount =
           dims.length === 0 ? 1 : dims.reduce((acc, d) => acc * aShape[d], 1);
         return [this.runtime.mul(expanded, 1 / reduceCount)];
