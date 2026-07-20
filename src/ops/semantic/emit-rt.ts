@@ -17,6 +17,8 @@ import type { Tensor as RuntimeTensor } from "../../runtime/tensor";
 import type { BinaryTTGradFn, UnaryGradFn } from "../registry";
 import { type GradGuard, vjpBinary, vjpUnary } from "./adjoint";
 import type { ElementwiseDef } from "./catalog";
+import type { CompNode, CompositeDef } from "./composite";
+import { ERF_A, ERF_P } from "./erf";
 import type { Expr } from "./expr";
 
 type RtVal = number | RuntimeTensor;
@@ -88,6 +90,11 @@ function emit(e: Expr, rt: RuntimeEngine, env: RtLeaves): RtVal {
       const a = emit(e.a, rt, env);
       return typeof a === "number" ? 1 / a : rt.div(1, a);
     }
+    case "erf":
+      // Realize erf over the runtime via the A-S poly (the SAME single-sourced
+      // coefficients as the CPU/WGSL realizations — no 2nd owner). Used by a
+      // composite VJP that recomputes erf in backward (e.g. gelu_erf's cdf term).
+      return emitErf(emitT(e.a, rt, env), rt);
     case "floor":
       return rt.floor(emitT(e.a, rt, env));
     case "ceil":
@@ -150,6 +157,34 @@ function asTensor(v: RtVal): RuntimeTensor {
   return v;
 }
 
+/**
+ * Realize erf(u) over the runtime engine — the A-S 7.1.26 poly, reading the ONE
+ * `ERF_A`/`ERF_P` source. Byte-structure-identical to `erfApprox` (the CPU
+ * reference) and `BlockExpr.erf` (WGSL); ULP-bounded across the CPU↔GPU seam.
+ */
+function emitErf(u: RuntimeTensor, rt: RuntimeEngine): RuntimeTensor {
+  const [a1, a2, a3, a4, a5] = ERF_A;
+  const au = rt.abs(u);
+  const t = rt.div(1, rt.add(1, rt.mul(au, ERF_P)));
+  // Horner: ((((a5·t + a4)·t + a3)·t + a2)·t + a1)·t
+  const poly = rt.mul(
+    rt.add(
+      rt.mul(
+        rt.add(
+          rt.mul(rt.add(rt.mul(rt.add(rt.mul(t, a5), a4), t), a3), t),
+          a2,
+        ),
+        t,
+      ),
+      a1,
+    ),
+    t,
+  );
+  const expTerm = rt.exp(rt.neg(rt.mul(au, au))); // exp(-u²)
+  const erfAbs = rt.sub(1, rt.mul(poly, expTerm));
+  return rt.mul(rt.sign(u), erfAbs);
+}
+
 // ----------------------------------------------------------------------------
 // Registry-compatible grad factories — the derived replacements for the hand
 // lambdas. VJP terms are computed ONCE at construction; each backward call only
@@ -173,6 +208,95 @@ export function makeUnaryGrad(def: ElementwiseDef): UnaryGradFn {
         g: () => g,
       }),
     );
+}
+
+// ----------------------------------------------------------------------------
+// Composite interpreter (design §4.4, Probe-4 shape) — realize a `CompositeDef`
+// term over the runtime engine. This is the SEMANTIC REFERENCE: the decomposed/
+// fused forward is checked to agree with it (test/semantic-composite.spec.ts).
+// The fused kernel is NOT re-derived here (§4.4) — the composition is its
+// reference, met at the schedule-state `SemanticRegionUid` seam.
+// ----------------------------------------------------------------------------
+
+/** Interpret a composition over `rt`, reducing along `dim`. `inputs` supplies the
+ *  named roles (tensor operands + the scalar `eps`). */
+export function interpretComposition(
+  def: CompositeDef,
+  rt: RuntimeEngine,
+  dim: number,
+  inputs: Readonly<Record<string, RtVal>>,
+): RuntimeTensor {
+  const go = (n: CompNode): RtVal => {
+    switch (n.k) {
+      case "in": {
+        const v = inputs[n.role];
+        if (v === undefined) {
+          throw new Error(
+            `interpretComposition: ${def.name} references role '${n.role}' but it was not provided.`,
+          );
+        }
+        return v;
+      }
+      case "kc":
+        return n.v;
+      case "u": {
+        const a = goT(n.a);
+        switch (n.op) {
+          case "exp":
+            return rt.exp(a);
+          case "log":
+            return rt.log(a);
+          case "sqrt":
+            return rt.sqrt(a);
+          case "rsqrt":
+            return rt.rsqrt(a);
+          case "neg":
+            return rt.neg(a);
+        }
+        break;
+      }
+      case "b": {
+        const a = go(n.a);
+        const b = go(n.b);
+        switch (n.op) {
+          case "add":
+            return rt.add(a, b);
+          case "sub":
+            return rt.sub(a, b);
+          case "mul":
+            return rt.mul(a, b);
+          case "div":
+            return rt.div(a, b);
+        }
+        break;
+      }
+      case "r": {
+        const a = goT(n.a);
+        const opts = { dim, keepdim: true } as const;
+        const res =
+          n.op === "sum" ? rt.sum(a, opts)
+          : n.op === "max" ? rt.max(a, opts)
+          : rt.mean(a, opts);
+        if (typeof res === "number") {
+          throw new Error(
+            `interpretComposition: reduce '${n.op}' with keepdim returned a scalar.`,
+          );
+        }
+        return res;
+      }
+    }
+    throw new Error(`interpretComposition: unhandled node ${JSON.stringify(n)}`);
+  };
+  const goT = (n: CompNode): RuntimeTensor => {
+    const v = go(n);
+    if (typeof v === "number") {
+      throw new Error(
+        "interpretComposition: expected a tensor sub-term but it folded to a scalar.",
+      );
+    }
+    return v;
+  };
+  return asTensor(go(def.root));
 }
 
 /** Derive a `BinaryTTGradFn` from a definition (design S2). */

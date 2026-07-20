@@ -12,6 +12,7 @@
  * at the f32 boundary (test/semantic-derivation.spec.ts S1).
  */
 
+import { erfApprox } from "./erf";
 import type { Expr } from "./expr";
 
 export interface ScalarEnv {
@@ -51,6 +52,8 @@ export function evalScalar(e: Expr, env: ScalarEnv): number {
       return Math.sign(evalScalar(e.a, env));
     case "recip":
       return 1.0 / evalScalar(e.a, env);
+    case "erf":
+      return erfApprox(evalScalar(e.a, env)); // A-S realization (single source)
     case "floor":
       return Math.floor(evalScalar(e.a, env));
     case "ceil":

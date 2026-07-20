@@ -17,7 +17,12 @@
 // The Expr schema — a term over the closed primitive algebra.
 // ----------------------------------------------------------------------------
 
-/** Unary scalar primitives. Irreducible transcendental/rounding operations. */
+/** Unary scalar primitives. Irreducible transcendental/rounding operations.
+ *  `erf` is admitted here (P2): its realization is the A-S approximation
+ *  (single-sourced in erf.ts), but its DERIVATIVE is analytic (2/√π·e^(−u²)), so
+ *  a composite that uses erf differentiates to the exact gaussian, not the
+ *  derivative of the polynomial — exactly as `exp`/`tanh` are primitives whose
+ *  hardware realizations approximate but whose adjoints are exact. */
 export type Prim1Op =
   | "neg"
   | "exp"
@@ -29,6 +34,7 @@ export type Prim1Op =
   | "abs"
   | "sign"
   | "recip"
+  | "erf"
   | "floor"
   | "ceil"
   | "round"
@@ -77,6 +83,7 @@ export const tanh = (a: Expr): Expr => ({ k: "tanh", a });
 export const abs = (a: Expr): Expr => ({ k: "abs", a });
 export const sign = (a: Expr): Expr => ({ k: "sign", a });
 export const recip = (a: Expr): Expr => ({ k: "recip", a });
+export const erf = (a: Expr): Expr => ({ k: "erf", a });
 export const floor = (a: Expr): Expr => ({ k: "floor", a });
 export const ceil = (a: Expr): Expr => ({ k: "ceil", a });
 export const round = (a: Expr): Expr => ({ k: "round", a });
@@ -124,6 +131,7 @@ const EXPR_KINDS = new Set<string>([
   "abs",
   "sign",
   "recip",
+  "erf",
   "floor",
   "ceil",
   "round",

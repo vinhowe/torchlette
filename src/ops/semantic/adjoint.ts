@@ -17,12 +17,14 @@
  *     explicit/reviewable, not inherited silently.
  */
 
+import { TWO_OVER_SQRT_PI } from "./erf";
 import {
   add,
   c,
   cos,
   div,
   type Expr,
+  exp,
   ge,
   le,
   mul,
@@ -68,6 +70,13 @@ export function deriv(e: Expr, wrt: "x" | "y"): Expr {
       return mul(sign(e.a), deriv(e.a, wrt));
     case "recip":
       return neg(div(deriv(e.a, wrt), mul(e.a, e.a))); // -u'/u²
+    case "erf":
+      // ANALYTIC gaussian derivative — NOT the derivative of the A-S poly (§4.5):
+      // d erf(u) = 2/√π · e^(−u²) · u'.
+      return mul(
+        mul(c(TWO_OVER_SQRT_PI), exp(neg(mul(e.a, e.a)))),
+        deriv(e.a, wrt),
+      );
     // Rounding / discontinuous primitives: subgradient 0.
     case "sign":
     case "floor":
@@ -170,6 +179,7 @@ function normalizeStep(e: Expr): Expr {
     case "tanh":
     case "abs":
     case "sign":
+    case "erf":
     case "floor":
     case "ceil":
     case "round":

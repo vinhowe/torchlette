@@ -7,7 +7,9 @@
 
 export * from "./adjoint";
 export * from "./catalog";
+export * from "./composite";
 export * from "./emit-rt";
+export * from "./erf";
 export * from "./expr";
 export * from "./interpret";
 export * from "./reduction";
