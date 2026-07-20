@@ -880,24 +880,41 @@ skipped straight to lowered. The threshold sits ABOVE the warmup horizon (config
 no-input-pattern artifacts resolve by the 2nd execution, and a fullyCovered result deletes
 the counter), so a truly-coverable template is never stranded. Always-on, strictly a saving.
 
-### The one blemish — a compiled-plan external-buffer-destroy transient (P4 precondition)
+### The one blemish — RESOLVED (the compiled-plan external-buffer-destroy transient; P4 precondition met, 2026-07-20)
 
-Making the block compile newly exercises a **bounded, non-corrupting** compiled-plan
-external-lifetime transient: in the block-diff's single long-lived process (many block
-templates: K=1/4/8/16 × prompts), a compiled plan binds an EXTERNAL materialized input
-(`kind=external ref=materialized`, the block's per-block host-token `idx` — NOT a RoPE or
-params buffer) that was destroyed → "used in submit while destroyed", the dropped-submit
-class (CLAUDE.md). Evidence it is a per-template-first-compile transient, not a corruption:
-it is **bounded to 2 occurrences**, ABSENT when fully lowered (`COMPILED_PLAN=0`), ABSENT
-in the isolated-process multiplier (steady-state compiled decode — host AND block arms —
-is clean), and **every gate remains byte-identical compiled==lowered==host**. Blast radius
-is RoPE-using compiled plans only (training uses learned position embeddings, not
-fusedRoPE — the gate-wall training profile is unaffected). **P4 (demo cutover / default-on)
-is gated on root-causing this external-destroy** (the block's fresh-per-block `idx`
-external captured by a compiled plan across a template transition) — the win is real and
-measured; the transient must be proven benign or fixed before the compiled block ships
-default-on. Named, reproducible (`TORCHLETTE_DEBUG_DESTROYED=1 … t-uk-block-diff.ts`),
-not swept.
+Making the block compile newly exercised a **bounded, non-corrupting** compiled-plan
+external-lifetime transient: a compiled plan bound an EXTERNAL materialized input
+(`kind=external ref=materialized`, the block's/host-loop's per-step host-token `idx`) that
+had been destroyed → "used in submit while destroyed", the dropped-submit class (CLAUDE.md).
+
+**Root cause (single-variable, deterministic repro `TORCHLETTE_DEBUG_DESTROYED=1
+TORCHLETTE_STRICT_GPU=1 … t-uk-block-diff.ts`).** The `idx` upload's result is HARVESTED
+into a co-owned planner-registry entry buffer (cross-plan temp packing), and that same
+physical buffer is what the NEXT forward plan resolves as its slot-0 external input
+(`getInputStorage` → `gpuBuffer(storage.backendTensor)`). When the producer template is
+invalidated at a step boundary (`observeStepBoundary` → the compiled-invalidator guard →
+`destroyCompiledPlanBuffers`), the registry entry's last plan-owner drops, so the entry
+buffer is freed — **while the live `idx` storage still backs it and the consumer plan is
+about to bind it.** The existing park-live guard (`liveHarvestIdsForBuffer`) that should
+have caught this had an `isRegisteredStorage` gate: it parked ONLY `registerState`'d
+post-boundary readers (the whole-step deferred loss), excluding the plain materialized
+harvest storage the decode block relies on. Proof: at the destroy, the plan's
+`_lastHarvestIds` contained the idx storage `1040:dead=false:reg=false:buf=531` — ALIVE,
+backing the freed buffer `#531`, but skipped by the registered gate.
+
+**Fix (smallest honest, at the seam — `compiled-plan.ts` `liveHarvestIdsForBuffer`).** Drop
+the `isRegisteredStorage` gate: a registry-entry buffer is PARKED (kept pinned, reclaimed
+once its readers die via `reclaimParkedLiveBuffers`) while ANY live storage backs it
+(identity match on the current backing buffer), not only registerState'd ones. Genuinely
+-dead entries still free promptly (empty live set → destroy, unchanged). The block-diff
+gate now asserts `getGpuUncapturedErrorCount() === 0` (failing-first: 2 → 0).
+
+**Verified green:** `t-uk-block-diff.ts` under `DEBUG_DESTROYED + STRICT_GPU` — **zero
+destroyed-binds, zero uncaptured GPU errors, VERDICT PASS** (was 2 dropped submits);
+`gate-wall --profile training` **PASS=15 ENV=0 REAL=0** (test:gates, parity-fullstack, tape
+matrix, 124M-regression, ledger, checkpoint-seg — strict-lifetime default throughout);
+multiplier spot-check UNCHANGED (K=4 low/def 2.91×, host/def 1.46×). **P4 (demo cutover /
+default-on) is UNBLOCKED.**
 
 ### Gates run
 

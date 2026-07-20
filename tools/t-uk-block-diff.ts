@@ -16,7 +16,11 @@
  * Run: eval "$(tools/pick-gpu.sh)"; VULKAN_DEVICE_INDEX=$VULKAN_DEVICE_INDEX \
  *        LD_LIBRARY_PATH=tools/vk-shim:$LD_LIBRARY_PATH npx tsx tools/t-uk-block-diff.ts
  */
-import { getWebGPUInitError, initWebGPU } from "../src/backend/webgpu";
+import {
+  getGpuUncapturedErrorCount,
+  getWebGPUInitError,
+  initWebGPU,
+} from "../src/backend/webgpu";
 import {
   getSubmitCount,
   resetSubmitCount,
@@ -308,6 +312,22 @@ async function main() {
       `block issues fewer submits than host (${blockSubmits} < ${hostSubmits})`,
     );
   }
+
+  // P4 precondition: making the block compile must introduce ZERO uncaptured
+  // GPU errors. The first-compile external-buffer-destroy transient: the
+  // per-step `idx` upload is harvested into a co-owned planner-registry buffer
+  // and bound as the slot-0 external of the NEXT forward plan; when the
+  // producer template is invalidated at a step boundary, destroyCompiledPlanBuffers
+  // freed that registry buffer while the live idx storage still backed it —
+  // poisoning the consumer replay's submit ("used in submit while destroyed").
+  // Fixed at the seam (compiled-plan.ts liveHarvestIdsForBuffer): the entry
+  // buffer is PARKED while ANY live storage backs it, not only registerState'd
+  // ones. This assertion is the gate.
+  const uncaptured = getGpuUncapturedErrorCount();
+  ok(
+    uncaptured === 0,
+    `zero uncaptured GPU errors across the whole run (external-destroy transient) — got ${uncaptured}`,
+  );
 
   console.log(
     `\n=== VERDICT: ${

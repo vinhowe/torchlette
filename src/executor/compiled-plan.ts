@@ -617,13 +617,22 @@ export function dbgIsDestroyed(buf: GPUBuffer): boolean {
  *  live-harvest check applied PER BUFFER, so convergence still proceeds. */
 let parkedLiveBuffers: Array<{ buf: GPUBuffer; ids: number[] }> = [];
 
-/** Storage ids in `harvestIds` that are STILL ALIVE, REGISTERED STATE, and
- *  back `buf` (identity on the current backing buffer). Empty when no such
- *  storage reads it. The REGISTERED gate keeps parking whole-step-only: only a
- *  `registerState`'d result read after the boundary (the deferred loss) needs
- *  its result-entry buffer to outlive plan invalidation. Merely-alive
- *  step-scoped results (every default-path harvest) are excluded, so the
- *  default path's buffer teardown is byte-identical (ledger-flat). */
+/** Storage ids in `harvestIds` that are STILL ALIVE and back `buf` (identity on
+ *  the current backing buffer). Empty when no such storage reads it — then the
+ *  buffer is safe to destroy.
+ *
+ *  A co-owned registry-entry buffer whose last plan-owner is being torn down
+ *  must NOT be destroyed while ANY live storage still binds it — not only a
+ *  `registerState`'d post-boundary reader (the deferred loss), but ALSO a plain
+ *  materialized harvest storage that another not-yet-torn-down plan resolves as
+ *  its EXTERNAL input. The unrolled-K decode block exposes exactly the latter:
+ *  the per-step `idx` upload is harvested into a registry-entry buffer and
+ *  bound as slot-0 external by the next forward plan; destroying it at the
+ *  producer's invalidation poisoned that replay's submit ("used in submit while
+ *  destroyed"). So this parks on the IDENTITY match alone — a live storage
+ *  whose current backing buffer IS this entry — with no registered-state gate.
+ *  Parked buffers are reclaimed once every reader storage dies
+ *  (reclaimParkedLiveBuffers), so a genuinely-dead entry still frees promptly. */
 function liveHarvestIdsForBuffer(
   buf: GPUBuffer,
   harvestIds: number[] | undefined,
@@ -632,7 +641,6 @@ function liveHarvestIdsForBuffer(
   const ids: number[] = [];
   for (const id of harvestIds) {
     if (storageTracker.isDestroyed(id)) continue;
-    if (!storageTracker.isRegisteredStorage(id)) continue;
     const sh = storageTracker.getStorage(id);
     if (sh && gpuBuffer(sh.backendTensor) === buf) ids.push(id);
   }
