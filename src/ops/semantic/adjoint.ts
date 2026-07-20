@@ -24,9 +24,7 @@ import {
   div,
   type Expr,
   ge,
-  gt,
   le,
-  lt,
   mul,
   neg,
   powE,
@@ -126,6 +124,8 @@ export function deriv(e: Expr, wrt: "x" | "y"): Expr {
 // ----------------------------------------------------------------------------
 
 const isConst = (e: Expr, v: number): boolean => e.k === "c" && e.v === v;
+const exprEq = (a: Expr, b: Expr): boolean =>
+  JSON.stringify(a) === JSON.stringify(b);
 
 function negateCompare(op: string): "gt" | "ge" | "lt" | "le" | "eq" | "ne" {
   switch (op) {
@@ -157,6 +157,11 @@ function normalizeStep(e: Expr): Expr {
       if (a.k === "neg") return a.a; // neg(neg u) → u
       return neg(a);
     }
+    case "recip": {
+      const a = normalizeStep(e.a);
+      if (a.k === "recip") return a.a; // recip(recip u) → u
+      return recip(a);
+    }
     case "exp":
     case "log":
     case "sqrt":
@@ -165,7 +170,6 @@ function normalizeStep(e: Expr): Expr {
     case "tanh":
     case "abs":
     case "sign":
-    case "recip":
     case "floor":
     case "ceil":
     case "round":
@@ -197,11 +201,23 @@ function normalizeStep(e: Expr): Expr {
       if (isConst(a, -1)) return normalizeStep(neg(b)); // -1·u → neg u (exact)
       if (isConst(b, -1)) return normalizeStep(neg(a)); // u·-1 → neg u (exact)
       if (a.k === "c" && b.k === "c") return c(a.v * b.v);
+      // a·recip(b) → a/b (folds the reciprocal into a single division — keeps
+      // the derived quotient grads at the hand table's op count; a heavier
+      // graph materializes a redundant intermediate that the whole-step merged
+      // plan's liveness cannot place, see test/whole-step-checkpoint-refusal).
+      if (b.k === "recip") return normalizeStep(div(a, b.a));
+      if (a.k === "recip") return normalizeStep(div(b, a.a));
       return mul(a, b);
     }
     case "div": {
       const a = normalizeStep(e.a);
       const b = normalizeStep(e.b);
+      // Cancellation u/(u·u) → recip(u): the quotient rule's dA is
+      // (1·y − x·0)/y² = y/y²; cancelling to 1/y removes the y² intermediate
+      // and reaches the hand grad's byte form (mul(g, recip)→div downstream).
+      if (b.k === "mul" && exprEq(b.a, b.b) && exprEq(a, b.a)) {
+        return recip(a);
+      }
       return div(a, b);
     }
     case "pow":

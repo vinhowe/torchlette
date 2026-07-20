@@ -21,19 +21,38 @@ import type { Expr } from "./expr";
 
 type RtVal = number | RuntimeTensor;
 
+/**
+ * LAZY leaf resolvers, memoized per emit call. Lazy so a term that does not
+ * reference a saved operand (e.g. add's grad `[g, g]`) never forces it — the
+ * runtime's saved-tensor accessor throws when a non-saved input is read, and an
+ * eager env would trip that even when the operand is unused.
+ */
 interface RtLeaves {
-  x?: RtVal;
-  y?: RtVal;
-  g?: RtVal;
+  x?: () => RtVal;
+  y?: () => RtVal;
+  g?: () => RtVal;
 }
 
-function need(v: RtVal | undefined, role: string): RtVal {
-  if (v === undefined) {
+function need(resolver: (() => RtVal) | undefined, role: string): RtVal {
+  if (resolver === undefined) {
     throw new Error(
       `emit-rt: gradient term references '${role}' but it was not provided.`,
     );
   }
-  return v;
+  return resolver();
+}
+
+/** Memoize a resolver so a doubly-referenced operand is fetched once. */
+function memo(fn: () => RtVal): () => RtVal {
+  let cached: RtVal | undefined;
+  let done = false;
+  return () => {
+    if (!done) {
+      cached = fn();
+      done = true;
+    }
+    return cached as RtVal;
+  };
 }
 
 /** Interpret a term over the runtime engine, producing a tensor graph. */
@@ -140,14 +159,31 @@ function asTensor(v: RtVal): RuntimeTensor {
 /** Derive a `UnaryGradFn` from a definition (design S2). */
 export function makeUnaryGrad(def: ElementwiseDef): UnaryGradFn {
   const vjp: Expr = vjpUnary(def.expr, def.gradGuard as GradGuard | undefined);
-  return (rt, g, s) => asTensor(emit(vjp, rt, { x: s, g }));
+  return (rt, g, s) =>
+    asTensor(
+      emit(vjp, rt, {
+        x: memo(() => {
+          if (s === undefined) {
+            throw new Error(
+              `emit-rt: ${def.name} grad references its input but needsSave is false.`,
+            );
+          }
+          return s;
+        }),
+        g: () => g,
+      }),
+    );
 }
 
 /** Derive a `BinaryTTGradFn` from a definition (design S2). */
 export function makeBinaryTTGrad(def: ElementwiseDef): BinaryTTGradFn {
   const [dA, dB] = vjpBinary(def.expr);
-  return (rt, g, gs) => [
-    asTensor(emit(dA, rt, { x: gs(0), y: gs(1), g })),
-    asTensor(emit(dB, rt, { x: gs(0), y: gs(1), g })),
-  ];
+  return (rt, g, gs) => {
+    const leaves: RtLeaves = {
+      x: memo(() => gs(0)),
+      y: memo(() => gs(1)),
+      g: () => g,
+    };
+    return [asTensor(emit(dA, rt, leaves)), asTensor(emit(dB, rt, leaves))];
+  };
 }

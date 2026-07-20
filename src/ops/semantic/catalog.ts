@@ -122,7 +122,9 @@ export const UNARY_DEFS: readonly ElementwiseDef[] = [
  */
 export const BINARY_DEFS: readonly ElementwiseDef[] = [
   { name: "add", arity: 2, expr: add(x, y), gradPolicy: "derive" },
-  { name: "sub", arity: 2, expr: sub(x, y), gradPolicy: "derive" },
+  // sub's tensor grad is handled STRUCTURALLY by the frontend (no registry
+  // ttGrad); its formula still derives its CPU body / documents its meaning.
+  { name: "sub", arity: 2, expr: sub(x, y), gradPolicy: "hand" },
   { name: "mul", arity: 2, expr: mul(x, y), gradPolicy: "derive" },
   { name: "div", arity: 2, expr: div(x, y), gradPolicy: "derive" },
   { name: "pow", arity: 2, expr: powE(x, y), gradPolicy: "hand" },

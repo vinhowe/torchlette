@@ -2,14 +2,14 @@
  * Semantic Derivation — the CPU reference interpreter (surface S1).
  *
  * Interpret an `Expr` as an f64 scalar function; this IS the CPU reference body
- * (design §4.3 S1). The `numeric.ts` `UNARY_OPS`/`BINARY_OPS` scalar bodies are a
+ * (design §4.3 S1 — the interpreter itself is the reference, no generation
+ * step). The `numeric.ts` `UNARY_OPS`/`BINARY_OPS` scalar bodies were a
  * redundant copy of the definitions — they become `compileUnary(def)` /
- * `compileBinary(def)`, which pre-walk the term into a nested closure ONCE (no
- * per-element tree walk) so the derived body carries no runtime overhead.
+ * `compileBinary(def)`, thin binds of the term to a reused env.
  *
  * The bodies compute in f64 and round once on store (the `numeric.ts`
- * discipline); Probe 3 confirms 19/19 byte-for-byte reproduction of the hand
- * bodies at the f32 boundary.
+ * discipline); Probe 3 confirms byte-for-byte reproduction of the hand bodies
+ * at the f32 boundary (test/semantic-derivation.spec.ts S1).
  */
 
 import type { Expr } from "./expr";
@@ -95,177 +95,27 @@ export function evalScalar(e: Expr, env: ScalarEnv): number {
 }
 
 // ----------------------------------------------------------------------------
-// Ahead-of-time closure compilation — the derived body with no tree-walk cost.
-// The closure is DERIVED from the term (it is not smuggled back in — the term
-// stays the single source and `assertNoDefinitionBody` guards it).
+// Derived CPU bodies (surface S1). The interpreter itself IS the reference
+// (design §4.3 S1 — "the interpreter itself is the reference, no generation
+// step"): a definition binds to a reused env and evaluates per element. The
+// term stays the single source, guarded by `assertNoDefinitionBody`.
 // ----------------------------------------------------------------------------
-
-type Thunk = (env: ScalarEnv) => number;
-
-function compile(e: Expr): Thunk {
-  switch (e.k) {
-    case "x":
-      return (env) => env.x;
-    case "y":
-      return (env) => env.y;
-    case "g":
-      return (env) => env.g;
-    case "c": {
-      const v = e.v;
-      return () => v;
-    }
-    case "neg": {
-      const a = compile(e.a);
-      return (env) => -a(env);
-    }
-    case "exp": {
-      const a = compile(e.a);
-      return (env) => Math.exp(a(env));
-    }
-    case "log": {
-      const a = compile(e.a);
-      return (env) => Math.log(a(env));
-    }
-    case "sqrt": {
-      const a = compile(e.a);
-      return (env) => Math.sqrt(a(env));
-    }
-    case "sin": {
-      const a = compile(e.a);
-      return (env) => Math.sin(a(env));
-    }
-    case "cos": {
-      const a = compile(e.a);
-      return (env) => Math.cos(a(env));
-    }
-    case "tanh": {
-      const a = compile(e.a);
-      return (env) => Math.tanh(a(env));
-    }
-    case "abs": {
-      const a = compile(e.a);
-      return (env) => Math.abs(a(env));
-    }
-    case "sign": {
-      const a = compile(e.a);
-      return (env) => Math.sign(a(env));
-    }
-    case "recip": {
-      const a = compile(e.a);
-      return (env) => 1.0 / a(env);
-    }
-    case "floor": {
-      const a = compile(e.a);
-      return (env) => Math.floor(a(env));
-    }
-    case "ceil": {
-      const a = compile(e.a);
-      return (env) => Math.ceil(a(env));
-    }
-    case "round": {
-      const a = compile(e.a);
-      return (env) => Math.round(a(env));
-    }
-    case "isfinite": {
-      const a = compile(e.a);
-      return (env) => (Number.isFinite(a(env)) ? 1.0 : 0.0);
-    }
-    case "add": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => a(env) + b(env);
-    }
-    case "sub": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => a(env) - b(env);
-    }
-    case "mul": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => a(env) * b(env);
-    }
-    case "div": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => a(env) / b(env);
-    }
-    case "pow": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => a(env) ** b(env);
-    }
-    case "min": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => Math.min(a(env), b(env));
-    }
-    case "max": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => Math.max(a(env), b(env));
-    }
-    case "mod": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => a(env) % b(env);
-    }
-    case "gt": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => (a(env) > b(env) ? 1.0 : 0.0);
-    }
-    case "ge": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => (a(env) >= b(env) ? 1.0 : 0.0);
-    }
-    case "lt": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => (a(env) < b(env) ? 1.0 : 0.0);
-    }
-    case "le": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => (a(env) <= b(env) ? 1.0 : 0.0);
-    }
-    case "eq": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => (a(env) === b(env) ? 1.0 : 0.0);
-    }
-    case "ne": {
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => (a(env) !== b(env) ? 1.0 : 0.0);
-    }
-    case "where": {
-      const cnd = compile(e.c);
-      const a = compile(e.a);
-      const b = compile(e.b);
-      return (env) => (cnd(env) !== 0 ? a(env) : b(env));
-    }
-  }
-}
 
 /** Derive a unary CPU body `(x) => number` from a term (design S1). */
 export function compileUnary(def: Expr): (x: number) => number {
-  const thunk = compile(def);
   const env: ScalarEnv = { x: 0, y: 0, g: 0 };
   return (xv: number) => {
     env.x = xv;
-    return thunk(env);
+    return evalScalar(def, env);
   };
 }
 
 /** Derive a binary CPU body `(x, y) => number` from a term (design S1). */
 export function compileBinary(def: Expr): (x: number, y: number) => number {
-  const thunk = compile(def);
   const env: ScalarEnv = { x: 0, y: 0, g: 0 };
   return (xv: number, yv: number) => {
     env.x = xv;
     env.y = yv;
-    return thunk(env);
+    return evalScalar(def, env);
   };
 }
