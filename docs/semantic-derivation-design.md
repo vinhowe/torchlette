@@ -658,3 +658,105 @@ shape are byte-identical).
 - **Gate:** each composite's fused kernel == its composition reference via the
   EXISTING schedule-state per-move differential (not a new mechanism); CPU
   reference == composition (Probe 4 shape); CPU↔GPU at declared ULP tolerance.
+
+## 14. Phase 2 — LANDED (2026-07-20)
+
+Composites derive. The GELU family is a *pure-elementwise* composition — a unary
+`Expr` over the P0 algebra — so its CPU reference, gradient, and runtime
+grad-graph all derive with **no new engine**; the softmax/norm family is authored
+as `Composition` DATA with a Probe-4 reference gate. The named payoff — **the erf
+triplication + the two GELU custom backwards — is cashed.** Commits: `the erf
+realization + GELU composites` → `derive the GELU CPU bodies` → `derive the GELU
+backwards (delete the custom rules)` → `the WGSL seam (single-source the erf
+poly)` → `the reduction-composite reference` → this docs entry.
+
+### The erf/GELU spine, as landed
+- **`erf` admitted as an ALGEBRA PRIMITIVE** (`expr.ts`), like `exp`/`tanh`: its
+  *realization* is the A-S 7.1.26 polynomial, single-sourced ONCE in
+  `ops/semantic/erf.ts` (`ERF_A`/`ERF_P` + `erfApprox`); its *derivative* is the
+  ANALYTIC gaussian `erf'(u)=2/√π·e^(−u²)` (`adjoint.ts`). This split (design
+  §4.5) is the whole game: the forward approximates erf while the backward is the
+  exact gaussian — so `gelu_erf`'s derived grad is `cdf + x·φ(x)`, reproducing the
+  DELETED `geluErfBackward` (which was also analytic) to ~2e-16, NOT the derivative
+  of the polynomial.
+- **`GELU_TANH_DEF` / `GELU_ERF_DEF`** (`composite.ts`) — the two GELU forms as
+  unary `Expr` terms; constants single-sourced from `erf.ts`. CPU body derives via
+  `compileUnary`, backward via `makeUnaryGrad` (the adjoint over the runtime).
+- **`emit-rt.ts` `emitErf`** realizes erf over the runtime for the backward's
+  recomputed `cdf` term — reading the SAME `ERF_A`/`ERF_P`, no 2nd owner.
+
+### THE TRIPLICATION'S DEATH (the named deletions, sized)
+The A-S erf polynomial and the GELU-tanh constants had, between them, these owners
+before P2; each now REFERENCES `ops/semantic/erf.ts`:
+
+| magic-number family | owners before | after |
+|---------------------|---------------|-------|
+| erf A-S poly (`0.254829592…`, `p=0.3275911`) | `numeric.ts erf()`, `tile-ir.ts BlockExpr.erf`, `fusion-tile-ir.ts gelu_erf`, `custom-backward.ts geluErfBackward` — **4** | **1** (`ERF_A`/`ERF_P`) |
+| GELU-tanh (`√(2/π)`, `0.044715`, `0.134145`) | `numeric.ts gelu()`, `fusion-tile-ir.ts gelu_tanh`, `custom-backward.ts geluTanhBackward` — **3** | **1** (`GELU_*`; `0.134145` derived = `3·GELU_TANH_C`) |
+
+Named code deletions (house policy):
+- `numeric.ts`: the hand `erf()` Horner helper + the tanh/erf `gelu()` loop bodies
+  → `compileUnary(GELU_*_DEF.expr)` (design §4.3 S1). Byte-exact (semantic spec S1,
+  0/713 mismatches over the probe grid).
+- `custom-backward.ts`: `geluTanhBackward` + `geluErfBackward` (~70 code lines) →
+  derived. Only the **2** admitted contraction adjoints (`matmulBackward`,
+  `linearBackward`) remain — exactly the design §4.2 count.
+- `tile-ir.ts` / `fusion-tile-ir.ts`: the erf poly + GELU constants → references to
+  the shared source. The WGSL emit STRUCTURE is byte-identical (the fused kernels
+  stay schedule-state's, §4.4) — this is the "reference shared constants" option
+  the design §S3 sanctions, not an Expr-emit rewrite; it kills the triplication
+  with zero GPU-codegen risk (fusion-tile-ir 61 + tile-ir-block 32 GPU tests green).
+
+### The adjoint-vs-custom-backward verdict
+| composite | derived adjoint vs the DELETED custom backward | ruling |
+|-----------|-----------------------------------------------|--------|
+| `gelu_erf` | maxAbs **2.2e-16** | identical — both are the analytic gaussian; the delete is free |
+| `gelu_tanh` | maxAbs **1.1e-7** (only at \|x\|≳5.7) | the old backward CLAMPED its tanh arg to ±10; the derived adjoint drops the clamp. tanh has already saturated there (sech²(10)≈8e-9), so the clamp was a cosmetic guard — dropping it removes a hand-tuned magic number (no `clampInner` guard needed; the §4.5 rule-of-three is not tripped). Verified correct vs finite-difference of the derived forward to 1.3e-9. |
+
+### The reduction composites (softmax / log_softmax / rmsnorm / layernorm)
+Authored as `Composition` DATA (`composite.ts`): a small tensor dataflow over the
+primitive algebra + the P1 reduction monoids, dim-agnostic, schema-gated
+(`assertNoCompositionBody`). `interpretComposition` (`emit-rt.ts`) realizes a
+composition over the runtime — the **Probe-4 reference**: the hand decomposed/fused
+forward is proven to AGREE with the ONE composition source
+(`test/semantic-composite.spec.ts`: each composite == its op forward AND == an
+independent plain-JS row-wise reference, maxAbs <1e-6/1e-5 on CPU). The **fused
+kernel is NOT re-derived** (§4.4): the composition is its reference, met at the
+schedule-state `SemanticRegionUid` seam and checked there by the existing
+per-move differential (RT3). `cross_entropy` DEFERS: its `log_softmax` core is a
+composition, but the per-row gather at `target` is an INDEX-SPACE map whose
+realizer is **P4's index algebra** — CE's full term (and tensor gate) lands with
+P4, not by fabricating an index primitive here.
+
+### The honest SLOC direction (the split)
+`srcSLOC` 67254 (P1) → **67463 (+209)**. Two components, named per house policy:
+- **The erf/GELU spine is net-NEGATIVE** (~−15 code): the erf primitive + GELU
+  terms + `emitErf` (~90 code) minus the deleted custom backwards + hand erf/gelu
+  bodies (~105 code). This is the design §5 ledger cashing — the triplication payoff.
+- **The reduction-composite reference is net-additive** (~+220): the `Composition`
+  schema + catalog + `interpretComposition` + the Probe-4 gate. This is the
+  WARRANTED new mechanism — the charter's explicit ask (softmax/norm/CE as
+  definitions-as-compositions), the single semantic SOURCE those ops now have, and
+  the P5/schedule-state precondition (the `SemanticRegionUid` region to reference).
+  It deletes nothing today because the ops were ALREADY hand-compositions; what it
+  adds is the missing SOURCE + the gate proving the hand impl agrees with it.
+
+### Gates (all green)
+cpu: semantic-derivation (**46** — +4 composite rows: erf-primitive byte-exact,
+GELU CPU byte-exact, GELU adjoints vs fd + analytic), semantic-composite (**5** —
+schema gate + the 4 Probe-4 references), semantic-reduction (9), gradcheck (35,
+incl. gelu tanh/erf backward), unary-ops (16, incl. gelu fwd/bwd). webgpu
+(serial-exclusive): fusion-tile-ir (**61**), tile-ir-block (**32**) — the erf/GELU
+WGSL emit. gate-wall `--profile training` (build, test:gates, whole-step-diff,
+parity-fullstack, tape matrix ×4, step-object/edit-null, ring-probe, ledger,
+**124M-regression**, refusal, checkpoint-seg) — PASS (`parity-fullstack` + `124M`
+exercise gelu fwd + the derived backward on GPU end-to-end). The 5 torch-oracle
+suites remain unavailable (no `torch` in the venv, as in P0/P1).
+
+### P3 / P4 preconditions carried
+- **P3 (contraction adjoints)**: the 2 admitted rules already isolated in
+  `custom-backward.ts` (matmul + linear) — P3 admits them formally with their
+  differentials; conv=im2col∘matmul, linear=matmul+bias as compositions.
+- **P4 (index algebra)**: CE's target-gather, the broadcast-VJP (§8.1, still the
+  reduction gradient's transpose held out of P1/P2), and scatter⇄gather transposes.
+  The reduction-composite `Composition` schema is the shape P4's index maps extend.
