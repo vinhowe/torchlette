@@ -993,10 +993,95 @@ REFERENCE (asserted by the fused-vs-elementwise differential at the CPU↔GPU-to
 seam), not re-emitted from the term. Deriving the adamStep WGSL from the program is
 future work behind the same schedule-state differential.
 
+## 16b. CRYSTAL 3 TAIL — structure-keyed Adam batching, MAPPED + re-STOPPED (2026-07-20)
+
+A dedicated pass at §16's "node dissolution" boundary. Verdict: **a second clean
+partial** (the §5.4 precedent) — the boundary is re-named with its precise blocker,
+NOT crossed. The optimizer path is untouched (Adam IS training; a broken optimizer is
+the framework's worst outcome, so the bar to touch it is a cashed deletion, and there
+is none short of the full dissolution). What this pass produced is the mechanical MAP
+the dissolution campaign needs, plus one correction to §16's site list.
+
+### The name-keyed sites, precisely (the §16 "load-bearing across the batching
+machinery" claim, resolved to file:line + the STRUCTURAL fact each encodes)
+
+1. **adam-batch grouping** — `src/executor/lowered-plan.ts`:
+   - `horizontalPackKey` (L525): the single-source structural group key. Its ONLY
+     name-inline datum is `sharedOperandInputIndices = node.op === "adamStep" ? [4,5]`
+     (L534) — the dispatch-shared operands (t, lr) bound once per batch.
+   - batch detection (L815, L827): `node.op === "adamStep"` starts + continues the
+     consecutive run; `stream-generate.ts` (L4490+) mirrors it and MUST consume the
+     same key (single-source-at-the-seam).
+   - **CORRECTION to §16:** the affinity/`ADAM_HOISTABLE_OPS` hoisting site is ALREADY
+     gone — `enforceWriteAfterReadOrder` (plan-builder L247-255) generalized it to a
+     GENERIC same-op affinity tie-break keyed on `!isFusibleOp(op)` (structural, not
+     the adam name). So the batching's ADJACENCY is already structure-keyed; only the
+     GROUPING key + the run predicate still read the string.
+2. **plan-builder write-sets** — `src/executor/plan-builder.ts` L108:
+   `IN_PLACE_DST_INPUTS.adamStep = [1,2,3]` (param, m, v) — the WAR-ordering in-place
+   destination set.
+3. **CSE / template caches** — `src/compiler/graph-rewrites.ts` L238
+   (`NON_CSE_OPS ∋ "adamStep"`, side-effect exclusion) + `src/compiler/fusion-detect.ts`
+   L1752 (`PAYLOAD_HASH_EXEMPT.adamStep = "ALL"`, config-delivered-as-data).
+4. **backend buffer transfer** — `src/backend/webgpu/ops/fused.ts`
+   (`adamStep`/`adamStepBatch`/`adamStepInner`, ownership transfer at execution),
+   `src/executor/op-dispatch.ts` `executeAdamStep` (L612) + registration (L786),
+   `src/executor/executor.ts` adam-batch execution (L2876), `src/backend/types.ts`
+   interface. This is the FUSED-KERNEL dispatch — legitimately named; it stays named
+   as long as the fused node exists.
+
+### The structure key — the design (so the future campaign is mechanical)
+Every one of the four facts is DERIVABLE from the node's OptimizerProgram identity +
+its input layout `[grad, param, ...state, ...tensorHypers]`:
+- write-set `[1,2,3]` = `[param-input, ...state-inputs]` = `[1 .. 1+|state|]`
+  (ADAMW state `["m","v"]` → `[1,2,3]`; a fused Lion, state `["m"]` → `[1,2]`).
+- shared-operand indices `[4,5]` = the tensor-hyper inputs (`t`, `lr`) = `[2+|state| ..]`.
+- CSE/payload exclusion = "node has in-place dst inputs" (side-effecting) — structural.
+- backend transfer = "in-place dst inputs get ownership-transferred" — structural.
+
+There are TWO notions of "structure key", and only one is a re-key:
+- **(a) op-metadata-driven** (keep the named fused node; the four sites read a metadata
+  record instead of inlining `=== "adamStep"`). This is `horizontalPackKey`'s own
+  documented wart-exit. It generalizes a *fused Lion* to one metadata entry. **But it
+  cashes NO deletion today**: the four tables' OTHER members (`unscaleGrad`, the
+  scatters, rng, `narrow`) sit in them for DISTINCT structural reasons, so an
+  adam-only metadata record is net-add mechanism duplicating concepts already tabled —
+  and there is no second client (no fused Lion is built). Held out per the
+  admission-pressure rule (§7 / the complexity budget): it enters `src/` when it has
+  earned generality, not before.
+- **(b) composition-structure dissolution** (the real prize): the frontend emits the
+  `OptTerm` as elementwise graph nodes; the batcher recognizes **N parallel isomorphic
+  compositions over disjoint param groups** and packs them into ONE dispatch. THIS is
+  what "key on structure not the name" means in §16.
+
+### The blocker that re-STOPS it (named, not hand-waved)
+Notion (b) requires a **graph-altitude horizontal-pack of parallel isomorphic chains**,
+and **that mechanism does not exist**. The only horizontal-pack (`horizontalPackKey`)
+packs same-OP-NAME runs where each node is already one packed dispatch; the fusion
+detector fuses VERTICAL chains only (confirmed: no `parallel-instance`/`isomorph` packer
+anywhere in `src/compiler`, `src/executor`). The schedule-state horizontal-pack
+precedent §16 cites was at the KERNEL altitude, over an already-flat packed buffer — its
+graph-altitude analogue (detect + pack parallel isomorphic elementwise subgraphs) is a
+NEW mechanism, a separate campaign, not a re-key. Without it, dissolution replaces the
+~8 packed `adamStepBatch` submits with N×(chain-length) unpacked dispatches → a submit
+blow-up + a 124M memory/step regression → an automatic STOP under the submit-sensitive
+distil-profile gate and the 124M-EXACT gate. So attempting (b) here would trip exactly
+the maximum-severity gates that guard the optimizer.
+
+### Verdict
+The batching site resists beyond this phase's budget on BOTH notions — (a) cashes no
+deletion (budget STOP), (b) needs the unbuilt parallel-instance packer (mechanism STOP).
+So §16's boundary holds, now re-named to its blocker: **dissolution awaits a
+graph-altitude parallel-isomorphic-chain packer; the fused path keeps its named
+`adamStep` node until then, asserted against the program (unchanged).** No src/test
+change landed — the honorable output is the map above, not speculative hot-path
+mechanism against a non-negotiable optimizer.
+
 ### What remains
 - **Node dissolution** for the fused path (let islands/fusion claim the Adam
-  arithmetic) awaits a refactor of the adam-batch machinery to key on structure not
-  op-name — a separate campaign, boundary named above.
+  arithmetic) awaits a **graph-altitude parallel-isomorphic-chain packer** (§16b) — the
+  named blocker, a separate campaign. The op-metadata re-key (§16b notion a) is its
+  cheap half and lands with its first second client (a fused Lion / the packer itself).
 - **Muon** awaits the P3 contraction composition.
 - **P3-WGSL composites / the final ledger phase** (§6 P6) — land the campaign-wide
   deletions and retire any soak flag; the semantic-derivation algebra now spans
