@@ -760,3 +760,123 @@ suites remain unavailable (no `torch` in the venv, as in P0/P1).
 - **P4 (index algebra)**: CE's target-gather, the broadcast-VJP (§8.1, still the
   reduction gradient's transpose held out of P1/P2), and scatter⇄gather transposes.
   The reduction-composite `Composition` schema is the shape P4's index maps extend.
+
+## 15. Phase 4 — LANDED (2026-07-20)
+
+The INDEX ALGEBRA is in `src/ops/semantic/index-map.ts`. An index-space map's
+*meaning* is first-class DATA — a description of how output coordinates read input
+coordinates (shapes / dims / offsets, never a closure or buffer) — and from that
+ONE source every index op's gradient DERIVES by a single structural rule: **the
+adjoint of an index map is its TRANSPOSE**. The nine independently hand-authored
+view/gather/scatter/broadcast backward choices collapse to one `adjointIndexMap`
+DATA→DATA function; the §8.1 broadcast-VJP debt P1/P2 explicitly deferred is
+discharged; `cross_entropy` COMPLETES as a composition. Commits: `the index-map
+schema + the transpose derivation` → `route the view/gather/scatter/reduction
+backwards through the derived adjoint (delete _expandGrad)` → `cross_entropy
+completes as a composition` → this docs entry.
+
+### The index-map schema, as landed
+- **The map as DATA** (`IndexMap`): `reshape`/`transpose`/`permute` (bijections),
+  `narrow`/`cat` (injection / disjoint-union), `broadcast`/`reduce` (many-to-one),
+  `gather`/`scatterAdd` (data-indexed) — each carrying only shapes/dims/offsets,
+  proven DATA by `assertNoIndexMapBody` (the P0 schema-gate analogue extended to
+  the index frame: a smuggled `narrowBackward` closure behind a leaf is
+  unconstructible; the covenant/R22 defense). **The index TENSOR of a
+  gather/scatter is NOT part of the map** — it is runtime data supplied to the
+  realizer (as operands/eps are to `interpretComposition`), so the map stays pure
+  DATA and the gate holds.
+- **The transpose is the derivation** (`adjointIndexMap`, pure DATA→DATA): a
+  bijection's adjoint is its inverse (permute → `invertPermutation`, transpose →
+  itself, reshape → reshape-back); the DUAL PAIRS are single-sourced —
+  **narrow⇄pad, cat⇄split, broadcast⇄reduce, gather⇄scatter** are each ONE
+  transpose fact, not two hand copies. Unit-tested per kind + `invertPermutation`
+  involution.
+- **Realization composes runtime kernels, never re-owns them** (design §4.4):
+  `realizeIndexAdjoint` dispatches the derived adjoint to the SAME `rt.*` movement
+  the hand closures called — the transpose DECISION derives, the movement is
+  referenced. `reduceToShape` (the implicit-broadcast VJP) and `broadcastOverDims`
+  (the reduction VJP) live here as the broadcast⇄reduce transpose, single-sourced.
+
+### The derived-vs-hand verdicts (byte-gated) + the named deletions
+Each rewired frontend backward emits the IDENTICAL runtime movement it did by
+hand; the byte gate (`test/semantic-index.spec.ts`, cpu) proves the realized
+adjoint == an independent hand-written transpose f32-exact, and the PyTorch
+**oracle** (now runnable — `TORCH_ORACLE_PYTHON=.venv/bin/python`; torch 2.9.1+cpu
+IS present, contra the P0/P1/P2 "unavailable" note) confirms reshape / transpose /
+permute / narrow / cat / gather / scatterAdd / mean forward+backward vs PyTorch.
+
+| forward op (frontend) | hand adjoint that DELETED | derived adjoint |
+|-----------------------|---------------------------|-----------------|
+| `permute` | the inline `inverseDims` loop | `invertPermutation` (the map's transpose) |
+| `narrow` | hardcoded `narrowBackward` choice | `narrow⇄pad` transpose |
+| `cat` | the hand offset-narrow loop | `cat⇄split` transpose |
+| `expand` | `_sumToShape` call | `broadcast⇄reduce` transpose |
+| reductions (`sum`/`mean`) | **`_expandGrad`** (the §8.1 P1 debt) | `reduce⇄broadcast` (`broadcastOverDims`) |
+| `gather` / `scatterAdd` | two hand closures | `gather⇄scatter` ONE transpose fact |
+| `reshape`/`squeeze`/`unsqueeze`/`transpose` | four `rt.reshape`/`rt.transpose` closures | reshape-back / self-inverse |
+
+Named code deletions (house policy): `torchlette.ts` `_expandGrad` (~18 code)
+DELETED wholesale (routed to `broadcastOverDims`); `_sumToShape`'s 28-line body →
+a 1-line delegator to the index algebra's `reduceToShape` (single-sourced); the
+hand `inverseDims` loop; the seven view/gather/scatter/cat backward closures →
+`backwardOfIndexMap(map)` one-liners. The broadcast⇄reduce movement now has ONE
+owner (was `_sumToShape` + `_expandGrad`, two copies of the same transpose).
+
+### cross_entropy COMPLETES (the P2 deferral, cashed)
+`CROSS_ENTROPY_DEF` (`composite.ts`) is now a full `Composition`: per-sample loss =
+`neg(gather(log_softmax(logits), target))`, reusing `LOG_SOFTMAX_DEF.root` and the
+new **`gi` (gather-at-index) node** — the composite frame's INDEX-SPACE bridge,
+whose adjoint derives through the index algebra (gather's transpose is
+scatter/onehot, so CE's grad is `softmax − onehot(target)` — the exact fused-kernel
+semantics, RT3's seam). The batch mean stays the caller's reduction (the fused
+kernel returns per-sample loss). Gate (`test/semantic-index.spec.ts`): the
+composition == the decomposed CE forward == an independent JS `−log_softmax[target]`
+reference (maxAbs <1e-5, CPU). This is the single semantic SOURCE for CE that P2
+deferred until the index family existed — the last composite made whole.
+
+### The honest SLOC direction (engine-dominated, like P0)
+`srcSLOC` 67463 (P2) → **67688 (+225)**. The index-algebra ENGINE (`index-map.ts`,
+~226 code: the schema + the transpose derivation + the realizer + the broadcast⇄
+reduce movement + the schema gate) is the warranted new mechanism — the charter's
+explicit ask (the index-space category as the op algebra's index family, with
+DERIVED transposes). It is net-additive exactly as P0 (+783) was: the deletions it
+cashes are modest because the hand index backwards were already 1-liners
+(`rt.transpose(grad, options)`) — what P4 buys is the UNIFICATION (9 hand adjoint
+choices → 1 transpose fact), the four dualities single-sourced, the §8.1 P1 debt
+discharged, and CE completed. The engine amortizes forward: **P5**
+(optimizers-as-programs) reuses it for sharded/scattered state movement with no new
+index mechanism, exactly as P1/P2 reused the P0 algebra. The full-campaign
+net-negative remains a §5-ledger property.
+
+### The WGSL seam (S3) — DEFERRED with rationale (as in P0/P1)
+Not landed. The index-space movement kernels (`gather`/`scatterAdd`/`narrow`/
+`transpose`/`expand` WGSL) are the realizer's, untouched — the transpose DECISION
+derives here; the GPU movement is referenced (design §4.4). The CPU↔GPU tie/scatter
+seam is the pre-existing §4.5 boundary, gated by the oracle + the training gates,
+not byte-equality across backends.
+
+### Gates (all green)
+cpu: semantic-index (**11** — schema gate, the per-kind transpose derivation,
+`invertPermutation` involution, the six realized-adjoint byte gates, CE
+composition == decomposed == JS ref), semantic-composite (5), semantic-reduction
+(9), semantic-derivation (46), gradcheck (35 — the view/broadcast/gather grads are
+heavily exercised). **oracle** (now runnable): op-conformance + autograd +
+optimizer + checkpoint parity vs PyTorch (35 — reshape/transpose/permute/narrow/
+cat/gather/scatterAdd/mean fwd+bwd). Full cpu project: **1498 pass / 1 skip** (the
+lone red was `websocket-relay` heads-routing — a networking flake, green on
+isolated rerun; untouched by this change). gate-wall `--profile training` (build,
+test:gates, whole-step-diff, parity-fullstack, tape matrix ×4, step-object/edit-
+null, ring-probe, ledger-default, **124M-regression**, refusal, checkpoint-seg) —
+PASS; `parity-fullstack` + `124M` exercise the derived reshape/transpose/expand/
+reduction/gather backwards on GPU end-to-end (embedding = gather, CE loss), and the
+**strict-lifetime** default (index-adjoint bugs are the silent-corruption class —
+the derived scatter must place every element) held throughout.
+
+### P5 (optimizers-as-programs) preconditions carried
+- Adam/SGD/scaler arithmetic is a derivable `Expr` (P0 algebra); their m/v state +
+  step boundary are §4.6 declared effects — the arithmetic derives, the effect is
+  declared. The index algebra is the movement primitive sharded/foreach optimizer
+  state needs (gather/scatter over param groups), reused not re-built.
+- The 2 admitted contraction adjoints (`matmulBackward`/`linearBackward`) remain
+  hand (design §4.2) — P3's formal admission is the only remaining backward that is
+  not either a derived elementwise/index adjoint or a declared effect.
