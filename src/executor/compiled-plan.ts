@@ -617,34 +617,28 @@ export function dbgIsDestroyed(buf: GPUBuffer): boolean {
  *  live-harvest check applied PER BUFFER, so convergence still proceeds. */
 let parkedLiveBuffers: Array<{ buf: GPUBuffer; ids: number[] }> = [];
 
-/** Storage ids in `harvestIds` that are STILL ALIVE and back `buf` (identity on
- *  the current backing buffer). Empty when no such storage reads it — then the
- *  buffer is safe to destroy.
+/** Live storage ids that currently ALIAS each of `candidates`, bucketed by the
+ *  buffer they back, in ONE pass over live storages.
  *
- *  A co-owned registry-entry buffer whose last plan-owner is being torn down
- *  must NOT be destroyed while ANY live storage still binds it — not only a
- *  `registerState`'d post-boundary reader (the deferred loss), but ALSO a plain
- *  materialized harvest storage that another not-yet-torn-down plan resolves as
- *  its EXTERNAL input. The unrolled-K decode block exposes exactly the latter:
- *  the per-step `idx` upload is harvested into a registry-entry buffer and
- *  bound as slot-0 external by the next forward plan; destroying it at the
- *  producer's invalidation poisoned that replay's submit ("used in submit while
- *  destroyed"). So this parks on the IDENTITY match alone — a live storage
- *  whose current backing buffer IS this entry — with no registered-state gate.
- *  Parked buffers are reclaimed once every reader storage dies
- *  (reclaimParkedLiveBuffers), so a genuinely-dead entry still frees promptly. */
-function liveHarvestIdsForBuffer(
-  buf: GPUBuffer,
-  harvestIds: number[] | undefined,
-): number[] {
-  if (!harvestIds || harvestIds.length === 0) return [];
-  const ids: number[] = [];
-  for (const id of harvestIds) {
-    if (storageTracker.isDestroyed(id)) continue;
-    const sh = storageTracker.getStorage(id);
-    if (sh && gpuBuffer(sh.backendTensor) === buf) ids.push(id);
-  }
-  return ids;
+ *  A plan-owned buffer being torn down (a co-owned registry entry OR a TAG_WRITE
+ *  upload buffer) is UNSAFE to destroy while ANY live storage still aliases it:
+ *  a `registerState`'d post-boundary reader (the whole-step deferred loss), a
+ *  harvest RESULT another plan reads cross-plan, or a materialized external
+ *  upload — the unrolled-K decode block's per-step first-token feed AND its
+ *  views — that a consumer plan binds. Destroying it under that bind drops the
+ *  enclosing submit ("used in submit while destroyed"). Such buffers are PARKED
+ *  (kept pinned, reclaimed once every aliasing storage dies); a buffer no live
+ *  storage aliases frees promptly. Keying by the CURRENT backing buffer catches
+ *  EVERY alias (including views), which a per-id candidate list misses — the
+ *  sampled block's live reader is often a view of the upload, not the upload id.
+ *  One pass, gated to the (small) set of buffers actually being torn down. */
+function liveIdsBackingBuffers(
+  candidates: Set<GPUBuffer>,
+): Map<GPUBuffer, number[]> {
+  if (candidates.size === 0) return new Map();
+  return storageTracker.bucketLiveStorageIdsByBuffer(candidates, (s) =>
+    gpuBuffer(s.backendTensor),
+  );
 }
 
 /** Reclaim parked result buffers whose reader storages have all been
@@ -687,6 +681,39 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
     }
     compiled._viewBaseRetains = undefined;
   }
+  // [unrolled-K P4] Build the buffer→live-aliasing-ids map ONCE for every
+  // plan-owned buffer this teardown may free (registry entries + TAG_WRITE
+  // upload buffers). A buffer a live storage still aliases must be PARKED, not
+  // destroyed (see `liveIdsBackingBuffers`). One pass over live storages,
+  // gated to the buffers actually in play.
+  const candidates = new Set<GPUBuffer>();
+  if (
+    compiled.plannerEntries &&
+    compiled.plannerGen === plannerRegistry.generation
+  ) {
+    for (const idx of compiled.plannerEntries) {
+      const b = plannerRegistry.entries[idx]?.buffer;
+      if (b) candidates.add(b);
+    }
+  }
+  for (const cmd of compiled.commands) {
+    if (cmd.tag === TAG_WRITE && cmd.stableBuf) candidates.add(cmd.stableBuf);
+  }
+  const liveByBuf = liveIdsBackingBuffers(candidates);
+  const parkOrDestroy = (buf: GPUBuffer): boolean => {
+    const live = liveByBuf.get(buf);
+    if (live && live.length > 0) {
+      // PARK (kept pinned, reclaimed once every aliasing storage dies).
+      parkedLiveBuffers.push({ buf, ids: live });
+      return true;
+    }
+    pinnedBufferSet.delete(buf);
+    // DEFERRED destruction, never immediate: teardown fires MID-STEP (staleness
+    // gates, eviction) while the step encoder holds encoded passes binding these
+    // buffers.
+    bufferPool.deferredDestroy(buf, (buf as { size?: number }).size ?? 0);
+    return false;
+  };
   // Release co-owned registry entries (cross-plan packing). An entry's
   // buffer dies with its LAST owner; the entry record itself stays and is
   // re-listed for future plans (the buffer rematerializes on demand).
@@ -699,26 +726,7 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
         e.owners.delete(compiled);
         if (e.owners.size === 0) {
           if (e.buffer) {
-            // [P2 whole-step] A persistent harvested result (the deferred
-            // loss) may still read this buffer AFTER the step boundary.
-            // Park it (kept pinned) rather than destroy — destroying now
-            // drops that read's submit. Reclaimed once its readers die.
-            const liveIds = liveHarvestIdsForBuffer(
-              e.buffer,
-              compiled._lastHarvestIds,
-            );
-            if (liveIds.length > 0) {
-              parkedLiveBuffers.push({ buf: e.buffer, ids: liveIds });
-            } else {
-              pinnedBufferSet.delete(e.buffer);
-              // DEFERRED destruction, never immediate: teardown fires MID-STEP
-              // (staleness gates, eviction) while the step encoder holds
-              // encoded passes binding these buffers.
-              bufferPool.deferredDestroy(
-                e.buffer,
-                (e.buffer as { size?: number }).size ?? 0,
-              );
-            }
+            parkOrDestroy(e.buffer);
             e.buffer = undefined;
           }
           plannerRegistry.relist(idx);
@@ -729,16 +737,13 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
     compiled.plannerAssignment = undefined;
     compiled.plannerGen = undefined;
   }
-  // Destroy plan-owned stable upload buffers (TAG_WRITE fast path). Unpin
-  // first (deferredDestroy is pin-guarded), then defer: teardown can fire
-  // mid-step with encoded-but-unsubmitted passes binding them.
+  // Destroy (or park) plan-owned stable upload buffers (TAG_WRITE fast path).
+  // The sampled decode block's per-step first-token upload aliases its
+  // producer's stableBuf and its VIEWS are what a consumer binds — parkOrDestroy
+  // catches every alias via the single-pass map.
   for (const cmd of compiled.commands) {
     if (cmd.tag === TAG_WRITE && cmd.stableBuf) {
-      pinnedBufferSet.delete(cmd.stableBuf);
-      bufferPool.deferredDestroy(
-        cmd.stableBuf,
-        (cmd.stableBuf as { size?: number }).size ?? 0,
-      );
+      parkOrDestroy(cmd.stableBuf);
       cmd.stableBuf = undefined;
     }
   }

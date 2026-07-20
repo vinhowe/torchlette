@@ -37,7 +37,11 @@ import type {
   StaticKV,
 } from "../packages/qwen3-browser/src/model";
 import { Qwen3 } from "../packages/qwen3-browser/src/model";
-import { getWebGPUInitError, initWebGPU } from "../src/backend/webgpu";
+import {
+  getGpuUncapturedErrorCount,
+  getWebGPUInitError,
+  initWebGPU,
+} from "../src/backend/webgpu";
 import { Torchlette } from "../src/frontend/torchlette";
 
 const CONFIG: Qwen3Config = {
@@ -315,6 +319,16 @@ async function main() {
       `gumbel formula (unit): device argmax ${dev} == host argmax ${host}`,
     );
   }
+
+  // (6) ZERO UNCAPTURED GPU ERRORS — the gate that would have caught the
+  //     sampled-block external-destroy transient at P3' (a dropped submit
+  //     "used in submit while destroyed" emitted but never asserted). The park
+  //     fix (compiled-plan teardown parks a plan-owned buffer any live storage
+  //     still aliases) drives this to 0; before it this count was ≥1.
+  ok(
+    getGpuUncapturedErrorCount() === 0,
+    `zero uncaptured GPU errors across the sampled run (external-destroy transient) — got ${getGpuUncapturedErrorCount()}`,
+  );
 
   console.log(
     `\n=== VERDICT: ${

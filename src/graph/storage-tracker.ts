@@ -693,6 +693,28 @@ class StorageTracker {
     return false;
   }
 
+  /** [unrolled-K P4] Live storage ids bucketed by the buffer they currently
+   *  back, restricted to `candidates`. ONE pass over live storages; `bufOf`
+   *  maps a storage to its current GPUBuffer (the caller supplies it to avoid a
+   *  backend import here). Used by the compiled-plan teardown to decide which
+   *  plan-owned buffers a live storage still aliases (park) vs. which are free
+   *  to destroy — keying on the current backing buffer catches views/aliases a
+   *  per-id list would miss. */
+  bucketLiveStorageIdsByBuffer<B>(
+    candidates: Set<B>,
+    bufOf: (s: StorageHandle) => B,
+  ): Map<B, number[]> {
+    const m = new Map<B, number[]>();
+    for (const [id, s] of this.allStorages) {
+      const buf = bufOf(s);
+      if (!candidates.has(buf)) continue;
+      const arr = m.get(buf);
+      if (arr) arr.push(id);
+      else m.set(buf, [id]);
+    }
+    return m;
+  }
+
   /**
    * Release tensor refs for step-scoped temporaries — driven by the DERIVED
    * classification (task #70 D2 authoritative). For each tracked storage the
