@@ -196,6 +196,41 @@ def run_case(case):
             "grads": grads,
         }
 
+    # Optimizer trajectory: run a real torch.optim over the toy problem
+    # L = sum((p - target)^2) (grad = 2(p-target)) for `steps` steps, returning
+    # the [steps, N] param trajectory. The P5 oracle: torchlette's DERIVED
+    # optimizer (adam.ts / lion.ts realizing OPTIMIZER_PROGRAMS) must track this.
+    if op == "optimizer_trajectory":
+        import torch.optim as optim
+
+        p0 = inputs[0].float()
+        target = inputs[1].float()
+        name = option(options, "optimizer", "adamw")
+        lr = option(options, "lr", 0.01)
+        betas = tuple(option(options, "betas", [0.9, 0.999]))
+        eps = option(options, "eps", 1e-8)
+        wd = option(options, "weightDecay", 0.0)
+        steps = int(option(options, "steps", 20))
+        p = p0.clone().requires_grad_(True)
+        if name == "adamw":
+            opt = optim.AdamW([p], lr=lr, betas=betas, eps=eps, weight_decay=wd)
+        elif name == "adam":
+            opt = optim.Adam([p], lr=lr, betas=betas, eps=eps, weight_decay=wd)
+        elif name == "sgd":
+            mom = option(options, "momentum", 0.0)
+            opt = optim.SGD([p], lr=lr, momentum=mom, weight_decay=wd)
+        else:
+            raise RuntimeError(f"optimizer_trajectory: unknown optimizer {name}")
+        traj = []
+        for _ in range(steps):
+            opt.zero_grad()
+            loss = ((p - target) ** 2).sum()
+            loss.backward()
+            opt.step()
+            traj.append(p.detach().clone())
+        flat = torch.stack(traj, dim=0)  # [steps, N]
+        return {"output": tensor_payload(flat)}
+
     # LayerNorm forward + backward
     if op == "layer_norm_backward":
         x = inputs[0].float().requires_grad_(True)
