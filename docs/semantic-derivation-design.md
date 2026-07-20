@@ -880,3 +880,141 @@ the derived scatter must place every element) held throughout.
 - The 2 admitted contraction adjoints (`matmulBackward`/`linearBackward`) remain
   hand (design §4.2) — P3's formal admission is the only remaining backward that is
   not either a derived elementwise/index adjoint or a declared effect.
+
+## 16. Phase 5 — LANDED (2026-07-20): OPTIMIZERS AS PROGRAMS
+
+The composition payoff (design §1, §4.6, §6-P5). An optimizer's update is now a
+SEMANTIC COMPOSITION — a term over named state/hyper roles in
+`src/ops/semantic/optimizer.ts` — the single source from which the foreach and
+elementwise Adam paths GENERATE their moment/param chains, and against which the
+fused adamStep kernel is asserted. The `adamStep` op-vocabulary carveout at the
+GRAPH altitude dissolves into a program interpretation; the KERNEL altitude was
+already schedule-state-derived (the referenced precedent). Commits: `the
+optimizer-program stratum` → `Adam foreach + elementwise derive from the program`
+→ `Lion — the generality dividend` → `the AdamW-vs-torch.optim oracle` → this docs
+entry.
+
+### The optimizer-program schema, as landed
+- **The update as DATA** (`OptTerm`): a pure-elementwise term over NAMED roles
+  (`m`,`v`,`g`,`p`,`lr`,`bc1`,`bc2`,`eps`,`wd`,`beta*`) — add/sub/mul/div +
+  sqrt/sign/abs/neg/exp. An `OptimizerProgram` carries its persistent `state`
+  slots, the in-place `stateUpdates` (each an `OptTerm` over the OLD state + g +
+  hypers), and the `paramUpdate` — proven DATA by `assertNoOptimizerProgramBody`
+  (the P0 schema-gate analogue extended to the optimizer frame; the covenant/R22
+  defense — a smuggled `mNew=…` lambda behind a leaf is unconstructible).
+- **The design §4.6 split made concrete.** The ARITHMETIC derives (the term); the
+  in-place m/v EFFECT + step boundary are the realizer's (adam.ts / lion.ts
+  sequence the copy_ / persist / dispose). `evalOptTerm` interprets a term over the
+  runtime — `number×number` folds in JS so a pure-scalar sub-term (`1−β1`) stays a
+  constant, keeping the generated graph BYTE-IDENTICAL to the hand chains it
+  replaced.
+- **The catalog** (design §4.6): `ADAMW_PROGRAM`, `SGD_MOMENTUM_PROGRAM` /
+  `SGD_PROGRAM`, `LION_PROGRAM` — SGD+momentum and Lion as SIBLING definitions
+  (the generality proof: Lion is sign-based, ~free from the algebra). `bc1`/`bc2`
+  ride in as roles (bias-correction as DATA — the step as input, the volatile-
+  uniform discipline); the existing `_biasCorrection` expm1-form stays the ONE
+  source that computes them.
+
+### The realization verdicts
+- **foreach + elementwise: DERIVED.** `_foreachGroupStep` and
+  `_updateParamElementwise` (adam.ts) now interpret `ADAMW_M_NEW`/`ADAMW_V_NEW`/
+  `ADAMW_SCALED`/`ADAMW_P_NEW` — the hand `add(mul(m,β1),…)` chain that was written
+  TWICE (once per path) is ONE source. Byte-identical by construction (same op
+  order, same constant placement): the fused-vs-elementwise / oracle / 124M gates
+  hold unchanged. Weight-decay MODE stays the realizer's declared POLICY (L2 folds
+  wd into g; AdamW binds it in the param term) — matching the fused kernel's
+  `decoupledWd` branch; the decoupled term is applied CONDITIONALLY so the common
+  wd=0 path never materializes a full-model-size `+0` intermediate.
+- **fused kernel: ASSERTED.** The elementwise + foreach paths now DERIVE from the
+  program, so `test/optim/fused-vs-elementwise.spec.ts` (the fused == elementwise ==
+  foreach trajectory differential, a gate-wall member) IS the RT3 seam — the fused
+  kernel is checked against the composition's realization, not re-owned (§4.4). All
+  12 cells green (incl. SGD, late-LR, CosineAnnealingLR under compiled plan).
+- **node dissolution: STOPPED, boundary named** (the §5.4 clean-partial precedent).
+  Dissolving the `adamStep` node into the composition (letting fusion/islands claim
+  it) is NOT safe cheaply: the node is load-bearing across the batching machinery —
+  the plan-builder in-place write-sets (`adamStep: [1,2,3]`), the lowered-plan
+  `adam-batch`/`adamStepBatch` action + its shared-input (t/lr) handling, the
+  graph-rewrites CSE key, and the backend fused kernel's buffer-ownership transfer.
+  The adam-batch grouping KEYS on the op name; dissolution is a bigger surgery than
+  P5's scope. So the GRAPH-altitude carveout dissolves for the DERIVED paths
+  (foreach/elementwise emit the pure composition), while the FUSED path keeps its
+  `adamStep` node, asserted against the program — a clean partial, not a stranded
+  whole.
+
+### Lion — the generality dividend (validated end-to-end)
+`src/optim/lion.ts`: a complete optimizer realized from `LION_PROGRAM` ALONE — no
+hand kernel, no hand grads (optimizers never need a VJP). Its sign-based step
+(`p' = p − lr·(sign(β1·m+(1−β1)·g) + wd·p)`; `m' = β2·m+(1−β2)·g`) falls out of the
+same algebra AdamW derives from; the realizer only sequences the in-place m-state
+effect (the param reads the OLD momentum — its β1-interp direction — so the m-write
+is a dangling copy_ forced at the boundary's `forceAllPending`, exactly as SGD's
+velocity is). Validated: (1) the LION_PROGRAM interprets to an independent JS Lion
+reference (`test/semantic-optimizer.spec.ts`); (2) the Lion OPTIMIZER tracks a JS
+Lion reference over an 8-step toy trajectory (≤1e-4); (3) Lion trains DistilGPT-2
+for 20 full-finetune steps with smooth monotone descent (`7.89 → 4.36`, all finite;
+`test/lion-distil-descent.spec.ts`). torch.optim ships no Lion, so the reference is
+implemented honestly in the probe.
+
+### MUON — declared but DEFERRED (honest scope, §2 category d + §7)
+`MUON_DEFERRED` names the deferral: Muon's Newton–Schulz orthogonalization is a
+matmul-CONTRACTION fixed-point (`X ← 1.5·X − 0.5·X·XᵀX`), not a pure-elementwise
+term. The optimizer-program frame is the elementwise sub-algebra; Muon needs the
+P3 contraction composition the frame lacks. Held out per the admission-pressure
+rule, not fabricated as an elementwise approximation.
+
+### The oracle verdict (torch.optim, the strongest gate)
+A new `optimizer_trajectory` op in the torch oracle runs REAL `torch.optim.AdamW`/
+`.Adam`/`.SGD` over the toy problem `L = sum((p−target)²)` for 20 steps.
+torchlette's DERIVED optimizer tracks the full trajectory to **≤1e-6**
+(`test/oracle/optimizer-trajectory.spec.ts`): AdamW (decoupled wd=0.1), Adam (L2
+wd=0.1), SGD+momentum. The decoupled-wd algebra was verified identical to torch's
+`param.mul_(1−lr·wd)` form. (torch 2.9.1+cpu is present in the worktree venv.)
+
+### The honest SLOC direction (engine + a new optimizer)
+`srcSLOC` 67688 (P4) → **68127 (+439)**. Two named components (house policy):
+- **The optimizer-program ENGINE** (`optimizer.ts`, 272 code: schema + gate +
+  `evalOptTerm` + the catalog) — the warranted new mechanism, the charter's explicit
+  ask (optimizers-as-programs), net-additive exactly as the P0 (+783) and P4 (+225)
+  engines were. The deletion it CASHES is the Adam moment/param arithmetic that was
+  written TWICE (foreach + elementwise): now ONE program source (adam.ts nets only
+  +19 code — the chain removed, role-binding added).
+- **The LION optimizer** (`lion.ts`, 153 code) — a genuinely NEW capability, not a
+  deletion; a whole optimizer that needed NO new engine is the generality dividend
+  itself. No new env flag (envFlags unchanged at 66 — nothing to sunset).
+
+The full-campaign net-negative remains a §5-ledger property; P5, like P0/P4, is an
+engine phase (plus a new optimizer), and does not itself cash net-negative.
+
+### The WGSL seam (S3) — untouched (as in P0-P4)
+The fused adamStep WGSL (`schedule/adam-skeleton.ts`, `emitExpm1`/
+`emitBiasCorrection`) is the realizer's, unchanged — the composition is its
+REFERENCE (asserted by the fused-vs-elementwise differential at the CPU↔GPU-toleranced
+seam), not re-emitted from the term. Deriving the adamStep WGSL from the program is
+future work behind the same schedule-state differential.
+
+### What remains
+- **Node dissolution** for the fused path (let islands/fusion claim the Adam
+  arithmetic) awaits a refactor of the adam-batch machinery to key on structure not
+  op-name — a separate campaign, boundary named above.
+- **Muon** awaits the P3 contraction composition.
+- **P3-WGSL composites / the final ledger phase** (§6 P6) — land the campaign-wide
+  deletions and retire any soak flag; the semantic-derivation algebra now spans
+  elementwise (P0), reductions (P1), composites (P2), index (P4), and optimizers
+  (P5), with contraction (P3) the one remaining stratum.
+
+### Gates (all green)
+cpu: semantic-optimizer (**6** — schema gate, AdamW/SGD/Lion program == JS
+reference, the Lion optimizer trajectory, MUON deferred), semantic-derivation (46),
+semantic-composite (5), semantic-index (11), semantic-reduction (9), gradcheck (35).
+**oracle**: optimizer (5, the existing JS-reference parity) + optimizer-trajectory
+(**3** — AdamW/Adam/SGD == torch.optim, 20 steps ≤1e-6). webgpu (serial-exclusive):
+fused-vs-elementwise (**12** — the RT3 seam: fused == derived elementwise == derived
+foreach, incl. SGD + LR schedules), adam-multigroup, lion-distil-descent (**1** —
+20-step monotone descent on DistilGPT-2). gate-wall `--profile training` (build,
+test:gates, whole-step-diff, parity-fullstack, tape matrix ×4, step-object/edit-null,
+ring-probe, ledger-default, **124M-regression** — Adam IS its optimizer, any drift is
+a STOP — refusal, checkpoint-seg) — the derived Adam paths run the fused kernel on the
+124M/fullstack path (unchanged, asserted), and the derived elementwise/foreach paths
+are pinned by fused-vs-elementwise. The strict-lifetime default held throughout
+(the derived-intermediate disposal preserved via the `evalOptTerm` sink collector).
