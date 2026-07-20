@@ -170,10 +170,7 @@ function emitErf(u: RuntimeTensor, rt: RuntimeEngine): RuntimeTensor {
   const poly = rt.mul(
     rt.add(
       rt.mul(
-        rt.add(
-          rt.mul(rt.add(rt.mul(rt.add(rt.mul(t, a5), a4), t), a3), t),
-          a2,
-        ),
+        rt.add(rt.mul(rt.add(rt.mul(rt.add(rt.mul(t, a5), a4), t), a3), t), a2),
         t,
       ),
       a1,
@@ -274,9 +271,11 @@ export function interpretComposition(
         const a = goT(n.a);
         const opts = { dim, keepdim: true } as const;
         const res =
-          n.op === "sum" ? rt.sum(a, opts)
-          : n.op === "max" ? rt.max(a, opts)
-          : rt.mean(a, opts);
+          n.op === "sum"
+            ? rt.sum(a, opts)
+            : n.op === "max"
+              ? rt.max(a, opts)
+              : rt.mean(a, opts);
         if (typeof res === "number") {
           throw new Error(
             `interpretComposition: reduce '${n.op}' with keepdim returned a scalar.`,
@@ -284,8 +283,24 @@ export function interpretComposition(
         }
         return res;
       }
+      case "gi": {
+        // gather-at-index — the index tensor comes from a named role (runtime
+        // DATA, not part of the term), gathered along `dim`. Its adjoint is the
+        // index algebra's gather transpose (scatter/onehot); this is the bridge
+        // that lets cross_entropy complete as a composition (design §2 c/e).
+        const a = goT(n.a);
+        const index = inputs[n.indexRole];
+        if (index === undefined || typeof index === "number") {
+          throw new Error(
+            `interpretComposition: ${def.name} gather references index role '${n.indexRole}' but no index tensor was provided.`,
+          );
+        }
+        return rt.gather(a, index, { dim });
+      }
     }
-    throw new Error(`interpretComposition: unhandled node ${JSON.stringify(n)}`);
+    throw new Error(
+      `interpretComposition: unhandled node ${JSON.stringify(n)}`,
+    );
   };
   const goT = (n: CompNode): RuntimeTensor => {
     const v = go(n);

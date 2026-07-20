@@ -21,15 +21,7 @@
  */
 
 import type { ElementwiseDef } from "./catalog";
-import {
-  add,
-  c,
-  erf,
-  type Expr,
-  mul,
-  tanh,
-  x,
-} from "./expr";
+import { add, c, erf, type Expr, mul, tanh, x } from "./expr";
 import { GELU_SQRT_2_OVER_PI, GELU_TANH_C } from "./erf";
 
 const HALF = c(0.5);
@@ -104,7 +96,13 @@ export type CompNode =
   | { k: "kc"; v: number } // a constant
   | { k: "u"; op: CompUnary; a: CompNode }
   | { k: "b"; op: CompBinary; a: CompNode; b: CompNode }
-  | { k: "r"; op: CompReduceOp; a: CompNode }; // reduce along dim, keepdim=true
+  | { k: "r"; op: CompReduceOp; a: CompNode } // reduce along dim, keepdim=true
+  // gather-at-index — the P4 INDEX-SPACE bridge: select `a`'s values at the
+  // integer indices carried by the `indexRole` tensor, along the composition's
+  // `dim`. Its adjoint is the index algebra's gather transpose (scatter/onehot),
+  // so a composition that gathers differentiates through `index-map.ts` — this is
+  // what lets `cross_entropy` COMPLETE as a composition (design §2 category c/e).
+  | { k: "gi"; a: CompNode; indexRole: string };
 
 /** A named composite op: the roles it consumes + its composition term. */
 export interface CompositeDef {
@@ -174,7 +172,11 @@ export const LAYERNORM_DEF: CompositeDef = {
         LN_CENTERED,
         cu(
           "sqrt",
-          cb("add", cr("mean", cb("mul", LN_CENTERED, LN_CENTERED)), cin("eps")),
+          cb(
+            "add",
+            cr("mean", cb("mul", LN_CENTERED, LN_CENTERED)),
+            cin("eps"),
+          ),
         ),
       ),
       cin("w"),
@@ -184,13 +186,22 @@ export const LAYERNORM_DEF: CompositeDef = {
 };
 
 /**
- * cross_entropy = mean_batch( −log_softmax(logits)[target] ).
- * The `log_softmax` sub-term IS a composition (`LOG_SOFTMAX_DEF`); the per-row
- * gather at `target` is an INDEX-SPACE map (design §2 category c) whose realizer
- * is P4's index algebra — so CE's full composition term (and its tensor gate)
- * is DEFERRED to P4, exactly as the design scopes the index family. Its softmax
- * core lands here as data; the gather does not fabricate an index primitive.
+ * cross_entropy per-sample = −log_softmax(logits)[target]  (COMPLETED, P4).
+ *
+ * The `log_softmax` sub-term IS a composition (`LOG_SOFTMAX_DEF.root` reused);
+ * the per-row gather at `target` is now the `gi` INDEX-SPACE node (design §2
+ * category c/e), whose adjoint derives through the index algebra
+ * (`index-map.ts`: gather's transpose is scatter/onehot — so CE's grad is
+ * `softmax − onehot(target)`, the exact fused-kernel semantics). The batch mean
+ * is applied by the caller's reduction (as the fused kernel returns per-sample
+ * loss), so the composition term is the per-sample loss — the single semantic
+ * SOURCE for CE that P2 deferred until the index family existed.
  */
+export const CROSS_ENTROPY_DEF: CompositeDef = {
+  name: "cross_entropy",
+  roles: ["x", "target"],
+  root: cu("neg", { k: "gi", a: LOG_SOFTMAX_DEF.root, indexRole: "target" }),
+};
 
 /** The reduction-composite catalog authored as data (softmax core family). */
 export const REDUCTION_COMPOSITE_DEFS: readonly CompositeDef[] = [
@@ -198,9 +209,10 @@ export const REDUCTION_COMPOSITE_DEFS: readonly CompositeDef[] = [
   LOG_SOFTMAX_DEF,
   RMSNORM_DEF,
   LAYERNORM_DEF,
+  CROSS_ENTROPY_DEF,
 ];
 
-const COMP_KINDS = new Set(["in", "kc", "u", "b", "r"]);
+const COMP_KINDS = new Set(["in", "kc", "u", "b", "r", "gi"]);
 
 /**
  * Prove a composition term is DATA (the `assertNoDefinitionBody` analogue for the
@@ -215,7 +227,9 @@ export function assertNoCompositionBody(node: CompNode, path = "comp"): void {
       throw new Error(`CompositeDef schema gate: ${p} is null/undefined.`);
     const t = typeof v;
     if (t === "function")
-      throw new Error(`CompositeDef schema gate: ${p} is a function (not DATA).`);
+      throw new Error(
+        `CompositeDef schema gate: ${p} is a function (not DATA).`,
+      );
     if (t === "string" || t === "number" || t === "boolean") return;
     if (t === "object") {
       if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer)
