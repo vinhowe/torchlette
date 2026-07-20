@@ -10,3 +10,4 @@ export * from "./catalog";
 export * from "./emit-rt";
 export * from "./expr";
 export * from "./interpret";
+export * from "./reduction";
