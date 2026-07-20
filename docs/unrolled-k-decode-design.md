@@ -983,6 +983,10 @@ using the demo's actual additive-steering mechanism:
 
 ### The sampled (Gumbel) cutover — opt-IN, gated on a PRE-EXISTING transient (named blocker)
 
+> **RESOLVED 2026-07-20 — see "P4b STATUS" below.** The transient is fixed and the
+> Gumbel sampled block is now DEFAULT-eligible; `unrolledKExplicit()` is deleted.
+> The P4-era account below is retained as the discovery record.
+
 The Gumbel sampled block (§3.5, on-device `argmax(logits/temp + gumbel)`) is
 **wired end-to-end** in `generateChat` (routing + a Gumbel-consistent prefill
 token, `gumbelPrefillToken`) but is **opt-IN via an explicit flag
@@ -1071,6 +1075,102 @@ loop persists as long as they sample with top-k/top-p — which forks P5 (below)
 
 ---
 
+## P4b STATUS — the sampled-block external-destroy transient RESOLVED; Gumbel default-on (2026-07-20)
+
+*Worktree off `main@fe0b457a` (P4 HEAD). Staged commits, no push. dw-2-1 (A100),
+random-init Qwen3 static-KV path, node v22 + Dawn/Vulkan vk-shim, device via
+`tools/pick-gpu.sh`. Reproduce the (now-fixed) transient:
+`TORCHLETTE_DEBUG_DESTROYED=1 TORCHLETTE_STRICT_GPU=1 LD_LIBRARY_PATH=tools/vk-shim
+npx tsx tools/t-uk-gumbel-parity.ts`.*
+
+### The trace — the P4 attribution was right on the CLASS, wider than the first seam
+
+P4 named the sampled transient as "the block's first-token upload
+(`tensorFromArray([lastTok],[1,1])`), a materialized EXTERNAL, not a harvest
+RESULT" — correct on the class (a materialized-external upload, not a harvest
+result the P3' park set tracked). The deterministic repro
+(`[destroyed-bind] kind=external ref=materialized storage=945 buf=b1 IS DESTROYED`
++ one `used in submit while destroyed`) confirmed it. But the destroy site and the
+candidate set were WIDER than "fold the phase-1 external materialized storages into
+the park set" assumed:
+
+- **The buffer freed is the PRODUCER plan's TAG_WRITE `stableBuf`, not a co-owned
+  registry entry.** The token upload's TAG_WRITE fast path (`compiled-plan.ts`
+  ~1441) creates a result storage **aliasing** the plan-owned, pinned `stableBuf`
+  (`ownsBuffer=false`); the consumer decode block resolves that storage as a
+  materialized input next replay. `destroyCompiledPlanBuffers`'s stableBuf loop
+  frees it under the consumer's bind.
+- **The upload is CROSS-PLAN, so a per-plan external-id list on the DESTROYING plan
+  cannot catch it** (measured: the destroying plan's `ext=[]`; the id lived only in
+  the *consumer's* phase-1). Registering it globally at produce time fixed
+  gumbel-parity but NOT the steering arm — because **the live reader is often a
+  VIEW of the upload, not the upload id** (`t-uk-steering-diff` sampled arm: the
+  hook's residual-add shifts reuse so a view aliases the freed stableBuf).
+
+### The fix (smallest honest, at the seam — `compiled-plan.ts` `destroyCompiledPlanBuffers`)
+
+The invariant is one line: **a plan-owned buffer (a co-owned registry entry OR a
+TAG_WRITE upload buffer) is UNSAFE to destroy while ANY live storage still aliases
+it** — the whole-step deferred loss, a cross-plan harvest result, OR a materialized
+external upload and its views. The teardown now builds a `buffer → live-aliasing
+storage-ids` map in **ONE pass** over live storages, gated to the (small) set of
+buffers this teardown may free (`storageTracker.bucketLiveStorageIdsByBuffer`), and
+`parkOrDestroy` parks any buffer the map finds an aliaser for (kept pinned,
+reclaimed once every aliaser dies via `reclaimParkedLiveBuffers`), destroying only
+the genuinely-unaliased. Keying on the CURRENT backing buffer catches EVERY alias
+(views included) — which a per-id candidate list structurally misses. This
+**subsumes** the P3' `_lastHarvestIds` park (a superset — the loss/harvest storages
+are aliasers) AND the greedy registry-entry park in one principled check; net
+`src` is roughly flat (the id-scan helper is replaced, not added to).
+
+### Zero-error proofs (all STRICT_GPU-clean)
+
+- **`t-uk-gumbel-parity.ts`** — now **ASSERTS `getGpuUncapturedErrorCount()===0`**
+  (the gate that would have caught this at P3'; failing-first: 1 → 0). PASS.
+- **`t-uk-steering-diff.ts`** sampled arm — the HOOKED Gumbel block == HOOKED Gumbel
+  host across K∈{1,4,8}, **zero uncaptured GPU errors** (was: dropped submit → ids
+  MISMATCH, i.e. real corruption). PASS.
+- **`t-uk-block-diff.ts`** — all arms under `TORCHLETTE_STRICT_GPU=1`, incl. the
+  compiled arm; asserts zero uncaptured errors. PASS.
+- Multiplier spot-check UNCHANGED (K=4 low/def **2.64×**, host/def **1.50×**,
+  `getCompiledStreams>0`); the fix is in the infrequent teardown path, not the hot
+  replay — no perf delta.
+
+### Gumbel sampled cutover — now DEFAULT-eligible (the P4 opt-in reverts)
+
+With the transient fixed, `generateChat` (qwen3 + gemma2) routes **pure-temperature
+sampling (no top-k/top-p) through the on-device Gumbel block BY DEFAULT** — the
+opt-in flag `unrolledKExplicit()` is **deleted** (dead once the sampled path ships
+default-on). The global opt-out is unchanged: `TORCHLETTE_UNROLLED_K=0/1` still
+routes the whole block (greedy AND sampled) to the per-token host loop.
+**The demos' sampler is untouched** — `examples/qwen3-steering` and
+`examples/gemma2-sae-demo` sample with `topK 20/40, topP 0.95`, which is the §4
+host residue (a full-distribution host read the block cannot express); their decode
+stays byte-unchanged. Gate: `t-uk-cutover.ts` now asserts pure-temperature routes
+to the block by default (tape undefined) and opt-out routes to host, STRICT_GPU
+zero-error. **This product fork — whether the DEMOS adopt Gumbel or stay top-k/top-p
+— is Vin's (§8 Q1), untouched here.**
+
+### Weight-norm delta
+
+`src` SLOC roughly flat: the fragile per-id `liveHarvestIdsForBuffer` scan is
+REPLACED by the single-pass `liveIdsBackingBuffers` + a `parkOrDestroy` closure in
+`compiled-plan.ts`, plus one method (`bucketLiveStorageIdsByBuffer`) in
+`storage-tracker.ts`. NO new `src` env flag. `packages/` loses the
+`unrolledKExplicit` opt-in (−1 export ×2 packages). New/edited tools:
+`t-uk-gumbel-parity` (+zero-error assert), `t-uk-cutover` (+pure-temp routing).
+
+### What this unblocks for P5
+
+The sampled-block park-external fix P5 named as feeding its "harvest-seam re-proof"
+(P5 item 3) is DONE, and P5 item 1(c) — "the sampled-block transient is fixed AND
+the demos switch to Gumbel" — now has its **first half** satisfied. The demos still
+sample top-k/top-p (the §4 host residue), so the tape's decode consumer is **not
+yet gone**; P5 remains BLOCKED on the demo-sampler fork (§8 Q1 — Vin's call). See
+the restated P5 checklist below.
+
+---
+
 ## P5 — THE LEDGER EXECUTION (declared next, with its absence-proof checklist)
 
 The P4b ledger (`step-function-compiler-design.md` §5: obs-liveness 807 + step-tape
@@ -1085,10 +1185,12 @@ through it). P5's entry checklist:
    but the **shipped demos still route their top-k+top-p sampling through the
    per-token host loop** (the CapturedFn + tape). So the tape's decode consumer is
    NOT yet gone. P5 is BLOCKED until one of (forks §8 Q1, Vin's call):
-   - (a) the demos adopt a block-covered sampler (greedy or on-device Gumbel), OR
+   - (a) the demos adopt a block-covered sampler (greedy or on-device Gumbel — now
+     DEFAULT-eligible after the P4b transient fix), OR
    - (b) on-device small-top-k + top-p lands (§4 net-new: workgroup `inclusiveScan`
      prefilter + Gumbel; §8 Q1), moving the demo sampler onto the block, OR
-   - (c) the sampled-block **transient is fixed** AND the demos switch to Gumbel.
+   - (c) ~~the sampled-block **transient is fixed**~~ (DONE, P4b) AND the demos
+     switch to Gumbel (still open — the demos sample top-k/top-p).
    Until then the P4b STOP rule holds: a proven decode consumer remains.
 2. **Absence re-proofs (run under unrolled-K, greedy-and-block-sampler decode):**
    - **`tools/t-p4b-decode-edges.ts` under unrolled-K** ⇒ expect
@@ -1104,9 +1206,10 @@ through it). P5's entry checklist:
      reductions — each behind a green parity gate, the retained two-plan-eager
      path + `CHECKPOINT_EAGER_REFUSAL` (P4b PERMANENT POLICY, a TRAINING concern)
      untouched.
-3. **The fix P5 also wants from P4's residue:** the sampled-block park-external
-   fix (above) is the same lifetime discipline the ledger's harvest/arena
-   partial reductions touch — closing it feeds P5's harvest-seam re-proof.
+3. **The fix P5 wanted from P4's residue — DONE (P4b).** The sampled-block
+   park-external fix is the same lifetime discipline the ledger's harvest/arena
+   partial reductions touch; it landed as the single-pass alias-park in
+   `destroyCompiledPlanBuffers` (P4b above), feeding P5's harvest-seam re-proof.
 
 The covenant reaches net-negative when this ledger executes (§5 projected
 `src` **−3100…−3600 vs pre-Everest**); P4 is the cutover that unblocks the greedy
