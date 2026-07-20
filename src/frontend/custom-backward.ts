@@ -1,6 +1,13 @@
 /**
  * Custom backward functions for non-elementwise ops.
  * Extracted from torchlette.ts to reduce the monolithic frontend.
+ *
+ * Only the TWO admitted contraction adjoints live here now (design §4.2):
+ * `matmulBackward` and its `linearBackward` specialization — the index-transpose
+ * facts about contraction that do NOT derive from the elementwise chain-rule.
+ * The GELU tanh/erf custom backwards were DELETED (Crystal Campaign 3, P2): they
+ * are the adjoint of the GELU composition and now derive via
+ * `makeUnaryGrad(GELU_*_DEF)` (ops/semantic/composite.ts).
  */
 
 import type { RuntimeEngine } from "../runtime/engine";
@@ -93,85 +100,5 @@ export function linearBackward(
     return hasBias
       ? [resultInput, resultWeight, resultBias as RuntimeTensor]
       : [resultInput, resultWeight];
-  };
-}
-
-/**
- * GELU backward (tanh approximation).
- * gelu(x) ≈ 0.5x(1 + tanh(√(2/π)(x + 0.044715x³)))
- */
-export function geluTanhBackward(ctx: BackwardContext): GradFn {
-  return (grad, getSaved) => {
-    const x = getSaved(0)._unwrap();
-    const { rt } = ctx;
-
-    const x2 = rt.mul(x, x);
-    const x3 = rt.mul(x2, x);
-    const term = rt.add(x, rt.mul(0.044715, x3));
-    const innerVal = rt.mul(0.7978845608, term);
-
-    const clampedInner = rt.where(
-      rt.lt(innerVal, -10),
-      -10,
-      rt.where(rt.gt(innerVal, 10), 10, innerVal),
-    );
-
-    const tanhInner = rt.tanh(clampedInner);
-    const cdf = rt.mul(0.5, rt.add(1, tanhInner));
-    const tanh2 = rt.mul(tanhInner, tanhInner);
-    const sech2 = rt.sub(1, tanh2);
-
-    const pdfTerm = rt.add(1, rt.mul(0.134145, x2));
-    const pdf = rt.mul(rt.mul(0.7978845608, pdfTerm), sech2);
-
-    const xPdfHalf = rt.mul(rt.mul(x, pdf), 0.5);
-    const geluGrad = rt.add(cdf, xPdfHalf);
-    return [rt.mul(grad, geluGrad)];
-  };
-}
-
-/**
- * GELU backward (erf approximation using Horner's method).
- * gelu(x) = 0.5x(1 + erf(x/√2))
- */
-export function geluErfBackward(ctx: BackwardContext): GradFn {
-  return (grad, getSaved) => {
-    const x = getSaved(0)._unwrap();
-    const { rt } = ctx;
-
-    const z = rt.mul(x, Math.SQRT1_2);
-    const absZ = rt.abs(z);
-
-    const t = rt.div(1, rt.add(1, rt.mul(0.3275911, absZ)));
-    const t2 = rt.mul(t, t);
-    const t3 = rt.mul(t2, t);
-    const t4 = rt.mul(t3, t);
-    const t5 = rt.mul(t4, t);
-
-    const poly = rt.add(
-      rt.mul(0.254829592, t),
-      rt.add(
-        rt.mul(-0.284496736, t2),
-        rt.add(
-          rt.mul(1.421413741, t3),
-          rt.add(rt.mul(-1.453152027, t4), rt.mul(1.061405429, t5)),
-        ),
-      ),
-    );
-
-    const negZ2 = rt.mul(-0.5, rt.mul(x, x));
-    const expNegZ2 = rt.exp(negZ2);
-
-    const erfAbs = rt.sub(1, rt.mul(poly, expNegZ2));
-    const xGe0 = rt.ge(x, 0);
-    const erfPos = rt.add(1, erfAbs);
-    const erfNeg = rt.sub(1, erfAbs);
-    const erfTerm = rt.where(xGe0, erfPos, erfNeg);
-    const cdf = rt.mul(0.5, erfTerm);
-
-    const pdf = rt.mul(expNegZ2, 0.3989422804014327);
-    const xPdf = rt.mul(x, pdf);
-    const geluGrad = rt.add(cdf, xPdf);
-    return [rt.mul(grad, geluGrad)];
   };
 }

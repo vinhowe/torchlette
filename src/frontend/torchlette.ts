@@ -109,7 +109,15 @@ import {
   OP_REGISTRY,
   UNARY_AUTOGRAD_OPS,
 } from "../ops/registry";
+import { GELU_ERF_DEF, GELU_TANH_DEF } from "../ops/semantic/composite";
+import { makeUnaryGrad } from "../ops/semantic/emit-rt";
 import { REDUCTION_DEF_BY_NAME } from "../ops/semantic/reduction";
+
+// GELU backward is DERIVED (design §6 P2): the adjoint of the GELU composition,
+// interpreted over the runtime engine — replacing the hand `geluTanhBackward`/
+// `geluErfBackward` custom backwards (deleted). The VJP term is built ONCE.
+const GELU_TANH_GRAD = makeUnaryGrad(GELU_TANH_DEF);
+const GELU_ERF_GRAD = makeUnaryGrad(GELU_ERF_DEF);
 // Import extracted modules
 import {
   applyAutocastImpl,
@@ -121,8 +129,6 @@ import {
 import { backwardImpl } from "./autograd";
 import {
   type BackwardContext,
-  geluErfBackward,
-  geluTanhBackward,
   linearBackward,
   matmulBackward,
 } from "./custom-backward";
@@ -935,11 +941,14 @@ export class Torchlette {
     const inner = this.runtime.gelu(a._unwrap(), options);
     const tensorsToSave = a.requiresGrad ? [a] : [];
 
-    const bwdFn =
-      approximate === "tanh"
-        ? geluTanhBackward(this._backwardCtx())
-        : geluErfBackward(this._backwardCtx());
-    return this._wrapWithGrad(inner, [a], bwdFn, tensorsToSave);
+    // Backward DERIVED from the GELU composition's adjoint (design §6 P2).
+    const gradFn = approximate === "tanh" ? GELU_TANH_GRAD : GELU_ERF_GRAD;
+    return this._wrapWithGrad(
+      inner,
+      [a],
+      (grad, getSaved) => [gradFn(this.runtime, grad, getSaved(0)._unwrap())],
+      tensorsToSave,
+    );
   }
 
   clamp(a: Tensor, min: number | null, max: number | null): Tensor {

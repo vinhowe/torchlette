@@ -60,6 +60,11 @@ import {
   F32_POS_MAX,
   MAX_WORKGROUPS_PER_DIM,
 } from "./shape-utils";
+// The erf polynomial coefficients are single-sourced (Crystal Campaign 3, P2 —
+// the erf triplication's death). This WGSL emit REFERENCES the one source; the
+// same `ERF_A`/`ERF_P` feed the CPU reference (`erfApprox`) and the runtime
+// grad-graph realization (emit-rt). No 2nd owner of the polynomial.
+import { ERF_A, ERF_P } from "../../ops/semantic/erf";
 
 // ============================================================================
 // IR Node Types
@@ -1251,17 +1256,18 @@ export class BlockExpr {
     const one = new BlockExpr(resolveArg(1.0));
     const signX = this.sign();
     const absX = this.abs();
-    const t = one.div(one.add(absX.mul(0.3275911)));
+    const [a1, a2, a3, a4, a5] = ERF_A;
+    const t = one.div(one.add(absX.mul(ERF_P)));
     // Horner: ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
     const inner = t
-      .mul(1.061405429)
-      .add(-1.453152027)
+      .mul(a5)
+      .add(a4)
       .mul(t)
-      .add(1.421413741)
+      .add(a3)
       .mul(t)
-      .add(-0.284496736)
+      .add(a2)
       .mul(t)
-      .add(0.254829592);
+      .add(a1);
     const poly = inner.mul(t);
     const expTerm = absX.neg().mul(absX).exp(); // exp(-x²)
     return signX.mul(one.sub(poly.mul(expTerm)));

@@ -17,6 +17,12 @@ import {
   type KernelGenOptions,
   needsBroadcast,
 } from "./fusion-types";
+import {
+  ERF_A,
+  ERF_P,
+  GELU_SQRT_2_OVER_PI,
+  GELU_TANH_C,
+} from "../../ops/semantic/erf";
 import { compileTileKernel } from "./tile-compiler";
 import {
   type BindingSpec,
@@ -106,9 +112,11 @@ export function applyFusedOp(
 
     case "gelu":
     case "gelu_tanh": {
-      // x * 0.5 * (1 + tanh(clamp(0.7978845608 * (x + 0.044715 * x^3), -10, 10)))
+      // x * 0.5 * (1 + tanh(clamp(√(2/π) * (x + 0.044715 * x^3), -10, 10)))
       const x3 = a.mul(a).mul(a);
-      const inner = ctx.f32(0.7978845608).mul(a.add(ctx.f32(0.044715).mul(x3)));
+      const inner = ctx
+        .f32(GELU_SQRT_2_OVER_PI)
+        .mul(a.add(ctx.f32(GELU_TANH_C).mul(x3)));
       // clamp via min/max
       const clamped = inner.max(ctx.f32(-10)).min(ctx.f32(10));
       return a.mul(ctx.f32(0.5)).mul(ctx.f32(1).add(clamped.tanh()));
@@ -117,18 +125,19 @@ export function applyFusedOp(
     case "gelu_erf": {
       // x * 0.5 * (1 + erf(x / sqrt(2)))
       // Abramowitz & Stegun polynomial approximation for erf
+      const [a1, a2, a3, a4, a5] = ERF_A;
       const ax = a.abs().mul(ctx.f32(Math.SQRT1_2)); // |x| / sqrt(2)
-      const t = ctx.f32(1).div(ctx.f32(1).add(ctx.f32(0.3275911).mul(ax)));
+      const t = ctx.f32(1).div(ctx.f32(1).add(ctx.f32(ERF_P).mul(ax)));
       const poly = ctx
-        .f32(1.061405429)
+        .f32(a5)
         .mul(t)
-        .add(ctx.f32(-1.453152027))
+        .add(ctx.f32(a4))
         .mul(t)
-        .add(ctx.f32(1.421413741))
+        .add(ctx.f32(a3))
         .mul(t)
-        .add(ctx.f32(-0.284496736))
+        .add(ctx.f32(a2))
         .mul(t)
-        .add(ctx.f32(0.254829592))
+        .add(ctx.f32(a1))
         .mul(t);
       const erfAbs = ctx.f32(1).sub(poly.mul(ax.neg().mul(ax).exp()));
       const erf = a.sign().mul(erfAbs);

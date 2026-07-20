@@ -6,6 +6,7 @@ import {
   sizeOf,
 } from "../../core/shape";
 import { BINARY_DEFS, UNARY_DEFS } from "../../ops/semantic/catalog";
+import { GELU_ERF_DEF, GELU_TANH_DEF } from "../../ops/semantic/composite";
 import { compileBinary, compileUnary } from "../../ops/semantic/interpret";
 import {
   ARGMAX_DEF,
@@ -615,54 +616,17 @@ export function sigmoid(a: Tensor): Tensor {
   return applyUnaryOp(a, UNARY_OPS.sigmoid);
 }
 
-/**
- * Error function approximation using Horner's method.
- * Maximum error ~1.5e-7 in the range [-∞, +∞].
- */
-function erf(x: number): number {
-  // Abramowitz and Stegun approximation 7.1.26
-  const a1 = 0.254829592;
-  const a2 = -0.284496736;
-  const a3 = 1.421413741;
-  const a4 = -1.453152027;
-  const a5 = 1.061405429;
-  const p = 0.3275911;
-
-  const sign = x < 0 ? -1 : 1;
-  x = Math.abs(x);
-
-  const t = 1.0 / (1.0 + p * x);
-  const y =
-    1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
-
-  return sign * y;
-}
+// GELU CPU bodies are DERIVED from the composite semantic definitions (design
+// §4.3 S1). The tanh-gelu / erf-gelu hand loops and the hand `erf()` Horner
+// helper were redundant copies of those formulas — `compileUnary` interprets
+// each composition term ONCE. Byte-exact vs the old bodies (semantic spec S1).
+const GELU_TANH_BODY = compileUnary(GELU_TANH_DEF.expr);
+const GELU_ERF_BODY = compileUnary(GELU_ERF_DEF.expr);
 
 export function gelu(a: Tensor, options?: GeluOptions): Tensor {
   const approximate = options?.approximate ?? "tanh";
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-
-  if (approximate === "tanh") {
-    // Tanh approximation (GPT-2 "new GELU"):
-    // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    const sqrt2OverPi = 0.7978845608; // sqrt(2/pi)
-    for (let i = 0; i < a.size; i += 1) {
-      const x = readAtLinear(a, i, shapeStrides);
-      out[i] =
-        x * 0.5 * (1.0 + Math.tanh(sqrt2OverPi * (x + 0.044715 * x * x * x)));
-    }
-  } else {
-    // Exact formula using erf:
-    // x * 0.5 * (1 + erf(x / sqrt(2)))
-    const sqrt2Inv = Math.SQRT1_2; // 1/sqrt(2)
-    for (let i = 0; i < a.size; i += 1) {
-      const x = readAtLinear(a, i, shapeStrides);
-      out[i] = x * 0.5 * (1.0 + erf(x * sqrt2Inv));
-    }
-  }
-
-  return new Tensor(a.shape, out);
+  const body = approximate === "tanh" ? GELU_TANH_BODY : GELU_ERF_BODY;
+  return applyUnaryOp(a, body);
 }
 
 export function silu(a: Tensor): Tensor {
