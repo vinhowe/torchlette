@@ -32,7 +32,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+cd "$ROOT" || { echo "gate-wall: cannot cd to $ROOT" >&2; exit 1; }
 PROFILE="quick"
 DO_PICK=1
 GATE_TIMEOUT="${GATE_TIMEOUT:-3600}"
@@ -47,6 +47,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$PROFILE" in quick|training|full) ;; *) echo "bad --profile: $PROFILE" >&2; exit 2;; esac
+
+# --- worktree pre-flight: refuse to run in an unset-up tree ------------------
+# Enforcement beats instruction. A missing models/.venv symlink (the item-1 gap)
+# silently fails half the gates AND makes the torch oracle look "unavailable".
+# The wall will not run until agent-worktree-setup.sh --verify is green.
+if ! bash "$ROOT/tools/agent-worktree-setup.sh" --verify >/dev/null 2>&1; then
+  echo "[gate-wall] REFUSING to run: worktree is not set up." >&2
+  echo "[gate-wall] --- agent-worktree-setup.sh --verify ---" >&2
+  bash "$ROOT/tools/agent-worktree-setup.sh" --verify >&2 || true
+  echo "[gate-wall] fix: bash tools/agent-worktree-setup.sh   (then re-run the wall)" >&2
+  exit 3
+fi
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOGDIR="${TMPDIR:-/tmp}/gate-wall-$STAMP"
@@ -134,7 +146,7 @@ run_once() {
 log "profile=$PROFILE, ${#GATE_NAMES[@]} gates, logs in $LOGDIR"
 i=0
 while [ "$i" -lt "${#GATE_NAMES[@]}" ]; do
-  name="${GATE_NAMES[$i]}"; kind="${GATE_KINDS[$i]}"; cmd="${GATE_CMDS[$i]}"
+  name="${GATE_NAMES[$i]}"; cmd="${GATE_CMDS[$i]}"
   slug="$(echo "$name" | tr '/ :,' '____')"
   log1="$LOGDIR/${i}-${slug}.log"
   log "[$((i+1))/${#GATE_NAMES[@]}] $name ..."
