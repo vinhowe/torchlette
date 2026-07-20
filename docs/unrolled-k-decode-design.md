@@ -927,6 +927,193 @@ default-on) is UNBLOCKED.**
 
 ---
 
+## P4 STATUS — THE DEMO CUTOVER: greedy default-on, steering composes, sampled opt-in (2026-07-20)
+
+*Worktree off `main@48cda47b` (P3' HEAD). Staged commits, no push. dw-2-1 (A100),
+random-init Qwen3 (packages/qwen3-browser, the static-KV `forwardStatic` path),
+node v22 + Dawn/Vulkan vk-shim, device via `tools/pick-gpu.sh`. Reproduce:
+`eval "$(tools/pick-gpu.sh)"; LD_LIBRARY_PATH=tools/vk-shim:$LD_LIBRARY_PATH
+npx tsx tools/t-uk-cutover.ts` (the cutover routing gate), `… tools/t-uk-steering-diff.ts`
+(the steering differential), `… tools/t-uk-block-diff.ts` (mother gate),
+`… tools/t-uk-gumbel-parity.ts` (Gumbel logic).*
+
+### The cutover as landed — GREEDY default-on (opt-OUT), the flag inverted
+
+`generateChat` (both `packages/qwen3-browser` AND `packages/gemma2-browser` — the
+gemma2 block was the P1-deferred "mechanical port", now landed) routes **GREEDY
+decode through the unrolled-K block BY DEFAULT**. `unrolledKFromEnv()` inverted to
+opt-OUT: **UNSET → the block, `K = UNROLLED_K_DEFAULT = 4`**; **`0`/`1` → the
+per-token host loop** (the pre-cutover decode, the soak escape hatch); **`≥2` →
+the block at that K**.
+
+- **K DEFAULT = 4 (justified from the P3' multiplier).** K=4 is the sweet-spot
+  cell with the best compiled win (`host/def 1.43×`, `low/def 2.55×`) AND the
+  finest streaming granularity (K tokens per readback); K=8 is the other sweet
+  cell (`host/def 1.12×`); **K=16 REGRESSES** (`host/def 0.50×`, un-root-caused
+  memory-plan pressure). Default clamped to the low end of {4,8}.
+- **The residue (per-token host loop), by §4:** any **top-k / top-p / nucleus**
+  sampler (a full-distribution host read the block cannot express), **default
+  (unflagged) temperature sampling**, and any **non-static-KV** path. **The
+  shipped demo samplers are exactly this residue** — both `examples/qwen3-steering`
+  and `examples/gemma2-sae-demo` decode with `temperature 0.7, topK 20/40,
+  topP 0.95`, so their runtime decode stays on the host loop (byte-unchanged
+  pre/post cutover). The cutover changes the DEFAULT for the samplers the block
+  covers on-device; it does not silently alter the demos' sampling distribution.
+- **Sunset:** `TORCHLETTE_UNROLLED_K` born 2026-07-19 (opt-in), **default-on
+  2026-07-20 (this pass)**. No NEW flag; the opt-out reuses the existing one.
+  P6 removes the K=1 host loop for the covered samplers and retires the knob.
+
+### The steering hook composes with the block — BYTE-IDENTICAL (the load-bearing proof)
+
+The live consumers' core behavior is a residual-stream steering hook threaded into
+`model.forward` every step (`steering.ts makeResidualHook`: `x += α·dir` at layer
+L). Post-cutover that hook applies per-step **inside the block's graph**.
+**`tools/t-uk-steering-diff.ts` (VERDICT PASS)** proves the composition exact,
+using the demo's actual additive-steering mechanism:
+- **GREEDY composition**: hooked block ids **byte-identical** to the hooked
+  per-token host loop over 2 prompts × K∈{1,4,8,16} × a bucket crossing (all PASS).
+- **Steering is LIVE (α≠0)**: the hooked stream **differs** from the unsteered
+  (α=0) stream — so the composition proof is real, not a no-op agreeing with a
+  no-op. Unsteered block == unsteered host (baseline intact).
+- **α scales**: α=2 stream ≠ α=16 stream, and each still == its host loop —
+  the steering magnitude flows through the block unchanged.
+- **COMPILED vs LOWERED with the hook active**: hooked block build-from-IR
+  ENABLED (default) == LOWERED == host — steering composes with compiled replay.
+- **Zero uncaptured GPU errors** across the greedy composition.
+
+### The sampled (Gumbel) cutover — opt-IN, gated on a PRE-EXISTING transient (named blocker)
+
+The Gumbel sampled block (§3.5, on-device `argmax(logits/temp + gumbel)`) is
+**wired end-to-end** in `generateChat` (routing + a Gumbel-consistent prefill
+token, `gumbelPrefillToken`) but is **opt-IN via an explicit flag
+(`unrolledKExplicit`), NOT default-on**. Reason — a **P4-discovered PRE-EXISTING
+dropped-submit transient** in the sampled block path:
+
+- **Symptom:** `t-uk-gumbel-parity.ts` (which passes its ids-match verdict) emits
+  a `[Buffer] used in submit while destroyed` uncaptured GPU error — it never
+  asserted `getGpuUncapturedErrorCount()===0`, so the transient shipped unnoticed
+  at P3'. `t-uk-steering-diff.ts`'s sampled arm surfaces it as **actual
+  corruption** (the dropped submit's stale buffer feeds a load-bearing read →
+  sampled ids MISMATCH). It is timing-dependent (gumbel-parity's ids happened to
+  be unaffected; the steering ordering's were not) — the classic silently-wrong
+  class CLAUDE.md warns of.
+- **Root cause (traced, `TORCHLETTE_DEBUG_DESTROYED=1`):** the destroyed bind is
+  `kind=external ref=materialized storage=945 buf=b1` — the block's **first-token
+  upload** (`api.tensorFromArray([lastTok],[1,1])`), a materialized EXTERNAL, not
+  a harvest RESULT. The P3' park fix (`liveHarvestIdsForBuffer` /
+  `compiled._lastHarvestIds`) parks a torn-down registry-entry buffer only when a
+  live **harvest RESULT** backs it; it does not track external-INPUT uploads. In
+  GREEDY the block's `idx` feed IS the reshaped selection RESULT (a harvested id),
+  so it is parked — which is why greedy is STRICT_GPU-clean (`t-uk-block-diff`
+  zero errors). The sampled path's extra per-step `u` uniform upload shifts buffer
+  reuse so the un-parked first-token upload's buffer is destroyed while a consumer
+  plan binds it.
+- **Ruling:** fixing this is a real extension to the harvest-park mechanism in
+  the most delicate part of the runtime (the fence-gated destroy / cross-plan
+  buffer-lifetime class that has bitten this project repeatedly); per
+  `docs/agent-ops.md` (reproduce-before-theorizing; no blind lifetime fixes) it
+  is a **named, bounded follow-on**, not a same-pass patch. Shipping the sampled
+  block default-on would ship the corruption, so it is opt-in until the park
+  mechanism tracks external-input uploads (the fix: fold the phase-1 external
+  materialized storages into the park set, or park on the upload buffer's
+  registry-entry identity). The Gumbel SELECTION LOGIC is proven correct
+  (gumbel-parity's block==host); only its lifetime is gated.
+
+### Perf on the record (this A100 box, random-init Qwen3 8L/64d)
+
+The mother gate's block-vs-loop economics (N=16, K=8, lowered):
+
+| arm | submits | ms/tok |
+|---|---|---|
+| host per-token loop | 48 | ~110 |
+| **unrolled block (greedy)** | **15** | **~26** |
+
+**~3.2× fewer submits, ~4.2× faster ms/tok** on this tiny config — the host-tax
+amortization measured honestly. The compiled multiplier at demo scale is the P3'
+table (`host/def 1.43×` @ K=4, `getCompiledStreams>0`), still the authoritative
+number; the browser projection is a strict LOWER bound on `host/def` (the per-token
+host tax — fence + JS dispatch + slower readback bus — is a larger share of the
+per-token wall in-browser). **How to measure the browser number** (Vin's to run
+when next driving a demo): the demos read `TORCHLETTE_UNROLLED_K` via
+`globalThis.__TORCHLETTE_ENV__` (browser hook) — set it to `0` (host) vs unset
+(block K=4) across two runs and compare `stats.tokPerSec` / `decodeBreakdown`; a
+`?unrolledK=<K>` URL param wiring the same global is the one-line UI hook.
+
+### Gates run (all green unless noted)
+
+`tools/t-uk-cutover.ts` (P4 routing gate, PASS — greedy default→block
+byte-identical to opt-out host; explicit K→block; top-k+top-p→host residue; zero
+GPU errors); `tools/t-uk-steering-diff.ts` (PASS — greedy hooked composition +
+α-live + α-scale + compiled==lowered + zero GPU errors; sampled arm is a logged
+characterization of the transient); `tools/t-uk-block-diff.ts` **under
+`TORCHLETTE_STRICT_GPU=1`** (mother gate + compiled arm, byte-identical, zero
+errors — did not crash); `tools/t-uk-gumbel-parity.ts` (Gumbel logic block==host,
+PASS verdict; the sampled transient noted above); `tools/gate-wall.sh --profile
+training` (test:gates, parity-fullstack, tape-matrix ON≡OFF, ledger,
+checkpoint-seg — strict-lifetime default throughout); decode byte-unchanged when
+`TORCHLETTE_UNROLLED_K=0` (opt-out) or for the top-k/top-p residue. **Weight-norm
+delta:** `src` SLOC **unchanged** — the cutover lives entirely in `packages/`
+(admission pressure; packages/ is not the src diamond) and adds NO new env flag
+(opt-out reuses `TORCHLETTE_UNROLLED_K`). New tools: `t-uk-cutover.ts`,
+`t-uk-steering-diff.ts`.
+
+### P4 acceptance vs the phase plan (§5)
+
+§5 P4's gate — "the demos' token streams byte-identical pre/post cutover; browser
+suite green; SAE-steering interactivity unregressed" — is met **for the greedy
+covered path** (byte-identical, steering composes) and **trivially for the demos'
+top-k+top-p sampler** (it stays the host residue, path byte-unchanged). §5 P4 also
+says "remove the K=1-per-token host loop for the COVERED samplers" — that removal
+is P6's, and it is bounded to GREEDY here: **the demos' sampler is the §4 residue,
+so their host loop is NOT removed by this cutover.** This is the honest state of
+"the cutover frees the live consumers": the greedy path is freed; the demos' host
+loop persists as long as they sample with top-k/top-p — which forks P5 (below).
+
+---
+
+## P5 — THE LEDGER EXECUTION (declared next, with its absence-proof checklist)
+
+The P4b ledger (`step-function-compiler-design.md` §5: obs-liveness 807 + step-tape
+820 + replay 680 + step-object 156 + cross-plan-edges 152 + tape-profile 18 =
+**−2633** outright, + **−1100…−1900** partial) executes ONLY once decode is
+proven **no longer a consumer** of the tape / observed-liveness / cross-plan-edges
+— per-item, each with a **consumer-ABSENCE re-proof** mirroring the P4b
+presence-proofs (Objection 3 / risk 1: no file deleted while a decode demo routes
+through it). P5's entry checklist:
+
+1. **The consumer fork must be closed FIRST.** P4 freed GREEDY decode to the block,
+   but the **shipped demos still route their top-k+top-p sampling through the
+   per-token host loop** (the CapturedFn + tape). So the tape's decode consumer is
+   NOT yet gone. P5 is BLOCKED until one of (forks §8 Q1, Vin's call):
+   - (a) the demos adopt a block-covered sampler (greedy or on-device Gumbel), OR
+   - (b) on-device small-top-k + top-p lands (§4 net-new: workgroup `inclusiveScan`
+     prefilter + Gumbel; §8 Q1), moving the demo sampler onto the block, OR
+   - (c) the sampled-block **transient is fixed** AND the demos switch to Gumbel.
+   Until then the P4b STOP rule holds: a proven decode consumer remains.
+2. **Absence re-proofs (run under unrolled-K, greedy-and-block-sampler decode):**
+   - **`tools/t-p4b-decode-edges.ts` under unrolled-K** ⇒ expect
+     `crossPlanEdgeStats().producers = 0` and no observed-liveness convergence on
+     the decode path (the P4b PRESENCE proof was `producers=1, convergedTemplates=1`;
+     the deletion gate is BOTH → 0 because the block STATES its liveness).
+   - **`tools/t-decode-whole-step.ts`** ⇒ expect **Verdict A** (decode traces +
+     compiles as a distinct static function), inverting P4a's Verdict B.
+   - **Per-item consumer-absence** for each file before deleting it, decode AND
+     training: `cross-plan-edges.ts` (152) → `tape-profile.ts` (18) →
+     `step-object.ts` (156) → `step-tape-replay.ts` (680) → `step-tape.ts` (820)
+     → `observed-liveness.ts` (807), plus the partial harvest/arena/pool
+     reductions — each behind a green parity gate, the retained two-plan-eager
+     path + `CHECKPOINT_EAGER_REFUSAL` (P4b PERMANENT POLICY, a TRAINING concern)
+     untouched.
+3. **The fix P5 also wants from P4's residue:** the sampled-block park-external
+   fix (above) is the same lifetime discipline the ledger's harvest/arena
+   partial reductions touch — closing it feeds P5's harvest-seam re-proof.
+
+The covenant reaches net-negative when this ledger executes (§5 projected
+`src` **−3100…−3600 vs pre-Everest**); P4 is the cutover that unblocks the greedy
+half of the consumer removal, and names precisely what still gates the rest.
+
+---
+
 ## Appendix — reproduction
 
 - Probes (this worktree, `main@1cc28d3e`): `tools/t-uk-feedback.ts` (P1),
