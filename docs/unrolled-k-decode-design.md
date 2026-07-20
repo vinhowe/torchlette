@@ -739,6 +739,177 @@ P3's seed-as-data reuses.
 
 ---
 
+## P3' STATUS — the RoPE generator (block compiles → the REAL multiplier), Gumbel sampling, the failed-gen memo (2026-07-20)
+
+*Worktree off `main@0b4d4900` (P2 HEAD). Staged commits, no push. dw-2-1 (A100),
+random-init Qwen3 (the static-KV `forwardStatic` path), node v22 + Dawn/Vulkan
+vk-shim, device reserved via `tools/pick-gpu.sh`. Reproduce: `eval "$(tools/pick-gpu.sh)";
+LD_LIBRARY_PATH=tools/vk-shim:$LD_LIBRARY_PATH npx tsx tools/t-uk-multiplier.ts` (the
+multiplier), `… tools/t-uk-gumbel-parity.ts` (Gumbel), `… tools/t-uk-block-diff.ts`
+(mother gate + compiled arm), `TORCHLETTE_DEBUG_CENSUS=1 … t-uk-block-diff.ts` (census).*
+
+### The census correction — the P2 `{fusedRoPE}` attribution was right on the OP, wrong on the WHY
+
+The P2 census named `{fusedRoPE}` as the lone residual and attributed it to "RoPE's
+per-position offset is a per-replay-varying uniform" (the frozen-uniform class). The
+**runtime census on the actual `forwardStatic` path falsifies the WHY**: on the
+static-KV decode path the RoPE cos/sin are **`gather` results**, not narrow views —
+the model deliberately routes the position through the gather's INDEX TENSOR as DATA
+(`model.ts` `buildRope`: "position enters as an INDEX TENSOR … so the plan template
+stays stable across decode steps") precisely BECAUSE a narrow view's per-token `start`
+is payload the template fingerprint hashes. A gather output is contiguous+offset-0, so
+**the RoPE config's `cos_offset`/`sin_offset` are 0 on this path** — the position never
+enters the RoPE config at all; it is already covered as data in the gather index.
+fusedRoPE was uncovered simply because it had **no generator** in `generateSequential`,
+not because of a varying offset. (Prior-agent attributions are hypotheses, not facts —
+`docs/agent-ops.md`. The runtime census, `TORCHLETTE_DEBUG_CENSUS`, was the referee.)
+
+### The RoPE mechanism as landed — offset-as-volatile-data, unconditional (the seam)
+
+`generateRoPE` (`src/executor/stream-generate.ts`) + `planRoPEDispatch` /
+`ropeVolatilePack` (`src/backend/webgpu/rope-kernel.ts`, single-sourced with the
+imperative `dispatchRoPE` through the same `ropeTileKernel`) emit, per node:
+`ALLOC(output) + a per-node params slot (the tile config as a UNIFORM buffer) +
+TAG_UNIFORM(volatile offset repack) + DISPATCH [input, cos_table, sin_table, output,
+config]`.
+
+- **How the offset flows.** The tile config's `{seq_len, head_dim, sin_scale,
+  cos_offset, sin_offset}` are re-derived from the CURRENT node every replay by a
+  volatile `TAG_UNIFORM` (`ropeVolatilePack` → the instance's `volatilePack` → the same
+  `packUniforms` the imperative dispatch writes; the offsets from `directInputOffset`,
+  single-sourced with #71's view-meta deriver). This is the compiled-plan-volatile-
+  uniforms precedent (`setAdamConfigUniforms` the exemplar). A per-node params slot (not
+  the shared keyed config buffer) is used deliberately: distinct buffers per rope node
+  avoid the `volatileRewriteNeedsFlush` storm a shared config would trigger across the 4
+  rope dispatches/step.
+- **The seam assertion — no positional value bakes.** The volatile repack is emitted
+  **UNCONDITIONALLY**, so the record-time offset is overwritten on every replay by
+  construction — a positional value can never freeze. On the gather path the repack
+  writes 0 (position is in the gather index); on any contiguous-narrow path it re-derives
+  the real offset. qk (input 0) is raw-bound flat-from-0 (`CONTIGUOUS_OPERANDS ["fusedRoPE",
+  [0]]`); cos/sin need only contiguous STRIDES (offset folded), asserted by
+  `refIsContiguousStrides` — which handles the RELEASED-storage case (decode cos/sin are
+  gather intermediates freed before plan-build) by deriving contiguity structurally (a
+  non-view producer allocates contiguous+offset-0 by construction); a released view
+  producer bails to lowered rather than fold into a possibly-strided table.
+
+### The census after RoPE — EMPTY (steady-state fully covered) → the block COMPILES
+
+Runtime census on the K=8 block (`~1049`-node plan, one force): **steady-state uncovered
+= `{}`**. The only census lines are the FIRST-EXECUTION artifacts
+(`op:*[config-missing]`, `fused[no-input-pattern]`) that `populateCapturesFromIR`
+captures on the 1st run and covers on the 2nd+ — never logged at steady state. The block
+reaches full coverage → **compiled forward replay** (`getCompiledStreams()>0` on every
+`block-comp` multiplier cell). The mother gate (`t-uk-block-diff`) is byte-identical
+compiled==lowered==host across the full P1 matrix.
+
+### THE REAL MULTIPLIER (measured, honest — random-init Qwen3 8L/512d, N=64, 3 repeats, medians)
+
+| K  | block-low ms/tok | subs | block-def ms/tok | subs | host/low | host/def | low/def |
+|----|-----------------|------|-----------------|------|----------|----------|---------|
+|  4 |           61.96 |  144 |          **24.26** |  144 |    0.56× |  **1.43×** | **2.55×** |
+|  8 |           56.49 |  120 |          **30.81** |  120 |    0.61× |  **1.12×** | **1.83×** |
+| 16 |           59.60 |  112 |           68.88 |  112 |    0.58× |    0.50× |   0.87× |
+
+*host per-token loop: 34.62 ms/tok, 192 submits (K-independent). `getCompiledStreams>0`
+on every block-comp cell = YES.*
+
+- **block-def** = build-from-IR ENABLED (the shipping DEFAULT). With the RoPE generator
+  the block fullyCovers and reaches **compiled forward replay** — **`low/def = 2.55×` at
+  K=4** (compiled 2.55× faster than the lowered block) and **`host/def = 1.43×`** (faster
+  than the per-token host loop). **This is the compiled-forward win the P2 design projected,
+  now REALIZED** — RoPE coverage was the single gate, exactly as P2 predicted (the WHY was
+  "add a generator", not "offset-as-data", but the offset-as-data is the correct robust
+  mechanism and it is what landed).
+- **P2's honest verdict is INVERTED.** P2 measured `low/def ≈ 0.77×` (build-from-IR
+  net-NEGATIVE — every block wasted a failed generateStream attempt on the uncovered
+  ~1000-node template). Post-RoPE that tax is gone and the compiled replay is the win.
+- **block-low** = build-from-IR DISABLED (`TORCHLETTE_COMPILED_PLAN=0`): the pure-lowered
+  floor. It is slower than host here only because host decodes WITH build-from-IR (its
+  per-token forward compiles) — block-low is a lowered-vs-compiled control, not a shipping
+  path.
+- **The K=16 regime regresses** (block-def 68.9 ms/tok, low/def 0.87×) — reproducible
+  across both runs. The larger unrolled template (~2097 nodes, 16 steps of activations
+  live at once) raises the compiled per-token overhead above the K=4/8 sweet spot; the
+  cause (memory-plan pressure vs a partial-recompile) is un-root-caused. **The sweet spot
+  is K∈{4,8}.** Named, not hidden.
+- **Browser projection:** the per-token host tax (fence + JS dispatch + slower readback
+  bus) is a larger share of the per-token wall in-browser, so `host/def` is a strict LOWER
+  bound for the browser amortization win.
+
+### Gumbel-max sampling (P3) — on-device, deterministic, seed-as-DATA
+
+`decodeBlock`'s `opts.sample = { temperature>0, seed }` makes the feedback selection
+on-device **Gumbel-max**: `id = argmax(logits/temperature + g)`, `g = -log(-log(u))`.
+The uniform `u` is the seed-as-DATA channel (§3.5 explicitly sanctions "an uploaded
+uniform/tensor"): `gumbelUniform(seed + absolutePosition, V)` (a mulberry32 host PRNG,
+the SINGLE SOURCE both `decodeBlock` and the parity reference draw from) is uploaded as a
+tensor, and the transform + `argmax` close on-device (no per-token readback inside the
+block). The seed is **position-canonical** (`seed + absolutePosition`), so it is
+byte-reproducible across replay AND aligns a per-token host loop's seeds with the block's
+regardless of K/bucketing. `temperature===0` stays the greedy `argmax(logits)` path,
+unchanged. Full-vocab top-p / arbitrary host samplers remain the typed K=1 host residue
+(§4).
+
+*Why uploaded-uniform, not on-device `randF32`:* the on-device RNG data-source
+(`api.rand`) tripped a lowered-path buffer-destroy in the block's forced graph, and the
+§3.5 "uploaded uniform/tensor" pattern is both the sanctioned channel AND cleaner
+(host-controlled determinism, no RNG-buffer lifetime). The GPU-Philox variant (seed as a
+tiny uniform, noise generated on-device) remains a possible future optimization gated on
+`rand`-as-data coverage — the SAME shape as any per-replay-varying uniform — but is not
+needed for correct, deterministic sampling.
+
+**Gate `tools/t-uk-gumbel-parity.ts` (all PASS):** (1) PARITY — the sampled block is
+byte-identical to a per-token host-loop reference drawing the same per-position seeds and
+the same on-device Gumbel-max, over K∈{1,4,8} × short + bucket-crossing prompts; (2)
+DETERMINISM — same seed decodes byte-identically twice; (3) SEED SENSITIVITY (T=30, gumbel
+-dominated so the argmax-dominated tiny model actually varies) — different seed ⇒ different
+stream; (4) TEMPERATURE 0 == greedy; (5) GUMBEL FORMULA unit — device
+`argmax(logits/temp + -log(-log(u)))` == host, wide-margin.
+
+### The failed-generation-tax — memoed for the GENERAL class (sized, not forced)
+
+The RoPE coverage removes the tax for the decode block (it now fullyCovers). For the
+GENERAL class — any genuinely-uncovered RECURRING template (a strided view, a >128MB
+chunked path, a non-f32 dtype) that re-enters the build block every step and re-pays the
+whole ~N-node `generateStream` walk for a verdict that never changes — a cheap memo lands
+(`executor.ts` `buildFailures` / `BUILD_FAILURE_MEMO=4`, no flag): after 4 consecutive
+coverage misses a template's structure will not become coverable mid-process (generators
+are static; templateFp hashes structure), so the verdict is memoed and the build block
+skipped straight to lowered. The threshold sits ABOVE the warmup horizon (config-missing /
+no-input-pattern artifacts resolve by the 2nd execution, and a fullyCovered result deletes
+the counter), so a truly-coverable template is never stranded. Always-on, strictly a saving.
+
+### The one blemish — a compiled-plan external-buffer-destroy transient (P4 precondition)
+
+Making the block compile newly exercises a **bounded, non-corrupting** compiled-plan
+external-lifetime transient: in the block-diff's single long-lived process (many block
+templates: K=1/4/8/16 × prompts), a compiled plan binds an EXTERNAL materialized input
+(`kind=external ref=materialized`, the block's per-block host-token `idx` — NOT a RoPE or
+params buffer) that was destroyed → "used in submit while destroyed", the dropped-submit
+class (CLAUDE.md). Evidence it is a per-template-first-compile transient, not a corruption:
+it is **bounded to 2 occurrences**, ABSENT when fully lowered (`COMPILED_PLAN=0`), ABSENT
+in the isolated-process multiplier (steady-state compiled decode — host AND block arms —
+is clean), and **every gate remains byte-identical compiled==lowered==host**. Blast radius
+is RoPE-using compiled plans only (training uses learned position embeddings, not
+fusedRoPE — the gate-wall training profile is unaffected). **P4 (demo cutover / default-on)
+is gated on root-causing this external-destroy** (the block's fresh-per-block `idx`
+external captured by a compiled plan across a template transition) — the win is real and
+measured; the transient must be proven benign or fixed before the compiled block ships
+default-on. Named, reproducible (`TORCHLETTE_DEBUG_DESTROYED=1 … t-uk-block-diff.ts`),
+not swept.
+
+### Gates run
+
+`tools/gate-wall.sh --profile training`; `test/argmax-strided-view.spec.ts`;
+`tools/t-uk-block-diff.ts` (mother gate + compiled arm, byte-identical); the census
+(`TORCHLETTE_DEBUG_CENSUS=1` → steady `{}`); `tools/t-uk-generators-parity.ts`;
+`tools/t-uk-gumbel-parity.ts` (all PASS); `tools/t-uk-multiplier.ts` (the table above);
+`tools/t-uk-feedback.ts`; decode paths byte-unchanged when `TORCHLETTE_UNROLLED_K` is off
+(block branch compile-time-guarded); strict-lifetime default.
+
+---
+
 ## Appendix — reproduction
 
 - Probes (this worktree, `main@1cc28d3e`): `tools/t-uk-feedback.ts` (P1),
