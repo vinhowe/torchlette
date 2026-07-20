@@ -122,8 +122,11 @@ register_training() {
   add_gate "checkpoint-seg-spec"    vitest "npx vitest run --project webgpu test/checkpoint-segmentation.spec.ts"
 }
 register_full() {
+  # t-witness-harvest-matrix reads TORCHLETTE_STEP_TAPE at module load and bails
+  # ("FAIL: set TORCHLETTE_STEP_TAPE=record") if unset — the same module-load
+  # precondition the tape gates above honor. The env must be exported per gate.
   for cell in checkpoint medium chunked124m scaler-inf lr-milestone; do
-    add_gate "witness:$cell"        tsx    "CELL=$cell npx tsx tools/t-witness-harvest-matrix.ts"
+    add_gate "witness:$cell"        tsx    "TORCHLETTE_STEP_TAPE=record CELL=$cell npx tsx tools/t-witness-harvest-matrix.ts"
   done
   add_gate "ledger-48"              tsx    "STEPS=48 npx tsx tools/t-ledger-attack-probe.ts"
   add_gate "profile-distil"         tsx    "TORCHLETTE_PROFILE=1 TORCHLETTE_MODEL=distilgpt2 TORCHLETTE_SEQ_LEN=512 NUM_STEPS=18 npx tsx tools/profile-training.ts"

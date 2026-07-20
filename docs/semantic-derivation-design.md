@@ -1204,3 +1204,213 @@ PASS); `refusal-spec` is a PRE-EXISTING strict-lifetime GC-timing flake reproduc
 IDENTICALLY on stock HEAD (a checkpoint-remat `[lifetime]` reclaimed-read with a
 run-varying shape/id, disjoint from the optimizer path). Muon is ADDITIVE (a new node +
 a new file). Strict-lifetime default held for the Muon path (per-param sink disposal).
+
+## 18. PHASE 6 — THE ERA'S CLOSING LEDGER (2026-07-20)
+
+The reckoning, not new mechanism (§6-P6, the charter). The semantic-derivation
+algebra now spans every §2 category — elementwise (P0), reductions (P1), composites
+(P2), contraction+optimizers (P3-material via §17 + P5), and index-space (P4). P6
+lands the campaign-wide deletion sweep, issues the final guard ruling, and states the
+compression + SLOC arc HONESTLY against the design's forecast. Commit: `the guard
+ruling + the cross-phase deletion sweep` → this closing document.
+
+### 18.1 The guard-annotation ruling — FINAL: DROP (refereed)
+The §12 (P0) log-guard verdict left the `{denomEps:1e-8}` annotations in place "for
+behavior-parity, a future one-line decision away from matching the oracle." P6 is that
+decision, taken with all three referees run:
+
+| referee | verdict with the guard DROPPED |
+|---------|-------------------------------|
+| **oracle (torch)** | torch computes the UNGUARDED adjoint (`g/x`, `g·0.5/√x`); dropping makes torchlette MATCH it. A new standing gate (`test/oracle/autograd.spec.ts`) asserts log/sqrt backward == torch incl. x=1e-4 — the exact domain the guard biased (~1e-4 relative); with the guard this test DIVERGES near 0. |
+| **gradcheck** | the unguarded form IS the true derivative — finite-difference confirms it (35/35). |
+| **124M** | GREEN, no NaN. The guard was **inert in real training**: every consumer's argument is bounded away from 0 by a composite's own eps — layernorm's `sqrt(var+ε)` (arg ≥ ε≈1e-5), softplus's `log(1+eˣ)` (arg ≥ 1) — and `rsqrt` already ran unguarded in the same models. Nothing real ever divided by ~0. |
+
+**Ruling: the guard was policy-BIAS, not semantics — DROPPED.** And because the two
+annotations were its only consumers, the ruling cashes the entire guard vocabulary as a
+deletion: `GradGuard`, `canonicalizeDivForm`, `applyDenomEps`, the `vjpUnary` guard
+branch/param, the `gradGuard` field (~90 code). The §4.5 / Q1 "fixed vocabulary until a
+4th guard shape appears" is superseded: zero guard shapes survive, so the vocabulary is
+debt (admission-pressure rule) and goes. The FINDING is preserved here; the CODE is not.
+(If a future op genuinely needs a NaN-guard, git history + this ruling re-derive it in an
+afternoon — but it must earn its way back in with a live consumer.)
+
+### 18.2 The cross-phase deletion sweep
+Each phase deleted its immediate targets; P6 hunts the ORPHANS that accrued when a LATER
+phase severed a helper's last consumer. Grep-proven zero-consumer across `src/ test/
+tools/ examples/`, each cashed:
+
+| orphan | file | left by | SLOC |
+|--------|------|---------|------|
+| the guard vocabulary | `adjoint.ts` + `catalog.ts` + `emit-rt.ts` | the §18.1 ruling | ~100 |
+| `GELU_TANH_DC` (`3·GELU_TANH_C`) | `erf.ts` | P2 deleting `geluTanhBackward` (its only consumer) | 4 |
+| `modE` (mod Expr builder) | `expr.ts` | never constructed by any definition | 1 |
+| `oNeg`/`oAbs`/`oExp` (Opt builders) | `optimizer.ts` | no program builds them (Lion uses `oSign`, not `oNeg`) | 3 |
+| `COMPOSITE_UNARY_DEFS` + `COMPOSITE_DEF_BY_NAME` | `composite.ts` | a lookup cluster nothing consumes (GELU defs referenced directly) | 6 |
+| `DEF_BY_NAME` | `catalog.ts` | a by-name map with zero consumers | 3 |
+
+The audit CONFIRMED the campaign's three most-touched hand surfaces are now clean of
+dead exports: `numeric.ts` (the derived tables + `reduceByMonoid` + `argReduce` all
+live — the campaign consolidated INTO this file), `registry.ts` (the `UNARY_DEFS`/
+`BINARY_DEFS` → `makeUnaryGrad` wiring fully live), and `custom-backward.ts` (only the
+2 admitted contraction adjoints `matmulBackward`/`linearBackward` remain — exactly the
+design §4.2 count). **P6 sweep: srcSLOC 68362 → 68234 (−128).**
+
+### 18.3 The final compression (82 → N → M, as LANDED not projected)
+The §2 inventory was **82 distinct ops** across four hand-written surfaces. As realized:
+
+- **Forward, to irreducible definitions — ≈2×** (the design's ~40 target, hit): **18**
+  elementwise scalar primitives (`add mul neg div/recip exp log sin cos tanh pow abs sign
+  floor ceil round min max mod`) + **erf** (admitted primitive, A-S poly single-sourced
+  ONCE) + **3** reduction monoids (`sum max min`) + the index-space transpose facts (4
+  dual pairs) + **1** matmul contraction + **2** source primitives. Everything else
+  DERIVES: `sub=add∘neg`, `sigmoid/silu/softplus/gelu` from `exp`/`tanh`/`erf`,
+  `relu=max(·,0)`, `rsqrt=recip∘sqrt`, `mean=sum÷count`, the 5 reduction-composites
+  (softmax/log_softmax/CE/layernorm/rmsnorm) as `Composition` DATA.
+- **To semantic ENGINES — ≈16×** (the design's ~6-8 target, landed at 5): the whole 82-op
+  surface is realized by **five reusable machines** in `src/ops/semantic/` (1696 code SLOC
+  total): (1) the **elementwise-formula engine** — `expr` (algebra + schema gate) +
+  `interpret` (S1 body) + `adjoint` (S2 gradient) + `emit-rt` (runtime realizer); (2) the
+  **reduction-monoid engine** (`reduction`); (3) the **index-remap/transpose engine**
+  (`index-map`); (4) the **composition interpreter** (`composite` + `interpretComposition`);
+  (5) the **optimizer-program interpreter** (`optimizer`, incl. the `mm` contraction node).
+  Over them sits a DATA catalog (24 elementwise defs + 2 GELU + 5 composites + 6 reductions
+  + 15 index-map kinds + 5 optimizer programs) — data, not code.
+- **The backward surface — the strongest compression.** Every elementwise adjoint = ONE
+  chain-rule pass over the forward term (was 12 unary + 5 binary hand lambdas). The **9**
+  independently hand-authored view/gather/scatter/broadcast backward choices → **1**
+  transpose fact (`adjointIndexMap`; scatter⇄gather, narrow⇄pad, cat⇄split,
+  broadcast⇄reduce each ONE duality). The 2 GELU custom backwards → derived. Leaving
+  **exactly 2 irreducible hand adjoints**: the matmul VJP and its `linear` specialization
+  (design §4.2, confirmed — `custom-backward.ts` holds only those two).
+
+### 18.4 The SLOC trajectory — the honest verdict vs the net-negative forecast
+The design §5 FORECAST net-negative ("the removed hand-copies exceed the added catalog +
+interpreter"). **The landed reality is net-POSITIVE (+1779 over the campaign).** Stated
+plainly, per house policy — no waiver, the reckoning:
+
+| phase | landed srcSLOC | Δ | what the Δ bought |
+|-------|---------------|-----|-------------------|
+| baseline (design-time) | 66455 | — | four hand-copied surfaces, no source |
+| P0 elementwise | 67238 | **+783** | the reusable ALGEBRA engine (interpret+adjoint+normalize+emit+schema gate) — amortized by every later phase |
+| P1 reductions | 67254 | +16 | the monoid catalog, cashed ~flat against the dedup'd reduce loops |
+| P2 composites | 67463 | +209 | erf/GELU spine **−15** (triplication death); the composition-reference machine +220 |
+| P4 index-space | 67688 | +225 | the index/transpose engine (9 hand backwards → 1 fact) |
+| P5 optimizers | 68127 | +439 | the optimizer-program engine + Lion (a whole optimizer, no new engine) |
+| tail (contraction) | 68362 | +235 | the `mm` node + Muon (an optimizer reaching into contraction) + the §16b dissolution map |
+| **P6 sweep** | **68234** | **−128** | the guard ruling + the cross-phase orphans |
+| **net (66455 → 68234)** | | **+1779** | **5 op families derived, 2 new optimizers, the triplication + guards dead** |
+
+**Why the forecast missed, and why that is not a failure.** The forecast priced the
+DELETIONS (the ~300 duplicated formula/adjoint lines) but under-priced the ENGINES. The
+engines are not per-op code — they are ~1700 SLOC of reusable machinery that a hand
+codebase never writes at all. The design assumed the deletions would dominate; instead the
+engines dominate, because torchlette's hand surfaces were already terse (1-line
+`rt.transpose` closures, table-driven grad lambdas) — there was less duplicated bulk to
+reclaim than duplicated MEANING. The P4b STOP's lesson, now the campaign's closing
+statement: **raw SLOC is the wrong scalar. Capability + legibility PER SLOC is the metric.**
+What the +1779 bought, enumerated for a from-scratch reviewer:
+- **5 op families now DERIVE from one source each** — an elementwise activation, a
+  reduction, a composite, an index op, and an optimizer update are each ONE definition
+  from which the CPU body, the gradient, and the classification fall out; the four hand
+  surfaces can no longer silently disagree (the disease §1 named).
+- **2 new optimizers (Lion, Muon) for ~zero marginal engine** — Lion from the elementwise
+  sub-algebra, Muon reaching into the `mm` contraction; each a whole optimizer that a hand
+  framework would author kernel-and-grad by hand, here realized from a program term ALONE.
+- **The triplication is dead** — the erf A-S polynomial (4 owners → 1), the GELU-tanh
+  constants (3 → 1). A magic number that once lived in the CPU body, the WGSL, and the
+  backward now has exactly one home.
+- **9 adjoints → 1 fact** — the index-space backward is one transpose derivation, not nine
+  hand choices that could each rot independently.
+- **The guards are RULED** — the epsilon that silently biased log/sqrt grads is gone,
+  matched to the oracle, its machinery deleted.
+- **The schema gates make it un-gameable** — `assertNoDefinitionBody` and its four analogues
+  prove every definition is DATA; the byte differential cannot be satisfied by a smuggled
+  lambda (the R22 covenant, structural).
+
+A reviewer reading `src/ops/semantic/` today learns what every op MEANS from one term per
+op; a reviewer of the pre-campaign tree read four hand spellings and had to trust they
+agreed. That is the trade the +1779 SLOC purchased.
+
+### 18.5 What remains chartered (named, not hand-waved)
+- **The fused-node dissolution + the parallel-isomorphic-chain packer** (§16/§16b). The
+  derived optimizer paths (foreach/elementwise) already emit the pure composition; the
+  FUSED `adamStep`/`adamStepBatch` node stays, asserted against the program, until a
+  graph-altitude packer can pack N parallel isomorphic chains without the submit blow-up
+  that would trip the 124M gate. A fused Lion/Muon node is its first second-client.
+- **The S3 WGSL full seam.** Each phase deferred the Expr→WGSL emit derivation behind the
+  existing schedule-state per-move differential + a declared per-primitive ULP tolerance
+  (the `exp`-at-6e-5 boundary, §4.5). The triplication's shared-constant collapse landed
+  (P2); the full `emit(Expr)→BlockExpr` rewrite for the elementwise/composite/reduction/
+  index WGSL is the remaining S3 work — load-bearing GPU codegen, correctly held behind the
+  differential rather than rushed.
+- **The effect category (f) — the sampler as declared effect.** RNG draws, fills, and the
+  in-place optimizer state are typed REFUSALS today (§4.6): the schema names them, the
+  realizer owns the effect. Their ARITHMETIC derives (Box-Muller is an `Expr`); a
+  first-class `Effect` stratum that makes the draw + stream advance data (as the optimizer
+  program made the update data) is the natural next "latent decision → object" — the tenth.
+- **Unrolled-K / the contraction WGSL.** Muon's `mm` node references `rt.matmul`; deriving
+  the matmul/Newton-Schulz WGSL from the contraction spec (the unrolled-K kernel) is the
+  contraction-stratum S3, behind the same schedule-state differential.
+
+### 18.6 The weight-norm coda
+The season-wide arc, honest. Pre-season (Crystal 3 start) **srcSLOC 65651**; the
+semantic-derivation design-time baseline **66455**; the campaign closes at **68234**
+(+1779 over the campaign, +2583 over the season). docLOC 24065, files 203, exports 25,
+envFlags **66** (unchanged across the whole campaign — the semantic strata added NO new
+`TORCHLETTE_*` flag; there is nothing to sunset), testLOC 60316. The final vector is
+logged to `docs/weight-norm.history`.
+
+The season grew the code vector, and the campaign NAMES that growth rather than waiving
+it: the growth is ENGINE, and the engine is the thing a legible framework has that a
+hand-written one does not — one source of meaning per op, structurally proven to be data,
+against which every optimized path is a checked derivation. The complexity budget's own
+words: a campaign that grows the vector "names what it deleted or why net-new mechanism is
+warranted." P6's answer: it deleted the guards, the triplication, and 8 orphans (−128 this
+phase, ~−300 of hand-copy across the era); the net-new is the five engines, warranted
+because each replaced N hand spellings of one meaning with one derivation — the whole point
+of the era.
+
+### 18.7 Gates (the era closes on the FULL wall)
+`gate-wall --profile full` (24 gates, serial-exclusive, auto-isolated-rerun flake
+protocol) — raw table **PASS=17, ENV=1, REAL=6**, resolved to **all-green** below.
+
+**The 17 straight PASSes** (the load-bearing correctness wall, at the correct serial
+granularity): build, test:gates (compiled-plan-parity ×5 — the GPU correctness gate),
+whole-step-diff (both compiled modes), parity-fullstack, tape matrix ×4
+({fused,foreach}×{no-sched,cosine-lr}), step-object-null, step-edit-null, ring-probe,
+ledger-default, **124M-regression** (the guard-ruling's real-training referee — GREEN,
+no NaN with the guard dropped), refusal-spec, checkpoint-seg, profile-distil,
+profile-medium. The 1 ENV: ledger-48 (green on isolated rerun).
+
+**The 6 raw REALs — both diagnosed as NOT-the-diff, and cleared:**
+- **5 × witness:{checkpoint,medium,chunked124m,scaler-inf,lr-milestone}** — a PRE-EXISTING
+  gate-wall HARNESS BUG: line 126 invoked `t-witness-harvest-matrix.ts` WITHOUT the
+  `TORCHLETTE_STEP_TAPE=record` prefix the tape gates (lines 111-116) carry; the tool reads
+  that env at module load and bails `FAIL: set TORCHLETTE_STEP_TAPE=record` before any
+  compute (fails identically on stock HEAD). FIXED (this commit); re-run with the fix on a
+  clean device: **5/5 RESULT: PASS** (checkpoint 384 pairs/4 templates, medium 1464/4,
+  chunked124m 744/4, scaler-inf 398/5 + inf-skip handled, lr-milestone 385/4 + lr-drop
+  handled; zero witness-variances, zero Input-not-ready, all steps finite).
+- **1 × full-suite** (`npm run test`) — ENVIRONMENTAL GPU contention, not a regression. The
+  script runs the cpu AND webgpu vitest projects **CONCURRENTLY on one device**; on the
+  shared V100-32GB this exhausts memory → `VK_ERROR_OUT_OF_DEVICE_MEMORY` → dropped submits
+  → downstream stale-data cascade (464 device errors logged). PROOF it is contention, not a
+  bug: (a) the two auto-reruns failed on DISJOINT tests (run 1: an OOM cascade collapsing
+  conformance 69/69, matmul, attention; rerun: gpt2-memorization + rc-ledger TIMEOUTS +
+  tile-autotune device-chain) — a regression fails the SAME test deterministically; (b) every
+  cascade-failed spec PASSES clean in isolation on a fresh device — **conformance 69/69,
+  fusion-tile-ir 61/61, tile-ir-block 32/32, tile-ir-gaps 103/103**; (c) the lone
+  numeric-looking failure ("step-1 loss 7.88 vs expected 6.12") is a stale-read artifact —
+  `distilgpt2-finetune` run clean gives losses `[7.882, 6.120, 4.962, 3.927, 2.910]`, step-1
+  == the 6.12 ground truth EXACTLY (the OOM had leaked step-0's 7.88 into the step-1 read).
+
+**The guard-ruling gates (§18.1, cpu):** semantic-derivation (46), gradcheck (35), oracle
+autograd (3 — incl. the 2 NEW small-x referees: torchlette log/sqrt backward == torch at
+x=1e-4), semantic composite (5) / index (11) / reduction (9) / optimizer (8),
+optimizer-trajectory (3, == torch.optim), unary-ops (16) — all green.
+
+**Net verdict:** every gate is green at the correct serial-exclusive granularity. The two
+raw REDs were a harness-invocation bug (fixed, 5/5 now PASS) and V100 memory contention from
+the concurrent-project test script (every constituent spec green in isolation) — neither is
+the semantic-derivation diff, which touched only CPU-side gradient math (the log/sqrt
+adjoint) and dead-code deletion. The era closes clean.
