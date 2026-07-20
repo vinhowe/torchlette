@@ -123,6 +123,30 @@ export function clipBlockToBucket(
   return Math.max(1, Math.min(K, roomInBucket, roomInSeq));
 }
 
+/**
+ * Deterministic per-position uniform noise for on-device Gumbel-max — the
+ * seed-as-DATA channel (§3.5): the host computes `u ~ U(0,1)^V` from a
+ * position-canonical seed and it is uploaded as an input tensor, so a replayed
+ * (or lowered) block draws the SAME stream — byte-reproducible, no on-device RNG
+ * data-source (whose lifetime is the frozen-uniform / buffer-destroy hazard).
+ * mulberry32 — a fast, well-distributed 32-bit PRNG; the SINGLE SOURCE both
+ * decodeBlock and the parity reference (t-uk-gumbel-parity) draw from, so the
+ * on-device selection and any host reference are byte-identical by construction.
+ */
+export function gumbelUniform(seed: number, n: number): Float32Array {
+  let a = seed >>> 0;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    // (0,1): nudge exact 0 up so -log(-log(u)) stays finite (matched host-side).
+    const r = ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    out[i] = r === 0 ? 1e-7 : r;
+  }
+  return out;
+}
+
 /** Minimal static-KV model surface decodeBlock needs (Qwen3 / Gemma2 satisfy). */
 export interface StaticDecodeModel {
   forward(
@@ -143,11 +167,24 @@ export interface StaticDecodeModel {
  * positions as DATA). K is clipped to the bucket edge so the block is a single
  * stable template. Exactly ONE readback of the K ids happens at the boundary;
  * the host truncates on the first stop token (§3.3 — compute all K, truncate at
- * readback). Greedy only (P3 adds on-device sampling).
+ * readback).
+ *
+ * SAMPLING (P3): with `opts.sample = { temperature>0, seed }` the feedback
+ * selection becomes on-device GUMBEL-MAX — `argmax(logits/temperature + g)`,
+ * `g = -log(-log(u))`. The uniform `u` is the seed-as-DATA channel (§3.5): drawn
+ * HOST-side from a position-canonical seed (`gumbelUniform(seed +
+ * absolutePosition, V)`, the single source the parity reference also uses) and
+ * uploaded as a tensor, while the transform + argmax close ON-DEVICE (no
+ * per-token readback inside the block). So the stream is byte-reproducible: same
+ * seed ⇒ same uniforms ⇒ same ids, and a per-token host loop drawing the same
+ * per-position seeds produces byte-identical ids (the parity gate,
+ * t-uk-gumbel-parity). `temperature===0` (or no `sample`) is the greedy
+ * `argmax(logits)` path, unchanged. Full-vocab top-p / arbitrary host samplers
+ * stay the K=1 host-loop residue (§4) — not expressible as a block node.
  *
  * `lastTok` is the token fed into the FIRST step (a host value, exactly like the
- * per-token loop's `nextTok`); the returned `ids` are the K greedy tokens it
- * produces. `staticKV.len` advances by the clipped K.
+ * per-token loop's `nextTok`); the returned `ids` are the K tokens it produces.
+ * `staticKV.len` advances by the clipped K.
  *
  * Forces the block with a SINGLE readback — the caller owns step boundaries
  * (markStep) and the KV lifetime, as in generateChat.
@@ -158,23 +195,43 @@ export async function decodeBlock(
   staticKV: StaticKV,
   lastTok: number,
   K: number,
-  opts?: { residualHook?: ResidualHook; stopTokens?: Set<number> },
+  opts?: {
+    residualHook?: ResidualHook;
+    stopTokens?: Set<number>;
+    sample?: { temperature: number; seed: number };
+  },
 ): Promise<{ ids: number[]; stopIndex: number }> {
   const maxSeq = model.config.maxSeqLen;
   const Kc = clipBlockToBucket(staticKV.len, K, maxSeq);
   const residualHook = opts?.residualHook;
+  const sample = opts?.sample;
+  const stochastic = sample !== undefined && sample.temperature > 0;
+  const startLen = staticKV.len; // absolute position of this block's first step
+  const V = model.config.vocabSize;
 
   const idTensors: Tensor[] = [];
   // First input is the host token; every subsequent input is the on-device
-  // argmax id tensor (the argmax output IS the next gather index).
+  // argmax/sample id tensor (the selection output IS the next gather index).
   let idx: Tensor = api.tensorFromArray([lastTok], [1, 1]);
   for (let j = 0; j < Kc; j++) {
     const logits = api.noGrad(
       () => model.forward(idx, { staticKV, residualHook }).logits,
     ); // [1,1,vocab] — the decode row is contiguous
-    const id = api.noGrad(() =>
-      api.argmax(logits, { dim: -1, keepdim: false }),
-    ); // [1,1] LAZY f32 token id
+    const id = api.noGrad(() => {
+      if (!stochastic) {
+        return api.argmax(logits, { dim: -1, keepdim: false }); // greedy
+      }
+      // Gumbel-max: id = argmax(logits/temp + (-log(-log(u)))). The uniform is
+      // drawn HOST-side from a position-canonical seed (seed + absolutePosition)
+      // and uploaded as DATA (§3.5), so the draw is a deterministic function of
+      // position — replay- and reference-byte-reproducible — while the transform
+      // + selection close ON-DEVICE (no per-token readback inside the block).
+      const uArr = gumbelUniform(sample.seed + startLen + j, V);
+      const u = api.tensorFromArray(uArr, [1, 1, V]);
+      const g = api.neg(api.log(api.neg(api.log(u)))); // -log(-log(u))
+      const scaled = api.add(api.div(logits, sample.temperature), g);
+      return api.argmax(scaled, { dim: -1, keepdim: false });
+    }); // [1,1] LAZY f32 token id
     idTensors.push(id);
     idx = api.reshape(id, [1, 1]); // feed on-device into the next gather
   }
@@ -478,7 +535,11 @@ export async function generateChat(
             }`,
         },
       );
-      while (count < maxNew && !QWEN3_STOP_TOKENS.has(nextTok) && !isAborted()) {
+      while (
+        count < maxNew &&
+        !QWEN3_STOP_TOKENS.has(nextTok) &&
+        !isAborted()
+      ) {
         emit(nextTok);
         count++;
         const t0 = performance.now();
