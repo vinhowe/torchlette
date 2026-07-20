@@ -107,6 +107,8 @@ export {
   Lion,
   type LionOptions,
   type LRScheduler,
+  Muon,
+  type MuonOptions,
   PolynomialLR,
   SGD,
   type SGDOptions,

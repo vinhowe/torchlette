@@ -6,6 +6,7 @@ export {
   type Optimizer,
 } from "./grad-scaler";
 export { Lion, type LionOptions, type LionParamGroup } from "./lion";
+export { Muon, type MuonOptions } from "./muon";
 export {
   CosineAnnealingLR,
   ExponentialLR,
