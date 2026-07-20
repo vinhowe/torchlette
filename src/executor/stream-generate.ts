@@ -45,7 +45,6 @@ import {
   planLayerNormBackwardGradXDispatch,
   planLayerNormForwardDispatch,
 } from "../backend/webgpu/layernorm-kernel";
-import { planRMSNormForwardDispatch } from "../backend/webgpu/rmsnorm-kernel";
 import {
   lookupKSplitTempBuffer,
   planTiledMatmul,
@@ -75,6 +74,11 @@ import {
   planNarrowBackward,
 } from "../backend/webgpu/ops/views";
 import { planWhereDirect } from "../backend/webgpu/ops/where";
+import { planRMSNormForwardDispatch } from "../backend/webgpu/rmsnorm-kernel";
+import {
+  planRoPEDispatch,
+  ropeVolatilePack,
+} from "../backend/webgpu/rope-kernel";
 import { planRowProgramDispatch } from "../backend/webgpu/row-program-dispatch";
 import { alignBufferSize, dtypeBytes } from "../backend/webgpu/shape-utils";
 import type { WebGPUTensor } from "../backend/webgpu/tensor";
@@ -1059,6 +1063,7 @@ function generateSequential(
     return generateLayerNormForward(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "fusedRMSNormForward")
     return generateRMSNormForward(node, slots, resolveRefSlot, bufferSlot);
+  if (node.op === "fusedRoPE") return generateRoPE(node, slots, resolveRefSlot);
   if (node.op === "argmax" || node.op === "argmin")
     return generateArgReduce(node, slots, resolveRefSlot);
   if (node.op === "gather") return generateGather(node, slots, resolveRefSlot);
@@ -2538,10 +2543,7 @@ function derivedContigCopyFromIR(
 ): { slot: Slot; prologue: GpuCommand[] } | string | undefined {
   if (ref.kind !== "pending" || (ref.outputIndex ?? 0) !== 0) return undefined;
   const node = ref.node;
-  const vm = deriveNodeViewMeta(
-    node as unknown as MetaNodeLike,
-    refLiveMeta,
-  );
+  const vm = deriveNodeViewMeta(node as unknown as MetaNodeLike, refLiveMeta);
   if (!vm) return undefined; // not IR-derivable → keep the historical bail.
   // Already contiguous & offset 0 → flat-bindable, no copy. (Rarely reached:
   // refShapeDtype/contiguousViewShapeDtype would have derived it upstream.)
@@ -2865,8 +2867,8 @@ function generateLayerNormForward(
  *  persistent norm weight are contiguous by construction, so the prologue is
  *  empty. Geometry from planRMSNormForwardDispatch (single-sourced with the
  *  dispatcher's rmsNormFwdSpec). One of the two Qwen3/Gemma2 decode-forward ops
- *  the K-block adds to the build-from-IR coverage (the other is fusedRoPE — see
- *  the P2 census; RoPE's per-position offset is the remaining blocker). */
+ *  the K-block adds to the build-from-IR coverage (the other is fusedRoPE, now
+ *  covered by generateRoPE with the offset flowing as volatile data — P3'). */
 function generateRMSNormForward(
   node: LazyIRNode,
   slots: SlotSource[],
@@ -2877,7 +2879,12 @@ function generateRMSNormForward(
   const cfg = node.payload as
     | { numRows?: number; featureDim?: number; eps?: number }
     | undefined;
-  if (!cfg || cfg.numRows == null || cfg.featureDim == null || cfg.eps == null) {
+  if (
+    !cfg ||
+    cfg.numRows == null ||
+    cfg.featureDim == null ||
+    cfg.eps == null
+  ) {
     return "payload";
   }
   const prologue: GpuCommand[] = [];
@@ -2929,6 +2936,175 @@ function generateRMSNormForward(
         gx: planned.plan.grid[0],
         gy: planned.plan.grid[1],
         gz: planned.plan.grid[2],
+      },
+    ],
+    outSlot,
+  };
+}
+
+/** Are ref's strides contiguous (any offset — the offset is folded, not the
+ *  strides)? When the result storage is LIVE we check its strides directly. When
+ *  it is RELEASED (a decode intermediate freed before plan-build — the common
+ *  case for the static-KV cos/sin, which are `gather` outputs) we derive
+ *  structurally: a NON-view producer (gather / fused kernel / elementwise)
+ *  allocates fresh contiguous+offset0 storage by construction, so it is
+ *  contiguous; a released VIEW producer (narrow/transpose/…) we cannot verify,
+ *  so we conservatively bail (→ lowered) rather than fold into a possibly-strided
+ *  table. This is the seam that keeps the offset-fold sound. */
+function refIsContiguousStrides(ref: LazyIRNode["inputs"][number]): boolean {
+  const m = refLiveMeta(ref as unknown as MetaNodeLike["inputs"][number]);
+  if (m) {
+    const cs = contiguousStrides(m.shape);
+    for (let i = 0; i < m.shape.length; i++) {
+      if (m.shape[i] !== 1 && m.strides[i] !== cs[i]) return false;
+    }
+    return true;
+  }
+  // Released: contiguous iff the producer is a fresh-allocating (non-view) op.
+  if (ref.kind === "pending" && ref.node)
+    return !VIEW_META_OPS.has(ref.node.op);
+  return false;
+}
+
+/**
+ * fusedRoPE: ALLOC(output, kind 0) + a per-node params slot (the tile config as
+ * a UNIFORM buffer) + TAG_UNIFORM (volatile offset repack) + one dispatch
+ * [input, cos_table, sin_table, output, config].
+ *
+ * THE OFFSET-AS-DATA SEAM. RoPE's cos/sin element offsets are POSITIONAL — the
+ * frozen-uniform class (CLAUDE.md) if baked into a compiled replay. So the
+ * config is a per-node params slot that a volatile TAG_UNIFORM repack
+ * (`ropeVolatilePack`) rewrites EVERY replay from the CURRENT node's cos/sin
+ * input offsets (`directInputOffset`, single-sourced with #71's view-meta
+ * deriver) — never the record-time value. The repack is UNCONDITIONAL, so no
+ * positional value can ever freeze: the seam holds by construction. On the
+ * static-KV decode path the offsets are 0 (cos/sin are `gather` results whose
+ * index tensor carries the position as DATA — separately covered), so the
+ * repack writes 0; on any narrow-view path they vary and it re-derives.
+ *
+ * qk (input 0) is raw-bound flat-from-0 (CONTIGUOUS_OPERANDS `[0]`); cos (1) /
+ * sin (2) need only contiguous STRIDES (offset folded), asserted here — a
+ * strided/released cos/sin bails to lowered rather than fold a wrong offset.
+ * Geometry from planRoPEDispatch (single-sourced with dispatchRoPE via the same
+ * ropeTileKernel). The block-diff (compiled==lowered==host) is the guardian.
+ */
+function generateRoPE(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 3) return "arity";
+  const cfg = node.payload as
+    | { total?: number; seqLen?: number; headDim?: number; sinScale?: number }
+    | undefined;
+  if (
+    !cfg ||
+    cfg.total == null ||
+    cfg.seqLen == null ||
+    cfg.headDim == null ||
+    cfg.sinScale == null
+  ) {
+    return "payload";
+  }
+  const prologue: GpuCommand[] = [];
+  const qkSlot = resolveContiguousInto(
+    node.op,
+    0,
+    node.inputs[0],
+    resolveRefSlot,
+    slots,
+    prologue,
+  );
+  if (typeof qkSlot === "string") return qkSlot;
+  const cosSlot = resolveRefSlot(node.inputs[1]);
+  const sinSlot = resolveRefSlot(node.inputs[2]);
+  if (cosSlot === undefined || sinSlot === undefined) {
+    return "rope-cossin-untracked";
+  }
+  if (
+    !refIsContiguousStrides(node.inputs[1]) ||
+    !refIsContiguousStrides(node.inputs[2])
+  ) {
+    return "rope-cossin-strided";
+  }
+  // The volatile uniform record, re-derived from the CURRENT node every replay.
+  // seq_len/head_dim/sin_scale are template-invariant; cos_offset/sin_offset are
+  // the positional data (0 on the gather path, varying on the narrow path).
+  const uniformsFromNode = (n: LazyIRNode): Record<string, number> => {
+    const c = n.payload as {
+      total: number;
+      seqLen: number;
+      headDim: number;
+      sinScale: number;
+    };
+    return {
+      total: c.total,
+      seq_len: c.seqLen,
+      head_dim: c.headDim,
+      sin_scale: c.sinScale,
+      cos_offset: directInputOffset(n.inputs[1]),
+      sin_offset: directInputOffset(n.inputs[2]),
+    };
+  };
+  const pack = ropeVolatilePack(uniformsFromNode);
+  const recBytes = pack(node); // record-time bytes (offset here is overwritten each replay)
+  const recCos = directInputOffset(node.inputs[1]);
+  const recSin = directInputOffset(node.inputs[2]);
+  const { plan, outputBytes } = planRoPEDispatch(
+    cfg.total,
+    cfg.seqLen,
+    cfg.headDim,
+    cfg.sinScale,
+    recCos,
+    recSin,
+  );
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const paramsSlot = slots.length;
+  slots.push({
+    kind: "params",
+    seqIndex: -1,
+    data: new Uint8Array(
+      recBytes.buffer.slice(
+        recBytes.byteOffset,
+        recBytes.byteOffset + recBytes.byteLength,
+      ),
+    ),
+  });
+  const named: Record<string, Slot> = {
+    input: qkSlot,
+    cos_table: cosSlot,
+    sin_table: sinSlot,
+    output: outSlot,
+  };
+  const bindings: Slot[] = [];
+  for (const name of plan.bindingOrder) {
+    if (name === null) {
+      bindings.push(paramsSlot);
+    } else {
+      const s = named[name];
+      if (s === undefined) return "rope-binding";
+      bindings.push(s);
+    }
+  }
+  return {
+    commands: [
+      ...prologue,
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: outputBytes,
+        allocKind: 0,
+        inputSlots: [],
+      },
+      { tag: TAG_UNIFORM, slot: paramsSlot, nodeIndex: -1, pack },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: plan.pipeline,
+        bindings,
+        gx: plan.grid[0],
+        gy: plan.grid[1],
+        gz: plan.grid[2],
       },
     ],
     outSlot,

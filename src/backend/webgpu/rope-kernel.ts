@@ -137,6 +137,52 @@ export function dispatchRoPE(
   return outBuf;
 }
 
+/**
+ * Geometry + pipeline for ONE fused-RoPE dispatch — the SINGLE SOURCE both the
+ * imperative dispatcher (`dispatchRoPE`, above, via the same `ropeTileKernel`)
+ * and the stream generator (`stream-generate.ts` `generateRoPE`) derive from,
+ * mirroring `planRMSNormForwardDispatch`. The cos/sin element offsets are passed
+ * through so the record-time plan is well-formed, but they NEVER freeze in a
+ * compiled replay: `generateRoPE` binds a per-node params slot that
+ * `ropeVolatilePack` rewrites each replay (the offset-as-DATA channel — the
+ * frozen-uniform class, CLAUDE.md). qk [B,H,S,D] → out [B,H,S,D].
+ */
+export function planRoPEDispatch(
+  total: number,
+  seqLen: number,
+  headDim: number,
+  sinScale: number,
+  cosOffset: number,
+  sinOffset: number,
+): { plan: import("./tile-dispatch").TileKernelPlan; outputBytes: number } {
+  return {
+    plan: ropeTileKernel.plan({
+      total,
+      seq_len: seqLen,
+      head_dim: headDim,
+      sin_scale: sinScale,
+      cos_offset: cosOffset,
+      sin_offset: sinOffset,
+    }),
+    outputBytes: total * 4, // f32
+  };
+}
+
+/**
+ * The volatile-uniform packer for the RoPE tile config: re-derives the FULL
+ * uniform record (incl. the per-position cos/sin ELEMENT OFFSETS) from the
+ * CURRENT step's node on every replay, packed byte-identical to what the
+ * imperative dispatch writes (single-sourced via the instance's `volatilePack`
+ * → the same `packUniforms`). This is the offset-as-DATA channel: no positional
+ * offset ever bakes into a compiled plan (the frozen-step_size / frozen-uniform
+ * class — see setAdamConfigUniforms, task #71).
+ */
+export function ropeVolatilePack(
+  repack: import("./tile-dispatch").VolatileUniformRepack,
+): (node: import("../../graph/types").LazyIRNode) => ArrayBufferView {
+  return ropeTileKernel.volatilePack(repack);
+}
+
 export function resetRoPEKernelState(): void {
   ropeTileKernel.reset();
 }

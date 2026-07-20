@@ -67,6 +67,13 @@ export const CONTIGUOUS_OPERANDS: ReadonlyMap<string, ContiguousOperandSpec> =
     // asContiguous'd at dispatch (fused.ts). The decode residual + persistent
     // norm weight are contiguous by construction, so the prologue is empty.
     ["fusedRMSNormForward", [0, 1]],
+    // Fused RoPE raw-binds qk (input 0) flat-from-0 (asContiguous(qk) at
+    // dispatch, fused.ts). cos (1) / sin (2) are NOT here: the kernel folds
+    // THEIR element offset into the table index (contiguous strides, any
+    // offset — the offset-as-data channel), so they need contiguous strides
+    // but not offset 0; generateRoPE checks that separately and threads the
+    // offset through the volatile config repack.
+    ["fusedRoPE", [0]],
   ]);
 
 /** Whether input position `idx` of op `op` is declared contiguity-required. */
