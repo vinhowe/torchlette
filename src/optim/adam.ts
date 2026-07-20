@@ -1,9 +1,17 @@
-import { LiveScalar } from "../core/live-scalar";
 import type { AdamStepConfig, DeviceKind } from "../backend/types";
 import { ENV } from "../core/env";
+import { LiveScalar } from "../core/live-scalar";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
 import { createLazyIRNode } from "../graph/node-factory";
 import { createPendingRef } from "../graph/types";
+import {
+  ADAMW_M_NEW,
+  ADAMW_P_NEW,
+  ADAMW_SCALED,
+  ADAMW_V_NEW,
+  evalOptTensor,
+  type OptRoles,
+} from "../ops/semantic/optimizer";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import { validateOptimizerParams } from "./validate";
 
@@ -327,7 +335,8 @@ export class Adam {
     }
     // Persist t/lr (materialize mid-step).
     runtime.registerState(this._tTensor());
-    for (const s of this._lrLive) if (s) runtime.registerState(s.tensor._unwrap());
+    for (const s of this._lrLive)
+      if (s) runtime.registerState(s.tensor._unwrap());
     return updated;
   }
 
@@ -408,40 +417,60 @@ export class Adam {
       this._foreachState.set(gi, st);
     }
 
-    // The exact tensor program of _updateParamElementwise, batched.
+    // The moment + param arithmetic GENERATES from ADAMW_PROGRAM (P5, design
+    // §4.6): the hand `add(mul(m,β1),…)` chain that used to live here (and,
+    // copied, in _updateParamElementwise) is now ONE source — the program —
+    // interpreted over the runtime. The pack / copy_ / persist / dispose EFFECTS
+    // stay here (the arithmetic derives; the effect is declared). L2-vs-decoupled
+    // weight decay is the realizer's POLICY (matching the fused kernel's
+    // decoupledWd): L2 folds wd into g; AdamW binds it in the param term.
+    const sink: RuntimeTensor[] = [];
     let gAdj = G;
     if (wd !== 0 && !this.adamW) {
       gAdj = runtime.add(gAdj, runtime.mul(P, wd));
     }
-    const mNew = runtime.add(
-      runtime.mul(st.m, this.beta1),
-      runtime.mul(gAdj, 1 - this.beta1),
-    );
-    const vNew = runtime.add(
-      runtime.mul(st.v, this.beta2),
-      runtime.mul(runtime.mul(gAdj, gAdj), 1 - this.beta2),
-    );
+    const stateRoles: OptRoles = {
+      m: st.m,
+      v: st.v,
+      g: gAdj,
+      beta1: this.beta1,
+      om_beta1: 1 - this.beta1,
+      beta2: this.beta2,
+      om_beta2: 1 - this.beta2,
+    };
+    const mNew = evalOptTensor(ADAMW_M_NEW, runtime, stateRoles, sink);
+    const vNew = evalOptTensor(ADAMW_V_NEW, runtime, stateRoles, sink);
     runtime.copy_(st.m, mNew);
     runtime.copy_(st.v, vNew);
 
-    // Read m/v through the POST-copy_ state refs so the param-update chain
-    // depends on the copies and any force of the params executes them.
-    // Reading mNew/vNew directly leaves the copy_ nodes as dangling roots
-    // that defer to a LATER plan — after zeroGrad has zeroed/freed the grad
-    // buffer their pending source reads (see _updateParamElementwise).
-    // inc-2a: bias correction from the shared on-device `t` via the ONE
-    // expm1-form derivation (matches the fused kernel + elementwise path).
-    // bc1/bc2 are [1] tensors; the div broadcasts over the packed [total].
+    // Read m/v through the POST-copy_ state refs (st.m/st.v) so the param-update
+    // chain depends on the copies and any force of the params executes them.
+    // Reading mNew/vNew directly leaves the copy_ nodes as dangling roots that
+    // defer to a LATER plan — after zeroGrad has zeroed/freed the grad buffer
+    // their pending source reads (see _updateParamElementwise). inc-2a: bias
+    // correction rides in as bc1/bc2 (the step as DATA); [1] tensors that
+    // broadcast over the packed [total].
     const { bc1, bc2 } = this._biasCorrection(runtime, this._tTensor());
-    const mHat = runtime.div(st.m, bc1);
-    const vHat = runtime.div(st.v, bc2);
-    const denom = runtime.add(runtime.sqrt(vHat), this.eps);
-    let scaled = runtime.mul(runtime.div(mHat, denom), lrTensor);
-    if (wd !== 0 && this.adamW) {
-      // Decoupled weight decay: p -= lr*wd*p (PyTorch AdamW). lr is a tensor.
-      scaled = runtime.add(scaled, runtime.mul(P, runtime.mul(lrTensor, wd)));
-    }
-    const pNew = runtime.sub(P, scaled);
+    const paramRoles: OptRoles = {
+      p: P,
+      m: st.m,
+      v: st.v,
+      lr: lrTensor,
+      eps: this.eps,
+      wd: this.adamW ? wd : 0,
+      bc1,
+      bc2,
+    };
+    // The full p' (ADAMW_P_NEW) folds in the decoupled `lr·wd·p`; the no-wd path
+    // derives just the update magnitude (ADAMW_SCALED) and subtracts, avoiding a
+    // full-model-size `+0` intermediate in the common wd=0 case.
+    const pNew =
+      this.adamW && wd !== 0
+        ? evalOptTensor(ADAMW_P_NEW, runtime, paramRoles, sink)
+        : runtime.sub(
+            P,
+            evalOptTensor(ADAMW_SCALED, runtime, paramRoles, sink),
+          );
 
     // Unpack: copy each segment back into its (persistent) param storage.
     for (let k = 0; k < idxs.length; k++) {
@@ -459,24 +488,13 @@ export class Adam {
     // DONATE — their buffers. Without this, every full-group-size
     // intermediate (328MB each at 124M) is conservatively protected as
     // "user-held" and the packed chain costs ~2x the fused path's memory.
-    // st.m / st.v / params are NOT disposed (persistent state).
-    for (const t of [
-      G,
-      gAdj,
-      mNew,
-      vNew,
-      mHat,
-      vHat,
-      denom,
-      scaled,
-      pNew,
-      P,
-      bc1,
-      bc2,
-    ]) {
-      if (t !== (st.m as unknown) && t !== (st.v as unknown)) {
-        (t as { dispose?: () => void }).dispose?.();
-      }
+    // st.m / st.v / params are NOT disposed (persistent state). The derived
+    // intermediates are the `sink` (everything evalOptTensor CREATED) plus the
+    // packed cat results (G/P), the L2-adjusted grad (gAdj), and bias correction
+    // (bc1/bc2). A Set dedups gAdj===G (no L2 case). st.m/st.v are ROLE inputs,
+    // never in the sink, so nothing persistent is disposed.
+    for (const t of new Set<RuntimeTensor>([G, gAdj, P, bc1, bc2, ...sink])) {
+      (t as { dispose?: () => void }).dispose?.();
     }
   }
 
@@ -573,7 +591,8 @@ export class Adam {
 
     // Persist t/lr (lazily materialize mid-step; same rationale as m/v).
     runtime.registerState(tRt);
-    for (const s of this._lrLive) if (s) runtime.registerState(s.tensor._unwrap());
+    for (const s of this._lrLive)
+      if (s) runtime.registerState(s.tensor._unwrap());
 
     return updated;
   }
@@ -676,60 +695,61 @@ export class Adam {
     const prevAvg = this.expAvg[i];
     const prevAvgSq = this.expAvgSq[i];
 
-    const avg = runtime.add(
-      runtime.mul(prevAvg, this.beta1),
-      runtime.mul(gradAdj, 1 - this.beta1),
-    );
-
-    const gradSq = runtime.mul(gradAdj, gradAdj);
-
-    const avgSq = runtime.add(
-      runtime.mul(prevAvgSq, this.beta2),
-      runtime.mul(gradSq, 1 - this.beta2),
-    );
-
-    // Update state IN PLACE into the persistent (snapshot-protected) m/v
-    // tensors instead of replacing them with the mid-step-created results.
-    // Replacement was the silent-UAF pattern: the new tensor is demoted as a
-    // step temporary at markStep (it was not in the beginStep snapshot), its
-    // buffer returns to the pool while this.expAvg still points at it, and a
-    // later allocation corrupts it — the multi-param first-param m/v bug.
-    runtime.copy_(prevAvg, avg);
-    runtime.copy_(prevAvgSq, avgSq);
+    // The moment update GENERATES from ADAMW_PROGRAM — the SAME source the
+    // foreach path interprets (P5, design §4.6). State is written IN PLACE into
+    // the persistent (snapshot-protected) m/v; replacement was the silent-UAF
+    // pattern (the new tensor is demoted as a step temporary at markStep, its
+    // buffer pooled while this.expAvg still points at it — the multi-param
+    // first-param m/v bug).
+    const stateRoles: OptRoles = {
+      m: prevAvg,
+      v: prevAvgSq,
+      g: gradAdj,
+      beta1: this.beta1,
+      om_beta1: 1 - this.beta1,
+      beta2: this.beta2,
+      om_beta2: 1 - this.beta2,
+    };
+    runtime.copy_(prevAvg, evalOptTensor(ADAMW_M_NEW, runtime, stateRoles));
+    runtime.copy_(prevAvgSq, evalOptTensor(ADAMW_V_NEW, runtime, stateRoles));
 
     // PyTorch-style bias-corrected Adam: apply bias correction to v directly
     // in the denominator, not via the step size. This matters because the
     // epsilon term must NOT be scaled by 1/sqrt(bc2).
     // PyTorch: param -= lr * (m / bc1) / (sqrt(v / bc2) + eps)
     //
-    // Read m/v through the POST-copy_ state refs (prevAvg's lazy ref now
-    // points at the copy_ result), NOT through `avg`/`avgSq` directly. This
-    // makes the param-update chain DEPEND on the copies, so any force of the
-    // param (stepAsync's `force(param)`, partial forces) executes them.
-    // Reading `avg` left the copy_ nodes as DANGLING ROOTS: not in the
-    // param's dependency chain, they deferred to whatever plan next touched
-    // the state — one step LATE, after zeroGrad() had already zeroed/freed
-    // the grad buffer their pending source chain reads, and after freed
-    // intermediates were reacquired (src==dst in the scatter kernel is a
-    // Dawn read-write usage validation error → dropped command buffer).
-    // That was the gpt2-memorization stepAsync NaN regression.
-    // inc-2a: bias correction from the shared on-device `t` via the ONE
-    // expm1-form derivation; lr from the persistent per-group tensor. bc1/bc2/
-    // lr are [1] tensors that broadcast over the param shape.
+    // Read m/v through the POST-copy_ state refs (prevAvg's lazy ref now points
+    // at the copy_ result) by binding roles `m`/`v` to prevAvg/prevAvgSq AFTER
+    // the copy_. This makes the param-update chain DEPEND on the copies, so any
+    // force of the param (stepAsync's `force(param)`, partial forces) executes
+    // them. Reading the pre-copy moment tensors left the copy_ nodes as DANGLING
+    // ROOTS: not in the param's dependency chain, they deferred to whatever plan
+    // next touched the state — one step LATE, after zeroGrad() had already
+    // zeroed/freed the grad buffer their pending source chain reads (the
+    // gpt2-memorization stepAsync NaN regression). inc-2a: bias correction rides
+    // in as bc1/bc2 (the step as DATA); [1] tensors broadcasting over the param.
     const { bc1, bc2 } = this._biasCorrection(runtime, this._tTensor());
     const lrTensor = this._lrTensor(this._groupIndex[i]);
-    const mHat = runtime.div(prevAvg, bc1);
-    const vHat = runtime.div(prevAvgSq, bc2);
-    const denom = runtime.add(runtime.sqrt(vHat), this.eps);
-    let scaled = runtime.mul(runtime.div(mHat, denom), lrTensor);
-    if (wd !== 0 && this.adamW) {
-      // Decoupled weight decay: p -= lr*wd*p (PyTorch AdamW). lr is a tensor.
-      scaled = runtime.add(
-        scaled,
-        runtime.mul(param._unwrap(), runtime.mul(lrTensor, wd)),
-      );
-    }
-    runtime.copy_(param._unwrap(), runtime.sub(param._unwrap(), scaled));
+    const paramRoles: OptRoles = {
+      p: param._unwrap(),
+      m: prevAvg,
+      v: prevAvgSq,
+      lr: lrTensor,
+      eps: this.eps,
+      wd: this.adamW ? wd : 0,
+      bc1,
+      bc2,
+    };
+    // The full p' (ADAMW_P_NEW) folds in the decoupled `lr·wd·p`; the no-wd path
+    // derives just the update magnitude (ADAMW_SCALED) and subtracts.
+    const pNew =
+      this.adamW && wd !== 0
+        ? evalOptTensor(ADAMW_P_NEW, runtime, paramRoles)
+        : runtime.sub(
+            param._unwrap(),
+            evalOptTensor(ADAMW_SCALED, runtime, paramRoles),
+          );
+    runtime.copy_(param._unwrap(), pNew);
   }
 
   /**
@@ -752,7 +772,8 @@ export class Adam {
       updated.push(param);
     }
     runtime.registerState(this._tTensor());
-    for (const s of this._lrLive) if (s) runtime.registerState(s.tensor._unwrap());
+    for (const s of this._lrLive)
+      if (s) runtime.registerState(s.tensor._unwrap());
     return updated;
   }
 
@@ -780,7 +801,8 @@ export class Adam {
       updated.push(param);
     }
     runtime.registerState(this._tTensor());
-    for (const s of this._lrLive) if (s) runtime.registerState(s.tensor._unwrap());
+    for (const s of this._lrLive)
+      if (s) runtime.registerState(s.tensor._unwrap());
     this.api.queueStepBoundary();
     return updated;
   }
