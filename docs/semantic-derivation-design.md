@@ -451,3 +451,104 @@ claiming the composition IS the kernel; the design claims it is the kernel's *re
 If an op's meaning cannot be stated as a definition-term over the primitive algebra (or a
 declared effect) in one sentence — such that its CPU reference, gradient, WGSL, and execution
 declaration all *derive* from that one statement — reshape it before it lands.
+
+## 12. Phase 0 — LANDED (2026-07-20)
+
+The walking skeleton is in `src/ops/semantic/`. An op's meaning is a first-class
+DATA term; the CPU reference body and the gradient DERIVE from it. Commits:
+`the definition stratum` → `derive the CPU bodies` → `derive the gradients`.
+
+### The definition schema, as landed
+- `expr.ts` — the `Expr` term (18 unary + 8 binary + 6 compare + `where`
+  primitives), the builders, and `assertNoDefinitionBody` (the
+  `assertNoGeneratorLeaf` analogue: a definition is DATA — a function/string/
+  buffer leaf, or a kind outside the algebra, is unconstructible; the covenant/
+  R22 defense that keeps the byte differential un-gameable).
+- `interpret.ts` — the f64 scalar interpreter; `compileUnary`/`compileBinary`
+  ARE the CPU reference (design S1; "the interpreter itself is the reference").
+- `adjoint.ts` — `deriv` (chain rule) + the CONSERVATIVE normalizer (exact IEEE
+  folds only, so already-exact grads stay byte-exact) + two EARNED exact
+  cancellations (`u/(u·u)→recip u`, `a·recip b→a/b`) + the `denomEps` guard.
+- `catalog.ts` — the elementwise family as definitions (17 unary + 7 binary),
+  guard annotations on log/sqrt, a `gradPolicy` ∈ {derive, none, hand}.
+- `emit-rt.ts` — the derived VJP interpreted over the `RuntimeEngine` (LAZY,
+  memoized leaves, so a grad that ignores a saved operand never forces it).
+
+### The gate (productized Probe 2/3, standing)
+`test/semantic-derivation.spec.ts` (cpu project, 42 tests), run against the
+LANDED stratum: derived CPU body == hand `numeric.ts` body byte-exact (24/24);
+derived VJP == hand `registry.ts` table byte-exact (22/22). **The 3 probe
+divergences are RESOLVED**: `div.dB` sign-of-zero via the normalizer; `log`/
+`sqrt` via the explicit guard.
+
+### The guard ruling (the log-guard verdict — oracle-refereed)
+**The table's `log`/`sqrt` `+1e-8` is a NUMERICAL GUARD (policy), not the
+semantics.** Evidence from the PyTorch oracle (direct `torch.{log,sqrt}`
+backward, the referee): PyTorch computes the UNGUARDED adjoint `g/x`,
+`g·0.5/√x`; the table's epsilon biases the gradient near 0 —
+
+| x | op | torch (oracle) | table (`+1e-8`) | pure adjoint |
+|---|----|----------------|-----------------|--------------|
+| 1e-4 | log grad  | 10000       | 9999.0001       | 10000 |
+| 1e-4 | sqrt grad | 50          | 49.99995        | 50 |
+
+So the table's guard is a *bug relative to the oracle* — it silently biases the
+grad — but a defensible NaN-avoidance policy. **Ruling (design §4.5 + Q1 fixed
+vocabulary):** the guard is preserved verbatim for P0 behavior-parity, promoted
+to an explicit `{ denomEps: 1e-8 }` annotation on the definition — now
+visible/reviewable instead of buried in a lambda. A future decision may drop it
+to match the oracle; that is now a one-line annotation edit, not a code change.
+The `TORCH_ORACLE_PYTHON` spec suite is unavailable in the P0 worktree (the venv
+has no numpy/pip); the ruling's evidence was taken from direct torch.
+
+### Deletions cashed, and the honest SLOC direction
+Named deletions (house policy):
+- `numeric.ts` `UNARY_OPS` (17) + `BINARY_OPS` (5) hand bodies → `compileUnary`/
+  `compileBinary` (sub/div keep their option-carrying bodies).
+- `registry.ts` elementwise grad lambdas → `makeUnaryGrad`/`makeBinaryTTGrad`:
+  12 unary (relu silu sigmoid tanh neg abs exp log sqrt rsqrt sin cos) + 5 binary
+  ttGrad (add mul div minimum maximum).
+
+**P0 is NET-POSITIVE (+783 srcSLOC: 66455→67238)** — it lands the reusable
+algebra ENGINE (interpret + adjoint + normalize + emit + the schema gate, ~750
+code lines) against which only ~68 lines of hand copy delete. This is the
+honest crossover trajectory the design's §5 ledger describes: the net-negative
+is a FULL-campaign property. The engine is amortized — P1 (reduction monoids),
+P2 (composites: the erf polynomial written 3×, the GELU constants written 3×),
+P4 (index-space transposes), and P5 (optimizers-as-programs) all DELETE against
+this same algebra with no new engine. P0 does not itself cash net-negative and
+does not claim to; it builds the machine that lets the later phases cash.
+
+### Gates (all green)
+cpu: semantic-derivation (42), gradcheck (35), unary-ops. webgpu (per-device,
+serial-exclusive): ops/autograd/conformance/op-registry (141), fusion suites
+(92), test:gates / compiled-plan-parity (5). gate-wall `--profile training`:
+build, test:gates, whole-step-diff, the tape/fullstack parity matrix
+(fused×foreach × no-sched×cosine-lr, all 4), step-object-null, step-edit-null,
+ring-probe, ledger-default, **124M-regression**, refusal-spec, checkpoint-seg —
+all PASS. The strict-lifetime guard earned its keep: it caught the derived
+`div.dA` materializing a redundant `y²` intermediate the whole-step merged plan
+could not place (the silent-corruption class), fixed by the two normalizer
+cancellations above.
+
+### The WGSL seam (S3) — assessed, DEFERRED with rationale
+Not landed in P0. The elementwise WGSL (`sqrt`/`exp`/… ) is already single-valued
+via the registry's `wgslFnName`/`wgslInfix`/`wgslPrefix`; the remaining
+triplication is the **erf polynomial and GELU constants**, which live in
+`custom-backward.ts` (`geluErfBackward`) and `numeric.ts` — these are the
+GELU/erf COMPOSITE, whose backward the phase table places in **P2**, not the
+elementwise skeleton. Rewriting the `BlockExpr` activation emitter is load-
+bearing GPU codegen at the ULP seam (the `pow`/`exp` precedent) with a marginal
+P0 deletion; the design is explicit that a phase may stop with the ledger where
+it is. S3 lands with P2 (composites) behind the existing schedule-state
+differential + a declared per-primitive ULP tolerance at the CPU↔GPU seam.
+
+### P1 (reductions) preconditions
+- The monoid + epilogue as a definition (`sum`/`max`/`min` + `mean = sum÷count`);
+  the reduce LOOP stays a kernel, only the monoid/mean-div derive.
+- Reconcile with the already-data `REDUCTION_DECLARATIONS`
+  (`execution-declaration.ts`) — the S4 membership derivation (`family(kind)`)
+  is the natural P1 companion.
+- The broadcast-adjoint trap (§8.1) stays OUT of scope until P4: P1 is the
+  reduction monoid, not the broadcast-VJP (a reduction is the transpose of a
+  broadcast — that machinery is P4's index algebra).
