@@ -29,10 +29,16 @@ import {
   vjpUnary,
 } from "../src/ops/semantic";
 import {
+  GELU_ERF_DEF,
+  GELU_TANH_DEF,
+} from "../src/ops/semantic/composite";
+import { erfApprox } from "../src/ops/semantic/erf";
+import {
   add,
   c,
   cos,
   div,
+  erf,
   type Expr,
   exp,
   g,
@@ -205,6 +211,85 @@ describe("Semantic derivation — the definition is the single source", () => {
           }
         }
       });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2 — COMPOSITES. The GELU family as pure-elementwise compositions; the erf
+// primitive's realization single-sourced (the "triplication" that dies). Two
+// INDEPENDENT hand transcriptions of the DELETED bodies (numeric.ts gelu/erf,
+// custom-backward.ts geluErfBackward), so this is a genuine two-source diff.
+// ---------------------------------------------------------------------------
+
+// Independent transcription of the deleted `numeric.ts` erf() (A-S 7.1.26).
+const handErf = (v: number): number => {
+  const a1 = 0.254829592,
+    a2 = -0.284496736,
+    a3 = 1.421413741,
+    a4 = -1.453152027,
+    a5 = 1.061405429,
+    p = 0.3275911;
+  const s = v < 0 ? -1 : 1;
+  const ax = Math.abs(v);
+  const t = 1.0 / (1.0 + p * ax);
+  return s * (1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-ax * ax));
+};
+const handGeluTanh = (v: number) =>
+  v * 0.5 * (1.0 + Math.tanh(0.7978845608 * (v + 0.044715 * v * v * v)));
+const handGeluErf = (v: number) => v * 0.5 * (1.0 + handErf(v * Math.SQRT1_2));
+
+// The analytic gelu-erf gradient (design-retained semantics): cdf + x·φ(x).
+// φ(x) = e^(−x²/2)/√(2π). cdf uses the poly erf (matching erfApprox), so this is
+// exactly what the DELETED geluErfBackward computed.
+const INV_SQRT_2PI = 0.3989422804014327;
+const analyticGeluErfGrad = (v: number) =>
+  0.5 * (1 + handErf(v * Math.SQRT1_2)) + v * INV_SQRT_2PI * Math.exp(-0.5 * v * v);
+
+const GELU_SAMPLES = [
+  -6, -3.2, -1.7, -0.9, -0.3, -1e-4, 0, 1e-4, 0.3, 0.9, 1.7, 3.2, 6,
+];
+const centralFd = (f: (x: number) => number, v: number, h = 1e-4) =>
+  (f(v + h) - f(v - h)) / (2 * h);
+
+describe("Semantic derivation — P2 composites (GELU / erf)", () => {
+  it("schema gate: the GELU composites (incl. the erf primitive) are DATA", () => {
+    expect(() => assertNoDefinitionBody(GELU_TANH_DEF.expr)).not.toThrow();
+    expect(() => assertNoDefinitionBody(GELU_ERF_DEF.expr)).not.toThrow();
+    expect(() => assertNoDefinitionBody(erf(x))).not.toThrow();
+  });
+
+  it("S1: the erf primitive realization == the hand A-S poly byte-for-byte", () => {
+    for (const v of GELU_SAMPLES.concat([-8, 8, -0.5, 0.5, 2, -2])) {
+      expect(byteEqual(erfApprox(v), handErf(v))).toBe(true);
+      expect(byteEqual(evalScalar(erf(x), { x: v, y: 0, g: 0 }), handErf(v))).toBe(
+        true,
+      );
+    }
+  });
+
+  it("S1: the derived GELU CPU bodies == the deleted hand bodies byte-for-byte", () => {
+    const tanhBody = compileUnary(GELU_TANH_DEF.expr);
+    const erfBody = compileUnary(GELU_ERF_DEF.expr);
+    for (const v of GELU_SAMPLES) {
+      expect(byteEqual(tanhBody(v), handGeluTanh(v))).toBe(true);
+      expect(byteEqual(erfBody(v), handGeluErf(v))).toBe(true);
+    }
+  });
+
+  it("S2: the derived GELU adjoints are the true derivative of the derived forward", () => {
+    const tanhVjp = vjpUnary(GELU_TANH_DEF.expr, GELU_TANH_DEF.gradGuard);
+    const erfVjp = vjpUnary(GELU_ERF_DEF.expr, GELU_ERF_DEF.gradGuard);
+    const tanhBody = compileUnary(GELU_TANH_DEF.expr);
+    for (const v of GELU_SAMPLES) {
+      // tanh-gelu: fully analytic — adjoint matches fd of its own forward.
+      const dTanh = evalScalar(tanhVjp, { x: v, y: 0, g: 1 });
+      expect(Math.abs(dTanh - centralFd(tanhBody, v))).toBeLessThan(1e-4);
+      // erf-gelu: the §4.5 split — forward uses the A-S poly, backward the
+      // ANALYTIC gaussian. The derived adjoint reproduces the DELETED
+      // geluErfBackward (analytic cdf + x·φ) to fp precision.
+      const dErf = evalScalar(erfVjp, { x: v, y: 0, g: 1 });
+      expect(Math.abs(dErf - analyticGeluErfGrad(v))).toBeLessThan(1e-6);
     }
   });
 });
