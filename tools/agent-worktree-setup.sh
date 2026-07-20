@@ -67,7 +67,13 @@ PRIMARY="${TORCHLETTE_PRIMARY:-$(dirname "$COMMON_GITDIR")}"
 [ -d "$PRIMARY" ] || die "primary checkout not found: $PRIMARY"
 
 if [ "$(realpath "$WT")" = "$(realpath "$PRIMARY")" ]; then
-  die "this IS the primary checkout ($PRIMARY) — run from a linked worktree"
+  # The primary checkout is definitionally set up (real dirs, not symlinks):
+  # verify-mode proceeds to sentinel checks so gate-wall runs here; only the
+  # setup (write) mode is meaningless in the primary and refuses.
+  if [ "$MODE" != "verify" ]; then
+    die "this IS the primary checkout ($PRIMARY) — run from a linked worktree"
+  fi
+  info "primary checkout: skipping symlink checks, verifying sentinels only"
 fi
 info "mode: $MODE"
 info "worktree: $WT"
