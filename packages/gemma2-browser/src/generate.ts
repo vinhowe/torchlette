@@ -14,8 +14,8 @@
 
 import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
 import { stStats } from "torchlette";
-import type { Gemma2, ResidualHook } from "./model";
-import { kvBucketLen } from "./model";
+import type { Gemma2, ResidualHook, StaticKV } from "./model";
+import { KV_BUCKET, kvBucketLen } from "./model";
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
@@ -48,6 +48,10 @@ export type GenerateOptions = {
    * the prefill and every KV-decode step. Undefined → unsteered baseline.
    */
   residualHook?: ResidualHook;
+  /** Seed for the block's on-device Gumbel-max sampler (§3.5, pure-temperature
+   *  path). Fixed per generation ⇒ byte-reproducible. Undefined ⇒ fresh random
+   *  seed. Only consulted when the block Gumbel path is active. */
+  seed?: number;
 };
 
 export type GenerateStats = {
@@ -77,6 +81,168 @@ export type GenerateStats = {
 export const GEMMA2_STOP_TOKENS = new Set([1, 107]);
 /** <bos> is id 2 in the Gemma tokenizer. */
 const BOS = 2;
+
+// ============================================================================
+// Unrolled-K decode block (CRYSTAL-1 P4 cutover) — mechanical port of the
+// qwen3-browser static-KV surface (design P1 status: "gemma2 wiring is a
+// mechanical port, deferred to P4 cutover"). decodeBlock is generic over the
+// StaticDecodeModel interface; Gemma2 satisfies it. See packages/qwen3-browser/
+// src/generate.ts for the full contract + the flag's sunset. Kept in-package
+// (not shared into src/): packages/ is not the src diamond, and gemma2-browser
+// has no qwen3-browser dependency.
+// ============================================================================
+
+/** DEFAULT-ON (opt-out via TORCHLETTE_UNROLLED_K=0/1). K sweet spot {4,8}; K=4
+ *  default (best compiled win + finest streaming; K=16 regresses). */
+export const UNROLLED_K_DEFAULT = 4;
+function unrolledKRaw(): string | undefined {
+  const env: Record<string, string | undefined> =
+    typeof process !== "undefined" && process.env
+      ? (process.env as Record<string, string | undefined>)
+      : {};
+  const g = globalThis as { __TORCHLETTE_ENV__?: Record<string, string> };
+  const raw =
+    g.__TORCHLETTE_ENV__?.TORCHLETTE_UNROLLED_K ?? env.TORCHLETTE_UNROLLED_K;
+  return raw === undefined || raw === "" ? undefined : raw;
+}
+export function unrolledKFromEnv(): number {
+  const raw = unrolledKRaw();
+  if (raw === undefined) return UNROLLED_K_DEFAULT;
+  const k = Number(raw);
+  return Number.isFinite(k) && k >= 2 ? Math.floor(k) : 0;
+}
+/** Greedy block is default-on; the Gumbel sampled block is opt-IN (explicit
+ *  flag) pending the pre-existing sampled-path transient fix (see qwen3
+ *  generate.ts unrolledKExplicit for the full rationale). */
+export function unrolledKExplicit(): boolean {
+  return unrolledKRaw() !== undefined;
+}
+
+/** Clip K so all K forwards share one static-KV bucket template (§3.4). */
+export function clipBlockToBucket(
+  len: number,
+  K: number,
+  maxSeqLen: number,
+): number {
+  const nextBoundary = Math.ceil((len + 1) / KV_BUCKET) * KV_BUCKET;
+  const roomInBucket = nextBoundary - len;
+  const roomInSeq = maxSeqLen - len;
+  return Math.max(1, Math.min(K, roomInBucket, roomInSeq));
+}
+
+/** Deterministic per-position uniform noise (seed-as-DATA, §3.5) — mulberry32,
+ *  the single source both decodeBlock and any parity reference draw from. */
+export function gumbelUniform(seed: number, n: number): Float32Array {
+  let a = seed >>> 0;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    const r = ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    out[i] = r === 0 ? 1e-7 : r;
+  }
+  return out;
+}
+
+/** Minimal static-KV model surface decodeBlock needs (Gemma2 satisfies it). */
+export interface StaticDecodeModel {
+  forward(
+    idx: Tensor,
+    options: { staticKV: StaticKV; residualHook?: ResidualHook },
+  ): { logits: Tensor };
+  config: { vocabSize: number; maxSeqLen: number };
+}
+
+/**
+ * UNROLLED-K DECODE BLOCK (S_dec) on the static-KV path — greedy (argmax) or
+ * on-device Gumbel-max (opts.sample.temperature>0). Runs K steps as ONE lazy
+ * graph whose per-token feedback closes on-device (each step's selection tensor
+ * feeds the next gather); ONE readback of the K ids at the boundary; host
+ * truncation on the first stop token. See qwen3-browser for the full contract.
+ */
+export async function decodeBlock(
+  api: Torchlette,
+  model: StaticDecodeModel,
+  staticKV: StaticKV,
+  lastTok: number,
+  K: number,
+  opts?: {
+    residualHook?: ResidualHook;
+    stopTokens?: Set<number>;
+    sample?: { temperature: number; seed: number };
+  },
+): Promise<{ ids: number[]; stopIndex: number }> {
+  const maxSeq = model.config.maxSeqLen;
+  const Kc = clipBlockToBucket(staticKV.len, K, maxSeq);
+  const residualHook = opts?.residualHook;
+  const sample = opts?.sample;
+  const stochastic = sample !== undefined && sample.temperature > 0;
+  const startLen = staticKV.len;
+  const V = model.config.vocabSize;
+
+  const idTensors: Tensor[] = [];
+  let idx: Tensor = api.tensorFromArray([lastTok], [1, 1]);
+  for (let j = 0; j < Kc; j++) {
+    const logits = api.noGrad(
+      () => model.forward(idx, { staticKV, residualHook }).logits,
+    );
+    const id = api.noGrad(() => {
+      if (!stochastic) {
+        return api.argmax(logits, { dim: -1, keepdim: false });
+      }
+      const uArr = gumbelUniform(sample.seed + startLen + j, V);
+      const u = api.tensorFromArray(uArr, [1, 1, V]);
+      const g = api.neg(api.log(api.neg(api.log(u))));
+      const scaled = api.add(api.div(logits, sample.temperature), g);
+      return api.argmax(scaled, { dim: -1, keepdim: false });
+    });
+    idTensors.push(id);
+    idx = api.reshape(id, [1, 1]);
+  }
+  const stacked = api.cat(
+    idTensors.map((t) => api.reshape(t, [1, 1])),
+    1,
+  );
+  const rawIds = await api.cpu(stacked);
+  const ids: number[] = [];
+  for (let i = 0; i < Kc; i++) ids.push(Math.round(rawIds[i]));
+
+  const stopSet = opts?.stopTokens;
+  let stopIndex = Kc;
+  if (stopSet) {
+    for (let i = 0; i < Kc; i++) {
+      if (stopSet.has(ids[i])) {
+        stopIndex = i;
+        break;
+      }
+    }
+  }
+  return { ids, stopIndex };
+}
+
+/** Prefill's next token via on-device Gumbel-max (full vocab, one readback) —
+ *  keeps the sampled block's prefill token drawn the same way (§3.5). */
+async function gumbelPrefillToken(
+  api: Torchlette,
+  logits: Tensor,
+  lastPos: number,
+  vocab: number,
+  sample: { temperature: number; seed: number },
+): Promise<number> {
+  const id = api.noGrad(() => {
+    const row = api.contiguous(
+      api.narrow(api.narrow(logits, 1, lastPos, 1), 2, 0, vocab),
+    );
+    const uArr = gumbelUniform(sample.seed, vocab);
+    const u = api.tensorFromArray(uArr, [1, 1, vocab]);
+    const g = api.neg(api.log(api.neg(api.log(u))));
+    const scaled = api.add(api.div(row, sample.temperature), g);
+    return api.argmax(scaled, { dim: -1, keepdim: false });
+  });
+  const out = await api.cpu(api.reshape(id, [1, 1]));
+  return Math.round(out[0]);
+}
 
 /** Gemma-2 chat turn template (for -it checkpoints). Base uses raw mode. */
 export function buildChatPrompt(messages: ChatMessage[]): string {
@@ -174,6 +340,28 @@ export async function generateChat(
   );
   const isAborted = options?.isAborted ?? (() => false);
   const { temperature, topK, topP, residualHook } = options ?? {};
+  // P4 CUTOVER routing (see qwen3 generate.ts). Block = greedy (argmax) or
+  // pure-temperature (Gumbel, §4); residue (host per-token loop) = any top-k /
+  // top-p, or opt-out (TORCHLETTE_UNROLLED_K=0/1).
+  const greedy = temperature === 0;
+  const topKActive = topK !== undefined && topK < vocab;
+  const topPActive = topP !== undefined && topP < 1;
+  const gumbelEligible =
+    !greedy &&
+    (temperature ?? 0) > 0 &&
+    !topKActive &&
+    !topPActive &&
+    unrolledKExplicit(); // sampled block opt-in (pre-existing transient)
+  const flagK = unrolledKFromEnv();
+  const useBlock = flagK >= 2 && (greedy || gumbelEligible);
+  const blockK = useBlock ? flagK : 0;
+  const blockSample =
+    useBlock && gumbelEligible
+      ? {
+          temperature: temperature as number,
+          seed: options?.seed ?? ((Math.random() * 0x7fffffff) >>> 0),
+        }
+      : undefined;
 
   const genIds: number[] = [];
   let prevText = "";
@@ -202,12 +390,20 @@ export async function generateChat(
       const { logits } = api.noGrad(() =>
         model.forward(idx, { staticKV, residualHook }),
       );
-      const top = await api.readTopK(logits, K_PREFILTER, {
-        offset: (promptIds.length - 1) * vocab,
-        length: vocab,
-      });
-      logits.dispose();
-      nextTok = sampleFromTopK(top.values, top.indices, temperature, topK, topP);
+      if (blockSample) {
+        nextTok = await gumbelPrefillToken(api, logits, promptIds.length - 1, vocab, {
+          temperature: blockSample.temperature,
+          seed: blockSample.seed + promptIds.length - 1,
+        });
+        logits.dispose();
+      } else {
+        const top = await api.readTopK(logits, K_PREFILTER, {
+          offset: (promptIds.length - 1) * vocab,
+          length: vocab,
+        });
+        logits.dispose();
+        nextTok = sampleFromTopK(top.values, top.indices, temperature, topK, topP);
+      }
       await api.markStep();
     }
     const prefillMs = Date.now() - t0;
@@ -218,40 +414,82 @@ export async function generateChat(
     let tFence = 0;
     let tSample = 0;
     let tStep = 0;
-    // Taped decode: the residualHook is closure-captured and FROZEN for this
-    // CapturedFn's lifetime — sound by construction (one generateChat call =
-    // one hook/α = one fresh trace). The bucket length is the structural
-    // discriminator; attnModKey guards cross-model tape replay.
-    const decode = api.capture(
-      (idx: Tensor) =>
-        api.noGrad(() => model.forward(idx, { staticKV, residualHook }).logits),
-      {
-        key: () =>
-          `kv:bkt${kvBucketLen(staticKV.len + 1, maxSeq)}:mod${model.attnModKey}`,
-      },
-    );
-    while (count < maxNew && !GEMMA2_STOP_TOKENS.has(nextTok) && !isAborted()) {
+    // decode CapturedFn is a per-token-path construct; null on the block path.
+    let decode: ReturnType<Torchlette["capture"]> | null = null;
+    if (blockK >= 2) {
+      // UNROLLED-K BLOCK PATH (P4 default for covered samplers). K tokens per
+      // GPU-boundary readback via decodeBlock (greedy or on-device Gumbel);
+      // streaming granularity K; host truncation on the first stop token.
       emit(nextTok);
       count++;
-      const tb0 = performance.now();
-      const logits = (await decode(
-        api.tensorFromArray([nextTok], [1, 1]),
-      )) as Tensor;
-      const tb1 = performance.now();
-      const readback = api.readTopK(logits, K_PREFILTER, { length: vocab });
-      const tb2 = performance.now();
-      const top = await readback;
-      const tb3 = performance.now();
-      logits.dispose();
-      nextTok = sampleFromTopK(top.values, top.indices, temperature, topK, topP);
-      const tb4 = performance.now();
-      await api.markStep();
-      const tb5 = performance.now();
-      tBuild += tb1 - tb0;
-      tLower += tb2 - tb1;
-      tFence += tb3 - tb2;
-      tSample += tb4 - tb3;
-      tStep += tb5 - tb4;
+      while (
+        count < maxNew &&
+        !GEMMA2_STOP_TOKENS.has(nextTok) &&
+        !isAborted()
+      ) {
+        const tb0 = performance.now();
+        const { ids, stopIndex } = await decodeBlock(
+          api,
+          model,
+          staticKV,
+          nextTok,
+          blockK,
+          { residualHook, stopTokens: GEMMA2_STOP_TOKENS, sample: blockSample },
+        );
+        const tb1 = performance.now();
+        await api.markStep();
+        const tb2 = performance.now();
+        let brk = false;
+        for (let i = 0; i < ids.length; i++) {
+          if (i === stopIndex || count >= maxNew) {
+            brk = true;
+            break;
+          }
+          emit(ids[i]);
+          count++;
+        }
+        nextTok = ids[ids.length - 1];
+        tBuild += tb1 - tb0;
+        tStep += tb2 - tb1;
+        if (brk) break;
+      }
+    } else {
+      // Taped per-token decode (the §4 host residue + the opt-out path): the
+      // residualHook is closure-captured and FROZEN for this CapturedFn's
+      // lifetime — sound by construction (one generateChat call = one hook/α =
+      // one fresh trace). The bucket length is the structural discriminator;
+      // attnModKey guards cross-model tape replay.
+      decode = api.capture(
+        (idx: Tensor) =>
+          api.noGrad(() => model.forward(idx, { staticKV, residualHook }).logits),
+        {
+          key: () =>
+            `kv:bkt${kvBucketLen(staticKV.len + 1, maxSeq)}:mod${model.attnModKey}`,
+        },
+      );
+      while (count < maxNew && !GEMMA2_STOP_TOKENS.has(nextTok) && !isAborted()) {
+        emit(nextTok);
+        count++;
+        const tb0 = performance.now();
+        const logits = (await decode(
+          api.tensorFromArray([nextTok], [1, 1]),
+        )) as Tensor;
+        const tb1 = performance.now();
+        const readback = api.readTopK(logits, K_PREFILTER, { length: vocab });
+        const tb2 = performance.now();
+        const top = await readback;
+        const tb3 = performance.now();
+        logits.dispose();
+        nextTok = sampleFromTopK(top.values, top.indices, temperature, topK, topP);
+        const tb4 = performance.now();
+        await api.markStep();
+        const tb5 = performance.now();
+        tBuild += tb1 - tb0;
+        tLower += tb2 - tb1;
+        tFence += tb3 - tb2;
+        tSample += tb4 - tb3;
+        tStep += tb5 - tb4;
+      }
     }
     // Deterministic KV lifetime end (see qwen3 generate.ts).
     for (const t of staticKV.k) t.dispose();
@@ -262,7 +500,6 @@ export async function generateChat(
 
     const seconds = (Date.now() - t0) / 1000;
     const per = (t: number) => Number((t / Math.max(count, 1)).toFixed(1));
-    const c = decode.stats();
     void stStats();
     return {
       promptTokens: promptIds.length,
@@ -272,14 +509,18 @@ export async function generateChat(
       tokPerSec: Number(
         (count / Math.max(seconds - prefillMs / 1000, 0.001)).toFixed(1),
       ),
-      tape: {
-        hits: c.hits,
-        calls: c.calls,
-        traces: c.traces,
-        coldMisses: c.coldMisses,
-        invalidations: c.invalidations,
-        ready: c.ready,
-      },
+      tape: (() => {
+        if (!decode) return undefined; // block path: no per-token CapturedFn
+        const c = decode.stats();
+        return {
+          hits: c.hits,
+          calls: c.calls,
+          traces: c.traces,
+          coldMisses: c.coldMisses,
+          invalidations: c.invalidations,
+          ready: c.ready,
+        };
+      })(),
       decodeBreakdown: {
         buildMs: per(tBuild),
         lowerMs: per(tLower),

@@ -41,6 +41,15 @@ export type GenerateOptions = {
    * existing unsteered call sites keep working with no change.
    */
   residualHook?: ResidualHook;
+  /**
+   * Seed for the on-device Gumbel-max sampler (the block's pure-temperature
+   * path, §3.5 seed-as-DATA). Fixed per generation so the sampled stream is
+   * byte-reproducible. Only consulted when the block Gumbel path is active
+   * (temperature>0 with no top-k/top-p restriction and the flag on); the host
+   * top-k/top-p residue keeps its own Math.random draw. Undefined → a fresh
+   * random seed per generation (run-to-run variety, matching the host sampler).
+   */
+  seed?: number;
 };
 
 export type GenerateStats = {
@@ -80,21 +89,39 @@ export const QWEN3_STOP_TOKENS = new Set([
 ]);
 
 // ============================================================================
-// Unrolled-K greedy decode block (CRYSTAL-1 P1) — the static-KV product surface
+// Unrolled-K decode block (CRYSTAL-1) — the static-KV product surface
 // ============================================================================
 //
-// FLAG: TORCHLETTE_UNROLLED_K = <K> (integer). Unset / <2 → OFF (per-token host
-// loop, the existing decode). K>=2 → generateChat decodes K greedy tokens per
-// GPU-boundary readback via decodeBlock() (greedy only; any sampler falls back
-// to the per-token loop — the §4 typed boundary).
+// FLAG (P4 CUTOVER — now DEFAULT-ON, opt-OUT): TORCHLETTE_UNROLLED_K = <K>.
+//   - UNSET → the block is THE decode path, K = UNROLLED_K_DEFAULT.
+//   - "0" or "1" → OFF (opt out to the per-token host loop, the pre-cutover
+//     decode) — the soak escape hatch.
+//   - ">=2" → the block with that explicit K.
+// generateChat routes GREEDY (argmax) decode through the block by DEFAULT. The
+// on-device GUMBEL sampled block (pure-temperature, §4) is opt-IN via an
+// explicit flag (unrolledKExplicit) — NOT default-on: the sampled path carries a
+// pre-existing dropped-submit transient (see unrolledKExplicit). The typed
+// residue that STAYS on the per-token host loop: any top-k / top-p / nucleus
+// (§4 — a full-distribution host read the block cannot express), default
+// (unflagged) temperature sampling, and any non-static-KV path. So the shipped
+// top-k+top-p demo samplers are the residue; the block is byte-identical to the
+// host loop for the covered samplers (the mother gate) with the steering hook
+// composed (t-uk-steering-diff).
 //
-// SUNSET: born 2026-07-19. Soak behind the opt-in flag → default-on (P4 cutover,
-// byte-identical stream gate) → the K=1 host loop is removed for greedy and the
-// flag/knob dies. A flag that outlives P6 is debt (house policy).
+// K DEFAULT = 4. The measured multiplier (design §P3'): K=4 gives the best
+// compiled win (host/def 1.43×, low/def 2.55×) AND the finest streaming
+// granularity; K=8 is the other sweet-spot cell (host/def 1.12×); K=16
+// REGRESSES (host/def 0.50×) — so the default is clamped to the low end of the
+// {4,8} sweet spot.
+//
+// SUNSET: born 2026-07-19 (opt-in), default-on 2026-07-20 (P4). P6 removes the
+// K=1 host loop for the covered samplers and retires the flag/knob. A flag that
+// outlives P6 is debt (house policy).
 //
 // Browser-safe env read: process may be absent; globalThis.__TORCHLETTE_ENV__ is
 // the browser hook (mirrors src/core/env.ts).
-export function unrolledKFromEnv(): number {
+export const UNROLLED_K_DEFAULT = 4;
+function unrolledKRaw(): string | undefined {
   const env: Record<string, string | undefined> =
     typeof process !== "undefined" && process.env
       ? (process.env as Record<string, string | undefined>)
@@ -102,8 +129,29 @@ export function unrolledKFromEnv(): number {
   const g = globalThis as { __TORCHLETTE_ENV__?: Record<string, string> };
   const raw =
     g.__TORCHLETTE_ENV__?.TORCHLETTE_UNROLLED_K ?? env.TORCHLETTE_UNROLLED_K;
-  const k = Number(raw ?? "0");
-  return Number.isFinite(k) && k >= 2 ? Math.floor(k) : 0;
+  return raw === undefined || raw === "" ? undefined : raw;
+}
+export function unrolledKFromEnv(): number {
+  const raw = unrolledKRaw();
+  if (raw === undefined) return UNROLLED_K_DEFAULT; // default-on (greedy)
+  const k = Number(raw);
+  return Number.isFinite(k) && k >= 2 ? Math.floor(k) : 0; // "0"/"1" → off
+}
+/**
+ * Was TORCHLETTE_UNROLLED_K set EXPLICITLY (≥2)? The GREEDY block is default-on
+ * (opt-out); the on-device GUMBEL sampled block is default-OFF, opt-IN via an
+ * explicit flag. Reason (P4-discovered, 2026-07-20): the sampled block path
+ * carries a PRE-EXISTING dropped-submit transient (a materialized first-token
+ * upload whose registry buffer is destroyed without parking — `_lastHarvestIds`
+ * tracks harvest RESULTS, not external-input uploads; visible as "used in submit
+ * while destroyed" in t-uk-gumbel-parity, which never asserted zero GPU errors).
+ * It sometimes corrupts (t-uk-steering-diff surfaced it). Greedy is unaffected
+ * (its idx feed IS a harvest result → parked, block-diff STRICT_GPU-clean). So
+ * we do NOT ship the sampled block default-on; it activates only when a caller
+ * explicitly opts in with the flag, pending the transient fix (named blocker).
+ */
+export function unrolledKExplicit(): boolean {
+  return unrolledKRaw() !== undefined;
 }
 
 /**
@@ -258,6 +306,36 @@ export async function decodeBlock(
   return { ids, stopIndex };
 }
 
+/**
+ * Prefill's next token via on-device GUMBEL-max over the full vocab, one
+ * readback. Mirrors decodeBlock's feedback selection so the sampled block's
+ * prefill token is drawn the same way (full-vocab, seed-as-DATA, position
+ * canonical) — the whole sampled stream stays on-device-consistent and
+ * byte-reproducible under a fixed seed. `lastPos` is the last prompt position
+ * (whose logits row predicts the token); the row is forced contiguous to honor
+ * the arg-reduce contiguity seam (§2 Probe 1 sharp edge).
+ */
+async function gumbelPrefillToken(
+  api: Torchlette,
+  logits: Tensor,
+  lastPos: number,
+  vocab: number,
+  sample: { temperature: number; seed: number },
+): Promise<number> {
+  const id = api.noGrad(() => {
+    const row = api.contiguous(
+      api.narrow(api.narrow(logits, 1, lastPos, 1), 2, 0, vocab),
+    ); // [1,1,V] contiguous
+    const uArr = gumbelUniform(sample.seed, vocab);
+    const u = api.tensorFromArray(uArr, [1, 1, vocab]);
+    const g = api.neg(api.log(api.neg(api.log(u)))); // -log(-log(u))
+    const scaled = api.add(api.div(row, sample.temperature), g);
+    return api.argmax(scaled, { dim: -1, keepdim: false });
+  });
+  const out = await api.cpu(api.reshape(id, [1, 1]));
+  return Math.round(out[0]);
+}
+
 /** Qwen3 chat format, thinking disabled (empty think block, per the official template). */
 export function buildChatPrompt(messages: ChatMessage[]): string {
   let s = "";
@@ -381,12 +459,38 @@ export async function generateChat(
   );
   const isAborted = options?.isAborted ?? (() => false);
   const { temperature, topK, topP, residualHook } = options ?? {};
-  // Unrolled-K greedy block decode (TORCHLETTE_UNROLLED_K>=K). Greedy ONLY
-  // (temperature===0): any stochastic sampler stays on the per-token host loop
-  // (the §4 typed boundary — sampling moves on-device in P3). When blockK<2 the
-  // per-token path below is byte-identical to before.
+  // P4 CUTOVER routing. The unrolled-K block is the DEFAULT decode path for the
+  // samplers it covers on-device: GREEDY (argmax) and pure-temperature
+  // (GUMBEL-max, §4). The TYPED RESIDUE that stays on the per-token host loop —
+  // any top-k restriction OR top-p / nucleus (a full-distribution host read the
+  // block cannot express, §4). TORCHLETTE_UNROLLED_K=0/1 opts the whole thing
+  // out (blockK=0 → the pre-cutover host loop, byte-identical to before).
   const greedy = temperature === 0;
-  const blockK = greedy ? unrolledKFromEnv() : 0;
+  const topKActive = topK !== undefined && topK < vocab;
+  const topPActive = topP !== undefined && topP < 1;
+  // Gumbel sampled block is opt-IN (explicit flag) — the sampled path's
+  // pre-existing dropped-submit transient (see unrolledKExplicit) is not shipped
+  // default-on. Greedy is default-on.
+  const gumbelEligible =
+    !greedy &&
+    (temperature ?? 0) > 0 &&
+    !topKActive &&
+    !topPActive &&
+    unrolledKExplicit();
+  const flagK = unrolledKFromEnv(); // 0 ⇒ opt-out; else the block size
+  const useBlock = flagK >= 2 && (greedy || gumbelEligible);
+  const blockK = useBlock ? flagK : 0;
+  // Gumbel sampling for the block: the per-block seed flows as DATA (§3.5),
+  // position-canonical INSIDE decodeBlock (seed+absolutePosition). Fixed per
+  // generation so replay/reference are byte-reproducible; undefined ⇒ a fresh
+  // random seed (run-to-run variety, matching the host sampler's Math.random).
+  const blockSample =
+    useBlock && gumbelEligible
+      ? {
+          temperature: temperature as number,
+          seed: options?.seed ?? ((Math.random() * 0x7fffffff) >>> 0),
+        }
+      : undefined;
 
   const genIds: number[] = [];
   let prevText = "";
@@ -442,14 +546,26 @@ export async function generateChat(
       const { logits } = api.noGrad(() =>
         model.forward(idx, { staticKV, residualHook }),
       );
-      const top = await api.readTopK(logits, K_PREFILTER, {
-        offset: (promptIds.length - 1) * vocab,
-        length: vocab,
-      });
-      logits.dispose();
-      nextTok = greedy
-        ? top.indices[0] // greedy = argmax = top-K index 0 (bit-identical)
-        : sampleFromTopK(top.values, top.indices, temperature, topK, topP);
+      if (blockSample) {
+        // Gumbel-max prefill token (full-vocab, on-device) so the whole sampled
+        // stream stays on-device-consistent + deterministic. Seeded at the last
+        // prompt position (promptIds.length-1); decodeBlock's ids[j] then draw
+        // seed+promptIds.length+j — a clean monotonic per-position seed sequence.
+        nextTok = await gumbelPrefillToken(api, logits, promptIds.length - 1, vocab, {
+          temperature: blockSample.temperature,
+          seed: blockSample.seed + promptIds.length - 1,
+        });
+        logits.dispose();
+      } else {
+        const top = await api.readTopK(logits, K_PREFILTER, {
+          offset: (promptIds.length - 1) * vocab,
+          length: vocab,
+        });
+        logits.dispose();
+        nextTok = greedy
+          ? top.indices[0] // greedy = argmax = top-K index 0 (bit-identical)
+          : sampleFromTopK(top.values, top.indices, temperature, topK, topP);
+      }
       await api.markStep();
     }
     const prefillMs = Date.now() - t0;
@@ -479,11 +595,12 @@ export async function generateChat(
     // decode CapturedFn is a per-token-path construct; null on the block path.
     let decode: ReturnType<Torchlette["capture"]> | null = null;
     if (blockK >= 2) {
-      // UNROLLED-K GREEDY BLOCK PATH (TORCHLETTE_UNROLLED_K). Emit the prefill
-      // token once, then decode K greedy tokens per GPU-boundary readback via
-      // decodeBlock (on-device argmax->gather feedback, one readback/block,
-      // bucket-clipped). Streaming granularity is K (§3.3); host truncation on
-      // the first stop token.
+      // UNROLLED-K BLOCK PATH (the P4 default for covered samplers). Emit the
+      // prefill token once, then decode K tokens per GPU-boundary readback via
+      // decodeBlock (on-device argmax/Gumbel->gather feedback, one readback/
+      // block, bucket-clipped). Greedy when blockSample is undefined; on-device
+      // Gumbel-max when set (pure-temperature, §4). Streaming granularity is K
+      // (§3.3); host truncation on the first stop token.
       emit(nextTok);
       count++;
       while (
@@ -498,7 +615,7 @@ export async function generateChat(
           staticKV,
           nextTok,
           blockK,
-          { residualHook, stopTokens: QWEN3_STOP_TOKENS },
+          { residualHook, stopTokens: QWEN3_STOP_TOKENS, sample: blockSample },
         );
         const t1 = performance.now();
         await api.markStep();
