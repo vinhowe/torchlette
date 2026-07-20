@@ -104,6 +104,8 @@ export {
   GradScaler,
   type GradScalerOptions,
   type HasLR,
+  Lion,
+  type LionOptions,
   type LRScheduler,
   PolynomialLR,
   SGD,

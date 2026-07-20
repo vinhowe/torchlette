@@ -5,6 +5,7 @@ export {
   type GradScalerState,
   type Optimizer,
 } from "./grad-scaler";
+export { Lion, type LionOptions, type LionParamGroup } from "./lion";
 export {
   CosineAnnealingLR,
   ExponentialLR,

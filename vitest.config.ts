@@ -25,6 +25,7 @@ const GPU_TEST_FILES = [
   "test/gemv-generated-route.spec.ts",
   "test/implied-step-boundary.spec.ts",
   "test/lazy-materialize-gen-lifetime.spec.ts",
+  "test/lion-distil-descent.spec.ts",
   "test/matmul-view-input.spec.ts",
   "test/memory-aware-scheduler.spec.ts",
   "test/observed-liveness.spec.ts",
