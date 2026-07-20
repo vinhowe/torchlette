@@ -92,10 +92,7 @@ import type {
   LazyRef,
   StorageHandle,
 } from "../graph/types";
-import {
-  type GeneratedStream,
-  generateStream,
-} from "./stream-generate";
+import { type GeneratedStream, generateStream } from "./stream-generate";
 
 /** Mark a storage's GPU buffer as liveness-safe for immediate pool reuse. */
 function markLivenessSafe(storage: StorageHandle): void {
@@ -720,6 +717,21 @@ function buildFromIRActive(): boolean {
 // variants (reach 1). Gates constFill coverage so a transient plan's `full`
 // never triggers a compile that leaks its plan-owned buffer.
 const buildReaches = new Map<number, number>();
+
+// fp → consecutive times generateStream came back NOT fullyCovered. A recurring
+// template that a generator cannot cover (a genuinely-uncovered op — a strided
+// view, a >128MB chunked path, a non-f32 dtype) re-enters the build block EVERY
+// execution and re-pays the whole ~N-node generateStream walk for a verdict that
+// never changes (the P2 "failed-generation tax", ~24% on the uncovered decode
+// block before the fusedRoPE generator closed it). Once a template has missed
+// coverage BUILD_FAILURE_MEMO times its structure will not become coverable
+// mid-process (generators are static; templateFp hashes structure), so we memo
+// the verdict and skip straight to lowered — no flag, strictly a saving. The
+// threshold sits ABOVE the warmup horizon: config-missing / no-input-pattern
+// artifacts are captured on the 1st dispatch and covered by the 2nd execution,
+// so a truly-coverable template resets (delete on fullyCovered) well before 4.
+const buildFailures = new Map<number, number>();
+const BUILD_FAILURE_MEMO = 4;
 
 // [D3 checkpoint-arena compile refusal — TRANSITION SCAFFOLDING, SUNSET-BOUND]
 // The single typed reason a build-from-IR-ELIGIBLE plan is nonetheless kept
@@ -2120,9 +2132,16 @@ export async function executeLoweredPlan(
   if (buildFromIREligible && options.refuseCompileHazard) {
     compileRefusalCount++;
   }
+  // [failed-generation-tax memo] A template that has missed coverage
+  // BUILD_FAILURE_MEMO times will not become coverable mid-process — skip the
+  // build block (and its full generateStream walk) and run lowered directly.
+  const memoUncoverable =
+    options.templateFp !== undefined &&
+    (buildFailures.get(options.templateFp) ?? 0) >= BUILD_FAILURE_MEMO;
   if (
     buildFromIREligible &&
     !options.refuseCompileHazard &&
+    !memoUncoverable &&
     options.bufferArena
   ) {
     await ensureFusionImports();
@@ -2157,6 +2176,17 @@ export async function executeLoweredPlan(
       console.log(
         `[census] nodes=${planNodes.length} covered=${gen.coveredActions}/${gen.actionCount} uncovered={${[...gen.uncovered].join(", ")}}`,
       );
+    }
+    // [failed-generation-tax memo] Track consecutive coverage misses per
+    // template: a fullyCovered result clears the counter (it will cache+replay
+    // and never re-enter here); a miss increments toward the skip threshold.
+    if (options.templateFp !== undefined) {
+      if (gen?.fullyCovered) buildFailures.delete(options.templateFp);
+      else
+        buildFailures.set(
+          options.templateFp,
+          (buildFailures.get(options.templateFp) ?? 0) + 1,
+        );
     }
     if (gen?.fullyCovered) {
       // [observed-liveness] The conservative full action-output harvest is the
@@ -2679,8 +2709,9 @@ export async function executeLoweredPlan(
             donatableInputIds,
             donationSink,
           );
-          (action as { cachedDonatedRecipeIdx?: number }).cachedDonatedRecipeIdx =
-            donationSink.idx;
+          (
+            action as { cachedDonatedRecipeIdx?: number }
+          ).cachedDonatedRecipeIdx = donationSink.idx;
           stats.fusedNodes += groupNodes.length;
           stats.fusionGroups++;
           break;
@@ -3198,7 +3229,8 @@ export async function executeLoweredPlan(
     } else {
       const runs = (loweredWitnessRuns.get(options.templateFp) ?? 0) + 1;
       loweredWitnessRuns.set(options.templateFp, runs);
-      if (runs >= 2) stampLoweredActionOutputs(loweredPlan, planNodes, options.templateFp);
+      if (runs >= 2)
+        stampLoweredActionOutputs(loweredPlan, planNodes, options.templateFp);
     }
   }
 
