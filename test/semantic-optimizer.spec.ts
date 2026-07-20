@@ -19,9 +19,12 @@ import { Lion, Torchlette } from "../src";
 import {
   ADAMW_PROGRAM,
   assertNoOptimizerProgramBody,
+  buildMuonOrtho,
   evalOptTensor,
   LION_PROGRAM,
-  MUON_DEFERRED,
+  MUON_NS_COEFFS,
+  MUON_ORTHO,
+  MUON_PROGRAM,
   OPTIMIZER_PROGRAMS,
   type OptRoles,
   SGD_MOMENTUM_PROGRAM,
@@ -47,6 +50,92 @@ const maxAbs = (a: ArrayLike<number>, b: ArrayLike<number>): number => {
 };
 
 const N = 24;
+
+// ---- Muon helpers: an honest JS Newton-Schulz + a Jacobi eigensolver --------
+
+/** 2D matmul; `tb` transposes B (`A·Bᵀ`). Rows-major nested arrays. */
+function jsMM(A: number[][], B: number[][], tb = false): number[][] {
+  const ar = A.length;
+  const ac = A[0].length;
+  if (tb) {
+    const br = B.length; // B is [br, ac]; result [ar, br]
+    const out = Array.from({ length: ar }, () => new Array(br).fill(0));
+    for (let i = 0; i < ar; i++)
+      for (let j = 0; j < br; j++) {
+        let s = 0;
+        for (let k = 0; k < ac; k++) s += A[i][k] * B[j][k];
+        out[i][j] = s;
+      }
+    return out;
+  }
+  const bc = B[0].length;
+  const out = Array.from({ length: ar }, () => new Array(bc).fill(0));
+  for (let i = 0; i < ar; i++)
+    for (let j = 0; j < bc; j++) {
+      let s = 0;
+      for (let k = 0; k < ac; k++) s += A[i][k] * B[k][j];
+      out[i][j] = s;
+    }
+  return out;
+}
+
+/** The reference Newton-Schulz quintic (same coeffs as MUON_NS_COEFFS). */
+function jsNewtonSchulz(
+  X0: number[][],
+  scale: number,
+  steps: number,
+): number[][] {
+  const { a, b, c } = MUON_NS_COEFFS;
+  let X = X0.map((row) => row.map((v) => v * scale));
+  for (let it = 0; it < steps; it++) {
+    const A = jsMM(X, X, true); // X·Xᵀ
+    const A2 = jsMM(A, A);
+    const B = A.map((row, i) => row.map((v, j) => b * v + c * A2[i][j]));
+    const BX = jsMM(B, X);
+    X = X.map((row, i) => row.map((v, j) => a * v + BX[i][j]));
+  }
+  return X;
+}
+
+/** Ascending eigenvalues of a symmetric matrix (cyclic Jacobi). */
+function eigSym(Ain: number[][]): number[] {
+  const n = Ain.length;
+  const A = Ain.map((r) => r.slice());
+  for (let sweep = 0; sweep < 100; sweep++) {
+    let off = 0;
+    for (let p = 0; p < n; p++)
+      for (let q = p + 1; q < n; q++) off += A[p][q] * A[p][q];
+    if (off < 1e-22) break;
+    for (let p = 0; p < n; p++)
+      for (let q = p + 1; q < n; q++) {
+        if (Math.abs(A[p][q]) < 1e-16) continue;
+        const theta = (A[q][q] - A[p][p]) / (2 * A[p][q]);
+        const t =
+          Math.sign(theta) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+        const cs = 1 / Math.sqrt(t * t + 1);
+        const sn = t * cs;
+        for (let k = 0; k < n; k++) {
+          const akp = A[k][p];
+          const akq = A[k][q];
+          A[k][p] = cs * akp - sn * akq;
+          A[k][q] = sn * akp + cs * akq;
+        }
+        for (let k = 0; k < n; k++) {
+          const apk = A[p][k];
+          const aqk = A[q][k];
+          A[p][k] = cs * apk - sn * aqk;
+          A[q][k] = sn * apk + cs * aqk;
+        }
+      }
+  }
+  return A.map((_, i) => A[i][i]).sort((x, y) => x - y);
+}
+
+/** Singular values of a [m,n] matrix (m≤n) via eigenvalues of X·Xᵀ. */
+function singularValues(X: number[][]): number[] {
+  const G = jsMM(X, X, true); // X·Xᵀ  [m,m]
+  return eigSym(G).map((e) => Math.sqrt(Math.max(0, e)));
+}
 
 describe("P5 — optimizers as programs (schema + reference)", () => {
   it("schema gate: every program is DATA; a smuggled JS body is unconstructible", () => {
@@ -262,10 +351,109 @@ describe("P5 — optimizers as programs (schema + reference)", () => {
     expect(maxAbs(await p.cpu(), jsP)).toBeLessThan(1e-4);
   });
 
-  it("MUON is declared but DEFERRED (honest scope)", () => {
-    expect(MUON_DEFERRED.name).toBe("muon");
-    expect(MUON_DEFERRED.reason).toMatch(/contraction/);
-    // It is NOT in the realizable catalog.
-    expect(OPTIMIZER_PROGRAMS.some((p) => p.name === "muon")).toBe(false);
+  it("MUON is now a REALIZABLE program (the contraction node exists)", () => {
+    // Muon joined the catalog (no longer deferred); it schema-gates like the rest.
+    expect(OPTIMIZER_PROGRAMS.some((p) => p.name === "muon")).toBe(true);
+    expect(() => assertNoOptimizerProgramBody(MUON_PROGRAM)).not.toThrow();
+    // A contraction (`mm`) node with a smuggled function operand is unconstructible.
+    expect(() =>
+      assertNoOptimizerProgramBody({
+        name: "evil-mm",
+        state: [],
+        stateUpdates: [],
+        paramUpdate: {
+          k: "mm",
+          a: { k: "role", name: "p" },
+          b: (() => 0) as never,
+          ta: false,
+          tb: false,
+        },
+        hyperRoles: [],
+      }),
+    ).toThrow(/schema gate/);
+  });
+
+  it("MUON orthogonalization interprets == the JS Newton-Schulz reference", async () => {
+    // A random, non-orthogonal wide matrix (rows ≤ cols for full-rank X·Xᵀ).
+    const M = 12;
+    const K = 32;
+    const STEPS = 5;
+    const data = randData(M * K, 101);
+    const X2d: number[][] = [];
+    for (let i = 0; i < M; i++) X2d.push(data.slice(i * K, (i + 1) * K));
+    let ss = 0;
+    for (const v of data) ss += v * v;
+    const scale = 1 / (Math.sqrt(ss) + 1e-7);
+
+    const x = api.tensorFromArray(data, [M, K]);
+    const Xk = api._wrap(
+      evalOptTensor(buildMuonOrtho(STEPS), api.runtime, {
+        m: x._unwrap(),
+        ns_scale: scale,
+      } as OptRoles),
+    );
+    const got = Array.from(await Xk.cpu());
+    const ref = jsNewtonSchulz(X2d, scale, STEPS).flat();
+    // The contraction composition reproduces the reference NS (fp32 vs fp64).
+    expect(maxAbs(got, ref)).toBeLessThan(1e-4);
+  });
+
+  it("MUON orthogonality: X·Xᵀ ≈ I on the singular-value scale (spectral property)", async () => {
+    // A DELIBERATELY ill-conditioned input (singular values spanning ~40×), so
+    // the assertion tests real orthogonalization, not an already-orthogonal input.
+    const M = 12;
+    const K = 32;
+    const STEPS = 5;
+    const raw = randData(M * K, 202);
+    // Skew the rows' magnitudes to widen the singular spectrum.
+    const data: number[] = [];
+    for (let i = 0; i < M; i++)
+      for (let j = 0; j < K; j++)
+        data.push(raw[i * K + j] * (0.05 + (i / M) * 2));
+    const X2d: number[][] = [];
+    for (let i = 0; i < M; i++) X2d.push(data.slice(i * K, (i + 1) * K));
+    let ss = 0;
+    for (const v of data) ss += v * v;
+    const scale = 1 / (Math.sqrt(ss) + 1e-7);
+
+    // Input singular values: wide spread (poorly conditioned).
+    const inSv = singularValues(X2d.map((r) => r.map((v) => v * scale)));
+    const inCond = inSv[inSv.length - 1] / inSv[0];
+    expect(inCond).toBeGreaterThan(5); // genuinely ill-conditioned input
+
+    // MUON_ORTHO (the default 5-step term) over the runtime.
+    const x = api.tensorFromArray(data, [M, K]);
+    const Xk = api._wrap(
+      evalOptTensor(MUON_ORTHO, api.runtime, {
+        m: x._unwrap(),
+        ns_scale: scale,
+      } as OptRoles),
+    );
+    const flat = Array.from(await Xk.cpu());
+    const Xmat: number[][] = [];
+    for (let i = 0; i < M; i++) Xmat.push(flat.slice(i * K, (i + 1) * K));
+
+    // The spectral property: every singular value is O(1) (the quintic band),
+    // i.e. X·Xᵀ ≈ I up to the singular-value scale — a well-conditioned output.
+    const outSv = singularValues(Xmat);
+    const outCond = outSv[outSv.length - 1] / outSv[0];
+    expect(outSv[0]).toBeGreaterThan(0.6); // no collapsed singular value
+    expect(outSv[outSv.length - 1]).toBeLessThan(1.4); // none blown up
+    expect(outCond).toBeLessThan(2); // orthogonalized (cond → ~1)
+    expect(outCond).toBeLessThan(inCond / 3); // dramatic improvement vs input
+
+    // And directly: the off-diagonal of the row-Gram is small relative to the
+    // diagonal (rows are ~orthogonal).
+    const G = jsMM(Xmat, Xmat, true);
+    let offMax = 0;
+    let diagMin = Infinity;
+    for (let i = 0; i < M; i++)
+      for (let j = 0; j < M; j++) {
+        if (i === j) diagMin = Math.min(diagMin, G[i][j]);
+        else offMax = Math.max(offMax, Math.abs(G[i][j]));
+      }
+    // Rows are ~orthogonal: off-diagonal well under the diagonal. (The rigorous
+    // spectral statement is the outCond<2 band above; this is a direct corollary.)
+    expect(offMax).toBeLessThan(0.5 * diagMin);
   });
 });

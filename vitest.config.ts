@@ -27,6 +27,7 @@ const GPU_TEST_FILES = [
   "test/lazy-materialize-gen-lifetime.spec.ts",
   "test/lion-distil-descent.spec.ts",
   "test/matmul-view-input.spec.ts",
+  "test/muon-distil-descent.spec.ts",
   "test/memory-aware-scheduler.spec.ts",
   "test/observed-liveness.spec.ts",
   "test/offset-views.spec.ts",
