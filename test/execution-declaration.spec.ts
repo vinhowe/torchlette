@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import {
   assertNoGeneratorLeaf,
   ELEMENTWISE_BINARY_WGSL,
+  ELEMENTWISE_COMPARISON_OPS,
   ELEMENTWISE_DECLARATIONS,
   ELEMENTWISE_UNARY_OPS,
   type ExecutionDeclaration,
@@ -34,6 +35,7 @@ describe("execution-declaration schema (P0 elementwise)", () => {
     const expected = new Set<string>([
       ...ELEMENTWISE_BINARY_WGSL.keys(),
       ...ELEMENTWISE_UNARY_OPS,
+      ...ELEMENTWISE_COMPARISON_OPS,
       "gelu",
       "cast",
       "contiguous",
@@ -52,6 +54,11 @@ describe("execution-declaration schema (P0 elementwise)", () => {
       const d = elementwiseDeclaration(op);
       expect(d?.arity).toBe(1);
       expect(d?.kernel.kernel).toBe("unaryDirect");
+    }
+    for (const op of ELEMENTWISE_COMPARISON_OPS) {
+      const d = elementwiseDeclaration(op);
+      expect(d?.arity).toBe(2);
+      expect(d?.kernel.kernel).toBe("comparisonDirect");
     }
     expect(elementwiseDeclaration("where")?.arity).toBe(3);
     expect(elementwiseDeclaration("where")?.kernel.kernel).toBe("whereDirect");

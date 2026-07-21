@@ -92,6 +92,7 @@ export type KernelRef =
   | { kernel: "unaryDirect" }
   | { kernel: "castDirect" }
   | { kernel: "whereDirect" }
+  | { kernel: "comparisonDirect" }
   | { kernel: "contiguousDirect" };
 
 /**
@@ -193,6 +194,25 @@ export const ELEMENTWISE_BINARY_WGSL: ReadonlyMap<string, string> = new Map([
  * `gelu`/`cast`/`contiguous`/`where` are elementwise too but take their own
  * kernel family (below); `gelu`'s opKey is payload-derived at the realizer.
  */
+/**
+ * The COMPARISON family (lt/le/gt/ge/eq/ne). Elementwise binary ops with an
+ * `always_f32` output (0.0/1.0), realized by a BESPOKE kernel (`comparisonWGSL`
+ * bakes strides+offsets in — distinct from `binaryDirect`), so they take their
+ * own `comparisonDirect` KernelRef. Declaring them here makes them
+ * `isDeclaredElementwise` (dispatch already routes them through the backend
+ * `lt`/… ops) AND generatable: the serializer derives the plan from the SAME
+ * `planComparisonDirect` the dispatch uses (single-source-at-seams). The GradScaler
+ * / clip finiteness masking folds a `lt` pair onto the packed optimizer buffer —
+ * the sole steady-state coverage gap (coverage-campaign §2.2). */
+export const ELEMENTWISE_COMPARISON_OPS: ReadonlySet<string> = new Set([
+  "lt",
+  "le",
+  "gt",
+  "ge",
+  "eq",
+  "ne",
+]);
+
 export const ELEMENTWISE_UNARY_OPS: ReadonlySet<string> = new Set([
   "sqrt",
   "relu",
@@ -262,6 +282,9 @@ export const ELEMENTWISE_DECLARATIONS: ReadonlyMap<
   ),
   ...[...ELEMENTWISE_UNARY_OPS].map(
     (op) => [op, elementwiseDecl(1, { kernel: "unaryDirect" })] as const,
+  ),
+  ...[...ELEMENTWISE_COMPARISON_OPS].map(
+    (op) => [op, elementwiseDecl(2, { kernel: "comparisonDirect" })] as const,
   ),
   ["gelu", elementwiseDecl(1, { kernel: "unaryDirect" })],
   ["contiguous", elementwiseDecl(1, { kernel: "contiguousDirect" })],

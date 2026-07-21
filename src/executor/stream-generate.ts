@@ -49,7 +49,11 @@ import {
   lookupKSplitTempBuffer,
   planTiledMatmul,
 } from "../backend/webgpu/matmul/dispatch";
-import { planArgReduceDispatch } from "../backend/webgpu/ops/comparison";
+import {
+  planArgReduceDispatch,
+  planComparisonDirect,
+  COMPARISON_WGSL_OP,
+} from "../backend/webgpu/ops/comparison";
 import {
   planGatherDirect,
   planScatterAddDirect,
@@ -879,6 +883,17 @@ function resolveElementwiseKernel(
         },
       };
     }
+    case "comparisonDirect": {
+      // Comparison bakes strides+offsets into the WGSL (the pipeline key IS the
+      // WGSL) and carries NO volatile offset repack — a narrow-fed input's
+      // offset can vary across replays, stranding the frozen shader stale.
+      // Refuse it, exactly like whereDirect.
+      if (node.inputs.some((r) => inputHasNarrow(r))) return "comparison-narrow";
+      const wgslOp = COMPARISON_WGSL_OP.get(node.op);
+      if (!wgslOp) return "unknown-comparison";
+      const plan = planComparisonDirect(wgslOp, ins[0], ins[1]);
+      return plan ? { plan } : "non-direct-route";
+    }
     case "castDirect": {
       const plan = planCastDirect(ins[0], node.dtype);
       return plan ? { plan } : "non-direct-route";
@@ -1468,10 +1483,16 @@ function directOpInputCount(node: LazyIRNode): number {
 /** Ops that dispatch through the direct-elementwise params path (the only ops
  *  whose paramsData carries the #71 base_offset uniform). */
 function isDirectElementwiseOp(op: string): boolean {
-  // Every declared elementwise op EXCEPT `where` dispatches through the
-  // direct-elementwise params path (carries the #71 base_offset uniform); `where`
-  // runs on offset-0 tensors and is excluded from the offset repack.
-  return isDeclaredElementwise(op) && op !== "where";
+  // Every declared elementwise op EXCEPT `where` and the comparison family
+  // dispatches through the direct-elementwise params path (carries the #71
+  // base_offset uniform). `where` and comparison bake strides+offsets into the
+  // WGSL (no volatile params), run on offset-0 tensors, and are excluded from
+  // the offset repack.
+  return (
+    isDeclaredElementwise(op) &&
+    op !== "where" &&
+    !COMPARISON_WGSL_OP.has(op)
+  );
 }
 
 /** Does this node's input view chain contain a narrow (→ potentially-varying

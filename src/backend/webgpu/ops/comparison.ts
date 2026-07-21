@@ -13,9 +13,10 @@ import {
   dispatchComputePass,
   dispatchElementwise,
   getPipeline,
+  type ElementwiseDirectPlan,
 } from "../dispatch";
 import { requireContext } from "../gpu-context";
-import type { GPUBuffer } from "../gpu-types";
+import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
 import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
 import {
   broadcastShapes,
@@ -32,6 +33,76 @@ import { createTensor, createTrackedBuffer } from "../tensor";
 import { comparisonWGSL } from "./ops-tile-ir";
 import { contiguous } from "./views";
 
+/**
+ * Geometry + WGSL + params for ONE comparison dispatch (lt/le/gt/ge/eq/ne over a
+ * broadcast pair), the SINGLE SOURCE both the imperative dispatcher
+ * (`comparisonOp`) and the stream generator (`stream-generate.ts`
+ * `resolveElementwiseKernel` comparisonDirect case) derive from — mirroring
+ * `planBinaryDirectCore` / `planArgReduceDispatch`. The output is always f32
+ * (`always_f32` dtype rule); strides + offsets are baked into the WGSL (the
+ * pipeline cache key IS the WGSL, so a varying-offset input would drift — the
+ * generator refuses narrow-fed inputs, matching `whereDirect`). `outShape`/
+ * `outSize` are passed by callers that already broadcast (avoids a re-derive). */
+export function planComparisonDirectCore(
+  wgslOp: string,
+  a: WebGPUTensor,
+  b: WebGPUTensor,
+  outShape: number[],
+  outSize: number,
+): ElementwiseDirectPlan {
+  const indexShape = toIndexShape(outShape);
+  const aStrides = computeEffectiveBroadcastStrides(a, indexShape);
+  const bStrides = computeEffectiveBroadcastStrides(b, indexShape);
+  const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
+  const dispatch = compute2DDispatch(totalWorkgroups);
+  const code = comparisonWGSL(
+    wgslOp,
+    indexShape,
+    aStrides,
+    bStrides,
+    a.offset,
+    b.offset,
+    a.dtype,
+    b.dtype,
+  );
+  return {
+    // Key IS the WGSL (single-source-at-seams; tile-dispatch canonical).
+    key: code,
+    shader: code,
+    outputSizeBytes: outSize * F32_BYTES,
+    paramsData: params(outSize),
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y,
+  };
+}
+
+/**
+ * Generator-facing guard: bail at >maxStorageBufferBindingSize (the comparison
+ * kernel binds whole buffers; oversized has no windowed realizer — an honest
+ * generation miss → lowered). The dispatch path (`comparisonOp`) uses the
+ * unguarded core: comparison inputs in the packed optimizer are scalar/norm
+ * masks, never oversized. */
+export function planComparisonDirect(
+  wgslOp: string,
+  a: WebGPUTensor,
+  b: WebGPUTensor,
+): ElementwiseDirectPlan | null {
+  const outShape = broadcastShapes(a.shape, b.shape);
+  const outSize = sizeOf(outShape);
+  if (outSize === 0) return null;
+  const maxBinding =
+    requireContext().device.limits?.maxStorageBufferBindingSize ??
+    128 * 1024 * 1024;
+  if (
+    a.size * F32_BYTES > maxBinding ||
+    b.size * F32_BYTES > maxBinding ||
+    outSize * F32_BYTES > maxBinding
+  ) {
+    return null;
+  }
+  return planComparisonDirectCore(wgslOp, a, b, outShape, outSize);
+}
+
 function comparisonOp(
   wgslOp: string,
   a: BackendTensor,
@@ -42,36 +113,27 @@ function comparisonOp(
   const bTensor = asGPUTensor(b);
 
   const outShape = broadcastShapes(aTensor.shape, bTensor.shape);
-  const indexShape = toIndexShape(outShape);
   const outSize = sizeOf(outShape);
 
-  const aStrides = computeEffectiveBroadcastStrides(aTensor, indexShape);
-  const bStrides = computeEffectiveBroadcastStrides(bTensor, indexShape);
-
-  const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
-  const dispatch = compute2DDispatch(totalWorkgroups);
-
-  const code = comparisonWGSL(
+  // SINGLE SOURCE for geometry + WGSL + params (shared with the stream
+  // generator's comparisonDirect kernel realizer).
+  const plan = planComparisonDirectCore(
     wgslOp,
-    indexShape,
-    aStrides,
-    bStrides,
-    aTensor.offset,
-    bTensor.offset,
-    aTensor.dtype,
-    bTensor.dtype,
+    aTensor,
+    bTensor,
+    outShape,
+    outSize,
   );
 
   const outBuffer = dispatchElementwise({
-    // Key IS the WGSL (single-source-at-seams; tile-dispatch canonical).
-    key: code,
-    shader: code,
+    key: plan.key,
+    shader: plan.shader,
     inputs: [aTensor.buffer, bTensor.buffer],
-    outputSizeBytes: outSize * 4,
-    params: params(outSize),
+    outputSizeBytes: plan.outputSizeBytes,
+    params: plan.paramsData,
     outBuffer: options?.outBuffer,
-    dispatchX: dispatch.x,
-    dispatchY: dispatch.y,
+    dispatchX: plan.dispatchX,
+    dispatchY: plan.dispatchY,
   });
 
   return createTensor(outShape, outBuffer);
@@ -87,12 +149,26 @@ const cmp =
   (a, b, options) =>
     comparisonOp(op, a, b, options);
 
-export const gt = cmp(">");
-export const lt = cmp("<");
-export const ge = cmp(">=");
-export const le = cmp("<=");
-export const eq = cmp("==");
-export const ne = cmp("!=");
+/**
+ * op-name → WGSL comparison symbol. SINGLE SOURCE for both the backend exports
+ * below and the stream generator's comparisonDirect realizer (which must feed
+ * `planComparisonDirect` the same symbol the dispatch path used, or the pipeline
+ * key drifts). */
+export const COMPARISON_WGSL_OP: ReadonlyMap<string, string> = new Map([
+  ["gt", ">"],
+  ["lt", "<"],
+  ["ge", ">="],
+  ["le", "<="],
+  ["eq", "=="],
+  ["ne", "!="],
+]);
+
+export const gt = cmp(COMPARISON_WGSL_OP.get("gt")!);
+export const lt = cmp(COMPARISON_WGSL_OP.get("lt")!);
+export const ge = cmp(COMPARISON_WGSL_OP.get("ge")!);
+export const le = cmp(COMPARISON_WGSL_OP.get("le")!);
+export const eq = cmp(COMPARISON_WGSL_OP.get("eq")!);
+export const ne = cmp(COMPARISON_WGSL_OP.get("ne")!);
 
 // ============================================================================
 // ArgMax/ArgMin - return indices of max/min values
