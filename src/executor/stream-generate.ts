@@ -103,6 +103,7 @@ import {
   TAG_UNIFORM,
   TAG_WRITE,
 } from "./compiled-plan";
+import { ENV } from "../core/env";
 import { operandRequiresContiguous } from "./contiguous-operands";
 import {
   ELEMENTWISE_BINARY_WGSL,
@@ -4139,6 +4140,13 @@ interface FusedActionShape {
   }>;
   recipe: import("../backend/webgpu/fusion-types").FusedKernelRecipe;
   runtimeScalarInputs?: Set<number>;
+  /** [buffer-donation P2] Recording-time liveness proof: producer node ids
+   *  whose LAST reader is this action and which are not cross-plan/terminal
+   *  outputs. Consumed by the plan-build donation edge under
+   *  TORCHLETTE_PLANNER_DONATION (design §3.5) — the un-refused analog of
+   *  cachedDonatedRecipeIdx (which the executor detector arena-refuses). */
+  cachedDonatableIds?: Set<number>;
+  cachedDonatedRecipeIdx?: number;
 }
 
 /**
@@ -4283,6 +4291,11 @@ function generateFused(
     return bytes > maxBindingSize;
   });
   if (extInputOversized) {
+    if (ENV.TORCHLETTE_DEBUG_DONATION) {
+      console.log(
+        `[planner-donation] OVERSIZED fused group -> decomposed (chunked); ops=${groupNodes.map((n) => n.op).join("+")}`,
+      );
+    }
     return generateFusedDecomposed(
       action,
       planNodes,
@@ -4363,10 +4376,76 @@ function generateFused(
   // being cleared (step-scoped in-place outputs — the foreach optimizer's m/v
   // update). Fall back to POST-HOC detection (out0's result buffer aliasing an
   // input) for actions not executed under recording (e.g. isolated unit tests).
-  const cachedDonated = (action as { cachedDonatedRecipeIdx?: number })
-    .cachedDonatedRecipeIdx;
+  const cachedDonated = action.cachedDonatedRecipeIdx;
   const outNode = planNodes[action.outputNodeIndex];
   let donatedRecipeIdx: number | undefined = cachedDonated;
+
+  // [buffer-donation P2] PLANNER-LEVEL donation (opt-in). The executor-side
+  // detector refuses arena / planner-registry buffers (segment-executors:293) —
+  // exactly the packed optimizer's concatenated `P`/`G`/`pNew` temps — so
+  // cachedDonated never covers them and the +46 % medium premium survives. At
+  // plan-build the planner OWNS those registry slots, so it donates them
+  // (design §3.5). For each recipe input whose PRODUCER liveness proves dead
+  // after this action (cachedDonatableIds) and whose stream slot is an arena
+  // temp (NOT external/persistent/result — the LiveOwner/Result refusals),
+  // shape+dtype-matching and non-scalar, collapse the primary output onto that
+  // input's slot (the ratified slot-collapse edge; the existing donatedInput
+  // binding form below does the single-slot dispatch). DONATABLE_OPERANDS: a
+  // fused group is composed exclusively of the declared elementwise family (the
+  // fusion invariant → per-thread consume-before-write safe). Guards mirror the
+  // detector: no needed intermediates (they re-read a clobbered external), no
+  // duplicate binding of the donated slot. The planner overlap audit and the
+  // strict [lifetime] guard are the assertion seams.
+  if (
+    ENV.TORCHLETTE_PLANNER_DONATION === "1" &&
+    donatedRecipeIdx === undefined &&
+    action.cachedDonatableIds &&
+    action.cachedDonatableIds.size > 0 &&
+    (!action.neededIntermediateNodeIndices ||
+      action.neededIntermediateNodeIndices.length === 0) &&
+    groupNodes.every((n) => isDeclaredElementwise(n.op))
+  ) {
+    const donatableIds = action.cachedDonatableIds;
+    const out0 = recipe.outputs[0];
+    const outElems = sizeOf(out0.shape);
+    let pos = 0;
+    for (let i = 0; i < recipe.inputs.length; i++) {
+      const rin = recipe.inputs[i];
+      if (rin?.isInlinedConstant) continue;
+      const curPos = pos++;
+      if (rin.isScalar) continue;
+      const ref = extInputs[i];
+      if (!ref || ref.kind !== "pending") continue;
+      if (!donatableIds.has(ref.node.id)) continue;
+      if (sizeOf(rin.shape) !== outElems) continue;
+      if (rin.dtype !== out0.dtype) continue;
+      const slot = inputSlots[curPos];
+      // Only arena (planner-owned temp) slots are donatable. external /
+      // persistent / params slots have owners elsewhere (LiveOwnerRefusal);
+      // result-holder slots escape the plan (ResultOrExternalRefusal) — and
+      // are already excluded from cachedDonatableIds via livenessOutputIds,
+      // but the slot-kind gate is the structural backstop.
+      if (slots[slot]?.kind !== "arena") continue;
+      // No duplicate binding of this slot in the fused dispatch (read + rw of
+      // one buffer in a single dispatch is a WebGPU validation error).
+      let dup = false;
+      for (let q = 0; q < inputSlots.length; q++) {
+        if (q !== curPos && inputSlots[q] === slot) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) continue;
+      donatedRecipeIdx = i;
+      break;
+    }
+    if (ENV.TORCHLETTE_DEBUG_DONATION && outElems > 100_000) {
+      console.log(
+        `[planner-donation] out=${out0.shape.join("x")} outs=${recipe.outputs.length} donatable=${donatableIds.size} -> ${donatedRecipeIdx !== undefined ? "DONATED in" + donatedRecipeIdx : "no"}`,
+      );
+    }
+  }
+
   if (
     donatedRecipeIdx === undefined &&
     outNode?.result &&

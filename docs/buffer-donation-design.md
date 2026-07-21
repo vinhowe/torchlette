@@ -3,7 +3,13 @@
 > **Status:** P1 LANDED (2026-07-21, §2.4) — packed-path leak fixed, flat premium
 > measured (distil +2.1 % / medium +45.6 % peak on A100), donation downgraded from
 > "unbounded-leak P4 blocker" to "flat-residual closer required for chain-packing P5."
-> P2/P3 (planner donation) remain DESIGN. Original P0 deliverable of the BUFFER DONATION
+> **P2 IMPLEMENTED-then-STOPPED (2026-07-21, §2.5) — the ratified generated-stream
+> slot-collapse edge lands opt-in (`TORCHLETTE_PLANNER_DONATION=1`, bit-exact ON≡OFF)
+> but recovers 0 % of the packed premium: the packed-optimizer plans are UNCOVERED
+> (run on the recorded build, not the generated stream) and the buffers are oversized
+> → chunked. Premium recovery is BLOCKED behind a stage-4 coverage prerequisite — named
+> class in §2.5. P3 is not reachable until that prerequisite is met.**
+> Original P0 deliverable of the BUFFER DONATION
 > campaign. It cashes the named blocker in `docs/chain-packing-design.md` P4 and
 > `docs/architecture-debt.md` stage-3 row: *"Closing [the foreach working-set
 > premium] needs graph-level buffer donation (write pNew into P's buffer, G packed
@@ -170,6 +176,72 @@ the packed premium from an **unbounded per-step leak** (would OOM any real run) 
 **Recommendation to the user (taste-call 1):** keep P1 filed as its own landed disposal
 fix (done) and start the donation campaign from this flat baseline; the P4 memory
 tolerance `X%` should be set against the medium@512 +46 % figure, not distil's +2 %.
+
+### 2.5 P2 IMPLEMENTED-then-STOPPED (2026-07-21) — the edge lands, the premium is unreachable
+
+The ratified P2 mechanism (§3.2–§3.4: the `DONATABLE_OPERANDS` declaration + the
+plan-build DONATION EDGE as a slot-collapse in the generated stream, un-refused for
+arena/planner-registry temps) was implemented, opt-in behind `TORCHLETTE_PLANNER_DONATION=1`:
+
+- `DONATABLE_OPERANDS` (sibling of `IN_PLACE_DST_INPUTS`, `plan-builder.ts`).
+- Executor threads the RAW liveness proof (`cachedDonatableIds` — producers whose last
+  reader is this action, not a cross-plan/terminal output) onto the fused action.
+- `generateFused` (`stream-generate.ts`) makes the donation decision from that proof +
+  `DONATABLE_OPERANDS` + shape/dtype + **arena-slot-kind** gating (the un-refused analog
+  of the executor detector's `cachedDonatedRecipeIdx`, which skips arena buffers), and
+  collapses the primary output onto the dead donatable operand's slot via the existing
+  `planFusedKernel` `donatedInput` binding form.
+
+**It is SAFE.** `parity-packed-vs-unpacked.ts` is bit-exact (maxDiff 0.0, all 4 arms)
+ON and OFF across the compiled-plan activation threshold; the strict `[lifetime]` guard
+throws zero.
+
+**It recovers 0 % of the packed premium** (distilgpt2@512 packed peak **5753.5 MB with
+the flag ON == OFF**, V100 sivri). Instrumentation shows donation NEVER FIRES on any
+packed-optimizer workload — three INDEPENDENT structural blockers, each sufficient alone:
+
+1. **UNCOVERED plans → the generated stream is never the live plan.** On distil (and
+   larger), the forward/backward AND optimizer plans are `fullyCovered=false`
+   (e.g. 187/311, 228/231 actions covered; uncovered set = `data-source:*`,
+   `fused[no-input-pattern]`, `op:triu`). The executor uses the GENERATED build only when
+   `gen.fullyCovered` (`executor.ts` build block); an uncovered plan runs on the RECORDED
+   compiled build. **The P2 donation edge lives in `generateStream`, so it is discarded
+   for every real training plan.** (The design's §3.1/§3.4 premise — "under compiled
+   replay the packed P/G/pNew buffers ARE planner-registry buffers" — holds only for
+   fully-covered plans, which the packed path is not.)
+2. **OVERSIZED buffers → chunked, no in-kernel donation.** `packOptimizerProgram` cats the
+   whole class into one `[Σ size]` buffer (~328 MB at distil, ~1.4 GB at medium) — far
+   over `maxStorageBufferBindingSize` (128 MB). Oversized fused groups route to
+   `generateFusedDecomposed`/chunked elementwise (and, lowered, to
+   `executeSequentialSegment`), and the chunked elementwise dispatch has NO donation form:
+   in-place would require the chunked tile-IR kernel to bind the donated input as the
+   read-write `out` (the `planFusedKernel` `donatedInput` trick), which it does not.
+3. **Recording↔generation ref-kind mismatch.** Even for a non-oversized covered group
+   (`div+div+sqrt+add+div+mul+add+sub`, the packed Adam update, reached with
+   `donatableIds=4`), the candidates bail `not-in-liveness`/`not-pending`: at generation
+   time (post-execution) the donatable producers resolve as `materialized` refs, whose
+   identity does not match the recording-time `pending` node ids in `cachedDonatableIds`.
+
+**NAMED CLASS (the seam that resists):** *the ratified P2 substrate — the generated
+compiled stream — is not the substrate the packed optimizer runs on. The packed premium
+lives in (a) UNCOVERED plans (recorded/lowered build) and (b) OVERSIZED-CHUNKED buffers.
+A generated-stream slot-collapse edge, however correct, is inert against both.* Recovering
+the premium requires, as a PREREQUISITE campaign (not P2 slot-collapse work):
+**(A) stage-4 COVERAGE of the packed optimizer plan** (`cat`/`narrow`/`copy_`/data-source
++ oversized-chunked elementwise → `fullyCovered`), so the generated stream — and its
+donation edge — becomes the live plan; **AND (B) chunked-elementwise IN-KERNEL donation**
+(bind the donated input as the chunked kernel's rw `out`), since the premium buffers are
+all oversized. Both are beyond the ratified "slot-collapse at plan-build" scope, and (B)
+is the highest-risk aliasing change in the codebase — the §7.2 corruption class. Per the
+campaign covenant ("STOP-with-named-class beats a forced landing in THIS mechanism"), P2
+STOPS here: the edge is landed opt-in (inert, safe, ready for when the substrate exists);
+the premium recovery is deferred to the coverage prerequisite.
+
+**Recommendation to the user:** treat "cover the packed optimizer plan" as the real P2.5
+(supersedes the `cat`-only P2.5 in §8 taste-call 2 — `cat` coverage is a subset of it),
+BEFORE any P3 flip. The `X%` P3 gate cannot be met while the packed plan is uncovered.
+The landed opt-in edge + `DONATABLE_OPERANDS` declaration are the foundation to reuse
+once (A) lands; nothing about them needs redesign.
 
 ---
 
@@ -364,7 +436,7 @@ GPU work serial-exclusive (`tools/pick-gpu.sh`, HOST node toolchain).
 |---|---|---|---|
 | **P0** | THIS design doc. | — | No `src/` change. |
 | **P1 — fix the packed-path leak (PREREQUISITE, not donation). ✅ LANDED 2026-07-21 (see §2.4).** | DONE: `pack-optimizer.ts` disposes the unpack `narrow`/`seg` materializations (the `seg` reshape was the leak; `pNew` was already disposed via `sink`). Option-(b) copy-elision rejected for P1 — it needs a source-offset region-read = donation itself. Net +8 SLOC, no deletion (cashed at P5). New standing gate `tools/packed-optim-flatness.ts`. | ✅ **Packed memory FLAT** (slope 0.000/step, plateau ~step 5–12; Adam/Lion/SGD, compiled + lowered); `parity-packed-vs-unpacked.ts` 4 arms bit-exact; `fused-vs-elementwise` (12) + cpu project (1551) green; strict `[lifetime]` zero throws. **TRUE flat premium (A100): distil +2.1 % peak / medium +45.6 % peak.** | Unblocks an honest gate. **Verdict: donation is NO LONGER a P4 blocker in the "unbounded leak" sense (P1 fixed it); it REMAINS the required mechanism for the flat +46 % medium residual → chain-packing P5. `X%` set from medium, not distil.** |
-| **P2 — planner-level donation, opt-in.** | `DONATABLE_OPERANDS` declaration (§3.2); the donation edge (slot-collapse) at plan-build (§3.4); planner binds output↔dying-input entry (§3.3); anti-alias suppression via slot-collapse; **subsume the executor-side fused donation** (`segment-executors.ts` block + `donationSink`/`cachedDonatedRecipeIdx` + `stream-generate` post-hoc detection become planner facts). Behind `TORCHLETTE_PLANNER_DONATION=1` (born with sunset). | `test/donation-parity.spec.ts` (bit-exact + peak ≤ no-donation); the **subsumption check** (`TORCHLETTE_DONATION=0` with planner donation on ⇒ equal-or-better peak); overlap-audit clean; strict-lifetime green. | Net-neutral-to-negative SLOC (§6): the planner fact replaces the executor special form. |
+| **P2 — planner-level donation, opt-in. ⚠ IMPLEMENTED-then-STOPPED 2026-07-21 (§2.5).** | LANDED opt-in (`TORCHLETTE_PLANNER_DONATION=1`): `DONATABLE_OPERANDS` declaration (§3.2); the donation edge (slot-collapse) in `generateFused` (§3.4), un-refused for arena temps, driven by the executor's raw liveness proof (`cachedDonatableIds`). The executor detector is NOT yet subsumed (it stays live on the flag-off path). | ✅ bit-exact ON≡OFF (`parity-packed-vs-unpacked.ts`, maxDiff 0.0, 4 arms, across the threshold); strict-lifetime zero throws. ❌ **premium recovery = 0 %** (distil packed peak 5753.5 MB ON==OFF): the edge is INERT — packed plans are UNCOVERED (recorded build, not the generated stream) and buffers are OVERSIZED→chunked (§2.5). | Blocked. The premium precondition needs a stage-4 COVERAGE campaign for the packed optimizer plan + chunked in-kernel donation FIRST (§2.5 recommendation) — a prerequisite, not slot-collapse work. |
 | **P3 — THE FLIP (satisfies chain-packing P4 precondition).** | `TORCHLETTE_PLANNER_DONATION` default-on; packed optimizer `pNew`→`P`, `G` packed-in-place donation active on the compiled path. | **Hard:** 124M `{…}` EXACT; distil 9 / medium 18 submits EXACT; **packed-arm peak within X% of fused** (X from the P1 A100 re-measure) on A100, FLAT; `parity-fullstack-tl.ts` twice; fused-vs-packed trajectory. Re-measure A100 fresh at flip. | This is the precondition `chain-packing-design.md` P4 gates on. With it met, chain-packing P4 (packed optimizer default on WebGPU) proceeds; **chain-packing P5 then deletes the fused `adamStep` monolith (~1.3–1.6k SLOC)** — the campaign-level payoff. |
 
 **Which phase flips chain-packing P4:** P3. **What P5 then needs:** nothing further from

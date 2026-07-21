@@ -109,6 +109,36 @@ const IN_PLACE_DST_INPUTS: Record<string, number[]> = {
 };
 
 /**
+ * DONATABLE_OPERANDS — the OUT-OF-PLACE analog of IN_PLACE_DST_INPUTS
+ * (buffer-donation design §3.2). An op DECLARES which operand positions its
+ * PRIMARY output MAY consume-before-write (alias the output onto that operand's
+ * buffer) — permitted only WHEN the memory planner PROVES the operand dead
+ * after this op (no live owner, no later reader, not a plan result). Absence is
+ * a REFUSAL by omission (a typed absence, not a runtime check): a reduction /
+ * matmul / any op that reads an operand across threads while writing must NOT
+ * appear here.
+ *
+ *  - `"elementwise"` — every operand equal in shape+dtype to out0, non-scalar,
+ *    non-broadcast. Per-thread consume-before-write is safe (each thread reads
+ *    its element before storing) — the property the fused donation already
+ *    relies on. The concrete membership is the declared elementwise family
+ *    (`isDeclaredElementwise`, execution-declaration.ts); fused groups are
+ *    composed exclusively of it (the fusion invariant), so a whole fused
+ *    segment is donatable at any shape/dtype-matching external input.
+ *  - `number[]` — explicit donatable positions. `stridedScatterCopy`'s dst is
+ *    already the IN_PLACE_DST_INPUTS buffer; donation is that same buffer
+ *    identity expressed as a planner binding (design §3.2 `copy_` clause).
+ *
+ * The declaration is a function of the op alone (cheap, cacheable). It is
+ * CONSUMED by the plan-build donation edge (stream-generate `generateFused`)
+ * gated on `TORCHLETTE_PLANNER_DONATION`; the planner's overlap audit and the
+ * `[lifetime]` strict guard are the assertion seams.
+ */
+export const DONATABLE_OPERANDS: Record<string, "elementwise" | number[]> = {
+  stridedScatterCopy: [0],
+};
+
+/**
  * WAR (write-after-read) ordering: an in-place node that OVERWRITES the
  * buffer behind ref R must execute after every other plan node that READS R.
  * DFS postorder guarantees def-before-use but says nothing about sibling

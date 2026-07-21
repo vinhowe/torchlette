@@ -2712,6 +2712,17 @@ export async function executeLoweredPlan(
           (
             action as { cachedDonatedRecipeIdx?: number }
           ).cachedDonatedRecipeIdx = donationSink.idx;
+          // [buffer-donation P2] Stash the RAW liveness proof (producers whose
+          // last reader is THIS action, not a cross-plan/terminal output) for
+          // the plan-build donation edge. Unlike cachedDonatedRecipeIdx (the
+          // executor-side detector's PICK, which refuses arena/planner-registry
+          // buffers — segment-executors:293), this is the un-refused set: the
+          // planner OWNS those registry temps and donates them (design §3.5).
+          // The generator applies DONATABLE_OPERANDS + shape/dtype + slot-kind
+          // gating over it under TORCHLETTE_PLANNER_DONATION.
+          (
+            action as { cachedDonatableIds?: Set<number> }
+          ).cachedDonatableIds = donatableInputIds;
           stats.fusedNodes += groupNodes.length;
           stats.fusionGroups++;
           break;

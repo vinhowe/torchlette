@@ -18,6 +18,7 @@ const GPU_TEST_FILES = [
   "test/checkpoint-scaler-seed-lifetime.spec.ts",
   "test/checkpoint-segmentation.spec.ts",
   "test/compiled-plan-parity.spec.ts",
+  "test/donation-parity.spec.ts",
   "test/distilgpt2-checkpoint-memory.spec.ts",
   "test/distilgpt2-finetune.spec.ts",
   "test/distilgpt2-full-finetuning.spec.ts",
