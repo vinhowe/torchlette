@@ -7,7 +7,7 @@ import {
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import {
   type PackedOptState,
-  packOptimizerProgram,
+  packOptimizerClass,
 } from "./pack-optimizer";
 import { validateOptimizerParams } from "./validate";
 
@@ -39,7 +39,7 @@ export class SGD {
   private _groupIndex: number[];
   private velocity: Array<RuntimeTensor | null>;
   /** Packed foreach state, keyed by param-group index (chain-packing P2). */
-  private _packState = new Map<number, PackedOptState>();
+  private _packState = new Map<number, PackedOptState[]>();
 
   constructor(
     params: Tensor[] | SGDParamGroup[],
@@ -165,22 +165,25 @@ export class SGD {
     for (const [gi, idxs] of groups) {
       const group = this._groups[gi];
       const wd = group.weightDecay;
-      const st = packOptimizerProgram(runtime, {
-        program,
-        items: idxs.map((i) => ({
-          id: i,
-          param: this.params[i]._unwrap(),
-          grad: this.params[i].grad!._unwrap(),
-          state: hasMomentum ? [this.velocity[i]!] : [],
-        })),
-        sharedRoles: { lr: group.lr, mu: this.momentum },
-        // L2 folds wd into g (affects the velocity too, matching the per-param
-        // path); the param term carries no wd.
-        adjustGrad:
-          wd !== 0 ? (rt, g, p) => rt.add(g, rt.mul(p, wd)) : undefined,
-        paramReadsPostState: true,
-        prevState: this._packState.get(gi),
-      });
+      const st = packOptimizerClass(
+        runtime,
+        {
+          program,
+          items: idxs.map((i) => ({
+            id: i,
+            param: this.params[i]._unwrap(),
+            grad: this.params[i].grad!._unwrap(),
+            state: hasMomentum ? [this.velocity[i]!] : [],
+          })),
+          sharedRoles: { lr: group.lr, mu: this.momentum },
+          // L2 folds wd into g (affects the velocity too, matching the per-param
+          // path); the param term carries no wd.
+          adjustGrad:
+            wd !== 0 ? (rt, g, p) => rt.add(g, rt.mul(p, wd)) : undefined,
+          paramReadsPostState: true,
+        },
+        this._packState.get(gi),
+      );
       this._packState.set(gi, st);
     }
     return updated;

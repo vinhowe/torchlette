@@ -37,6 +37,12 @@ import {
   type OptRoles,
   type OptTerm,
 } from "../ops/semantic/optimizer";
+import { getMaxStorageBufferBindingSize } from "../backend/webgpu/gpu-context";
+import { DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE } from "../backend/webgpu/shape-utils";
+import { ENV } from "../core/env";
+
+/** f32 element width — the pack is over `[total]` f32 flats (design §3 clause 3). */
+const PACK_ELEM_BYTES = 4;
 
 /** A single per-parameter chain to fold into the class's packed dispatch. */
 export interface PackItem {
@@ -281,4 +287,101 @@ export function packOptimizerProgram(
   for (const t of toDispose) (t as { dispose?: () => void }).dispose?.();
 
   return state;
+}
+
+/**
+ * The max cat SIZE (elements) a sub-class may reach before the backend chunks it.
+ * SINGLE SOURCE at the seam: the same device limit the chunking decision reads
+ * (`getMaxStorageBufferBindingSize`, delegating to
+ * `device.limits.maxStorageBufferBindingSize`, with the shared
+ * `DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE` fallback). A CPU/no-limit backend
+ * returns Infinity → no split (the packed path is WebGPU-only in practice).
+ */
+function maxSubClassElems(device: string): number {
+  // Test seam (born-with-sunset: retires when C3 is validated on the A100 exit
+  // gate): a byte cap that forces the split on a box whose real binding limit is
+  // huge (this V100/Dawn reports 2 GB, so a real model never chunks here — the
+  // split can only be exercised end-to-end by overriding). Not a user feature.
+  const override = ENV.TORCHLETTE_PACK_MAX_BYTES;
+  if (override) return Math.floor(parseInt(override, 10) / PACK_ELEM_BYTES);
+  if (device !== "webgpu") return Infinity;
+  const maxBindingBytes =
+    getMaxStorageBufferBindingSize() ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
+  return Math.floor(maxBindingBytes / PACK_ELEM_BYTES);
+}
+
+/**
+ * [coverage C3] Split ONE isomorphism class's items into sequential sub-classes,
+ * each with `Σ size ≤ maxElems` (so its packed `[Σ size]` cat stays under the
+ * binding limit → a NORMAL fused elementwise segment, not chunked, so the
+ * landed single-dispatch donation edge fires). DETERMINISTIC: a greedy sweep in
+ * the given (stable, param-index) order — same params ⇒ same split ⇒ stable
+ * compiled-plan templates. A single item larger than `maxElems` becomes its own
+ * sub-class (unavoidably chunked — no split can shrink one param — but isolated,
+ * never regressing today's one-class behavior). Returns `[items]` unchanged when
+ * the whole class already fits (the ≤128 MB common case).
+ */
+export function splitPackItems(
+  items: PackItem[],
+  maxElems: number,
+): PackItem[][] {
+  if (!Number.isFinite(maxElems)) return [items];
+  const sizeOf = (it: PackItem) =>
+    it.param.shape.reduce((a: number, b: number) => a * b, 1);
+  const subClasses: PackItem[][] = [];
+  let cur: PackItem[] = [];
+  let curSize = 0;
+  for (const it of items) {
+    const s = sizeOf(it);
+    if (cur.length > 0 && curSize + s > maxElems) {
+      subClasses.push(cur);
+      cur = [];
+      curSize = 0;
+    }
+    cur.push(it);
+    curSize += s;
+  }
+  if (cur.length > 0) subClasses.push(cur);
+  return subClasses;
+}
+
+/**
+ * Realize ONE isomorphism class, SPLITTING it into sequential ≤128 MB sub-classes
+ * (design §5.2 / coverage C3) when its `Σ size` would exceed the binding limit.
+ * Each sub-class is realized by `packOptimizerProgram` as an ordinary
+ * (non-chunked) fused segment, so the ratified donation edge fires per sub-class,
+ * AND — because the planner frees each sub-class's `G`/`pNew` before the next —
+ * the transient working set is bounded to one ≤128 MB sub-class instead of the
+ * whole model width (the §5.2 dividend). Bit-exact with the single-cat path: the
+ * elementwise update is position-independent, so splitting the cat changes only
+ * buffer lifetimes, not arithmetic.
+ *
+ * Returns one `PackedOptState` per sub-class (the class's permanently-packed
+ * state, split the same way); the caller caches the array and passes it back as
+ * `prevStates` next step. The shared per-step `disposeExtra` temps (e.g. Adam's
+ * bc1/bc2, read by EVERY sub-class) are disposed exactly ONCE, after the last
+ * sub-class's update graph is built.
+ */
+export function packOptimizerClass(
+  rt: RuntimeEngine,
+  spec: PackSpec,
+  prevStates?: PackedOptState[],
+): PackedOptState[] {
+  const device = spec.items[0]?.param.device ?? "webgpu";
+  const subClasses = splitPackItems(spec.items, maxSubClassElems(device));
+  const out: PackedOptState[] = [];
+  for (let k = 0; k < subClasses.length; k++) {
+    const isLast = k === subClasses.length - 1;
+    out.push(
+      packOptimizerProgram(rt, {
+        ...spec,
+        items: subClasses[k]!,
+        prevState: prevStates?.[k],
+        // Shared per-step temps are read by every sub-class — dispose once, after
+        // the last (disposing earlier would UAF the next sub-class's role read).
+        disposeExtra: isLast ? spec.disposeExtra : undefined,
+      }),
+    );
+  }
+  return out;
 }

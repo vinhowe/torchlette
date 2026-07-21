@@ -34,7 +34,7 @@ import {
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import {
   type PackedOptState,
-  packOptimizerProgram,
+  packOptimizerClass,
 } from "./pack-optimizer";
 import { validateOptimizerParams } from "./validate";
 
@@ -73,7 +73,7 @@ export class Lion {
   /** Per-param β2-EMA momentum `m`. Lazily created (persistent state). */
   private momentum: Array<RuntimeTensor | null>;
   /** Packed foreach state, keyed by param-group index (chain-packing P2). */
-  private _packState = new Map<number, PackedOptState>();
+  private _packState = new Map<number, PackedOptState[]>();
 
   constructor(
     params: Tensor[] | LionParamGroup[],
@@ -202,28 +202,31 @@ export class Lion {
     }
     for (const [gi, idxs] of groups) {
       const group = this._groups[gi];
-      const st = packOptimizerProgram(runtime, {
-        program: LION_PROGRAM,
-        items: idxs.map((i) => ({
-          id: i,
-          param: this.params[i]._unwrap(),
-          grad: this.params[i].grad!._unwrap(),
-          state: [this.momentum[i]!],
-        })),
-        sharedRoles: {
-          lr: group.lr,
-          wd: group.weightDecay,
-          beta1: this.beta1,
-          om_beta1: 1 - this.beta1,
-          beta2: this.beta2,
-          om_beta2: 1 - this.beta2,
+      const st = packOptimizerClass(
+        runtime,
+        {
+          program: LION_PROGRAM,
+          items: idxs.map((i) => ({
+            id: i,
+            param: this.params[i]._unwrap(),
+            grad: this.params[i].grad!._unwrap(),
+            state: [this.momentum[i]!],
+          })),
+          sharedRoles: {
+            lr: group.lr,
+            wd: group.weightDecay,
+            beta1: this.beta1,
+            om_beta1: 1 - this.beta1,
+            beta2: this.beta2,
+            om_beta2: 1 - this.beta2,
+          },
+          // Full p' folds in the decoupled `lr·wd·p`; the no-wd path derives just
+          // the signed step (LION_STEP) and subtracts.
+          paramUpdate: group.weightDecay !== 0 ? LION_P_NEW : LION_P_NO_WD,
+          paramReadsPostState: false,
         },
-        // Full p' folds in the decoupled `lr·wd·p`; the no-wd path derives just
-        // the signed step (LION_STEP) and subtracts.
-        paramUpdate: group.weightDecay !== 0 ? LION_P_NEW : LION_P_NO_WD,
-        paramReadsPostState: false,
-        prevState: this._packState.get(gi),
-      });
+        this._packState.get(gi),
+      );
       this._packState.set(gi, st);
     }
     return updated;

@@ -18,7 +18,7 @@ import {
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import {
   type PackedOptState,
-  packOptimizerProgram,
+  packOptimizerClass,
 } from "./pack-optimizer";
 import { validateOptimizerParams } from "./validate";
 
@@ -95,7 +95,7 @@ export class Adam {
    * foreach optimizers: the per-param definition is the semantics, the
    * packed form is the batched execution of the same tensor program.
    */
-  private _foreachState = new Map<number, PackedOptState>();
+  private _foreachState = new Map<number, PackedOptState[]>();
   constructor(
     params: Tensor[] | AdamParamGroup[],
     options: AdamOptions,
@@ -383,35 +383,38 @@ export class Adam {
     // per-step DATA + the per-param state; L2-vs-decoupled weight decay is the
     // realizer's POLICY (L2 folds wd into g via adjustGrad; AdamW binds it in the
     // param term). The pack/copy_/persist/dispose EFFECTS are the packer's.
-    const st = packOptimizerProgram(runtime, {
-      program: ADAMW_PROGRAM,
-      items: idxs.map((i) => ({
-        id: i,
-        param: this.params[i]._unwrap(),
-        grad: this.params[i].grad!._unwrap(),
-        state: [this.expAvg[i], this.expAvgSq[i]],
-      })),
-      sharedRoles: {
-        lr: lrTensor,
-        eps: this.eps,
-        wd: this.adamW ? wd : 0,
-        beta1: this.beta1,
-        om_beta1: 1 - this.beta1,
-        beta2: this.beta2,
-        om_beta2: 1 - this.beta2,
-        bc1,
-        bc2,
+    const st = packOptimizerClass(
+      runtime,
+      {
+        program: ADAMW_PROGRAM,
+        items: idxs.map((i) => ({
+          id: i,
+          param: this.params[i]._unwrap(),
+          grad: this.params[i].grad!._unwrap(),
+          state: [this.expAvg[i], this.expAvgSq[i]],
+        })),
+        sharedRoles: {
+          lr: lrTensor,
+          eps: this.eps,
+          wd: this.adamW ? wd : 0,
+          beta1: this.beta1,
+          om_beta1: 1 - this.beta1,
+          beta2: this.beta2,
+          om_beta2: 1 - this.beta2,
+          bc1,
+          bc2,
+        },
+        // The full p' (ADAMW_P_NEW) folds in the decoupled `lr·wd·p`; the no-wd
+        // path derives just the update magnitude (ADAMW_SCALED) and subtracts.
+        paramUpdate: this.adamW && wd !== 0 ? ADAMW_P_NEW : ADAMW_P_NO_WD,
+        adjustGrad: isL2
+          ? (rt, g, p) => rt.add(g, rt.mul(p, wd))
+          : undefined,
+        paramReadsPostState: true,
+        disposeExtra: [bc1, bc2],
       },
-      // The full p' (ADAMW_P_NEW) folds in the decoupled `lr·wd·p`; the no-wd
-      // path derives just the update magnitude (ADAMW_SCALED) and subtracts.
-      paramUpdate: this.adamW && wd !== 0 ? ADAMW_P_NEW : ADAMW_P_NO_WD,
-      adjustGrad: isL2
-        ? (rt, g, p) => rt.add(g, rt.mul(p, wd))
-        : undefined,
-      paramReadsPostState: true,
-      prevState: this._foreachState.get(gi),
-      disposeExtra: [bc1, bc2],
-    });
+      this._foreachState.get(gi),
+    );
     this._foreachState.set(gi, st);
   }
 
