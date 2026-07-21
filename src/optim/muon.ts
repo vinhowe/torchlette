@@ -30,11 +30,13 @@ import {
   MUON_M_NEW,
   MUON_NS_STEPS,
   MUON_P_APPLY,
+  MUON_PROGRAM,
   type OptRoles,
   type OptTerm,
 } from "../ops/semantic/optimizer";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import { Adam } from "./adam";
+import { assertFlattenable, OptimizerPackRefusal } from "./pack-optimizer";
 import { validateOptimizerParams } from "./validate";
 
 export type MuonOptions = {
@@ -79,6 +81,9 @@ export class Muon {
   /** The internal AdamW for embedding/1D/excluded params (null if none). */
   private readonly adamw: Adam | null;
   private _lr: number;
+  /** Cached once-per-class pack verdict (chain-packing P3, design §6.1). */
+  private _packRefusal: OptimizerPackRefusal | null = null;
+  private _packVerdictDecided = false;
 
   constructor(params: Tensor[], options: MuonOptions, api?: Torchlette) {
     const { api: engine, device } = validateOptimizerParams(
@@ -148,8 +153,44 @@ export class Muon {
     return this.muonParams.length;
   }
 
+  /**
+   * The Muon class's pack verdict, declared to the packer ONCE and cached
+   * (chain-packing P3 — design §6.1, "Muon full-refusal v1"). Muon declares
+   * `MUON_PROGRAM` to the packer exactly as Adam/Lion/SGD do; because the
+   * program carries an `mm` node (Newton–Schulz orthogonalization), the packer's
+   * clause-4 hard gate (`assertFlattenable`) refuses with a typed, named
+   * `OptimizerPackRefusal`, so Muon realizes its step through the per-param path.
+   *
+   * The verdict is a function of the PROGRAM alone (never the live shapes), so it
+   * is decided ONCE and cached — re-raising every step would be churn (design
+   * §6.1: "cheap, once-per-class decision, not per-step re-throw"). Returns the
+   * refusal (typed/named) for introspection, or `null` if the class were
+   * flat-packable — unreachable in v1, the seam a future elementwise partial pack
+   * (§6.1) would consume.
+   */
+  packVerdict(): OptimizerPackRefusal | null {
+    if (!this._packVerdictDecided) {
+      this._packVerdictDecided = true;
+      try {
+        assertFlattenable(MUON_PROGRAM, MUON_PROGRAM.paramUpdate);
+      } catch (e) {
+        if (!(e instanceof OptimizerPackRefusal)) throw e;
+        this._packRefusal = e;
+      }
+    }
+    return this._packRefusal;
+  }
+
   step(): Tensor[] {
     const rt = this.api._runtime();
+
+    // chain-packing P3 (design §6.1 — Muon full-refusal v1): declare the class
+    // to the packer. `MUON_PROGRAM` carries `mm` (Newton–Schulz), so the packer
+    // refuses (typed `OptimizerPackRefusal`, cached once-per-class) and the step
+    // realizes each 2D param through the per-param path below — byte-identical to
+    // the pre-routing math. A future elementwise partial pack (§6.1) would emit
+    // its accepted segments on a non-refusal verdict.
+    this.packVerdict();
 
     for (let i = 0; i < this.muonParams.length; i++) {
       const param = this.muonParams[i];

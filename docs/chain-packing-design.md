@@ -251,7 +251,7 @@ the compiled-plan activation threshold (Corollary 2).
 |---|---|---|---|
 | **P1** | **Extract the packer as a shared program-driven primitive.** Lift `Adam._foreachGroupStep`'s pack loop into `packOptimizerProgram(program, items, effects)` in `src/optim/` (or `src/ops/semantic/`): takes an `OptimizerProgram` + per-param `{param, grad, state[], hyperRoles}` items pre-grouped by the §3 key, does `cat → evalOptTerm → narrow → copy_`, sequences the declared `copy_`/`registerState`/`dispose` effects. Adam's foreach path calls it. **No default flip.** Behind existing `TORCHLETTE_FOREACH_ADAM`. | Nets ~0 SLOC (moves code out of `adam.ts`); establishes the single packing seam. No deletions yet. | `fused-vs-elementwise.spec.ts` (fused==derived-elementwise==derived-foreach, 12 cells) still green; new `parity-packed-vs-unpacked.ts` (Adam) added and green. |
 | **P2** | **Wire Lion + SGD(+momentum) to `packOptimizerProgram`.** They currently emit per-param chains (`lion.ts:149-206`, unfused across params). Replace with a grouped call; zero optimizer-specific code in the packer (it reads `LION_PROGRAM`/`SGD_*_PROGRAM`). | Cashes the per-param chain loops in `lion.ts`/`sgd.ts` (the realizer becomes group-by + one packer call). | `parity-packed-vs-unpacked.ts` extended to Lion + SGD; `test/lion-distil-descent.spec.ts` (20-step monotone descent) green; a Lion training run's submits measured (must not exceed the Adam-class submit budget for the same param count). |
-| **P3** | **Muon — the typed PARTIAL** (§6). Pack the maximal **elementwise segments** (`buf'=μ·buf+g`, the `rms·X` scale, the `p−lr·(…)` apply) per shape-class; the NS/`mm` contraction core stays per-param (typed refusal, per-param `rt.matmul` dispatch). The packer's clause-4 (§3) partitions the term automatically; no Muon-specific code in the packer. | Cashes Muon's per-param elementwise loops (the momentum + apply tails). The `mm` core is *refused*, not deleted. | `parity-packed-vs-unpacked.ts` extended to Muon (packed-partial vs per-param); a Muon DistilGPT-2 descent spec; assert the refusal is TYPED (per-param mm dispatch present, elementwise segments packed). |
+| **P3** | **✅ LANDED — Muon full-refusal v1** (§6.1, the sanctioned clean refusal). Muon declares `MUON_PROGRAM` to the packer through the same seam as Adam/Lion/SGD (`Muon.packVerdict()` → the packer's clause-4 gate `assertFlattenable`); because the program carries `mm` (Newton–Schulz) the packer refuses with a typed, named `OptimizerPackRefusal`, and Muon realizes its step per-param (correct-and-slow, byte-identical to pre-routing). The verdict is a **once-per-class** decision (function of the program alone), cached so it never re-throws per step. The elementwise-partial pack was **explicitly ruled OUT for v1** — see the future-work note below. | Near-net-zero SLOC (the routing seam + cached verdict on `muon.ts`); no deletions this phase. | `parity-packed-vs-unpacked.ts` extended with a Muon arm (packed-attempt = refused → per-param **vs** per-param, trivially bit-exact — the standing gate cell); `test/optim/muon-pack-refusal.spec.ts` (the standing spec of the HARD assertion: Muon → typed/named refusal; Adam/Lion/SGD accept — no collateral refusal; verdict cached & side-effect-free); the Muon DistilGPT-2 descent (`test/muon-distil-descent.spec.ts`, 7.89→0.35) reproduced unchanged. |
 | **P4** | **THE DEFAULT FLIP.** Make `packOptimizerProgram` Adam's default on WebGPU (route `step()` to the packed path when `params.length > 1`, ahead of `_stepFused`). **Precondition: graph-level buffer donation** (`pNew`→`P`'s buffer, `G` packed in place) landed so the ~2× foreach working-set premium closes and 124M memory + submit budgets hold. The fused kernel stays in-tree, unreferenced, as the assertion oracle for this phase only. | Cashes the `TORCHLETTE_FUSED_ADAM` default; `_stepFused` becomes opt-in. | **The hard gates:** 124M {…} EXACT; distil 9 / medium 18 submits EXACT; `parity-fullstack-tl.ts` twice; **fused-vs-packed trajectory** as the final assertion BEFORE P5 deletes fused. Re-measure the A100 baselines fresh at flip time (do NOT trust the historical foreach numbers as the flip evidence). |
 | **P5** | **THE DELETION.** Remove the fused `adamStep` node and everything downstream of it (the §5 ledger). | Net-negative SLOC (§5). | Full suite green post-deletion; `bash tools/weight-norm.sh --log` shows net-negative src vector; all standing gates green (the fused oracle is gone, so `fused-vs-elementwise.spec.ts` retires — its packed-vs-per-param successor from P1–P3 is the surviving guard). |
 | **P6 (separate campaign — scoped out here)** | **Bias-grad sum recognition pass** (§7). A recognition pass over the backward graph that detects N parallel isomorphic same-dim reductions (reusing the §3 isomorphism vocabulary) + tile-IR multi-output reduction. Different altitude (recognition, not declaration), different op class (reduction). | Would cash 244→~few sum dispatches (22% of full-FT GPU time). Needs net-new tile-IR mechanism; not a deletion. | Own campaign; own gate (packed-vs-unpacked reduction differential + the full-FT submit/GPU-time measurement). |
@@ -321,6 +321,29 @@ refusal the design sanctions — P3 may ship the full partial or the clean refus
 either way. What is NOT acceptable is silently flat-packing an `mm` (it would produce a
 wrong result, the worst failure mode). The packer must **assert** at group-build time
 that no packed class contains an `mm` node (clause-4 is a hard gate, not a heuristic).
+
+**Status — LANDED, full-refusal v1.** P3 shipped the **clean refusal**, not the partial.
+`Muon.step()` calls `Muon.packVerdict()` first: it declares `MUON_PROGRAM` to the packer's
+clause-4 gate (`assertFlattenable`, exported from `pack-optimizer.ts`), catches the typed
+`OptimizerPackRefusal`, and **caches** it — the verdict is a function of the program alone,
+so it is decided once and never re-thrown per step (the "cheap, once-per-class" requirement).
+The step then realizes each 2D param through the existing per-param path (the momentum
+copy_, the NS `rt.matmul` chain, the apply tail), byte-identical to the pre-routing math.
+The internal AdamW sub-path for embedding/1D params is a full `Adam` instance and inherits
+Adam's packer routing verbatim (it packs exactly when Adam packs) — structurally already on
+the shared machinery, so there is nothing Muon-specific to wire, and it packs for free once
+P4 flips Adam's default.
+
+**What a future elementwise partial-pack (§6.1 original) would need**, if the marginal win
+is ever wanted: (1) partition each Muon chain into `[elementwise momentum]` → `[mm-bearing
+NS core]` → `[elementwise apply]` at the realizer, packing the two elementwise ends across
+params **of the same shape-class** while the NS core stays per-param `rt.matmul`; (2) group
+by shape-class (Muon already requires same-shape for the orientation/rms policy), not just by
+the §3 key; (3) a per-shape-class flat pack of the momentum-update and apply tails that reads
+the per-param NS output back out — i.e. a scatter/gather boundary around the un-packable core.
+`packVerdict()` returning `null` is the seam that path would consume; today it is unreachable
+(MUON always refuses). The parity tool's Muon arm (packed-attempt vs per-param) is the
+red/green trajectory guard that partial would inherit.
 
 ### 6.2 What the packer REFUSES to pack (typed refusal → correct-and-slow fallback)
 

@@ -15,18 +15,28 @@
  *   unpacked Adam := per-param elementwise (+ TORCHLETTE_FOREACH_ADAM=0)
  *   packed   Lion/SGD := default (packOptimizerProgram)
  *   unpacked Lion/SGD := per-param (TORCHLETTE_PACK_OPTIM=0)
+ *   packed   Muon := packed-ATTEMPT (design §6.1: MUON refuses via mm → per-param)
+ *   unpacked Muon := per-param
  *
- * Env: STEPS (default 30), TOL (default 1e-4), OPTS (csv: adam,lion,sgd).
+ * The Muon arm is TRIVIALLY bit-exact (v1 ships full refusal — the "packed
+ * attempt" and the per-param path are the SAME execution, docs/chain-packing-
+ * design.md §6.1). It earns its place as the STANDING GATE CELL that pins the
+ * Muon routing across the compiled-plan activation threshold, so a future
+ * elementwise partial pack (§6.1) inherits a red/green trajectory guard.
+ *
+ * Env: STEPS (default 30), TOL (default 1e-4), OPTS (csv: adam,lion,sgd,muon).
  */
 
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
 import type { Tensor } from "../src/frontend/tensor";
 import { Torchlette } from "../src/frontend/torchlette";
-import { Adam, Lion, SGD } from "../src/optim/index.ts";
+import { Adam, Lion, Muon, SGD } from "../src/optim/index.ts";
 
 const STEPS = parseInt(process.env.STEPS ?? "30", 10);
 const TOL = parseFloat(process.env.TOL ?? "1e-4");
-const OPTS = (process.env.OPTS ?? "adam,lion,sgd").split(",").map((s) => s.trim());
+const OPTS = (process.env.OPTS ?? "adam,lion,sgd,muon")
+  .split(",")
+  .map((s) => s.trim());
 
 const VOCAB = 256;
 const NUM_LAYERS = 2;
@@ -115,6 +125,29 @@ const OPT_ARMS: Record<string, { packed: Arm; unpacked: Arm }> = {
       },
       make: (p, api) =>
         new SGD(p, { lr: 1e-2, momentum: 0.9, weightDecay: 0.01 }, api),
+    },
+  },
+  // Muon: v1 ships FULL REFUSAL (design §6.1) — both arms declare the class to
+  // the packer, the mm gate refuses, and both realize per-param. Trivially
+  // bit-exact; pins the routing across the compiled-plan threshold. Muon
+  // auto-routes 2D weights to orthogonalization and 1D params to its internal
+  // AdamW; lr kept conservative so the toy trajectory stays finite.
+  muon: {
+    packed: {
+      name: "muon/packed-attempt(refused→per-param)",
+      setEnv: () => {
+        delete process.env.TORCHLETTE_PACK_OPTIM;
+      },
+      make: (p, api) =>
+        new Muon(p, { lr: 1e-3, momentum: 0.95, adamwLr: 1e-3 }, api),
+    },
+    unpacked: {
+      name: "muon/per-param",
+      setEnv: () => {
+        process.env.TORCHLETTE_PACK_OPTIM = "0";
+      },
+      make: (p, api) =>
+        new Muon(p, { lr: 1e-3, momentum: 0.95, adamwLr: 1e-3 }, api),
     },
   },
 };
