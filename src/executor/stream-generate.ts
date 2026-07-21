@@ -85,6 +85,7 @@ import {
 } from "../backend/webgpu/rope-kernel";
 import { planRowProgramDispatch } from "../backend/webgpu/row-program-dispatch";
 import { alignBufferSize, dtypeBytes } from "../backend/webgpu/shape-utils";
+import { planDeviceTopK } from "../backend/webgpu/topk-kernel";
 import type { WebGPUTensor } from "../backend/webgpu/tensor";
 import type {
   TileKernelChunkedPlan,
@@ -1082,6 +1083,8 @@ function generateSequential(
   if (node.op === "fusedRoPE") return generateRoPE(node, slots, resolveRefSlot);
   if (node.op === "argmax" || node.op === "argmin")
     return generateArgReduce(node, slots, resolveRefSlot);
+  if (node.op === "deviceTopK")
+    return generateDeviceTopK(node, slots, resolveRefSlot, bufferSlot);
   if (node.op === "gather") return generateGather(node, slots, resolveRefSlot);
   if (node.op === "cat") return generateCat(node, slots, resolveRefSlot);
   if (node.op === "scatterAdd")
@@ -2304,6 +2307,27 @@ function contiguousViewShapeDtype(
   return { shape: ref.node.shape, dtype: (ref.node.dtype ?? "f32") as DType };
 }
 
+/** A RELEASED view producer (oi 0) is flat-bindable from its aliased base iff
+ *  its IR-derived layout (deriveNodeViewMeta — the single-source view-meta the
+ *  backend ops use) is contiguous AND offset-0: then the view's logical shape
+ *  equals the base buffer's physical layout, so a flat kernel binding the base
+ *  slot reads it correctly. Handles reshape/view AND a start-0 narrow whose
+ *  result is contiguous (`narrow(vals,2,0,1)` = the softmax-shift max) with one
+ *  rule; a strided or offset view returns false (caller keeps its no-storage
+ *  bail). Live-storage refs never reach here — the caller's storage branch runs
+ *  first. */
+function releasedViewFlatBindable(
+  ref: LazyIRNode["inputs"][number],
+): boolean {
+  if (ref.kind !== "pending" || (ref.outputIndex ?? 0) !== 0) return false;
+  const vm = deriveNodeViewMeta(
+    ref.node as unknown as MetaNodeLike,
+    refLiveMeta,
+  );
+  if (!vm) return false;
+  return checkContiguous(vm.shape, vm.strides) && vm.offset === 0;
+}
+
 /** scatterAdd (embedding backward): ALLOC(out,kind0,[a,index,src]) +
  *  COPY(a→out) + DISPATCH[index,src,out,params]. The copy seeds the
  *  accumulator (recorded, replayed — the +1x-grad bug class). Geometry from
@@ -2451,6 +2475,87 @@ function generateArgReduce(
   };
 }
 
+/**
+ * deviceTopK (on-device sampling prefilter): the two-pass tile-IR top-K
+ * selection over one logits row → packed `[1,2,k]` (values desc + token ids as
+ * f32). SINGLE-SOURCED with the lowered dispatch through `planDeviceTopK`
+ * (topk-kernel.ts) — the same offset/length-baked pipelines, the same per-k
+ * persistent pvals/pidx scratch, the same packed output size — so the compiled
+ * replay is byte-identical to the recording.
+ *
+ * offset/length flow as WGSL CONSTANTS baked into the pass-1 pipeline (not as a
+ * uniform), exactly as `dispatchDeviceTopK` bakes them: the decode input is
+ * `asContiguous`'d to a flat-from-0 row, so offset=0 and length=sizeOf(shape)=V
+ * are stable across the K per-step dispatches — no volatile repack needed (§3.5
+ * seed-as-DATA lives on the Gumbel `u` tensor upstream, not here). The two
+ * dispatches ride consecutive compute-pass usage scopes (WebGPU syncs storage
+ * access between dispatches in a pass), so pass-2's read of pvals/pidx after
+ * pass-1's write needs no explicit barrier — matching the lowered encoder.
+ */
+function generateDeviceTopK(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 1) return "arity";
+  const cfg = node.payload as { k?: number } | undefined;
+  if (!cfg || cfg.k == null) return "payload";
+  const ref = node.inputs[0];
+  const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
+  if (!sd) return "no-shape";
+  const prologue: GpuCommand[] = [];
+  const inSlot = resolveContiguousInto(
+    node.op,
+    0,
+    ref,
+    resolveRefSlot,
+    slots,
+    prologue,
+  );
+  if (typeof inSlot === "string") return inSlot;
+  // The op forces the row contiguous (offset 0), so length is the full element
+  // count — the single-source geometry the lowered `deviceTopK` derives from
+  // `asContiguous(logits).size`.
+  const length = sizeOf(sd.shape);
+  const k = cfg.k;
+  if (k > length) return "k-exceeds-length";
+  const plan = planDeviceTopK(0, length, k);
+  const pvalsSlot = bufferSlot(plan.pvals, "persistent");
+  const pidxSlot = bufferSlot(plan.pidx, "persistent");
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  return {
+    commands: [
+      ...prologue,
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: plan.outputBytes,
+        allocKind: 1,
+        inputSlots: [],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: plan.pass1,
+        bindings: [inSlot, pvalsSlot, pidxSlot],
+        gx: plan.pass1Groups,
+        gy: 1,
+        gz: 1,
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: plan.pass2,
+        bindings: [pvalsSlot, pidxSlot, outSlot],
+        gx: 1,
+        gy: 1,
+        gz: 1,
+      },
+    ],
+    outSlot,
+  };
+}
+
 function generateGather(
   node: LazyIRNode,
   slots: SlotSource[],
@@ -2464,8 +2569,14 @@ function generateGather(
   const aSlot = resolveRefSlot(aRef);
   const idxSlot = resolveRefSlot(idxRef);
   if (aSlot === undefined || idxSlot === undefined) return "untracked-input";
-  const a = refShapeDtype(aRef);
-  const idx = refShapeDtype(idxRef);
+  // A RELEASED contiguous-view operand (the sampler's index is
+  // `reshape(argmax(...), [1,1,1])`, whose result liveness may have dropped
+  // before plan-build) is shape-derivable from IR: reshape/view/… keep the
+  // logical shape == physical layout, so the flat kernel binding the aliased
+  // base buffer reads it correctly. Mirrors the fallback every other generator
+  // already uses (arg-reduce, reductions) — closes `gather[no-shape]`.
+  const a = refShapeDtype(aRef) ?? contiguousViewShapeDtype(aRef);
+  const idx = refShapeDtype(idxRef) ?? contiguousViewShapeDtype(idxRef);
   if (!a || !idx) return "no-shape";
   const plan = planGatherDirect(
     a.shape,
@@ -4376,8 +4487,20 @@ function generateFused(
       });
       inputBufs.push(t.buffer);
       inputSlots.push(slot);
-    } else if (ref.kind !== "materialized" && !VIEW_OPS.has(ref.node.op)) {
-      // Released non-view producer: slot logical, metadata synthesized.
+    } else if (
+      ref.kind !== "materialized" &&
+      (!VIEW_OPS.has(ref.node.op) || releasedViewFlatBindable(ref))
+    ) {
+      // Released producer, flat-bindable from its aliased base: either a
+      // non-view (fresh contiguous alloc) or a VIEW whose IR-derived layout is
+      // contiguous & offset-0 (releasedViewFlatBindable). resolveRefSlot aliases
+      // the whole view chain to the base slot, and a contiguous-offset-0 view's
+      // logical shape == the base's physical layout, so the flat kernel reads it
+      // correctly. Covers the filtered sampler's `reshape(matmul(...),[1,1,k])`
+      // (exclusive cumsum) AND the start-0 last-dim `narrow(vals,2,0,1)` (the
+      // softmax-shift max) — both contiguous-offset-0 releases feeding fused
+      // elementwise ops; closes their `fused[no-storage]` bail. A genuinely
+      // strided/offset view stays bailed.
       const slot = resolveRefSlot(ref);
       if (slot === undefined) return "untracked-input";
       dispatchInputs.push({

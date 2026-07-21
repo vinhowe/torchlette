@@ -457,12 +457,30 @@ export async function readTopK(
  * `input` is a contiguous f32 buffer holding the single logits row; `offset`/
  * `length` (elements) select the row. Returns the packed output GPUBuffer.
  */
-export function dispatchDeviceTopK(
-  input: GPUBuffer,
+/**
+ * The geometry + compiled pipelines + persistent scratch of a deviceTopK
+ * dispatch, derived from (offset, length, k). SINGLE SOURCE for both the
+ * lowered dispatch (`dispatchDeviceTopK`) and the build-from-IR serializer
+ * (`generateDeviceTopK` in stream-generate.ts) — the two must agree byte-for-
+ * byte on pipeline identity (offset/length baked as WGSL constants), the
+ * pvals/pidx scratch bindings, and the packed output size, or the compiled
+ * replay diverges from the recording. `outputBytes` is the packed `[2k]` f32.
+ */
+export interface DeviceTopKPlan {
+  pass1: import("./gpu-types").GPUComputePipeline;
+  pass2: import("./gpu-types").GPUComputePipeline;
+  pvals: GPUBuffer;
+  pidx: GPUBuffer;
+  outputBytes: number;
+  /** pass-1 grid (NW workgroups). pass-2 is a single workgroup. */
+  pass1Groups: number;
+}
+
+export function planDeviceTopK(
   offset: number,
   length: number,
   k: number,
-): GPUBuffer {
+): DeviceTopKPlan {
   if (k > length) {
     throw new Error(`deviceTopK: k=${k} exceeds slice length ${length}`);
   }
@@ -470,22 +488,40 @@ export function dispatchDeviceTopK(
   const bufs = getOrCreateBuffers(k); // reuse pvals/pidx scratch (per-k)
   const chunk = Math.ceil(length / NW);
   const maxPT = Math.ceil(chunk / WG);
-
   const wgsl1 = pass1WGSL(k, maxPT, { offset, length });
   const wgsl2 = pass2WGSL(k, true); // packed f32 output
-  const p1 = getPipeline(ctx, wgsl1, wgsl1);
-  const p2 = getPipeline(ctx, wgsl2, wgsl2);
+  return {
+    pass1: getPipeline(ctx, wgsl1, wgsl1),
+    pass2: getPipeline(ctx, wgsl2, wgsl2),
+    pvals: bufs.pvals,
+    pidx: bufs.pidx,
+    outputBytes: 2 * k * 4,
+    pass1Groups: NW,
+  };
+}
 
-  const out = allocateOutputBuffer(2 * k * 4); // packed [2k] f32
+export function dispatchDeviceTopK(
+  input: GPUBuffer,
+  offset: number,
+  length: number,
+  k: number,
+): GPUBuffer {
+  const ctx = requireContext();
+  const plan = planDeviceTopK(offset, length, k);
+  const out = allocateOutputBuffer(plan.outputBytes); // packed [2k] f32
 
-  const bg1 = cachedCreateBindGroup(ctx.device, p1, [
+  const bg1 = cachedCreateBindGroup(ctx.device, plan.pass1, [
     input,
-    bufs.pvals,
-    bufs.pidx,
+    plan.pvals,
+    plan.pidx,
   ]);
-  dispatchComputePass(p1, bg1, NW, 1, 1, "deviceTopKPass1");
-  const bg2 = cachedCreateBindGroup(ctx.device, p2, [bufs.pvals, bufs.pidx, out]);
-  dispatchComputePass(p2, bg2, 1, 1, 1, "deviceTopKPass2");
+  dispatchComputePass(plan.pass1, bg1, plan.pass1Groups, 1, 1, "deviceTopKPass1");
+  const bg2 = cachedCreateBindGroup(ctx.device, plan.pass2, [
+    plan.pvals,
+    plan.pidx,
+    out,
+  ]);
+  dispatchComputePass(plan.pass2, bg2, 1, 1, 1, "deviceTopKPass2");
   return out;
 }
 

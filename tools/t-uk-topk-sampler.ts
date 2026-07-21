@@ -516,6 +516,45 @@ async function main() {
     }
   }
 
+  // (v) COMPILED == LOWERED (the coverage follow-on's new differential) -------
+  // The filtered block now reaches build-from-IR fullyCovered (deviceTopK +
+  // gather + the released-view fused ops all have generators), so the K-block
+  // CUTS OVER to the compiled plan on the 2nd+ execution. This cell is the
+  // standing guard that the compiled sampled arm produces a BYTE-IDENTICAL token
+  // stream to the pure-lowered arm at the same seed — the exact correctness the
+  // new generators must preserve (the compiled plan replays the deviceTopK
+  // passes + the reshape/narrow-fed fused ops against the recording).
+  {
+    api.manualSeed(1234);
+    const model = new Qwen3(api, { ...CONFIG });
+    const SEED = 4242;
+    const p = { ids: [3, 14, 15, 92, 65, 33, 7], N: 24 };
+    const prev = process.env.TORCHLETTE_COMPILED_PLAN;
+    for (const K of [1, 4, 8]) {
+      // arm A: build-from-IR compiled (default). The block runs several times
+      // (N/K readbacks) so it crosses the 2nd-execution cutover threshold.
+      delete process.env.TORCHLETTE_COMPILED_PLAN;
+      const on = await filteredBlockLoop(
+        api, model, p.ids, p.N, K, 0.8, SEED, 20, 0.95,
+      );
+      await api.markStep();
+      // arm B: pure lowered.
+      process.env.TORCHLETTE_COMPILED_PLAN = "0";
+      const off = await filteredBlockLoop(
+        api, model, p.ids, p.N, K, 0.8, SEED, 20, 0.95,
+      );
+      await api.markStep();
+      const match = on.length === off.length && on.every((t, i) => t === off[i]);
+      ok(
+        match,
+        `compiled==lowered [K=${K}]: filtered block token stream identical across arms` +
+          (match ? "" : `\n  compiled: [${on}]\n  lowered : [${off}]`),
+      );
+    }
+    if (prev === undefined) delete process.env.TORCHLETTE_COMPILED_PLAN;
+    else process.env.TORCHLETTE_COMPILED_PLAN = prev;
+  }
+
   ok(
     getGpuUncapturedErrorCount() === 0,
     `zero uncaptured GPU errors — got ${getGpuUncapturedErrorCount()}`,
