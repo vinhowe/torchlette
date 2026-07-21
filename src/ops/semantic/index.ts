@@ -8,6 +8,7 @@
 export * from "./adjoint";
 export * from "./catalog";
 export * from "./composite";
+export * from "./contraction";
 export * from "./emit-rt";
 export * from "./erf";
 export * from "./expr";

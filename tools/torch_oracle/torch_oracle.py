@@ -165,6 +165,27 @@ def run_case(case):
     inputs = [build_tensor(tensor) for tensor in case.get("inputs", [])]
     options = case.get("options")
 
+    # Contraction backward: C = op(A,ta) @ op(B,tb), loss = (C*G).sum() (G=ones if
+    # absent). The referee for the semantic contraction-adjoint fact across all
+    # four transpose-flag combos (src/ops/semantic/contraction.ts).
+    if op == "contraction_backward":
+        ta = bool(option(options, "ta", False))
+        tb = bool(option(options, "tb", False))
+        a = inputs[0].float().requires_grad_(True)
+        b = inputs[1].float().requires_grad_(True)
+        op_a = a.transpose(-2, -1) if ta else a
+        op_b = b.transpose(-2, -1) if tb else b
+        c = torch.matmul(op_a, op_b)
+        if len(inputs) > 2:
+            loss = (c * inputs[2].float()).sum()
+        else:
+            loss = c.sum()
+        loss.backward()
+        return {
+            "output": tensor_payload(c),
+            "grads": [tensor_payload(a.grad), tensor_payload(b.grad)],
+        }
+
     # Generic backward test for any op
     if op == "backward":
         inner_op = option(options, "op")

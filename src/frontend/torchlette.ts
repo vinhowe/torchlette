@@ -110,6 +110,11 @@ import {
   UNARY_AUTOGRAD_OPS,
 } from "../ops/registry";
 import { GELU_ERF_DEF, GELU_TANH_DEF } from "../ops/semantic/composite";
+import {
+  type BackwardContext,
+  linearBackward,
+  matmulBackward,
+} from "../ops/semantic/contraction";
 import { makeUnaryGrad } from "../ops/semantic/emit-rt";
 import {
   backwardOfIndexMap,
@@ -133,11 +138,6 @@ import {
   savedTensorHooksImpl,
 } from "./autocast";
 import { backwardImpl } from "./autograd";
-import {
-  type BackwardContext,
-  linearBackward,
-  matmulBackward,
-} from "./custom-backward";
 import {
   crossEntropyFusedImpl,
   layernormImpl,

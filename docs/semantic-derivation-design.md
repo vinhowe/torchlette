@@ -1414,3 +1414,83 @@ raw REDs were a harness-invocation bug (fixed, 5/5 now PASS) and V100 memory con
 the concurrent-project test script (every constituent spec green in isolation) — neither is
 the semantic-derivation diff, which touched only CPU-side gradient math (the log/sqrt
 adjoint) and dead-code deletion. The era closes clean.
+
+---
+
+## §19 — Contraction closure (the calculus closes)
+
+**Verdict: LANDED.** The framework's last two hand-written adjoints —
+`matmulBackward` and its `linearBackward` specialization (§4.2, the two admitted
+contraction rules) — now DERIVE from ONE fact. Every gradient in the framework is
+a theorem: elementwise via the chain-rule pass (adjoint.ts), the nine index
+backwards via the transpose fact (index-map.ts), optimizers as OptTerm programs
+(optimizer.ts), and now contraction via the fact below.
+
+### The fact (one declaration)
+
+`src/ops/semantic/contraction.ts`, `contractionAdjoint`: **the adjoint of a
+contraction is two contractions.** For `C = op(A,ta) · op(B,tb)` (a batched
+matmul with per-operand transpose flags — the SAME 2-operand transpose-flag form
+the optimizer frame's `mm` node already carries), each operand's grad is a
+contraction of the upstream grad `G = dC` with the OTHER operand, transpose flags
+flipped by a fixed rule:
+
+```
+  C = A · B    (F,F) →  dA = G·Bᵀ ,  dB = Aᵀ·G     (matmul frontend)
+  C = A · Bᵀ   (F,T) →  dA = G·B  ,  dB = Gᵀ·A     (linear frontend)
+  C = Aᵀ · B   (T,F) →  dA = B·Gᵀ ,  dB = A·G
+  C = Aᵀ · Bᵀ  (T,T) →  dA = Bᵀ·Gᵀ,  dB = Gᵀ·Aᵀ
+```
+
+The four rows are the ONE flag-flip below, not four cases:
+
+```ts
+dA = ta ? { lhs:"B", rhs:"G", ta:tb,   tb:true } : { lhs:"G", rhs:"B", ta:false, tb:!tb };
+dB = tb ? { lhs:"G", rhs:"A", ta:true,  tb:ta  } : { lhs:"A", rhs:"G", ta:!ta,  tb:false };
+```
+
+The fact is pure DATA→DATA (`contractionAdjoint`, a schema-gated term); its
+realization (`realizeContractionAdjoint`) composes the existing `rt.transpose` +
+`rt.matmul`, never re-owning them (§4.4). `linear`'s `dBias` is the
+broadcast-adjoint reduction the engine already owned (`sumToShape`, index-map.ts).
+
+### Graph-shape parity (this is a derivation, not a reimplementation)
+
+The derived path emits the SAME graph op-for-op as the deleted hand code —
+`matmulBackward` was `[G·Bᵀ, Aᵀ·G]` (the F,F row), `linearBackward` was `[G·W,
+Gᵀ·X]` + bias reduction (linear's forward is `X·Wᵀ`, the F,T row). Same
+transposes (last-two-dim), same matmuls, same `sumToShape` order. The autocast
+discipline is untouched: backward still reads the f16-cast SAVED operands (the
+"input cast absorption" note in CLAUDE.md's don't-re-attempt list) — the fact
+only chooses transpose flags, it does not change what is saved. Trajectory parity
+is therefore byte-identical BY CONSTRUCTION.
+
+**Measured** (`tools/parity-fullstack-tl.ts`, 8-layer GPT-2, 30 steps, A100):
+- compiled == lowered (the internal gate): **max |Δloss| = 9.5e-6** (< 1e-5). ✓
+- derived (mine) vs stock HEAD `cfe0125e` (hand adjoints), compiled:
+  **max |Δloss| = 8.6e-6**, indistinguishable from the base's own run-to-run GPU
+  nondeterminism (base-run1 vs base-run2, IDENTICAL code: **6.7e-6**). The
+  trajectory is unchanged; the residual is stock GPU fp noise, not the change.
+
+### Gates
+
+- `npm run build` — clean.
+- `test/oracle/semantic-contraction.spec.ts` (NEW, 25 tests): (1) the fact as pure
+  DATA — `contractionAdjoint` returns the exact four-row structure (independent
+  transcription) + schema gate; (2) the realizer refereed by the torch oracle
+  (`contraction_backward`, a new referee op) for ALL four (ta,tb), 2-D and
+  batched; (3) the landed frontend `matmul` (F,F) and `linear` (F,T + bias) grads
+  == torch, f32 AND autocast-f16, 2-D and batched, with/without bias. All green.
+- `npm run test:gates` — 5/5. `npm run test` — full suite green.
+- semantic-derivation / -optimizer / -index specs — green (unchanged).
+
+### Deletions
+
+- `src/frontend/custom-backward.ts` — DELETED (the hand transpose+matmul bodies of
+  `matmulBackward`/`linearBackward`, plus the `BackwardContext` interface, moved to
+  the semantic stratum). The two GradFn builders survive as thin dispatch stubs in
+  `contraction.ts` (per-op bookkeeping: which grads, saved-slot order, bias) — the
+  ADJOINT MATH is now single-sourced in `contractionAdjoint`.
+
+The `custom-backward.ts` file — the last home of hand-written adjoints in the
+frontend — is gone. The calculus is closed.
