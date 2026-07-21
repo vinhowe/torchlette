@@ -247,20 +247,36 @@ export function packOptimizerProgram(
     evalStateUpdates();
   }
 
-  // Unpack: copy each segment back into its (persistent) param storage.
+  // Unpack: copy each segment back into its (persistent) param storage. The
+  // narrow-at-offset is a strided view, so the reshape MATERIALIZES a fresh
+  // per-param contiguous buffer (reshape-of-non-contiguous is the one view op
+  // that copies). These `seg`/`narrow` intermediates are step-scoped temporaries
+  // whose refs the packer holds; they MUST be disposed after the `copy_`-back is
+  // sequenced, or ~1 full-param-width buffer leaks per param per step (the
+  // packed-path retention leak — buffer-donation design §2.2). Collected and
+  // disposed alongside the big packed intermediates below.
+  const unpackTemps: RuntimeTensor[] = [];
   for (let k = 0; k < items.length; k++) {
-    const seg = rt.reshape(
-      rt.narrow(pNew, 0, offsets[k]!, sizes[k]!),
-      items[k]!.param.shape,
-    );
+    const view = rt.narrow(pNew, 0, offsets[k]!, sizes[k]!);
+    const seg = rt.reshape(view, items[k]!.param.shape);
     rt.copy_(items[k]!.param, seg);
+    unpackTemps.push(view, seg);
   }
 
   // Dispose the big packed intermediates now that the update graph is built (the
   // IR nodes survive; disposal drops them from the live-pending registry so
   // liveness can release / kernels can donate their buffers). State slots and
   // params are NOT disposed (persistent). A Set dedups gAdj===G (no-L2 case).
-  const toDispose = new Set<RuntimeTensor>([G, gAdj, P, ...sink]);
+  // The unpack `seg`/`narrow` materializations join the set — the `copy_`-back
+  // holds the graph edge into `param`, so dropping the wrappers is safe and
+  // reclaims the leaked per-param buffers (buffer-donation design P1).
+  const toDispose = new Set<RuntimeTensor>([
+    G,
+    gAdj,
+    P,
+    ...sink,
+    ...unpackTemps,
+  ]);
   if (disposeExtra) for (const t of disposeExtra) toDispose.add(t);
   for (const t of toDispose) (t as { dispose?: () => void }).dispose?.();
 

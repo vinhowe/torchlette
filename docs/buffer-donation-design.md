@@ -1,6 +1,9 @@
 # Buffer Donation: aliasing a dead input's buffer as an op's output
 
-> **Status:** DESIGN (no `src/` change). P0 deliverable of the BUFFER DONATION
+> **Status:** P1 LANDED (2026-07-21, §2.4) — packed-path leak fixed, flat premium
+> measured (distil +2.1 % / medium +45.6 % peak on A100), donation downgraded from
+> "unbounded-leak P4 blocker" to "flat-residual closer required for chain-packing P5."
+> P2/P3 (planner donation) remain DESIGN. Original P0 deliverable of the BUFFER DONATION
 > campaign. It cashes the named blocker in `docs/chain-packing-design.md` P4 and
 > `docs/architecture-debt.md` stage-3 row: *"Closing [the foreach working-set
 > premium] needs graph-level buffer donation (write pNew into P's buffer, G packed
@@ -98,6 +101,75 @@ Donation remains the right *mechanism* for the flat premium and for the broader
 stage-4 goal (`stage4-compile-from-ir.md`: "donation = assignment decision"). It is
 just **not the first thing standing between the packed path and flat memory**, and the
 gate must say so.
+
+### 2.4 P1 LANDED (2026-07-21) — leak fixed, TRUE flat premium measured, verdict
+
+**Root cause CONFIRMED (not `pNew`).** The `+~1 storage/param/step` retention leak is
+the unpack `seg = reshape(narrow(pNew, offset, size), shape)` in
+`pack-optimizer.ts` — one materialized per-param contiguous buffer per param per step,
+never disposed. `pNew` itself was ALREADY disposed (it is the top-level result of
+`evalOptTensor(paramUpdate, …, sink)`, and `sink` tracks every created intermediate
+*including the result*, so `pNew ∈ sink ⊂ toDispose`). The design's §2.2 "never disposes
+`seg` OR `pNew`" over-charged `pNew`; the `seg` half is the whole leak. Reproduced with a
+new probe `tools/packed-optim-flatness.ts` (least-squares storage-slope over a flat
+window, across the compiled-plan threshold): **before**, packed Adam on a toy GPT-2
+(28 params) climbed +29 storages/step (541→1034 over 18 steps), monotonic, reachable —
+i.e. retained refs in the live-pending registry, not GC-eligible; identical under
+`TORCHLETTE_COMPILED_PLAN=0` (lowered-path leak, confirming §2.1).
+
+**The fix (chosen: dispose the unpack materializations).** `pack-optimizer.ts` now
+collects each unpack `narrow` view + `seg` reshape into `unpackTemps` and disposes them
+in the same `toDispose` set as `G`/`P`/`gAdj`/`sink` — dropping the wrappers from the
+live-pending registry after the `copy_`-back has sequenced the graph edge into `param`
+(the standing dangling-`copy_` discipline: the IR node survives, disposal only releases
+liveness). Bit-exact by construction (the graph is unchanged; only wrapper lifetimes
+change). **Option (b) — "make the unpack a strided `copy_` that never materializes
+`seg`" — was evaluated and REJECTED for P1:** `stridedScatterCopy`'s payload carries only
+a DST view offset (`engine.ts` `_scatterInPlace`), so a narrow-at-offset *source* would
+be resolved by materializing it anyway (no copy actually deleted), and reading a strided
+source through `copy_` is exactly the GPU-vs-CPU-semantics hazard class the house rules
+warn against. Eliminating that move needs a source-offset region-read — which IS the
+donation mechanism (P2/P3), not a P1 disposal. So P1 is a disposal (net +8 SLOC, no
+deletion — the campaign's net-negative is cashed at chain-packing P5); option (b)'s
+copy-elision is correctly donation's job.
+
+**FLATNESS gate (new standing check): `tools/packed-optim-flatness.ts`.** After the fix,
+packed Adam/Lion/SGD all PLATEAU by ~step 5–12 at a constant storage count (slope
+0.000/step); Adam toy: 541-and-climbing → **flat 164**; lowered path flat 92; Lion 132,
+SGD 182. `parity-packed-vs-unpacked.ts` all 4 arms still **bit-exact** (maxDiff 0.0);
+strict `[lifetime]` guard green (zero throws) on the packed arm.
+
+**TRUE flat packed-vs-fused premium — A100 (dw-2-1), distilgpt2 & gpt2-medium @512,
+steady state (both arms `Storages/step: +0.0`, i.e. FLAT — the leak is gone in the
+measurement itself):**
+
+| model | fused peak / cur | packed peak / cur (fixed) | **flat peak premium** | flat cur premium |
+|---|---|---|---|---|
+| distilgpt2@512 | 5636.6 / 2110.1 MB | 5753.5 / 2561.5 MB | **+2.1 % (+117 MB)** | +21.4 % (+451 MB) |
+| gpt2-medium@512 | 16189.0 / 7246.5 MB | 23568.3 / 9618.9 MB | **+45.6 % (+7379 MB)** | +32.7 % (+2372 MB) |
+
+The historical "10.6 GB flat 2× premium" is now **disproven as a per-step accumulation**
+(§2.2 hypothesis confirmed): the genuine *flat* premium is only +2 % peak at distil and
++46 % peak at medium — model-size-scaling, because the packed path co-materializes
+`G`/`P`/`pNew` at full concatenated-model width (~3 full-param buffers), which is a small
+fraction of distil's activation-dominated peak but a large one at medium.
+
+**Verdict on donation (the design's own re-check clause, §8 taste-call 1).** P1 converts
+the packed premium from an **unbounded per-step leak** (would OOM any real run) into a
+**flat, model-size-scaling working-set premium**. Consequences:
+- **Donation is NO LONGER a P4 blocker in the "packed OOMs / grows without bound" sense**
+  — that failure mode is fixed by P1 alone. At distil scale the flat packed peak is
+  within +2 % of fused; donation there is a pure optimization.
+- **Donation REMAINS the required mechanism for the CAMPAIGN endgame (P5).** At
+  medium@512 the flat packed peak is +46 % of fused (+7.4 GB) — the real `G`/`P`/`pNew`
+  co-liveness residual donation is designed to close. chain-packing P5 (delete the fused
+  `adamStep` monolith) cannot proceed while packed costs +46 % peak at real scale, so
+  donation stays P4's memory precondition — now with `X%` honestly known (≈2 % distil →
+  ≈46 % medium peak), derived from a FLAT baseline rather than the leak-contaminated 2×.
+
+**Recommendation to the user (taste-call 1):** keep P1 filed as its own landed disposal
+fix (done) and start the donation campaign from this flat baseline; the P4 memory
+tolerance `X%` should be set against the medium@512 +46 % figure, not distil's +2 %.
 
 ---
 
@@ -291,7 +363,7 @@ GPU work serial-exclusive (`tools/pick-gpu.sh`, HOST node toolchain).
 | Phase | What lands | Gates (standing +) | Cashes / notes |
 |---|---|---|---|
 | **P0** | THIS design doc. | — | No `src/` change. |
-| **P1 — fix the packed-path leak (PREREQUISITE, not donation).** | Dispose the unpack materializations and `pNew` in `pack-optimizer.ts` (or make the unpack a strided `copy_` that never materializes `seg`). This is a disposal correctness fix; it is what makes the packed path *have* a flat footprint to donate against. | **Packed foreach memory FLAT** — peak non-growing over 30 steps (the §2 leak gone); `parity-packed-vs-unpacked.ts` still bit-exact; `fused-vs-elementwise.spec.ts` green. **Then re-measure the TRUE flat packed-vs-fused premium on A100** — this sets `X%` for P4. | No deletion; unblocks an honest gate. **If P1 alone brings packed peak within the P4 tolerance, donation becomes an optimization, not a P4 blocker — the design must re-check the gate after P1 lands (measure, don't assume).** |
+| **P1 — fix the packed-path leak (PREREQUISITE, not donation). ✅ LANDED 2026-07-21 (see §2.4).** | DONE: `pack-optimizer.ts` disposes the unpack `narrow`/`seg` materializations (the `seg` reshape was the leak; `pNew` was already disposed via `sink`). Option-(b) copy-elision rejected for P1 — it needs a source-offset region-read = donation itself. Net +8 SLOC, no deletion (cashed at P5). New standing gate `tools/packed-optim-flatness.ts`. | ✅ **Packed memory FLAT** (slope 0.000/step, plateau ~step 5–12; Adam/Lion/SGD, compiled + lowered); `parity-packed-vs-unpacked.ts` 4 arms bit-exact; `fused-vs-elementwise` (12) + cpu project (1551) green; strict `[lifetime]` zero throws. **TRUE flat premium (A100): distil +2.1 % peak / medium +45.6 % peak.** | Unblocks an honest gate. **Verdict: donation is NO LONGER a P4 blocker in the "unbounded leak" sense (P1 fixed it); it REMAINS the required mechanism for the flat +46 % medium residual → chain-packing P5. `X%` set from medium, not distil.** |
 | **P2 — planner-level donation, opt-in.** | `DONATABLE_OPERANDS` declaration (§3.2); the donation edge (slot-collapse) at plan-build (§3.4); planner binds output↔dying-input entry (§3.3); anti-alias suppression via slot-collapse; **subsume the executor-side fused donation** (`segment-executors.ts` block + `donationSink`/`cachedDonatedRecipeIdx` + `stream-generate` post-hoc detection become planner facts). Behind `TORCHLETTE_PLANNER_DONATION=1` (born with sunset). | `test/donation-parity.spec.ts` (bit-exact + peak ≤ no-donation); the **subsumption check** (`TORCHLETTE_DONATION=0` with planner donation on ⇒ equal-or-better peak); overlap-audit clean; strict-lifetime green. | Net-neutral-to-negative SLOC (§6): the planner fact replaces the executor special form. |
 | **P3 — THE FLIP (satisfies chain-packing P4 precondition).** | `TORCHLETTE_PLANNER_DONATION` default-on; packed optimizer `pNew`→`P`, `G` packed-in-place donation active on the compiled path. | **Hard:** 124M `{…}` EXACT; distil 9 / medium 18 submits EXACT; **packed-arm peak within X% of fused** (X from the P1 A100 re-measure) on A100, FLAT; `parity-fullstack-tl.ts` twice; fused-vs-packed trajectory. Re-measure A100 fresh at flip. | This is the precondition `chain-packing-design.md` P4 gates on. With it met, chain-packing P4 (packed optimizer default on WebGPU) proceeds; **chain-packing P5 then deletes the fused `adamStep` monolith (~1.3–1.6k SLOC)** — the campaign-level payoff. |
 
