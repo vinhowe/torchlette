@@ -7,13 +7,28 @@ import { createPendingRef } from "../graph/types";
 import {
   ADAMW_M_NEW,
   ADAMW_P_NEW,
+  ADAMW_PROGRAM,
   ADAMW_SCALED,
   ADAMW_V_NEW,
   evalOptTensor,
   type OptRoles,
+  oSub,
+  role,
 } from "../ops/semantic/optimizer";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
+import {
+  type PackedOptState,
+  packOptimizerProgram,
+} from "./pack-optimizer";
 import { validateOptimizerParams } from "./validate";
+
+/**
+ * The wd=0 param-update term: `p' = p − lr·m̂/(√v̂+ε)` (design §2.5). Evaluating
+ * `oSub(role("p"), ADAMW_SCALED)` is byte-identical to the hand
+ * `runtime.sub(P, eval(ADAMW_SCALED))` the foreach path used — avoiding the
+ * full-model-size `+0` the decoupled term would materialize at wd=0.
+ */
+const ADAMW_P_NO_WD = oSub(role("p"), ADAMW_SCALED);
 
 export type AdamOptions = {
   lr: number;
@@ -80,10 +95,7 @@ export class Adam {
    * foreach optimizers: the per-param definition is the semantics, the
    * packed form is the batched execution of the same tensor program.
    */
-  private _foreachState = new Map<
-    number,
-    { m: RuntimeTensor; v: RuntimeTensor; sig: string }
-  >();
+  private _foreachState = new Map<number, PackedOptState>();
   constructor(
     params: Tensor[] | AdamParamGroup[],
     options: AdamOptions,
@@ -345,18 +357,9 @@ export class Adam {
     gi: number,
     idxs: number[],
   ): void {
-    const sizes = idxs.map((i) =>
-      this.params[i].shape.reduce((a, b) => a * b, 1),
-    );
-    const offsets: number[] = [];
-    let total = 0;
-    for (const s of sizes) {
-      offsets.push(total);
-      total += s;
-    }
-    const sig = idxs.map((i, k) => `${i}:${sizes[k]}`).join(",");
-
-    // JS step mirror (diagnostics + intermittent-missing-grad detection).
+    // JS step mirror (diagnostics + intermittent-missing-grad detection). The
+    // packer re-derives the same guard from item `id`s (sig mismatch throws),
+    // but the JS mirror also catches diverging step counts BEFORE the pack.
     for (const i of idxs) this._advanceStep(i);
     const tScalar = this.steps[idxs[0]];
     for (const i of idxs) {
@@ -371,131 +374,45 @@ export class Adam {
     // inc-2a: lr flows as the persistent per-group tensor; wd stays a JS scalar.
     const lrTensor = this._lrTensor(gi);
     const wd = this._groups[gi].weightDecay;
-
-    // Pack grads and params: [size_i] flats concatenated to one [total].
-    const gFlat = idxs.map((i, k) =>
-      runtime.reshape(this.params[i].grad!._unwrap(), [sizes[k]]),
-    );
-    const G = runtime.cat(gFlat);
-    const pFlat = idxs.map((i, k) =>
-      runtime.reshape(this.params[i]._unwrap(), [sizes[k]]),
-    );
-    const P = runtime.cat(pFlat);
-
-    // Packed m/v: initialized ONCE by packing the current per-param state
-    // (zeros at start; real moments when switching paths or after
-    // resetState), then updated IN PLACE every step via copy_. Stable
-    // storage matters structurally: re-creating state tensors each step
-    // ping-pongs against the buffer arena (last step's m is still a live
-    // input while this step's m wants the same plan position) — fresh
-    // allocations every step, unbounded growth. In-place state also keeps
-    // the steady-state plan structure identical every step (one template,
-    // one compiled plan).
-    let st = this._foreachState.get(gi);
-    if (st && st.sig !== sig) {
-      throw new Error(
-        "Adam foreach: the set of grad-bearing params in a group changed " +
-          "across steps; packed state cannot be remapped. Set " +
-          "TORCHLETTE_FOREACH_ADAM=0 to use the per-param path.",
-      );
-    }
-    if (!st) {
-      const mFlat = idxs.map((i, k) =>
-        runtime.reshape(this.expAvg[i], [sizes[k]]),
-      );
-      const vFlat = idxs.map((i, k) =>
-        runtime.reshape(this.expAvgSq[i], [sizes[k]]),
-      );
-      // persist(): the packed state is created MID-STEP and held across
-      // steps — without adoption into the step snapshot it would be demoted
-      // as a temporary at markStep (buffer pooled while live → silent UAF).
-      st = {
-        m: runtime.registerState(runtime.cat(mFlat)),
-        v: runtime.registerState(runtime.cat(vFlat)),
-        sig,
-      };
-      this._foreachState.set(gi, st);
-    }
-
-    // The moment + param arithmetic GENERATES from ADAMW_PROGRAM (P5, design
-    // §4.6): the hand `add(mul(m,β1),…)` chain that used to live here (and,
-    // copied, in _updateParamElementwise) is now ONE source — the program —
-    // interpreted over the runtime. The pack / copy_ / persist / dispose EFFECTS
-    // stay here (the arithmetic derives; the effect is declared). L2-vs-decoupled
-    // weight decay is the realizer's POLICY (matching the fused kernel's
-    // decoupledWd): L2 folds wd into g; AdamW binds it in the param term.
-    const sink: RuntimeTensor[] = [];
-    let gAdj = G;
-    if (wd !== 0 && !this.adamW) {
-      gAdj = runtime.add(gAdj, runtime.mul(P, wd));
-    }
-    const stateRoles: OptRoles = {
-      m: st.m,
-      v: st.v,
-      g: gAdj,
-      beta1: this.beta1,
-      om_beta1: 1 - this.beta1,
-      beta2: this.beta2,
-      om_beta2: 1 - this.beta2,
-    };
-    const mNew = evalOptTensor(ADAMW_M_NEW, runtime, stateRoles, sink);
-    const vNew = evalOptTensor(ADAMW_V_NEW, runtime, stateRoles, sink);
-    runtime.copy_(st.m, mNew);
-    runtime.copy_(st.v, vNew);
-
-    // Read m/v through the POST-copy_ state refs (st.m/st.v) so the param-update
-    // chain depends on the copies and any force of the params executes them.
-    // Reading mNew/vNew directly leaves the copy_ nodes as dangling roots that
-    // defer to a LATER plan — after zeroGrad has zeroed/freed the grad buffer
-    // their pending source reads (see _updateParamElementwise). inc-2a: bias
-    // correction rides in as bc1/bc2 (the step as DATA); [1] tensors that
-    // broadcast over the packed [total].
+    // inc-2a: bias correction rides in as bc1/bc2 (the step as DATA); [1] tensors
+    // that broadcast over the packed [total]. Disposed by the packer.
     const { bc1, bc2 } = this._biasCorrection(runtime, this._tTensor());
-    const paramRoles: OptRoles = {
-      p: P,
-      m: st.m,
-      v: st.v,
-      lr: lrTensor,
-      eps: this.eps,
-      wd: this.adamW ? wd : 0,
-      bc1,
-      bc2,
-    };
-    // The full p' (ADAMW_P_NEW) folds in the decoupled `lr·wd·p`; the no-wd path
-    // derives just the update magnitude (ADAMW_SCALED) and subtracts, avoiding a
-    // full-model-size `+0` intermediate in the common wd=0 case.
-    const pNew =
-      this.adamW && wd !== 0
-        ? evalOptTensor(ADAMW_P_NEW, runtime, paramRoles, sink)
-        : runtime.sub(
-            P,
-            evalOptTensor(ADAMW_SCALED, runtime, paramRoles, sink),
-          );
+    const isL2 = wd !== 0 && !this.adamW;
 
-    // Unpack: copy each segment back into its (persistent) param storage.
-    for (let k = 0; k < idxs.length; k++) {
-      const seg = runtime.reshape(
-        runtime.narrow(pNew, 0, offsets[k], sizes[k]),
-        this.params[idxs[k]].shape,
-      );
-      runtime.copy_(this.params[idxs[k]]._unwrap(), seg);
-    }
-
-    // Dispose the big packed intermediates NOW that the update graph is
-    // built. The IR nodes survive (downstream nodes reference nodes, not
-    // wrappers); disposal removes them from the live-pending registry so
-    // the executor's liveness analysis can release — and the fused kernels
-    // DONATE — their buffers. Without this, every full-group-size
-    // intermediate (328MB each at 124M) is conservatively protected as
-    // "user-held" and the packed chain costs ~2x the fused path's memory.
-    // st.m / st.v / params are NOT disposed (persistent state). The derived
-    // intermediates are the `sink` (everything evalOptTensor CREATED) plus the
-    // packed cat results (G/P), the L2-adjusted grad (gAdj), and bias correction
-    // (bc1/bc2). A Set dedups gAdj===G (no L2 case). st.m/st.v are ROLE inputs,
-    // never in the sink, so nothing persistent is disposed.
-    for (const t of new Set<RuntimeTensor>([G, gAdj, P, bc1, bc2, ...sink])) {
-      (t as { dispose?: () => void }).dispose?.();
-    }
+    // Declare the class to the packer (design §2): AdamW's program + the shared
+    // per-step DATA + the per-param state; L2-vs-decoupled weight decay is the
+    // realizer's POLICY (L2 folds wd into g via adjustGrad; AdamW binds it in the
+    // param term). The pack/copy_/persist/dispose EFFECTS are the packer's.
+    const st = packOptimizerProgram(runtime, {
+      program: ADAMW_PROGRAM,
+      items: idxs.map((i) => ({
+        id: i,
+        param: this.params[i]._unwrap(),
+        grad: this.params[i].grad!._unwrap(),
+        state: [this.expAvg[i], this.expAvgSq[i]],
+      })),
+      sharedRoles: {
+        lr: lrTensor,
+        eps: this.eps,
+        wd: this.adamW ? wd : 0,
+        beta1: this.beta1,
+        om_beta1: 1 - this.beta1,
+        beta2: this.beta2,
+        om_beta2: 1 - this.beta2,
+        bc1,
+        bc2,
+      },
+      // The full p' (ADAMW_P_NEW) folds in the decoupled `lr·wd·p`; the no-wd
+      // path derives just the update magnitude (ADAMW_SCALED) and subtracts.
+      paramUpdate: this.adamW && wd !== 0 ? ADAMW_P_NEW : ADAMW_P_NO_WD,
+      adjustGrad: isL2
+        ? (rt, g, p) => rt.add(g, rt.mul(p, wd))
+        : undefined,
+      paramReadsPostState: true,
+      prevState: this._foreachState.get(gi),
+      disposeExtra: [bc1, bc2],
+    });
+    this._foreachState.set(gi, st);
   }
 
   /**
@@ -834,8 +751,7 @@ export class Adam {
     // Packed foreach state is built FROM the per-param state on the next
     // step — dispose it so the reset takes effect there too.
     for (const st of this._foreachState.values()) {
-      st.m.dispose();
-      st.v.dispose();
+      for (const slot of st.slots) slot.dispose();
     }
     this._foreachState.clear();
   }
