@@ -477,3 +477,17 @@ Cited rather than re-measured (re-measure fresh at P4 per `agent-ops.md`):
 - The oracle: derived optimizers track `torch.optim` AdamW/Adam/SGD to **≤1e-6 / 20
   steps** (`test/oracle/optimizer-trajectory.spec.ts`); Lion trains DistilGPT-2 20 steps
   7.89→4.36 (`test/lion-distil-descent.spec.ts`).
+
+---
+
+## P4/P5 STATUS (2026-07-21): STOPPED — see coverage-campaign-design.md §9
+
+The donation precondition was implemented (buffer-donation P2 + coverage C1–C3) and
+MEASURED: donation contributes ~0 to packed peak in the whole-step regime (+168.4% medium,
+unchanged by donation; class-splitting partial: +127%). The ≤+15% memory precondition is
+unreachable by the designed mechanism. P4 (default flip) and P5 (the ~1.3–1.6k deletion)
+are STOPPED with that named class. The fused `adamStep` kernel retains a live consumer
+(the memory budget) and stays, asserted against the derived packed reference
+(`fused-vs-elementwise`, `parity-packed-vs-unpacked`). Re-open only with a mechanism that
+attacks co-materialization itself (e.g. per-sub-class streaming with immediate state
+release), not buffer aliasing.

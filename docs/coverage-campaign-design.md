@@ -445,3 +445,38 @@ campaign:
    serializer landing cleanly. **Recommendation:** ship the comparison FAMILY (all six ops) at
    once so no sibling gap resurfaces, and gate on the converged census fraction, not a
    single-step read.
+
+---
+
+## 9. C-EXIT VERDICT (2026-07-21): STOP-WITH-NAMED-CLASS — the premium claim is FALSIFIED
+
+C1–C3 all landed and gated (whole-step plan 1140/1140 `fullyCovered`; donation fires 6×/step
+bit-exact; class-splitting deterministic, browser-load-bearing). The exit measurement
+(dw-2-1 A100, whole-step regime, steady flat peaks):
+
+| model | fused | packed | packed+donation | best split (donation OFF) |
+|---|---|---|---|---|
+| distil@512 | 3736.6 MB | +99.9% | +99.9% (no change) | +64.8% (32 MB split) |
+| medium@512 | 9683.3 MB | +168.4% | **+168.4% (no change)** | +127.0% (128 MB split) |
+
+**Named class:** the whole-step-remat regime — the substrate coverage/donation require to
+reach the compiled packed plan — co-materializes the entire step's working set in one plan,
+so the packed premium there is +100%/+168% (worse than the eager-regime +2.1%/+45.6% §2.5
+measured). Donation contributes ~0 to peak: it aliases pNew→P, but peak is set by co-live
+activations + the persistent packed m/v, neither of which donation touches
+(`TORCHLETTE_DONATION=0` gives the same peak — the executor-side detector was never the
+closer either). Class-splitting alone shrinks the transient working set (the §5.2 bonus,
+confirmed: distil +99.9→+64.8, medium +168→+127) but plateaus far above the ≤+15% target.
+
+**Consequences:**
+- Donation **P3 does NOT flip** — there is no memory payoff to cash. The
+  `TORCHLETTE_PLANNER_DONATION` edge remains opt-in, correct, and inert-by-value; its
+  sunset now reads: delete unless a future campaign finds a consumer with a real payoff.
+- `chain-packing-design.md` **P4/P5 are STOPPED** on this class. The fused `adamStep`
+  monolith keeps its live consumer (the memory budget); the packed path remains the
+  derived reference + the Lion/SGD/browser default. Same shape as the Everest P4b ledger
+  STOP: the summit deletion is blocked by a measured substrate fact, not by taste.
+- What stands regardless: full whole-step coverage (C1), the single-sourced donation
+  liveness proof + `[donatable-derive]` seam (C2), and the class-split machinery (C3),
+  which is load-bearing in browsers (128 MiB binding cap) where real models would
+  otherwise chunk.
