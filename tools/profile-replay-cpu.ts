@@ -47,9 +47,7 @@ async function main() {
   const optimizer = new Adam(model.parameters(), { lr: 1e-4 }, api);
   const useAMP = isF16Supported();
   const scaler = useAMP ? new GradScaler(api, { initScale: 1024.0 }) : null;
-  console.log(
-    `AMP: ${useAMP ? "enabled" : "disabled"}, Replay: ${process.env.TORCHLETTE_DISPATCH_REPLAY !== "0" ? "ON" : "OFF"}\n`,
-  );
+  console.log(`AMP: ${useAMP ? "enabled" : "disabled"}, Replay: ON\n`);
 
   const compiledForward = api.compile((input: Tensor, target: Tensor) => {
     return api.autocast(() => {

@@ -96,8 +96,7 @@ async function main() {
     );
   }
 
-  const replay = process.env.TORCHLETTE_DISPATCH_REPLAY === "0" ? "OFF" : "ON";
-  console.log(`\nMode: ${mode} | Replay: ${replay}`);
+  console.log(`\nMode: ${mode} | Replay: ON`);
   console.log(`Losses: [${losses.map((l) => l.toFixed(8)).join(", ")}]`);
 
   destroyWebGPU();

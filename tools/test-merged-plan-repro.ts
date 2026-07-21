@@ -171,9 +171,10 @@ async function main() {
     await loss.backward();
   });
 
-  // Test G: same as C but with rewritePlan/DSL disabled via env
-  await test("G: Adam, warmup, NO rewrite rules", async () => {
-    process.env.TORCHLETTE_NO_REWRITE = "1";
+  // Test G: same as C (the TORCHLETTE_NO_REWRITE env opt-out this once toggled
+  // was removed — the src hook no longer exists, so this now runs the default
+  // rewrite path like C).
+  await test("G: Adam, warmup, default rewrite rules", async () => {
     const api = new Torchlette("webgpu", { enableFusion: true });
     const model = createModel(api, nn, { ...MESS3_CONFIG, seqLen, vocabSize, posEncoding: "rope" });
     const optimizer = new Adam(model.parameters(), { lr: 1e-2 });
@@ -190,7 +191,6 @@ async function main() {
     });
     tok.dispose(); tgt.dispose();
     await loss.backward();
-    delete process.env.TORCHLETTE_NO_REWRITE;
   });
 
   // Test H: same as C but with enableFusion: false

@@ -10,9 +10,9 @@ import { cpuOnly } from "../helpers/webgpu";
  * and replays them on subsequent steps to bypass JS dispatch overhead.
  * These tests verify that replayed results are bit-identical to first execution.
  *
- * Dispatch replay is enabled by default (TORCHLETTE_DISPATCH_REPLAY != "0")
- * and is tested implicitly here by running the same computation across
- * multiple markStep() calls.
+ * Dispatch replay is always enabled (the former TORCHLETTE_DISPATCH_REPLAY
+ * opt-out was removed) and is tested implicitly here by running the same
+ * computation across multiple markStep() calls.
  */
 describe.skipIf(cpuOnly)("dispatch replay", { timeout: 60000 }, () => {
   it("elementwise ops produce identical results across steps", async () => {

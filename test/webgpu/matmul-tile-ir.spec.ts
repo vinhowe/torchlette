@@ -1,8 +1,8 @@
 /**
  * Tile IR matmul tests.
  *
- * Exercises the tile-IR codegen path (TORCHLETTE_TILE_MATMUL=1) for coverage
- * gaps not hit by the standard matmul tests:
+ * Exercises the tile-IR codegen path for coverage gaps not hit by the standard
+ * matmul tests:
  *   - f16 input/output (the exact bug that caused all-zero loss in training)
  *   - Transpose modes TN, NT, TT (standard tests only run NN)
  *   - K-split matmul (small M, large K)

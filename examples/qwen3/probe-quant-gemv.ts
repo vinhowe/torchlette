@@ -71,7 +71,6 @@ function uploadU32(data: Uint32Array): GPUBuffer {
 
 async function main() {
   process.env.TORCHLETTE_COMPILED_PLAN = "0";
-  process.env.TORCHLETTE_GENERATED_PLAN = "0";
 
   const ok = await initWebGPU();
   if (!ok) throw new Error(getWebGPUInitError() || "WebGPU init failed");

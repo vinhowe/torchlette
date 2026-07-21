@@ -11,8 +11,8 @@
  *
  * SUNSET: this module, the flag, and every `TAPE_PROFILE` guard are DELETED at
  * the step-tape default-flip (phase 2+), together with TORCHLETTE_STEP_TAPE.
- * (The 1a-only TORCHLETTE_TAPE_SLOTDIFF image recorder was removed in 1c —
- * superseded by the recorder's guard-3 byte-diff in src/core/step-tape.ts.)
+ * (The 1a-only slot-diff image recorder was removed in 1c — superseded by the
+ * recorder's guard-3 byte-diff in src/core/step-tape.ts.)
  * Measurement instrumentation only; must not grow behavior.
  */
 

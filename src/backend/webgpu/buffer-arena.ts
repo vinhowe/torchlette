@@ -417,8 +417,8 @@ function arenaAllocAt(
   }
   const ctx = requireContext();
   const pooledSize = getSizeForClass(neededSizeClass);
-  // NOTE: do NOT acquire pool buffers into arena positions. Tried
-  // (TORCHLETTE_ARENA_POOL_ACQUIRE, deleted 2026-06-12): a pool buffer
+  // NOTE: do NOT acquire pool buffers into arena positions. Tried once
+  // (the arena-pool-acquire path, deleted 2026-06-12): a pool buffer
   // recorded at one compiled-plan slot can be handed to another → slot
   // aliasing → training divergence. The in-place copy_ fast path removed
   // the allocation churn it was meant to fix.

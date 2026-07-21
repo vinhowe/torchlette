@@ -1507,10 +1507,10 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
 describe.runIf(isWebGPUEnabled)(
   "Block API matmul epilogue (BlockOps path)",
   () => {
-    const origEnv = process.env.TORCHLETTE_BLOCK_MATMUL;
-
+    // (The former TORCHLETTE_BLOCK_MATMUL env opt-in was removed — this suite
+    // realizes the block/epilogue kernels directly via realizeTiledMatmulKernel,
+    // so no flag routing is involved.)
     beforeAll(async () => {
-      process.env.TORCHLETTE_BLOCK_MATMUL = "1";
       if (!device) {
         const ok = await initWebGPU();
         if (ok) {
@@ -1518,11 +1518,6 @@ describe.runIf(isWebGPUEnabled)(
           queue = device.queue;
         }
       }
-    });
-
-    afterAll(() => {
-      if (origEnv === undefined) delete process.env.TORCHLETTE_BLOCK_MATMUL;
-      else process.env.TORCHLETTE_BLOCK_MATMUL = origEnv;
     });
 
     // Tile-aligned size: 32×32 fits exactly in one workgroup with DEFAULT_CONFIG

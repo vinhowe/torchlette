@@ -68,7 +68,6 @@ function maxAbsDiff(x: Float32Array, y: Float32Array): number {
 async function main() {
   // Force live dispatch on every execution (see header).
   process.env.TORCHLETTE_COMPILED_PLAN = "0";
-  process.env.TORCHLETTE_GENERATED_PLAN = "0";
 
   const ok = await initWebGPU();
   if (!ok) throw new Error(getWebGPUInitError() || "WebGPU init failed");
