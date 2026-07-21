@@ -19,16 +19,27 @@
  */
 
 import type { DeviceKind } from "../backend/types";
+import { ENV } from "../core/env";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
 import {
   evalOptTensor,
   LION_M_NEW,
   LION_P_NEW,
+  LION_PROGRAM,
   LION_STEP,
   type OptRoles,
+  oSub,
+  role,
 } from "../ops/semantic/optimizer";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
+import {
+  type PackedOptState,
+  packOptimizerProgram,
+} from "./pack-optimizer";
 import { validateOptimizerParams } from "./validate";
+
+/** The wd=0 param-update term `p' = p − lr·sign(c)` (no full-size `+0` at wd=0). */
+const LION_P_NO_WD = oSub(role("p"), LION_STEP);
 
 export type LionOptions = {
   lr: number;
@@ -61,6 +72,8 @@ export class Lion {
   private _groupIndex: number[];
   /** Per-param β2-EMA momentum `m`. Lazily created (persistent state). */
   private momentum: Array<RuntimeTensor | null>;
+  /** Packed foreach state, keyed by param-group index (chain-packing P2). */
+  private _packState = new Map<number, PackedOptState>();
 
   constructor(
     params: Tensor[] | LionParamGroup[],
@@ -148,6 +161,76 @@ export class Lion {
 
   step(): Tensor[] {
     const runtime = this.api._runtime();
+    // Packed path (chain-packing P2): one flat chain per isomorphism class via
+    // packOptimizerProgram (the SAME LION_PROGRAM the per-param path interprets).
+    // Opt out with TORCHLETTE_PACK_OPTIM=0; a single param has no class to pack.
+    let updated: Tensor[];
+    if (ENV.TORCHLETTE_PACK_OPTIM !== "0" && this.params.length > 1) {
+      updated = this._stepPacked(runtime);
+    } else {
+      updated = this._stepPerParam(runtime);
+    }
+    // Implied step boundary (minimal training loops): commits at the next
+    // backward() or explicit markStep().
+    this.api.queueStepBoundary();
+    return updated;
+  }
+
+  /**
+   * Packed Lion step: group grad-bearing params by isomorphism class (param
+   * group → shared lr/wd), then emit ONE flat chain per class. Lion's param
+   * update reads the OLD momentum (paramReadsPostState=false); its stored EMA
+   * `m'` is written afterwards.
+   */
+  private _stepPacked(runtime: ReturnType<Torchlette["_runtime"]>): Tensor[] {
+    const updated: Tensor[] = [];
+    const groups = new Map<number, number[]>();
+    for (let i = 0; i < this.params.length; i++) {
+      updated.push(this.params[i]);
+      const grad = this.params[i].grad?._unwrap() ?? null;
+      if (!grad) continue;
+      // Lazy persistent momentum (packed once). registerState adopts it into
+      // the step snapshot (the silent-UAF discipline).
+      if (!this.momentum[i])
+        this.momentum[i] = runtime.registerState(
+          runtime.zeros(this.params[i].shape, this.device),
+        );
+      const gi = this._groupIndex[i];
+      const list = groups.get(gi);
+      if (list) list.push(i);
+      else groups.set(gi, [i]);
+    }
+    for (const [gi, idxs] of groups) {
+      const group = this._groups[gi];
+      const st = packOptimizerProgram(runtime, {
+        program: LION_PROGRAM,
+        items: idxs.map((i) => ({
+          id: i,
+          param: this.params[i]._unwrap(),
+          grad: this.params[i].grad!._unwrap(),
+          state: [this.momentum[i]!],
+        })),
+        sharedRoles: {
+          lr: group.lr,
+          wd: group.weightDecay,
+          beta1: this.beta1,
+          om_beta1: 1 - this.beta1,
+          beta2: this.beta2,
+          om_beta2: 1 - this.beta2,
+        },
+        // Full p' folds in the decoupled `lr·wd·p`; the no-wd path derives just
+        // the signed step (LION_STEP) and subtracts.
+        paramUpdate: group.weightDecay !== 0 ? LION_P_NEW : LION_P_NO_WD,
+        paramReadsPostState: false,
+        prevState: this._packState.get(gi),
+      });
+      this._packState.set(gi, st);
+    }
+    return updated;
+  }
+
+  /** Per-param Lion step: the reference definition (also the >1-param opt-out). */
+  private _stepPerParam(runtime: ReturnType<Torchlette["_runtime"]>): Tensor[] {
     const updated: Tensor[] = [];
     for (let i = 0; i < this.params.length; i++) {
       const param = this.params[i];
@@ -199,9 +282,6 @@ export class Lion {
       runtime.copy_(param._unwrap(), pNew);
       updated.push(param);
     }
-    // Implied step boundary (minimal training loops): commits at the next
-    // backward() or explicit markStep().
-    this.api.queueStepBoundary();
     return updated;
   }
 

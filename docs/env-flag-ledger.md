@@ -24,7 +24,7 @@ its campaign is debt (CLAUDE.md "Complexity budget"). Audited 2026-07-21
 
 | Class | Count | Verdict |
 |---|---:|---|
-| Opt-out of a shipped default | 16 | KEEP — none has a completed, unblocked soak |
+| Opt-out of a shipped default | 17 | KEEP — none has a completed, unblocked soak (`PACK_OPTIM` born 2026-07-21, chain-packing P2) |
 | Debug / observability | ~40 | KEEP — every one verified to have a live `ENV` read hook |
 | Config / infra | ~13 | KEEP |
 | Dead references DELETED this sweep | 7 | removed (see below) |
@@ -55,6 +55,7 @@ KEPT.** See the diagnosis section at the bottom.
 | `TORCHLETTE_NO_ARENA` | off; `=1` disables arena | `executor.ts:3818` | Arena-free reference (witness census uses it). |
 | `TORCHLETTE_FUSED_ADAM` | on (webgpu); `=0` | `adam.ts:292` | Fused-vs-graph Adam differential arms. |
 | `TORCHLETTE_FOREACH_ADAM` | on (>1 param); `=0` = per-param | `adam.ts:294` | foreach-vs-per-param differential arms. |
+| `TORCHLETTE_PACK_OPTIM` | on (Lion/SGD, >1 param); `=0` = per-param | `lion.ts`, `sgd.ts` | Chain-packing P2 (docs/chain-packing-design.md): routes Lion/SGD through `packOptimizerProgram`. Opt-out is the per-param control arm of `parity-packed-vs-unpacked.ts`. **Sunset:** soak → default → the opt-out dies once the packed Lion/SGD path is the proven default (P4-analogue) and nothing load-bearing still compares against the per-param arm. |
 | `TORCHLETTE_PACKED_ADAM` | on; `=0` = per-item | `ops/fused.ts:276` | Packed-dispatch measurement kill switch. |
 | `TORCHLETTE_DONATION` | on; `=0` disables buffer donation | `segment-executors.ts:269` | Donation kill switch. |
 | `TORCHLETTE_BATCH_SUBMITS` | on; `=0` disables shared encoder | `gpu-context.ts:602` | Submit-batching kill switch. |
