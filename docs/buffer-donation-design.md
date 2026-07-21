@@ -1,0 +1,423 @@
+# Buffer Donation: aliasing a dead input's buffer as an op's output
+
+> **Status:** DESIGN (no `src/` change). P0 deliverable of the BUFFER DONATION
+> campaign. It cashes the named blocker in `docs/chain-packing-design.md` P4 and
+> `docs/architecture-debt.md` stage-3 row: *"Closing [the foreach working-set
+> premium] needs graph-level buffer donation (write pNew into P's buffer, G packed
+> in place), which is stage-4 work proper."* Companion to
+> `docs/stage4-compile-from-ir.md` (the memory planner this must extend).
+
+---
+
+## 1. The claim (one sentence)
+
+**Buffer donation is a PLANNER assignment decision — an op DECLARES which operand
+positions it may consume-before-write, and the memory planner binds that op's
+output slot to a declared operand's buffer whenever liveness PROVES the operand is
+dead after this op (no live owner, no later reader, not a plan result) — so the
+packed optimizer's `pNew`/`G` intermediates reuse `P`'s buffer with zero net
+allocation, subsuming today's executor-side fused-donation special form as one
+auditable planner fact.**
+
+---
+
+## 2. The measured gap — READ THIS FIRST (the campaign's premise is only half true)
+
+Measured fresh on **sivri, 1× V100-32GB** (physical GPU 7), `tools/profile-training.ts`,
+distilgpt2 @ seq 512, 15 steps, all default flags except the optimizer path. **These
+are V100-relative deltas measured in one session — authoritative absolute numbers
+require the dw-2-1 A100 re-measure; the DELTA and its SHAPE are what matter here.**
+
+| Arm | opt path | peak (late) | current (late) | peak trend | storages trend |
+|---|---|---|---|---|---|
+| **Fused** (default) | `_stepFused` (WGSL adamStep) | **5636.6 MB flat** | **2110.1 MB flat** | flat from step 1 | flat (~248) |
+| **Packed** (`TORCHLETTE_FUSED_ADAM=0`) | `_stepForeach` → `packOptimizerProgram` | **10233.5 MB @ step 14, STILL RISING** | **7361.5 MB @ step 14, STILL RISING** | **+320 MB / step** | **+78 / step** |
+
+### 2.1 The gap is a LEAK, not a flat "2× working-set premium"
+
+The chain-packing P4 gate, `adam.ts:295-302`, and `architecture-debt.md` stage-3 row
+all describe the packed-vs-fused gap as a **flat ~2× premium** — "foreach 10.6GB peak
+vs fused 5.0GB" (A100, 2026-06-10) — to be closed by donating `pNew`→`P`. **That is
+not what the packed path does today.** It does not reach a flat steady state at all:
+peak and current both climb **+320 MB per step** and storage count climbs **+78 per
+step**, monotonically, with no plateau across 15 steps and no GC sawtooth (pool reuse
+holds ~59%, `pendingDestroy` stays 0). This is a deterministic per-step retention leak,
+not an allocator working-set premium. **Donation cannot close a leak** — aliasing an
+output into a dead input reduces the *flat* footprint; it does nothing for storages
+that are never reclaimed.
+
+Identical growth (+78 storages/step) reproduces under `TORCHLETTE_COMPILED_PLAN=0`
+(pure lowered), so it is **a lowered-path leak in the packed program itself, not a
+compiled-replay artifact**.
+
+### 2.2 Where the extra bytes live, and root cause
+
++78 storages/step ≈ **one leaked storage per parameter per step** (distilgpt2 has ~76
+optimizable params). The leak is in the packed **unpack**
+(`src/optim/pack-optimizer.ts:250-257`):
+
+```ts
+const seg = rt.reshape(rt.narrow(pNew, 0, offsets[k]!, sizes[k]!), items[k]!.param.shape);
+rt.copy_(items[k]!.param, seg);
+```
+
+`narrow(pNew, 0, offset>0, size)` is an **offset (strided) view**, so the following
+`reshape` **materializes a fresh contiguous buffer** per param (reshape-of-non-contiguous
+is the one view op that copies — confirmed in `ops/view-meta.ts` / stage-4 phase-3
+notes). `packOptimizerProgram` disposes `G`, `gAdj`, `P`, and the eval `sink`
+(`pack-optimizer.ts:263`) but **never disposes the `seg` materializations or `pNew`**.
+They stay in the live-pending registry (`pendingTensorsByNodeId`), so `markStep`'s
+step-scoped demotion never reclaims them (the profiler DOES call `markStep`,
+`tools/profile-training.ts:451`). Result: ~1 full-param-width buffer leaked per param
+per step. On distil@512 that is ~320 MB/step; on any real run it OOMs.
+
+The historical "10.6 GB flat 2× premium" is suspicious in this light: my step-14 packed
+peak (10.2 GB) nearly equals it. The 2026-06-10 figure was very likely **the same leak
+sampled at a late step and mislabeled flat** — a single-step memory read cannot
+distinguish a 2× flat premium from an accumulation that has reached 2× by that step.
+This is exactly the trap `agent-ops.md` warns about (read LATE steps *and confirm the
+trend is flat*, not a single late sample).
+
+### 2.3 What this does to the campaign
+
+The gate the chain-packing doc wrote — "donation closes the ~2× premium, then flip P4"
+— **targets the wrong quantity**. The design below therefore SPLITS P4's memory
+precondition into two gated phases and inserts the truth between them:
+
+1. **First, eliminate the packed-path unpack leak** (a disposal fix in
+   `pack-optimizer.ts`, NOT a planner/donation matter). Only then does the packed path
+   have a *flat* footprint to compare.
+2. **Then re-measure the TRUE flat packed-vs-fused premium on A100.** That number — not
+   the historical, leak-contaminated "2×" — sets the `X%` for P4's memory gate. It may
+   be well under 2×; donation's job is to close whatever flat residual remains (the
+   genuine `G`/`P`/`pNew` co-liveness).
+3. **Then donation** (planner-level output↔dying-input aliasing) closes the flat
+   residual and satisfies chain-packing P4's precondition.
+
+Donation remains the right *mechanism* for the flat premium and for the broader
+stage-4 goal (`stage4-compile-from-ir.md`: "donation = assignment decision"). It is
+just **not the first thing standing between the packed path and flat memory**, and the
+gate must say so.
+
+---
+
+## 3. Altitude ruling — a PLANNER fact, gated on a DECLARED op property (both, with a division of labor)
+
+Donation is decided in the **memory planner**, but it needs one bit the planner cannot
+derive from liveness alone. The ruling: **the op DECLARES eligibility (a static
+property); the planner PROVES the precondition and makes the binding; the bind is
+ASSERTED by the existing overlap audit.** Neither half alone is sufficient — this is
+the single-source-at-the-seam rule applied to donation.
+
+### 3.1 Why not executor-only (today's form), and why not liveness-only
+
+Today donation is an **executor-side, per-fused-segment decision**
+(`segment-executors.ts:252-316`, gated by `TORCHLETTE_DONATION`): during the lowered
+execution it picks a dying input whose buffer out0 overwrites, then caches the choice
+on the action (`executor.ts:2698-2714 cachedDonatedRecipeIdx`) so `stream-generate.ts`
+reproduces it. Two structural limits make this the wrong altitude for the packed
+optimizer:
+
+- **It refuses exactly the buffers the packed path needs.**
+  `segment-executors.ts:293` skips any candidate in `arenaBufferSet` or
+  `pinnedBufferSet` — "their identity is managed elsewhere." But under compiled replay
+  the packed `P`/`G`/`pNew` buffers ARE planner-registry buffers
+  (`compiled-plan.ts:1084-1102`). So the one form of donation that could close the
+  premium is structurally unreachable to the executor-side detector. The planner is
+  precisely the owner that CAN safely donate its own registry entries.
+- **It only covers single-output fused elementwise segments.** `cat` (which allocates
+  and copies, `gather-scatter.ts:534-568`) and `copy_` (strided scatter into the dst
+  buffer) are not fused-segment outputs; the packed unpack's `copy_`-back and the
+  pack's `cat` are never donation candidates today.
+
+Liveness-only (planner infers "output N may reuse input X because X dies at N") is
+*also* insufficient: liveness proves X is dead, but not that op N is *semantically
+safe* to write into X's buffer. Elementwise reads each element before storing (safe);
+a reduction or a matmul reads X many times across threads while writing (unsafe); `cat`
+writes disjoint regions (safe only for the block whose source is X). The planner must
+be TOLD which operand positions an op may consume-before-write.
+
+### 3.2 The declaration: `DONATABLE_OPERANDS` (a static op property, sibling of `IN_PLACE_DST_INPUTS`)
+
+Add a static, op-keyed map declaring which input positions an op may write its primary
+output into, given the liveness precondition holds — the exact shape of the existing
+`IN_PLACE_DST_INPUTS` (`plan-builder.ts:104-109`), which already declares "these inputs
+are overwritten in place" and drives WAR ordering. Donation is its out-of-place analog:
+
+- **elementwise (binary/unary/cast)** — position(s) equal in shape+dtype to out0,
+  non-broadcast (this is what the fused detector already encodes at
+  `segment-executors.ts:279-291`; lifting it to a declaration makes it planner-visible).
+- **`copy_` / `stridedScatterCopy`** — dst position (already `IN_PLACE_DST_INPUTS[0]`;
+  donation is the same buffer identity, expressed as a planner binding rather than a
+  kernel side effect, so the packed unpack's `copy_(param, seg)` needs no new mechanism —
+  it is already in-place into `param`; the leak is the `seg` *source*, §2.2).
+- **`cat`** — the block position whose source input is dead and whose destination region
+  is a prefix/aligned sub-range (the classic XLA concat donation; elides one
+  block-copy). Optional/last — see §7 refusals.
+
+The declaration is a function of the op alone (cheap, once-per-op, cacheable) — the same
+"decide once per class" discipline the Muon pack-verdict uses.
+
+### 3.3 The planner binding (where it attaches)
+
+In `memory-planner.ts planMemory` phase 2 (the greedy first-fit loop, `:255-276`), when
+assigning the alloc slot for op N's output, if:
+
+1. op N declares operand position p donatable (§3.2), AND
+2. the operand's slot X satisfies `lastUse(X) == allocIdx(outputSlot)` (X's last read is
+   this op), AND
+3. X is a **temp** (not in `resultSlots`, not an external/`registerState` result), AND
+4. X's size-class matches the output's,
+
+then **bind the output slot to X's already-assigned entry** instead of drawing a fresh
+one. The planner already has an intra-step cross-plan analog to reuse — `externalReleases`
+/ `claimedEntries` (`memory-planner.ts:161-169, 243-276`), where one plan overlays a
+prior plan's released result entry. Donation is the *intra-plan* case of the same idea
+(output N overlays input X within one command stream). The existing structural overlap
+audit (`:277-329`, throws `OVERLAP`/`RESULT-SHARED`/`CLAIM-OVERLAP`) is the assertion
+seam: a bad donation that overlaps a still-live interval becomes a **build failure**,
+not a silent corruption.
+
+### 3.4 Interaction with compiled-plan REPLAY — falls out of assignment, with ONE new edge
+
+The **assignment** needs no new replay machinery: donation binds output slot N and input
+slot X to the *same* `entryIdx`; replay's `TAG_ALLOC` rebind (`compiled-plan.ts:1051-1102`)
+already maps slot→entry, so two slots mapping to one entry replays correctly and
+per-replay rebinding is unchanged. Donation "just falls out of liveness-aware
+assignment" for the buffer identity.
+
+What DOES need a new plan-level edge is **suppressing the two anti-alias guards** that
+currently forbid exactly this (both surfaced by the code map):
+
+- `resolveOutputBuffer` (`buffer-arena.ts:568-579`) actively **releases and reallocates**
+  any output buffer that aliases an input — the direct inverse of donation. A donation
+  edge must mark op N's alloc so this replacement is suppressed *for the donated
+  operand only* (via the existing `providedOutBuffer` seam, `buffer-arena.ts:476`, or an
+  `AllocCommand` flag alongside `inputSlots`, `compiled-plan.ts:84-95`).
+- The planner's own **next-command rule** (`memory-planner.ts:145-151`) forbids
+  same-command read+write of one slot, noting in-place forms "already share a single
+  slot upstream via donation/in-place discipline." So the cleanest expression is to
+  **collapse X and output-N to a single slot in the plan/stream builder upstream** (the
+  IR carries one slot for both), which makes the planner assign one entry with no
+  aliasing exception at all. Preferred over a per-binding suppression flag: it keeps the
+  planner's single-slot invariant intact and the overlap audit unmodified.
+
+**Ruling: the new mechanism is a DONATION EDGE at plan-build time (collapse donated
+operand X and output N to one slot), not a new planner algorithm.** The planner's
+liveness assignment and overlap audit consume it unchanged.
+
+### 3.5 park-live, arena, and the WAW `sharedEncoderWriteSet` check — explicit rulings
+
+- **park-live / `canRecycle`.** A donated buffer that some live storage still aliases is
+  the "later data leaks into earlier results" bug incarnate. Precondition 3 (X is a
+  temp, no live owner) is *exactly* `canRecycle(X.buffer) === true`
+  (`buffer-pool.ts:173-177`: no `bufferLiveCount` owner AND not in `sharedEncoderWriteSet`).
+  **Donation MUST consult `canRecycle` at bind time and refuse when false** — a
+  `registerState`'d / snapshot-member / cross-plan-read buffer is never donatable. This
+  is what keeps park-live (`compiled-plan.ts:618-660`) correct by construction: donation
+  only ever aliases a buffer with no live reader, so teardown never destroys a buffer a
+  live storage still needs.
+- **Arena.** The executor-side form refuses arena/pinned buffers
+  (`segment-executors.ts:293`). Planner-level donation **inverts** this correctly: the
+  planner OWNS the registry/arena buffers, so donating one registry entry into another
+  op's output is an ownership-preserving assignment (one entry, one owner-plan), not a
+  cross-regime hazard. This is the capability the executor-side form structurally lacks
+  and the reason donation must live in the planner.
+- **WAW `sharedEncoderWriteSet`.** Donation adds op N's output (= X's buffer) to the
+  write set. Within one dispatch, elementwise consume-before-write is per-thread safe
+  (no cross-thread hazard — the property the fused donation already relies on,
+  `fusion-types.ts:135-144`). The cross-dispatch hazard — an *earlier-in-encoder*
+  unsubmitted dispatch still reads X's old value while op N overwrites it — is ruled out
+  by precondition 2 (`lastUse(X) == allocIdx(N)`): X has no later reader, so no queued
+  reader survives op N. The `enforceWriteAfterReadOrder` WAR pass
+  (`plan-builder.ts:123-218`) that already sequences readers-before-in-place-writer
+  extends to the donated pair verbatim (donation is a declared in-place-like write).
+  **Ruling: donation within one shared encoder is permitted iff the WAR order pass has
+  sequenced every reader of X before op N; the `sharedEncoderWriteSet` WAW check remains
+  the runtime backstop and must stay armed** (`TORCHLETTE_STRICT_GPU=1` in CI).
+
+---
+
+## 4. The safety story
+
+Donation is the archetypal *"a later step's data leaks into an earlier step's results"*
+bug class (WebGPU Buffer Pool Invariants; the naive-`canRecycle`-reuse NaN, §7). The
+invariants, each with its enforcement seam:
+
+- **Single owner of the donatable decision.** The op DECLARES eligibility (§3.2); the
+  PLANNER alone proves the liveness precondition and makes the binding (§3.3). Two sides
+  never independently conclude "this is safe to reuse" — the classic silent-divergence
+  seam. Assert-at-bind: the overlap audit (`memory-planner.ts:277-329`) validates the
+  donated entry has no overlapping live interval, turning any bad donation into a build
+  failure.
+- **The precondition IS `canRecycle`.** No donation onto a buffer with a live owner or a
+  pending encoder write (§3.5). This is the persistence-contract UAF class
+  (`architecture-debt.md` ledger; `sequential-corruption-open`) restated as a bind-time
+  gate.
+- **The `[lifetime]` strict guard is the standing detector.** A donated buffer whose
+  original storage is read after the donating op is exactly what
+  `getInputStorage`'s `[lifetime]` reclaimed/released-read guard throws on
+  (default-throw since task #73). It runs on every test and training step, so a bad
+  donation that escapes the audit is caught the moment the stale read fires. Gate:
+  strict-lifetime green across the full suite AND the 124M soak.
+- **Differential gates (Corollary 1 + 2, cross the activation threshold).**
+  - `tools/parity-fullstack-tl.ts` twice (`TORCHLETTE_COMPILED_PLAN=0` vs default),
+    per-step loss ≤ 1e-5 over 30 steps — donation must not perturb the trajectory.
+  - `tools/parity-packed-vs-unpacked.ts` — packed vs per-param, Adam/Lion/SGD/Muon,
+    bit-exact, crossing the compiled-plan activation threshold.
+  - **NEW targeted spec `test/donation-parity.spec.ts`:** for the covered ops
+    (elementwise last-consumer, `cat`, the packed unpack), donation-on vs
+    `TORCHLETTE_PLANNER_DONATION=0` produces **bit-identical results** AND
+    **peak(donation) ≤ peak(no-donation)**. This is the Corollary-1 cross-path guard the
+    mechanism ships with. `tools/test-donation-multiout.ts` (the multi-output
+    donate-into-every-output corruption pin) is folded in as a standing cell.
+  - **Subsumption check** (from `stage4-compile-from-ir.md` phase 1): with planner
+    donation ON, the executor-side kernel donation can be disabled (`TORCHLETTE_DONATION=0`)
+    and peak memory must be **equal or better** — proving the planner fact subsumes the
+    executor special form rather than double-counting it.
+
+---
+
+## 5. Phase plan (each shippable + gated)
+
+**Standing gate set (every phase, before landing):** `npm run test:gates`
+(`compiled-plan-parity.spec.ts`); `tools/parity-fullstack-tl.ts` twice
+(`COMPILED_PLAN=0` vs default) ≤ 1e-5 / 30 steps; `tools/parity-packed-vs-unpacked.ts`
+4 arms bit-exact; the 124M DiLoCo regression `{0:9.81, 3:5.92, 6:5.15, 9:4.64}` EXACT;
+distil **9** / medium **18** submits non-regression (`TORCHLETTE_PROFILE=1 …
+profile-training.ts`, read LATE steps AND confirm the trend is flat); full suite green.
+GPU work serial-exclusive (`tools/pick-gpu.sh`, HOST node toolchain).
+
+| Phase | What lands | Gates (standing +) | Cashes / notes |
+|---|---|---|---|
+| **P0** | THIS design doc. | — | No `src/` change. |
+| **P1 — fix the packed-path leak (PREREQUISITE, not donation).** | Dispose the unpack materializations and `pNew` in `pack-optimizer.ts` (or make the unpack a strided `copy_` that never materializes `seg`). This is a disposal correctness fix; it is what makes the packed path *have* a flat footprint to donate against. | **Packed foreach memory FLAT** — peak non-growing over 30 steps (the §2 leak gone); `parity-packed-vs-unpacked.ts` still bit-exact; `fused-vs-elementwise.spec.ts` green. **Then re-measure the TRUE flat packed-vs-fused premium on A100** — this sets `X%` for P4. | No deletion; unblocks an honest gate. **If P1 alone brings packed peak within the P4 tolerance, donation becomes an optimization, not a P4 blocker — the design must re-check the gate after P1 lands (measure, don't assume).** |
+| **P2 — planner-level donation, opt-in.** | `DONATABLE_OPERANDS` declaration (§3.2); the donation edge (slot-collapse) at plan-build (§3.4); planner binds output↔dying-input entry (§3.3); anti-alias suppression via slot-collapse; **subsume the executor-side fused donation** (`segment-executors.ts` block + `donationSink`/`cachedDonatedRecipeIdx` + `stream-generate` post-hoc detection become planner facts). Behind `TORCHLETTE_PLANNER_DONATION=1` (born with sunset). | `test/donation-parity.spec.ts` (bit-exact + peak ≤ no-donation); the **subsumption check** (`TORCHLETTE_DONATION=0` with planner donation on ⇒ equal-or-better peak); overlap-audit clean; strict-lifetime green. | Net-neutral-to-negative SLOC (§6): the planner fact replaces the executor special form. |
+| **P3 — THE FLIP (satisfies chain-packing P4 precondition).** | `TORCHLETTE_PLANNER_DONATION` default-on; packed optimizer `pNew`→`P`, `G` packed-in-place donation active on the compiled path. | **Hard:** 124M `{…}` EXACT; distil 9 / medium 18 submits EXACT; **packed-arm peak within X% of fused** (X from the P1 A100 re-measure) on A100, FLAT; `parity-fullstack-tl.ts` twice; fused-vs-packed trajectory. Re-measure A100 fresh at flip. | This is the precondition `chain-packing-design.md` P4 gates on. With it met, chain-packing P4 (packed optimizer default on WebGPU) proceeds; **chain-packing P5 then deletes the fused `adamStep` monolith (~1.3–1.6k SLOC)** — the campaign-level payoff. |
+
+**Which phase flips chain-packing P4:** P3. **What P5 then needs:** nothing further from
+donation — once the packed default holds distil-9/medium-18 submits at flat memory
+within `X%` of fused (P3's gate), the fused kernel is unreferenced and P5's deletion is
+purely the chain-packing §5 ledger.
+
+---
+
+## 6. Deletion ledger + covenant
+
+Donation is a **net-additive but small** mechanism, and it **subsumes** an existing
+special form:
+
+| Item | Fate |
+|---|---|
+| `DONATABLE_OPERANDS` map + planner bind logic (§3.2–3.3) | **NEW** (small; sibling of `IN_PLACE_DST_INPUTS`) |
+| donation edge / slot-collapse at plan-build (§3.4) | **NEW** (small) |
+| `test/donation-parity.spec.ts` | **NEW** (test, free per complexity budget) |
+| executor-side fused donation: `segment-executors.ts:252-316` eligibility loop, `donationSink`, `donatableInputIds` plumbing (`executor.ts:2681-2714`), `cachedDonatedRecipeIdx`, `stream-generate.ts:4391` post-hoc reproduction | **SUBSUMED** → becomes the planner fact (delete the per-segment detector; keep the kernel's `donatedInput` binding form, now driven by the plan) |
+| `TORCHLETTE_DONATION` flag | retires (folded into `TORCHLETTE_PLANNER_DONATION`, itself born-with-sunset) |
+
+Donation's own src delta is roughly **net-neutral** (new declaration + edge ≈ the
+executor detector it deletes). **Does park-live simplify?** Not directly — park-live
+stays as the teardown discipline; donation respects it (never aliases a live-owned
+buffer) rather than removing it. **Does a pool special case fall?** The
+`arenaBufferSet`/`pinnedBufferSet` *exclusion* in the executor detector
+(`segment-executors.ts:293`) dies with that detector — the planner needs no such
+exclusion because it owns those buffers.
+
+**Covenant (campaign-level).** Donation is chargeable to the chain-packing campaign: it
+is the P4 precondition whose payoff is chain-packing **P5's ~1.3–1.6k SLOC deletion** of
+the fused `adamStep` monolith. Donation itself (net-neutral) plus that deletion makes
+the *combined* campaign strongly **net-negative src SLOC**. The one genuinely new
+mechanism (the donation edge + declaration) is warranted: it is the single seam that
+lets the planner reuse dying buffers uniformly — closing the foreach premium AND the
+broader stage-4 goal — where the executor special form could not reach the buffers that
+matter. Every phase names its deletions in the commit (house policy);
+`bash tools/weight-norm.sh --log` snapshots at campaign end.
+
+---
+
+## 7. Risks and refusals
+
+### 7.1 What the planner REFUSES to donate (typed, named — correct-and-slow fallback = fresh alloc)
+
+- **`LiveOwnerRefusal`** — X has a live owner or a pending encoder write (`canRecycle(X)
+  === false`): a `registerState`'d / snapshot-member / cross-plan-read buffer. This is
+  the persistence-contract UAF class; never donate. (§3.5)
+- **`ResultOrExternalRefusal`** — X is in `resultSlots` or is an external/leaf input a
+  later plan reads (`getLivePendingRootNodes`, `tensor.ts:146-158`). Cross-plan readers
+  make X not-dead.
+- **`LaterReaderRefusal`** — `lastUse(X) != allocIdx(outputSlot)`: a reader survives op
+  N. The WAW/WAR hazard.
+- **`ShapeDtypeRefusal`** — `sizeOf(X) != sizeOf(out0)`, dtype mismatch, X scalar, or X
+  broadcast (partial write leaves stale bytes). Matches the fused detector's hard
+  requirements (`segment-executors.ts:290-291`).
+- **`NonElementwiseRefusal`** — op position not in `DONATABLE_OPERANDS` (a reduction /
+  matmul / any op that reads X across threads while writing). Hard gate, not a heuristic
+  — the same clause-4 rigor `chain-packing-design.md` §6.1 demands for Muon's `mm`.
+- **`MultiOutputRefusal`** — donate into the PRIMARY output only; additional outputs keep
+  fresh allocations. Donating one buffer to multiple writable bindings is a WebGPU
+  validation error that drops the whole submit (pinned by
+  `tools/test-donation-multiout.ts`; `segment-executors.ts:270-277`).
+- **`DupBindingRefusal`** — X already bound elsewhere in op N's dispatch (read+rw of one
+  buffer in one dispatch is a WebGPU validation error).
+
+Every refusal → fresh output allocation (today's behavior). Refusal is never a
+correctness compromise, only a missed memory optimization.
+
+### 7.2 Do NOT re-walk (prior attempts, from the ledgers)
+
+- **Naive `canRecycle`-reuse NaN'd the 124M** (`MEMORY.md`
+  arena-memory-blowup-124m: *"Naive canRecycle-reuse NaN'd (do not retry)"*). Donation is
+  NOT "reuse any recyclable buffer" — it is a liveness-PROVEN, op-DECLARED, overlap-AUDITED
+  binding. The distinction is the whole safety story (§4); do not collapse it back to
+  opportunistic reuse.
+- **Flushing `pendingRelease` to pool mid-step** — deterministic ~2% loss drift
+  (`CLAUDE.md` WebGPU Buffer Pool Invariants). Donation must not touch `pendingRelease`
+  timing; it operates on planner entry assignment, not on pool reclamation cadence.
+- **Immediate `buf.destroy()` mid-encoder** — poisons the pending submit; all destruction
+  stays fence-gated `deferredDestroy`. A donated buffer is *reassigned*, never destroyed
+  early.
+- **Multi-output donate-into-every-output** — the corruption `test-donation-multiout.ts`
+  pins; primary-output only (§7.1 `MultiOutputRefusal`).
+- **`arena-positions-acquire-from-pool`** (`TORCHLETTE_ARENA_POOL_ACQUIRE`,
+  `architecture-debt.md` stage-2 row) — broke compiled replays via slot aliasing;
+  superseded. Donation must not reintroduce cross-regime buffer identity.
+
+### 7.3 Named risks
+
+- **R1 — the P1 leak masks the true premium.** Until P1 lands, no honest packed-vs-fused
+  memory number exists. Mitigation: P1 is a hard prerequisite with a FLAT-memory gate;
+  P4's `X%` is derived only after it. **Do not tune donation against the leaky baseline.**
+- **R2 — donation on a strided/offset X.** A partial-covering write leaves stale bytes in
+  X's buffer that the output view then reads. Mitigation: `ShapeDtypeRefusal` requires
+  full-buffer, contiguous, same-size donation; strided X refuses.
+- **R3 — compiled-replay staleness.** If the donation edge (slot-collapse) is not
+  reproduced identically at replay, output N binds a different buffer than the recording
+  → frozen/stale (the frozen-`step_size` class). Mitigation: donation is a PLANNER
+  assignment reproduced deterministically per replay (§3.4); the stream differential
+  (`stage4` phase 0) and `parity-fullstack-tl.ts` across the activation threshold catch
+  any drift.
+- **R4 — subsumption double-count.** If both the executor detector and the planner donate
+  the same pair, one may free a buffer the other still binds. Mitigation: P2 deletes the
+  executor detector as it lands the planner fact; the subsumption check
+  (`TORCHLETTE_DONATION=0`, equal-or-better peak) proves single ownership.
+
+---
+
+## 8. Genuine taste-calls for the user
+
+1. **Split the P4 gate (§2.3).** This design asserts the campaign's stated premise
+   ("donation closes the 2× premium") is contaminated by a per-step leak, and inserts a
+   leak-fix phase (P1) before donation. If you'd rather donation own the whole memory
+   story, the leak still has to be fixed first — but we could fold P1 into the donation
+   campaign vs. filing it as a standalone `pack-optimizer` disposal bug. Recommendation:
+   file P1 as its own fix (it is a correctness bug on the packed path today, independent
+   of donation) and let the donation campaign start from a flat baseline.
+2. **`cat` donation scope (§3.2).** Elementwise + `copy_` donation is clearly in scope
+   and closes the packed premium. `cat`-block donation (elide the first block-copy) is a
+   further win but adds the disjoint-region reasoning. Ship P2 with elementwise+`copy_`
+   only and add `cat` as a P2.5 increment? Recommendation: yes — keep P2 minimal.
+3. **Slot-collapse vs. suppression flag (§3.4).** The design prefers collapsing the
+   donated operand and output to one slot upstream (keeps the planner's single-slot
+   invariant) over a per-binding anti-alias suppression flag. Both are viable; the
+   slot-collapse is more invasive to plan-build but leaves the planner and its audit
+   untouched. Recommendation: slot-collapse.
