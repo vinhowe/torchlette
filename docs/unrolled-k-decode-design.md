@@ -480,8 +480,12 @@ consumer is *proven gone*, not assumed — the STOP rule's own logic, run forwar
 
 ## 8. Open questions (only those that materially fork the design)
 
-1. **Is full-vocab top-p worth an on-device multi-pass cumsum, or is K=1 fallback
-   acceptable forever?** This forks §4's residue: if the shipped product needs
+1. **RESOLVED 2026-07-21 — Vin chose (a): the block-side small-top-k + top-p sampler
+   landed (see "SAMPLER STATUS" below).** Small-top-k / temperature suffices for the
+   demos; NO full-vocab cumsum lands (full-vocab top-p WITHOUT a bounding top-k stays
+   the host residue). *Original question, for the record:* **Is full-vocab top-p worth
+   an on-device multi-pass cumsum, or is K=1 fallback acceptable forever?** This forks
+   §4's residue: if the shipped product needs
    full-vocab nucleus sampling *at unrolled-K speed*, a multi-workgroup cumsum
    (net-new, ~a kernel) enters src; if K=1 fallback for that sampler is acceptable
    (greedy + temperature + categorical + small-top-k cover the demos today), the
@@ -1187,8 +1191,11 @@ through it). P5's entry checklist:
    NOT yet gone. P5 is BLOCKED until one of (forks §8 Q1, Vin's call):
    - (a) the demos adopt a block-covered sampler (greedy or on-device Gumbel — now
      DEFAULT-eligible after the P4b transient fix), OR
-   - (b) on-device small-top-k + top-p lands (§4 net-new: workgroup `inclusiveScan`
-     prefilter + Gumbel; §8 Q1), moving the demo sampler onto the block, OR
+   - (b) **DONE 2026-07-21** — on-device small-top-k + top-p landed (`deviceTopK`
+     prefilter + triangular-matmul top-p cumsum + Gumbel; §8 Q1 → (a); see "SAMPLER
+     STATUS"), moving the demo sampler onto the block. This satisfies the consumer-
+     removal precondition for the demos' sampler; the ledger EXECUTION remains the
+     P5 follow-up (NOT done in the sampler pass), OR
    - (c) ~~the sampled-block **transient is fixed**~~ (DONE, P4b) AND the demos
      switch to Gumbel (still open — the demos sample top-k/top-p).
    Until then the P4b STOP rule holds: a proven decode consumer remains.
@@ -1214,6 +1221,109 @@ through it). P5's entry checklist:
 The covenant reaches net-negative when this ledger executes (§5 projected
 `src` **−3100…−3600 vs pre-Everest**); P4 is the cutover that unblocks the greedy
 half of the consumer removal, and names precisely what still gates the rest.
+
+---
+
+## SAMPLER STATUS — on-device top-k/top-p/temperature; the demo sampler moves onto the block (2026-07-21)
+
+*Worktree off `main@6361cff1`. Staged commits, no push. sivri (V100-SXM3-32GB, the
+correctness box), node v22 + Dawn/Vulkan vk-shim, device via `tools/pick-gpu.sh`.
+Reproduce: `eval "$(tools/pick-gpu.sh)"; LD_LIBRARY_PATH=tools/vk-shim:$LD_LIBRARY_PATH
+npx tsx tools/t-uk-topk-sampler.ts` (the sampler gate), `… tools/t-uk-topk-op.ts`
+(the deviceTopK op), `… tools/t-uk-topk-econ.ts` (economics).*
+
+**Vin resolved §8 Q1 with option (a): the BLOCK-SIDE top-k/top-p sampler** — sampled
+decoding moves into the unrolled block while preserving the demos' CURRENT sampling
+DISTRIBUTION exactly (top-k/top-p/temperature semantics as the host `sampleFromTopK`
+defines them today). This closes P5 item 1(b) (§4's "small-top-k prefilter + Gumbel"):
+**the demos' sampler is no longer the host residue** — greedy + gumbel + top-k/top-p
+now all decode on-device.
+
+### The mechanism as landed
+
+One net-new `src` op — **`deviceTopK`** (a LAZY packed-output op `[1,2,k]`: row 0 =
+the k values descending, row 1 = the k token ids as f32) — reusing the SAME tile-IR
+`readTopK` passes (`src/backend/webgpu/topk-kernel.ts`, parameterized for a
+constant-offset/length packed f32 dispatch), so the device top-k SET is byte-identical
+to the host reference (which draws its set from `readTopK`). Everything else composes
+from EXISTING lazy ops in `decodeBlock` (`packages/*/src/generate.ts`
+`sampleFilteredToken`):
+
+- **top-p support** = `mask[i] = ( (Σ_{j<i} softmax_temp[j]) < topP )` — the exact host
+  cut rule (`cut = first i with cumulative ≥ topP`, that i INCLUDED) reformulated
+  maskwise. The exclusive cumsum is a **strictly-upper-triangular matmul** (`exps @ M`)
+  — an existing lazy op, NOT a new scan kernel.
+- **selection** = **Gumbel-max over the survivors**: `argmax(logit/temp + g)`,
+  `g=-log(-log(u))`, `u=gumbelUniform(seed+absPos, k)` (the §3.5 seed-as-DATA channel).
+  This draws ∝ `softmax(logit/temp)` restricted to the support — **identical in
+  distribution to the host's `r·cutSum` multinomial walk** (Gumbel-max theorem), so the
+  demos' distribution is preserved EXACTLY (only the RNG source differs).
+
+`generateChat` (qwen3 + gemma2) routes top-k(+top-p)/temperature through the block by
+DEFAULT under `TORCHLETTE_UNROLLED_K` — **no new flag** (the sampler reuses the existing
+opt-out). The typed residue that STAYS host: **top-p WITHOUT a bounding top-k** (a
+full-vocab CDF, §4), non-static-KV paths, and the `0/1` opt-out.
+
+### Gates (all PASS, sivri/V100 unless noted)
+
+- **`tools/t-uk-topk-op.ts`** — `deviceTopK` byte-identical to a CPU top-k AND to
+  `readTopK` (values + indices, tie-break) across k∈{1,8,64}, V=1000/k=40, k==V; 0 GPU
+  errors. (Fixed a latent tile-IR bug: folding `u32.div` over CONSTANTS emitted a float
+  literal — the const-offset path computes `chunk=ceil(len/NW)` in JS.)
+- **`tools/t-uk-topk-sampler.ts`** — (i) FILTER EXACTNESS: device support == host
+  support byte-level across k=1, k>vocab, p=1.0, tiny p, typical, **ties@boundary**,
+  temp hot (T=50), temp cold (T=0.05) — AND the real block sampler ⊆ that support;
+  (ii) DETERMINISM: same seed → same tokens twice; (iii) DISTRIBUTION: TV vs the exact
+  target < 0.02 and chi²/df < 2.0 for device AND host across (k20 p.95 T.7 / k40 p.9 T1 /
+  k8 p1 T1.5), N=20000, 200 real device draws == the exact sim; (iv) PARITY: filtered
+  block == filtered host loop, K∈{1,4,8} + a 128-bucket crossing. 0 GPU errors.
+- **Unregressed:** `t-uk-block-diff` (greedy mother gate + compiled arm) and
+  `t-uk-gumbel-parity` (pure-temperature) both byte-identical, 0 GPU errors — the
+  filtered path is a NEW `sample` sub-mode; greedy/gumbel are untouched.
+- `npm run test:gates` **5/5**; `tools/gate-wall.sh --profile training` **PASS=15 ENV=0
+  REAL=0** (test:gates, parity-fullstack both arms, tape-matrix, 124M-regression,
+  checkpoint-seg — the executor-touch is `deviceTopK`'s FUSED_OP_TABLE +
+  contiguous-operands entries, additive). strict-lifetime default throughout.
+
+### Economics (sivri/V100 — the correctness box; NOT the A100 table) — HONEST
+
+`tools/t-uk-topk-econ.ts`, random-init Qwen3 8L/512d, topK=20 topP=0.95 T=0.7, N=48:
+
+| arm | submits/tok | ms/tok | host/block ms | host/block subs |
+|---|---|---|---|---|
+| host per-token loop | 4.1 | 81.5 | — | — |
+| block K=4 | 2.4 | 124.6 | 0.65× | 1.74× |
+| block K=8 | 2.1 | 111.4 | 0.73× | 1.96× |
+
+The filtered block issues **~1.7–2× fewer submits/tok** (the host-tax amortization is
+real) but is **~1.4× SLOWER in wall ms/tok** — because the block runs **LOWERED**: the
+runtime census (`TORCHLETTE_DEBUG_CENSUS`) on the filtered block is
+**`{deviceTopK, gather[no-shape]}`** uncovered, so the whole plan misses `fullyCovered`
+and loses the compiled-forward win (exactly the P2 pre-RoPE regime), and the top-p
+filter adds ~14 lazy dispatches/step. **The compiled-forward win is gated on a
+`deviceTopK` (+ the `[1,1,1]`-index gather) build-from-IR generator — a bounded, named
+follow-on, precisely analogous to how greedy/gumbel needed the arg-reduce (P1→P2) and
+RoPE (P3') generators.** Correctness — the taste-fork deliverable — is fully realized;
+the compiled speed is the follow-on. (Greedy/gumbel blocks still compile; only the
+filtered sub-mode is lowered.)
+
+### The sampler CONSUMER is RESOLVED (P5 note, ledger NOT executed here)
+
+§8 Q1 is answered (a): small-top-k + top-p on-device covers the demos, no full-vocab
+cumsum lands. **P5 item 1(b) is satisfied** — the shipped demos' top-k/top-p sampler now
+routes through the block, so the tape's decode consumer is removed for that path too.
+Per this pass's scope the **P4b/§5 tape-deletion ledger is NOT executed here** (it is the
+separate P5 follow-up); this pass lands the sampler and records that its consumer is
+resolved. The P5 absence-proofs (`t-p4b-decode-edges` → producers=0,
+`t-decode-whole-step` → Verdict A) remain the ledger's entry gate.
+
+### Weight-norm
+
+`src` +~1 op (`deviceTopK`: the pass2-packed/pass1-const kernel params +
+`dispatchDeviceTopK` + the `fused.ts` wrapper + LazyOpCode / backend-types / index /
+FUSED_OP_TABLE / contiguous-operands / engine / frontend registrations — ~70 code
+lines), **NO new env flag** (reuses `TORCHLETTE_UNROLLED_K`). The sampler composition
+(`sampleFilteredToken`, `strictUpperOnes`) lives in `packages/` (admission pressure).
 
 ---
 

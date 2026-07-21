@@ -2287,6 +2287,17 @@ export class RuntimeEngine {
     );
   }
 
+  /**
+   * Lazy device top-K over the last dim of a single logits row: [.., V] →
+   * packed [1, 2, k] (row 0 = values desc, row 1 = token ids as f32). The
+   * on-device sampling prefilter (decodeBlock composes top-p + Gumbel over it).
+   */
+  deviceTopK(logits: Tensor, k: number): Tensor {
+    return this.fusedOp("deviceTopK", [logits], [1, 2, k], logits.device, {
+      k,
+    });
+  }
+
   fusedRMSNormBackwardGradX(
     gradOutput: Tensor,
     x: Tensor,

@@ -42,12 +42,13 @@ export type GenerateOptions = {
    */
   residualHook?: ResidualHook;
   /**
-   * Seed for the on-device Gumbel-max sampler (the block's pure-temperature
-   * path, §3.5 seed-as-DATA). Fixed per generation so the sampled stream is
-   * byte-reproducible. Only consulted when the block Gumbel path is active
-   * (temperature>0 with no top-k/top-p restriction and the flag on); the host
-   * top-k/top-p residue keeps its own Math.random draw. Undefined → a fresh
-   * random seed per generation (run-to-run variety, matching the host sampler).
+   * Seed for the on-device Gumbel-max sampler (§3.5 seed-as-DATA). Fixed per
+   * generation so the sampled stream is byte-reproducible. Consulted for EVERY
+   * block-covered sampled path: pure-temperature (full-vocab Gumbel) AND
+   * top-k(+top-p)/temperature (the filtered block sampler). The only host
+   * residue left — top-p WITHOUT a bounding top-k, or the opt-out — keeps its
+   * own Math.random draw. Undefined → a fresh random seed per generation
+   * (run-to-run variety, matching the host sampler).
    */
   seed?: number;
 };
@@ -178,6 +179,73 @@ export function gumbelUniform(seed: number, n: number): Float32Array {
   return out;
 }
 
+/**
+ * Strictly-upper-triangular ones `[k,k]` (row-major): `M[j,i] = 1` iff `j < i`.
+ * `exps[1,k] @ M` is the EXCLUSIVE cumulative sum `cum[i] = Σ_{j<i} exps[j]` —
+ * the top-p boundary quantity, computed with an existing lazy matmul (no
+ * on-device scan op). k is small (≤ topK ≤ 64), so the matrix is tiny.
+ */
+export function strictUpperOnes(k: number): Float32Array {
+  const a = new Float32Array(k * k);
+  for (let j = 0; j < k; j++)
+    for (let i = j + 1; i < k; i++) a[j * k + i] = 1;
+  return a;
+}
+
+/**
+ * ON-DEVICE top-k / top-p / temperature sampling of ONE logits row, returning
+ * the selected token id as a lazy `[1,1]` TENSOR (fed straight into the next
+ * embedding gather — no host readback). Reproduces the host `sampleFromTopK`
+ * DISTRIBUTION exactly:
+ *   1. `deviceTopK` → the k highest logits (values desc + token ids), the SAME
+ *      set (same tie-break) the host draws from `readTopK`.
+ *   2. top-p support: `mask[i] = ( (Σ_{j<i} softmax_temp[j]) < topP )` — the
+ *      exact host cut rule `cut = first i with cumulative ≥ topP` (that i is
+ *      INCLUDED), reformulated maskwise via the exclusive cumsum matmul.
+ *   3. Gumbel-max over the surviving support: `argmax(logit/temp + g)`,
+ *      `g = -log(-log(u))`, so the winner is drawn ∝ `softmax(logit/temp)`
+ *      restricted to the support — identical in distribution to the host's
+ *      `r·cutSum` walk (Gumbel-max theorem). `u` is the seed-as-DATA channel
+ *      (`gumbelUniform(seed+absPos, k)`), so the stream is deterministic and
+ *      replay-reproducible.
+ * `L` = strictUpperOnes(k) and `topPT` = topP as a `[1,1,1]` tensor are built
+ * ONCE per block and shared across the K steps.
+ */
+export function sampleFilteredToken(
+  api: Torchlette,
+  logits: Tensor, // [1,1,V] contiguous row
+  V: number,
+  s: { temperature: number; seed: number; topK: number; topP: number },
+  absPos: number,
+  L: Tensor, // [k,k] strictly-upper ones
+  topPT: Tensor, // [1,1,1] = topP
+): Tensor {
+  const k = Math.min(s.topK, V);
+  const temp = s.temperature;
+  const packed = api.deviceTopK(logits, k); // [1,2,k]
+  const vals = api.contiguous(api.narrow(packed, 1, 0, 1)); // [1,1,k] values desc
+  const idsF = api.contiguous(api.narrow(packed, 1, 1, 1)); // [1,1,k] ids as f32
+  const mx = api.narrow(vals, 2, 0, 1); // [1,1,1] top value (softmax shift)
+  const exps = api.exp(api.div(api.sub(vals, mx), temp)); // [1,1,k]
+  const sum = api.sum(exps, { dim: -1, keepdim: true }); // [1,1,1]
+  // exclusive cumsum via the triangular matmul: exclCum[i] = Σ_{j<i} exps[j].
+  const exclCum = api.reshape(api.matmul(api.reshape(exps, [1, k]), L), [
+    1,
+    1,
+    k,
+  ]);
+  const mask = api.lt(api.div(exclCum, sum), topPT); // 1.0 in support, else 0.0
+  const u = api.tensorFromArray(gumbelUniform(s.seed + absPos, k), [1, 1, k]);
+  const g = api.neg(api.log(api.neg(api.log(u)))); // -log(-log(u))
+  const score = api.add(api.div(vals, temp), g); // gumbel-max score
+  // Mask out non-survivors: (mask-1)*BIG is 0 for survivors, -BIG otherwise.
+  const masked = api.add(score, api.mul(api.sub(mask, 1), 1e30));
+  const pos = api.argmax(masked, { dim: -1, keepdim: false }); // [1,1] position
+  // gather requires a non-negative dim; idsF is [1,1,k] so the support axis = 2.
+  const token = api.gather(idsF, api.reshape(pos, [1, 1, 1]), { dim: 2 });
+  return api.reshape(token, [1, 1]); // token id [1,1]
+}
+
 /** Minimal static-KV model surface decodeBlock needs (Qwen3 / Gemma2 satisfy). */
 export interface StaticDecodeModel {
   forward(
@@ -229,7 +297,12 @@ export async function decodeBlock(
   opts?: {
     residualHook?: ResidualHook;
     stopTokens?: Set<number>;
-    sample?: { temperature: number; seed: number };
+    sample?: {
+      temperature: number;
+      seed: number;
+      topK?: number;
+      topP?: number;
+    };
   },
 ): Promise<{ ids: number[]; stopIndex: number }> {
   const maxSeq = model.config.maxSeqLen;
@@ -237,8 +310,21 @@ export async function decodeBlock(
   const residualHook = opts?.residualHook;
   const sample = opts?.sample;
   const stochastic = sample !== undefined && sample.temperature > 0;
+  // top-k / top-p FILTERED sampling on-device (§4 small-top-k prefilter + Gumbel)
+  // when topK bounds the support; else pure-temperature full-vocab Gumbel.
+  const filtered = stochastic && sample.topK !== undefined;
   const startLen = staticKV.len; // absolute position of this block's first step
   const V = model.config.vocabSize;
+
+  // Per-block constants for the filtered path (shared across the K steps).
+  let L: Tensor | undefined;
+  let topPT: Tensor | undefined;
+  let kEff = 0;
+  if (filtered) {
+    kEff = Math.min(sample.topK as number, V);
+    L = api.tensorFromArray(strictUpperOnes(kEff), [kEff, kEff]);
+    topPT = api.tensorFromArray([sample.topP ?? 1], [1, 1, 1]);
+  }
 
   const idTensors: Tensor[] = [];
   // First input is the host token; every subsequent input is the on-device
@@ -251,6 +337,24 @@ export async function decodeBlock(
     const id = api.noGrad(() => {
       if (!stochastic) {
         return api.argmax(logits, { dim: -1, keepdim: false }); // greedy
+      }
+      if (filtered) {
+        // On-device top-k/top-p/temperature (the demos' sampler), the surviving
+        // support matches the host reference exactly, sampled via Gumbel-max.
+        return sampleFilteredToken(
+          api,
+          logits,
+          V,
+          {
+            temperature: sample.temperature,
+            seed: sample.seed,
+            topK: kEff,
+            topP: sample.topP ?? 1,
+          },
+          startLen + j,
+          L as Tensor,
+          topPT as Tensor,
+        );
       }
       // Gumbel-max: id = argmax(logits/temp + (-log(-log(u)))). The uniform is
       // drawn HOST-side from a position-canonical seed (seed + absolutePosition)
@@ -303,12 +407,34 @@ async function gumbelPrefillToken(
   logits: Tensor,
   lastPos: number,
   vocab: number,
-  sample: { temperature: number; seed: number },
+  sample: { temperature: number; seed: number; topK?: number; topP?: number },
 ): Promise<number> {
   const id = api.noGrad(() => {
     const row = api.contiguous(
       api.narrow(api.narrow(logits, 1, lastPos, 1), 2, 0, vocab),
     ); // [1,1,V] contiguous
+    if (sample.topK !== undefined) {
+      // Same on-device top-k/top-p/temperature selection the block uses, so the
+      // prefill token draws from the identical filtered distribution (absPos=0;
+      // the seed is already position-canonical from the caller).
+      const k = Math.min(sample.topK, vocab);
+      const L = api.tensorFromArray(strictUpperOnes(k), [k, k]);
+      const topPT = api.tensorFromArray([sample.topP ?? 1], [1, 1, 1]);
+      return sampleFilteredToken(
+        api,
+        row,
+        vocab,
+        {
+          temperature: sample.temperature,
+          seed: sample.seed,
+          topK: k,
+          topP: sample.topP ?? 1,
+        },
+        0,
+        L,
+        topPT,
+      );
+    }
     const uArr = gumbelUniform(sample.seed, vocab);
     const u = api.tensorFromArray(uArr, [1, 1, vocab]);
     const g = api.neg(api.log(api.neg(api.log(u)))); // -log(-log(u))
@@ -442,36 +568,43 @@ export async function generateChat(
   );
   const isAborted = options?.isAborted ?? (() => false);
   const { temperature, topK, topP, residualHook } = options ?? {};
-  // P4 CUTOVER routing. The unrolled-K block is the DEFAULT decode path for the
-  // samplers it covers on-device: GREEDY (argmax) and pure-temperature
-  // (GUMBEL-max, §4). The TYPED RESIDUE that stays on the per-token host loop —
-  // any top-k restriction OR top-p / nucleus (a full-distribution host read the
-  // block cannot express, §4). TORCHLETTE_UNROLLED_K=0/1 opts the whole thing
-  // out (blockK=0 → the pre-cutover host loop, byte-identical to before).
+  // CUTOVER routing (SAMPLER pass). The unrolled-K block is the DEFAULT decode
+  // path for every sampler it covers ON-DEVICE:
+  //   - GREEDY (argmax),
+  //   - pure-temperature (GUMBEL-max, §4),
+  //   - top-k / top-k+top-p / temperature (the demos' sampler): the block-side
+  //     top-k prefilter + top-p nucleus filter + Gumbel-max (Vin's taste-fork
+  //     resolution (a) — the demos' sampling DISTRIBUTION is preserved exactly;
+  //     the device support == host `sampleFromTopK` support, byte-level).
+  // The typed RESIDUE that stays on the per-token host loop: a top-p / nucleus
+  // WITHOUT a bounding top-k (a full-vocab distribution read the block cannot
+  // express, §4), and any non-static-KV path. TORCHLETTE_UNROLLED_K=0/1 opts
+  // the whole thing out (blockK=0 → the pre-cutover host loop, byte-identical).
   const greedy = temperature === 0;
   const topKActive = topK !== undefined && topK < vocab;
   const topPActive = topP !== undefined && topP < 1;
-  // Gumbel sampled block is DEFAULT-eligible (2026-07-20): the sampled-path
-  // external-destroy transient that gated it opt-in at P4 is FIXED (the
-  // compiled-plan teardown now parks any plan-owned buffer a live storage still
-  // aliases — src/executor/compiled-plan.ts; gates: t-uk-gumbel-parity /
-  // t-uk-steering-diff sampled arm STRICT_GPU-clean). Pure-temperature sampling
-  // (no top-k/top-p) now routes through the on-device Gumbel block by default,
-  // still under the global opt-out (TORCHLETTE_UNROLLED_K=0/1 → host loop).
+  // Pure-temperature (no top-k/top-p): full-vocab on-device Gumbel-max.
   const gumbelEligible =
     !greedy && (temperature ?? 0) > 0 && !topKActive && !topPActive;
+  // top-k (optionally + top-p) restricted sampling: the on-device small-top-k
+  // prefilter path. topK BOUNDS the support to a small set so top-p is over a
+  // ≤k set (never a full-vocab CDF). topP alone (no topK) stays host residue.
+  const filterEligible = !greedy && (temperature ?? 0) > 0 && topKActive;
   const flagK = unrolledKFromEnv(); // 0 ⇒ opt-out; else the block size
-  const useBlock = flagK >= 2 && (greedy || gumbelEligible);
+  const useBlock =
+    flagK >= 2 && (greedy || gumbelEligible || filterEligible);
   const blockK = useBlock ? flagK : 0;
-  // Gumbel sampling for the block: the per-block seed flows as DATA (§3.5),
-  // position-canonical INSIDE decodeBlock (seed+absolutePosition). Fixed per
-  // generation so replay/reference are byte-reproducible; undefined ⇒ a fresh
-  // random seed (run-to-run variety, matching the host sampler's Math.random).
+  // The per-block seed flows as DATA (§3.5), position-canonical INSIDE
+  // decodeBlock (seed+absolutePosition). Fixed per generation so replay/
+  // reference are byte-reproducible; undefined ⇒ a fresh random seed (run-to-run
+  // variety, matching the host sampler's Math.random). Filtered sampling carries
+  // topK/topP so the block reproduces the demos' exact distribution.
   const blockSample =
-    useBlock && gumbelEligible
+    useBlock && (gumbelEligible || filterEligible)
       ? {
           temperature: temperature as number,
           seed: options?.seed ?? (Math.random() * 0x7fffffff) >>> 0,
+          ...(filterEligible ? { topK, topP } : {}),
         }
       : undefined;
 
@@ -530,10 +663,12 @@ export async function generateChat(
         model.forward(idx, { staticKV, residualHook }),
       );
       if (blockSample) {
-        // Gumbel-max prefill token (full-vocab, on-device) so the whole sampled
-        // stream stays on-device-consistent + deterministic. Seeded at the last
-        // prompt position (promptIds.length-1); decodeBlock's ids[j] then draw
-        // seed+promptIds.length+j — a clean monotonic per-position seed sequence.
+        // On-device prefill token (full-vocab Gumbel, or the same top-k/top-p
+        // filtered selection when the block sampler is filtered) so the whole
+        // sampled stream stays on-device-consistent + deterministic. Seeded at
+        // the last prompt position (promptIds.length-1); decodeBlock's ids[j]
+        // then draw seed+promptIds.length+j — a clean monotonic per-position
+        // seed sequence.
         nextTok = await gumbelPrefillToken(
           api,
           logits,
@@ -542,6 +677,8 @@ export async function generateChat(
           {
             temperature: blockSample.temperature,
             seed: blockSample.seed + promptIds.length - 1,
+            topK: (blockSample as { topK?: number }).topK,
+            topP: (blockSample as { topP?: number }).topP,
           },
         );
         logits.dispose();

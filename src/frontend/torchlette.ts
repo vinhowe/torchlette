@@ -1127,6 +1127,18 @@ export class Torchlette {
     this._assertUsable(a);
     return this._wrap(this.runtime.argmax(a._unwrap(), options));
   }
+
+  /**
+   * Lazy device top-K over the last dim of a single logits row: `[.., V]` →
+   * packed `[1, 2, k]` (row 0 = the k values descending, row 1 = the k token
+   * ids as f32 values, ties broken smaller-index-first — byte-identical to the
+   * `readTopK` host reference). Stays on-device so the unrolled-K decode block
+   * composes top-p + Gumbel-max over the survivors with no per-token readback.
+   */
+  deviceTopK(a: Tensor, k: number): Tensor {
+    this._assertUsable(a);
+    return this._wrap(this.runtime.deviceTopK(a._unwrap(), k));
+  }
   argmin(a: Tensor, options: ArgReduceOptions): Tensor {
     this._assertUsable(a);
     return this._wrap(this.runtime.argmin(a._unwrap(), options));

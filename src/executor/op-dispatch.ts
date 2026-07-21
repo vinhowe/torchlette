@@ -662,6 +662,7 @@ const FUSED_OP_TABLE: Record<string, FusedOpDesc> = {
     extraFields: ["gradBias"],
   },
   fusedRMSNormForward: { kind: "dispatch" },
+  deviceTopK: { kind: "dispatch" },
   fusedRMSNormBackwardGradX: { kind: "dispatch" },
   fusedRMSNormBackwardGradWeight: { kind: "dispatch" },
   fusedRoPE: { kind: "dispatch" },

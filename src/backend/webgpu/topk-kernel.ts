@@ -32,6 +32,7 @@
 
 import type { BackendTensor } from "../types";
 import { cachedCreateBindGroup } from "./bind-group-cache";
+import { allocateOutputBuffer } from "./buffer-arena";
 import { dispatchComputePass, getPipeline } from "./dispatch";
 import type { GPUBuffer, WebGPUTensor } from "./gpu-types";
 import { asGPUTensor, GPUBufferUsage, GPUMapMode } from "./gpu-types";
@@ -57,23 +58,42 @@ const NO_IDX = 0xffffffff;
  * elements; K rounds of workgroup argmax (pairArgReduce) drain the top-K,
  * writing (value, index) partials for the chunk. maxPT = ceil(ceil(len/NW)/WG).
  */
-function pass1Spec(k: number, maxPT: number): TileKernelSpec {
+function pass1Spec(
+  k: number,
+  maxPT: number,
+  constParams?: { offset: number; length: number },
+): TileKernelSpec {
   return {
-    name: `topkPass1_k${k}_pt${maxPT}`,
+    name: `topkPass1_k${k}_pt${maxPT}${
+      constParams ? `_o${constParams.offset}_l${constParams.length}` : ""
+    }`,
     workgroupSize: WG,
     bindings: {
       input: { storage: "read", type: "f32" },
       pvals: { storage: "read_write", type: "f32" },
       pidx: { storage: "read_write", type: "u32" },
     },
-    uniforms: { offset: "u32", length: "u32" },
+    // Lazy (`dispatchDeviceTopK`) bakes offset/length as WGSL constants so NO
+    // params UNIFORM is bound — removing the shared-uniform last-write-wins
+    // hazard when K deviceTopK dispatches share one encoder (each block step
+    // calls deviceTopK once). readTopK keeps the uniform path unchanged.
+    uniforms: constParams ? {} : { offset: "u32", length: "u32" },
     grid: () => [NW],
     kernel(ctx: KernelContext) {
       const w = ctx.programId(0);
       const tid = ctx.localIndex();
-      const off = ctx.uniform("offset");
-      const len = ctx.uniform("length");
-      const chunk = len.add(ctx.u32(NW - 1)).div(ctx.u32(NW));
+      const off = constParams
+        ? ctx.u32(constParams.offset)
+        : ctx.uniform("offset");
+      const len = constParams
+        ? ctx.u32(constParams.length)
+        : ctx.uniform("length");
+      // chunk = ceil(length / NW). In the const path compute it in JS — folding
+      // `len.div(NW)` over u32 CONSTANTS emits a float literal (`4.98u`, invalid
+      // WGSL); the uniform path keeps runtime integer division.
+      const chunk = constParams
+        ? ctx.u32(Math.ceil(constParams.length / NW))
+        : len.add(ctx.u32(NW - 1)).div(ctx.u32(NW));
       const start = w.mul(chunk);
       const end = start.add(chunk).min(len);
 
@@ -128,18 +148,28 @@ function pass1Spec(k: number, maxPT: number): TileKernelSpec {
  * register slice of ptTwo (value, ORIGINAL-index) pairs; K rounds of workgroup
  * argmax drain the final top-K. ptTwo = ceil((NW*K)/WG).
  */
-function pass2Spec(k: number): TileKernelSpec {
+function pass2Spec(k: number, packed = false): TileKernelSpec {
   const count = NW * k;
   const ptTwo = Math.ceil(count / WG);
   return {
-    name: `topkPass2_k${k}`,
+    name: `topkPass2_k${k}${packed ? "_packed" : ""}`,
     workgroupSize: WG,
-    bindings: {
-      pvals: { storage: "read", type: "f32" },
-      pidx: { storage: "read", type: "u32" },
-      outVals: { storage: "read_write", type: "f32" },
-      outIdx: { storage: "read_write", type: "u32" },
-    },
+    // packed (lazy deviceTopK): ONE f32 output [2k] — values at [0,k), token
+    // ids as f32 VALUES at [k,2k) (the index rides as f32 like argmax's output,
+    // read natively by a downstream gather). Non-packed (readTopK readback):
+    // separate f32 values + u32 indices, unchanged.
+    bindings: packed
+      ? {
+          pvals: { storage: "read", type: "f32" },
+          pidx: { storage: "read", type: "u32" },
+          out: { storage: "read_write", type: "f32" },
+        }
+      : {
+          pvals: { storage: "read", type: "f32" },
+          pidx: { storage: "read", type: "u32" },
+          outVals: { storage: "read_write", type: "f32" },
+          outIdx: { storage: "read_write", type: "u32" },
+        },
     uniforms: {},
     grid: singleWorkgroup(),
     kernel(ctx: KernelContext) {
@@ -181,8 +211,19 @@ function pass2Spec(k: number): TileKernelSpec {
         const winI = ctx.emitLet("winI", win.index);
         ctx.barrier();
 
-        ctx.guardedStore("outVals", tid.eq(ctx.u32(0)), kk, winV);
-        ctx.guardedStore("outIdx", tid.eq(ctx.u32(0)), kk, winI);
+        if (packed) {
+          // values → out[kk]; token id as f32 → out[k + kk].
+          ctx.guardedStore("out", tid.eq(ctx.u32(0)), kk, winV);
+          ctx.guardedStore(
+            "out",
+            tid.eq(ctx.u32(0)),
+            ctx.u32(k).add(kk),
+            winI.toF32(),
+          );
+        } else {
+          ctx.guardedStore("outVals", tid.eq(ctx.u32(0)), kk, winV);
+          ctx.guardedStore("outIdx", tid.eq(ctx.u32(0)), kk, winI);
+        }
 
         // Removal: the thread holding the winning ORIGINAL index clears it.
         for (let s = 0; s < ptTwo; s++) {
@@ -205,25 +246,31 @@ function pass2Spec(k: number): TileKernelSpec {
 // Compiled kernel cache (WGSL compiled once per (k, maxPT) / k)
 // ============================================================================
 
-/** Pass-1 WGSL keyed by `${k}:${maxPT}`, pass-2 WGSL keyed by `${k}`. */
+/** Pass-1 WGSL keyed by `${k}:${maxPT}:${offset|u}:${length|u}`, pass-2 by
+ *  `${k}:${packed}`. */
 const pass1WGSLCache = new Map<string, string>();
-const pass2WGSLCache = new Map<number, string>();
+const pass2WGSLCache = new Map<string, string>();
 
-function pass1WGSL(k: number, maxPT: number): string {
-  const key = `${k}:${maxPT}`;
+function pass1WGSL(
+  k: number,
+  maxPT: number,
+  constParams?: { offset: number; length: number },
+): string {
+  const key = `${k}:${maxPT}:${constParams ? `${constParams.offset}:${constParams.length}` : "u"}`;
   let wgsl = pass1WGSLCache.get(key);
   if (!wgsl) {
-    wgsl = compileTileKernel(pass1Spec(k, maxPT));
+    wgsl = compileTileKernel(pass1Spec(k, maxPT, constParams));
     pass1WGSLCache.set(key, wgsl);
   }
   return wgsl;
 }
 
-function pass2WGSL(k: number): string {
-  let wgsl = pass2WGSLCache.get(k);
+function pass2WGSL(k: number, packed = false): string {
+  const key = `${k}:${packed}`;
+  let wgsl = pass2WGSLCache.get(key);
   if (!wgsl) {
-    wgsl = compileTileKernel(pass2Spec(k));
-    pass2WGSLCache.set(k, wgsl);
+    wgsl = compileTileKernel(pass2Spec(k, packed));
+    pass2WGSLCache.set(key, wgsl);
   }
   return wgsl;
 }
@@ -390,3 +437,55 @@ export async function readTopK(
   }
   return { values, indices };
 }
+
+// ============================================================================
+// Lazy device top-k (`deviceTopK`) — the on-device sampling prefilter
+// ============================================================================
+
+/**
+ * Encode the top-K passes into the shared plan encoder, writing a PACKED f32
+ * output `[2k]` (row 0 = the K values descending, row 1 = the K token ids as
+ * f32 values). Unlike `readTopK` there is NO readback / flush / mapAsync — the
+ * output buffer stays on-device and is consumed by downstream lazy ops (the
+ * top-p filter + Gumbel-max selection in decodeBlock). offset/length are baked
+ * as WGSL constants (no params uniform), so K per-step dispatches sharing one
+ * encoder never collide on a shared uniform. Reuses the SAME pass-1 / pass-2
+ * tile-IR kernels (and their tie-break: value desc, smaller index first) that
+ * `readTopK` uses, so the device support is byte-identical to the host
+ * `sampleFromTopK` reference (which draws its top-k set from `readTopK`).
+ *
+ * `input` is a contiguous f32 buffer holding the single logits row; `offset`/
+ * `length` (elements) select the row. Returns the packed output GPUBuffer.
+ */
+export function dispatchDeviceTopK(
+  input: GPUBuffer,
+  offset: number,
+  length: number,
+  k: number,
+): GPUBuffer {
+  if (k > length) {
+    throw new Error(`deviceTopK: k=${k} exceeds slice length ${length}`);
+  }
+  const ctx = requireContext();
+  const bufs = getOrCreateBuffers(k); // reuse pvals/pidx scratch (per-k)
+  const chunk = Math.ceil(length / NW);
+  const maxPT = Math.ceil(chunk / WG);
+
+  const wgsl1 = pass1WGSL(k, maxPT, { offset, length });
+  const wgsl2 = pass2WGSL(k, true); // packed f32 output
+  const p1 = getPipeline(ctx, wgsl1, wgsl1);
+  const p2 = getPipeline(ctx, wgsl2, wgsl2);
+
+  const out = allocateOutputBuffer(2 * k * 4); // packed [2k] f32
+
+  const bg1 = cachedCreateBindGroup(ctx.device, p1, [
+    input,
+    bufs.pvals,
+    bufs.pidx,
+  ]);
+  dispatchComputePass(p1, bg1, NW, 1, 1, "deviceTopKPass1");
+  const bg2 = cachedCreateBindGroup(ctx.device, p2, [bufs.pvals, bufs.pidx, out]);
+  dispatchComputePass(p2, bg2, 1, 1, 1, "deviceTopKPass2");
+  return out;
+}
+

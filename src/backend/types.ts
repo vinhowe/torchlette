@@ -612,6 +612,9 @@ export interface BackendOps {
     x: BackendTensor,
     config: FusedLayerNormConfig,
   ): { gradWeight: BackendTensor; gradBias: BackendTensor };
+  /** Lazy device top-K over one logits row: [.., V] → packed [1,2,k] (row 0 =
+   *  values desc, row 1 = token ids as f32). On-device sampling prefilter. */
+  deviceTopK?(logits: BackendTensor, config: { k: number }): BackendTensor;
   /** Fused RMSNorm forward: x [N,D] + weight [D] → output [N,D]. */
   fusedRMSNormForward?(
     x: BackendTensor,

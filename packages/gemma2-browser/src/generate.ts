@@ -48,9 +48,10 @@ export type GenerateOptions = {
    * the prefill and every KV-decode step. Undefined → unsteered baseline.
    */
   residualHook?: ResidualHook;
-  /** Seed for the block's on-device Gumbel-max sampler (§3.5, pure-temperature
-   *  path). Fixed per generation ⇒ byte-reproducible. Undefined ⇒ fresh random
-   *  seed. Only consulted when the block Gumbel path is active. */
+  /** Seed for the block's on-device Gumbel-max sampler (§3.5). Fixed per
+   *  generation ⇒ byte-reproducible. Consulted for every block-covered sampled
+   *  path: pure-temperature AND top-k(+top-p)/temperature (the filtered block
+   *  sampler). Undefined ⇒ fresh random seed. */
   seed?: number;
 };
 
@@ -138,6 +139,59 @@ export function gumbelUniform(seed: number, n: number): Float32Array {
   return out;
 }
 
+/**
+ * Strictly-upper-triangular ones `[k,k]`: `exps[1,k] @ M` = the EXCLUSIVE
+ * cumulative sum `cum[i] = Σ_{j<i} exps[j]` (the top-p boundary quantity, via an
+ * existing lazy matmul — no on-device scan op). See qwen3-browser for the full
+ * sampler contract.
+ */
+export function strictUpperOnes(k: number): Float32Array {
+  const a = new Float32Array(k * k);
+  for (let j = 0; j < k; j++)
+    for (let i = j + 1; i < k; i++) a[j * k + i] = 1;
+  return a;
+}
+
+/**
+ * ON-DEVICE top-k / top-p / temperature sampling of one logits row → selected
+ * token id `[1,1]` tensor. `deviceTopK` prefilter (the SAME set the host draws
+ * from `readTopK`) → top-p mask (`(Σ_{j<i} softmax_temp[j]) < topP`, the exact
+ * host cut rule) → Gumbel-max over the survivors (∝ softmax(logit/temp) on the
+ * support — identical in distribution to the host `sampleFromTopK` walk). See
+ * qwen3-browser for the full derivation.
+ */
+export function sampleFilteredToken(
+  api: Torchlette,
+  logits: Tensor, // [1,1,V] contiguous row
+  V: number,
+  s: { temperature: number; seed: number; topK: number; topP: number },
+  absPos: number,
+  L: Tensor, // [k,k] strictly-upper ones
+  topPT: Tensor, // [1,1,1] = topP
+): Tensor {
+  const k = Math.min(s.topK, V);
+  const temp = s.temperature;
+  const packed = api.deviceTopK(logits, k); // [1,2,k]
+  const vals = api.contiguous(api.narrow(packed, 1, 0, 1)); // [1,1,k] values desc
+  const idsF = api.contiguous(api.narrow(packed, 1, 1, 1)); // [1,1,k] ids as f32
+  const mx = api.narrow(vals, 2, 0, 1); // [1,1,1]
+  const exps = api.exp(api.div(api.sub(vals, mx), temp)); // [1,1,k]
+  const sum = api.sum(exps, { dim: -1, keepdim: true }); // [1,1,1]
+  const exclCum = api.reshape(api.matmul(api.reshape(exps, [1, k]), L), [
+    1,
+    1,
+    k,
+  ]);
+  const mask = api.lt(api.div(exclCum, sum), topPT); // 1.0 in support
+  const u = api.tensorFromArray(gumbelUniform(s.seed + absPos, k), [1, 1, k]);
+  const g = api.neg(api.log(api.neg(api.log(u))));
+  const score = api.add(api.div(vals, temp), g);
+  const masked = api.add(score, api.mul(api.sub(mask, 1), 1e30));
+  const pos = api.argmax(masked, { dim: -1, keepdim: false }); // [1,1]
+  const token = api.gather(idsF, api.reshape(pos, [1, 1, 1]), { dim: 2 });
+  return api.reshape(token, [1, 1]);
+}
+
 /** Minimal static-KV model surface decodeBlock needs (Gemma2 satisfies it). */
 export interface StaticDecodeModel {
   forward(
@@ -163,7 +217,12 @@ export async function decodeBlock(
   opts?: {
     residualHook?: ResidualHook;
     stopTokens?: Set<number>;
-    sample?: { temperature: number; seed: number };
+    sample?: {
+      temperature: number;
+      seed: number;
+      topK?: number;
+      topP?: number;
+    };
   },
 ): Promise<{ ids: number[]; stopIndex: number }> {
   const maxSeq = model.config.maxSeqLen;
@@ -171,8 +230,18 @@ export async function decodeBlock(
   const residualHook = opts?.residualHook;
   const sample = opts?.sample;
   const stochastic = sample !== undefined && sample.temperature > 0;
+  const filtered = stochastic && sample.topK !== undefined;
   const startLen = staticKV.len;
   const V = model.config.vocabSize;
+
+  let L: Tensor | undefined;
+  let topPT: Tensor | undefined;
+  let kEff = 0;
+  if (filtered) {
+    kEff = Math.min(sample.topK as number, V);
+    L = api.tensorFromArray(strictUpperOnes(kEff), [kEff, kEff]);
+    topPT = api.tensorFromArray([sample.topP ?? 1], [1, 1, 1]);
+  }
 
   const idTensors: Tensor[] = [];
   let idx: Tensor = api.tensorFromArray([lastTok], [1, 1]);
@@ -183,6 +252,22 @@ export async function decodeBlock(
     const id = api.noGrad(() => {
       if (!stochastic) {
         return api.argmax(logits, { dim: -1, keepdim: false });
+      }
+      if (filtered) {
+        return sampleFilteredToken(
+          api,
+          logits,
+          V,
+          {
+            temperature: sample.temperature,
+            seed: sample.seed,
+            topK: kEff,
+            topP: sample.topP ?? 1,
+          },
+          startLen + j,
+          L as Tensor,
+          topPT as Tensor,
+        );
       }
       const uArr = gumbelUniform(sample.seed + startLen + j, V);
       const u = api.tensorFromArray(uArr, [1, 1, V]);
@@ -221,12 +306,31 @@ async function gumbelPrefillToken(
   logits: Tensor,
   lastPos: number,
   vocab: number,
-  sample: { temperature: number; seed: number },
+  sample: { temperature: number; seed: number; topK?: number; topP?: number },
 ): Promise<number> {
   const id = api.noGrad(() => {
     const row = api.contiguous(
       api.narrow(api.narrow(logits, 1, lastPos, 1), 2, 0, vocab),
     );
+    if (sample.topK !== undefined) {
+      const k = Math.min(sample.topK, vocab);
+      const L = api.tensorFromArray(strictUpperOnes(k), [k, k]);
+      const topPT = api.tensorFromArray([sample.topP ?? 1], [1, 1, 1]);
+      return sampleFilteredToken(
+        api,
+        row,
+        vocab,
+        {
+          temperature: sample.temperature,
+          seed: sample.seed,
+          topK: k,
+          topP: sample.topP ?? 1,
+        },
+        0,
+        L,
+        topPT,
+      );
+    }
     const uArr = gumbelUniform(sample.seed, vocab);
     const u = api.tensorFromArray(uArr, [1, 1, vocab]);
     const g = api.neg(api.log(api.neg(api.log(u))));
@@ -333,26 +437,27 @@ export async function generateChat(
   );
   const isAborted = options?.isAborted ?? (() => false);
   const { temperature, topK, topP, residualHook } = options ?? {};
-  // P4 CUTOVER routing (see qwen3 generate.ts). Block = greedy (argmax) or
-  // pure-temperature (Gumbel, §4); residue (host per-token loop) = any top-k /
-  // top-p, or opt-out (TORCHLETTE_UNROLLED_K=0/1).
+  // CUTOVER routing (SAMPLER pass, see qwen3 generate.ts). Block covers ON-DEVICE:
+  // greedy (argmax), pure-temperature (Gumbel, §4), AND top-k(+top-p)/temperature
+  // (the demos' sampler — block-side top-k prefilter + top-p + Gumbel, the demos'
+  // DISTRIBUTION preserved exactly). Residue (host per-token loop): top-p WITHOUT
+  // a bounding top-k, or opt-out (TORCHLETTE_UNROLLED_K=0/1).
   const greedy = temperature === 0;
   const topKActive = topK !== undefined && topK < vocab;
   const topPActive = topP !== undefined && topP < 1;
-  // Gumbel sampled block is DEFAULT-eligible (2026-07-20, see qwen3 generate.ts):
-  // the sampled-path external-destroy transient is fixed, so pure-temperature
-  // sampling routes through the on-device Gumbel block by default (still under
-  // the global opt-out TORCHLETTE_UNROLLED_K=0/1).
   const gumbelEligible =
     !greedy && (temperature ?? 0) > 0 && !topKActive && !topPActive;
+  const filterEligible = !greedy && (temperature ?? 0) > 0 && topKActive;
   const flagK = unrolledKFromEnv();
-  const useBlock = flagK >= 2 && (greedy || gumbelEligible);
+  const useBlock =
+    flagK >= 2 && (greedy || gumbelEligible || filterEligible);
   const blockK = useBlock ? flagK : 0;
   const blockSample =
-    useBlock && gumbelEligible
+    useBlock && (gumbelEligible || filterEligible)
       ? {
           temperature: temperature as number,
           seed: options?.seed ?? (Math.random() * 0x7fffffff) >>> 0,
+          ...(filterEligible ? { topK, topP } : {}),
         }
       : undefined;
 
@@ -392,6 +497,8 @@ export async function generateChat(
           {
             temperature: blockSample.temperature,
             seed: blockSample.seed + promptIds.length - 1,
+            topK: (blockSample as { topK?: number }).topK,
+            topP: (blockSample as { topP?: number }).topP,
           },
         );
         logits.dispose();

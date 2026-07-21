@@ -113,10 +113,15 @@ counted by the `envFlags` regex but is a mechanism, not a flag.
 ## Flagged — LEFT for the campaign owner (not expired)
 
 - **`TORCHLETTE_UNROLLED_K`** — active decode campaign (design doc dated
-  2026-07-19). No `ENV` read has landed in `src/` in this tree; only
-  `tools/t-uk-cutover.ts` + `docs/unrolled-k-decode-design.md` reference it. Its
-  `unrolledKFromEnv()` reader is not present here. NOT deleted — it is
-  pre-landing/in-flight, not expired. Confirm with the campaign before touching.
+  2026-07-19). Read in `packages/{qwen3,gemma2}-browser/src/generate.ts`
+  (`unrolledKFromEnv`), not in `src/` (the block is a package surface;
+  admission pressure). Opt-OUT since the P4 cutover: UNSET → block (K=4); `0`/`1`
+  → per-token host loop; `≥2` → block at K. **The SAMPLER pass (2026-07-21) reuses
+  this same flag** — on-device top-k/top-p/temperature (the `deviceTopK` op) now
+  routes through the block by default under it; NO new flag was born. Sunset
+  unchanged: P6 removes the K=1 host loop for covered samplers and retires the
+  knob. NOT deleted — in-flight, not expired. Confirm with the campaign before
+  touching.
 - **`TORCHLETTE_STREAM_GENERATE`** — the flag's `ENV` read is gone, but its
   comments in `src/executor/stream-generate.ts` / `compiled-plan.ts` describe the
   still-live `generateStream` verify apparatus. Docs/stage4 marks deleting that

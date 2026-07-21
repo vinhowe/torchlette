@@ -62,7 +62,8 @@ export type LazyOpCode =
   | "fusedRMSNormForward"
   | "fusedRMSNormBackwardGradX"
   | "fusedRMSNormBackwardGradWeight"
-  | "fusedRoPE";
+  | "fusedRoPE"
+  | "deviceTopK";
 
 export interface StorageHandle {
   id: number;

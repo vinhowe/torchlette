@@ -67,6 +67,9 @@ export const CONTIGUOUS_OPERANDS: ReadonlyMap<string, ContiguousOperandSpec> =
     // asContiguous'd at dispatch (fused.ts). The decode residual + persistent
     // norm weight are contiguous by construction, so the prologue is empty.
     ["fusedRMSNormForward", [0, 1]],
+    // Device top-K raw-binds the logits row (input 0), asContiguous'd at
+    // dispatch — the decode logits row is contiguous by construction.
+    ["deviceTopK", [0]],
     // Fused RoPE raw-binds qk (input 0) flat-from-0 (asContiguous(qk) at
     // dispatch, fused.ts). cos (1) / sin (2) are NOT here: the kernel folds
     // THEIR element offset into the table index (contiguous strides, any

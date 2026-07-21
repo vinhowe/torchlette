@@ -31,6 +31,7 @@ import {
 } from "../shared-encoder";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import { createTileKernelDispatcher } from "../tile-dispatch";
+import { dispatchDeviceTopK } from "../topk-kernel";
 import type { TileKernelSpec } from "../tile-ir";
 import { elementwiseGrid } from "../tile-ir";
 import { gpuContext, sharedEncoderActive } from "../webgpu-state";
@@ -581,6 +582,31 @@ export function fusedRMSNormForward(
   );
   cleanupContiguous([x, xT], [weight, weightT]);
   return createTensor(xT.shape.slice(), outBuf);
+}
+
+// ============================================================================
+// Device top-K prefilter (lazy) — the on-device sampling support selector
+// ============================================================================
+
+/**
+ * Lazy top-K over a single logits row: `[.., V]` → packed `[1, 2, k]` (row 0 =
+ * the K values descending, row 1 = the K token ids as f32 values). Stays
+ * on-device (no readback) so decodeBlock composes top-p + Gumbel-max over the
+ * survivors without a per-token host roundtrip. Reuses the SAME tile-IR passes
+ * (and tie-break) as `readTopK`, so the device top-k SET is byte-identical to
+ * the host `sampleFromTopK` reference. Input is raw-bound flat-from-0
+ * (asContiguous), which also honors the arg-reduce contiguity seam downstream.
+ */
+export function deviceTopK(
+  logits: BackendTensor,
+  config: { k: number },
+): BackendTensor {
+  const lt = asContiguous(logits);
+  const gt = asGPUTensor(lt);
+  const length = gt.size; // single row [.., V] → V
+  const out = dispatchDeviceTopK(gt.buffer, gt.offset ?? 0, length, config.k);
+  cleanupContiguous([logits, lt]);
+  return createTensor([1, 2, config.k], out);
 }
 
 export function fusedRMSNormBackwardGradX(
