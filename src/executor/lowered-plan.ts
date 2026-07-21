@@ -68,6 +68,22 @@ interface LoweredFusedAction {
     nodeLocalIdx: number;
     inputIdx: number;
   }>;
+  /**
+   * [buffer-donation P2 / coverage C2] The donation liveness proof: plan-node
+   * producers whose LAST reader is this action and which are not plan outputs /
+   * cross-plan-referenced — the un-refused set the plan-build donation edge
+   * (`generateFused`) collapses onto the primary output slot. DERIVED from IR
+   * liveness in `populateCapturesFromIR` (the build-from-IR default path, which
+   * skips the lowered execution loop); the lowered loop recomputes the SAME set
+   * as an observation and asserts equality (`[donatable-derive]`). Single source
+   * = `deriveFusedDonatableIds`.
+   */
+  cachedDonatableIds?: Set<number>;
+  /** [buffer-donation P2] The executor-side detector's donation PICK (recipe
+   *  input index), cached from the lowered segment execution so the generator
+   *  reproduces it on the flag-off path. Distinct from cachedDonatableIds (the
+   *  planner-level un-refused set). */
+  cachedDonatedRecipeIdx?: number;
 }
 
 /** A single-node action (sequential op, view, data source, or prologue skip). */

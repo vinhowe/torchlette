@@ -1609,6 +1609,7 @@ function stubTensor(m: DerivedMeta): {
  * generator simply leaves that matmul uncovered (→ lowered fallback).
  */
 function populateCapturesFromIR(
+  plan: ExecutionPlan,
   loweredPlan: LoweredPlan,
   planNodes: LazyIRNode[],
   backendName: string,
@@ -1625,6 +1626,35 @@ function populateCapturesFromIR(
     "cachedStridedInputs",
   ] as const;
   const resets: Array<() => void> = [];
+
+  // [coverage C2 / buffer-donation §5.3] Derive the donation liveness proof
+  // (`cachedDonatableIds`) for every fused action FROM IR liveness — the
+  // build-from-IR path skips the lowered execution loop that used to be the sole
+  // populator (executor.ts fused case), so without this the plan-build donation
+  // edge in `generateFused` never sees the proof and donation is inert on the
+  // covered optimizer plan. Same two liveness facts the execution loop derives
+  // (single source via `computeLivenessLastAction` / `computeLivenessOutputIds`
+  // / `deriveFusedDonatableIds`); the loop asserts equality (`[donatable-derive]`).
+  {
+    const livenessOutputIds = computeLivenessOutputIds(plan, planNodes);
+    const livenessLastAction = computeLivenessLastAction(loweredPlan, planNodes);
+    for (let ai = 0; ai < loweredPlan.actions.length; ai++) {
+      const action = loweredPlan.actions[ai];
+      if (action.kind !== "fused") continue;
+      const prev = action.cachedDonatableIds;
+      const derived = deriveFusedDonatableIds(
+        action,
+        ai,
+        planNodes,
+        livenessLastAction,
+        livenessOutputIds,
+      );
+      action.cachedDonatableIds = derived;
+      resets.push(() => {
+        action.cachedDonatableIds = prev;
+      });
+    }
+  }
 
   for (const action of loweredPlan.actions) {
     if (action.kind !== "sequential" && action.kind !== "view") continue;
@@ -1765,6 +1795,92 @@ function harvestGenResults(
   }
   return { genResults, genOk };
 }
+
+/**
+ * nodeId → last action index (action-index space) that reads it as an input.
+ * Pure function of the lowered plan + nodes. SINGLE SOURCE for the
+ * liveness-release schedule (the execution loop) AND the donation liveness proof
+ * (`deriveFusedDonatableIds`, used by the build-from-IR capture and the
+ * lowered-loop differential). Mirrors the inline computation the execution loop
+ * previously duplicated.
+ */
+function computeLivenessLastAction(
+  loweredPlan: LoweredPlan,
+  planNodes: LazyIRNode[],
+): Map<number, number> {
+  const nodeIdSet = new Set(planNodes.map((n) => n.id));
+  const lastAction = new Map<number, number>();
+  for (let ai = 0; ai < loweredPlan.actions.length; ai++) {
+    const actionNodeIndices = getActionNodeIndices(loweredPlan.actions[ai]);
+    for (const ni of actionNodeIndices) {
+      const node = planNodes[ni];
+      for (const ref of node.inputs) {
+        if (ref.kind === "pending" && nodeIdSet.has(ref.node.id)) {
+          const cur = lastAction.get(ref.node.id);
+          if (cur === undefined || ai > cur) {
+            lastAction.set(ref.node.id, ai);
+          }
+        }
+      }
+    }
+  }
+  return lastAction;
+}
+
+/**
+ * [coverage C2 / buffer-donation §5.3] The donation liveness proof for one fused
+ * action: plan-node PRODUCERS (pending external inputs) whose LAST reader is
+ * THIS action and which are not plan outputs / cross-plan-referenced. A pure
+ * function of the plan graph + liveness — the SINGLE SOURCE both the
+ * build-from-IR capture (`populateCapturesFromIR`) and the lowered-loop
+ * observation derive from, so a `[donatable-derive]` differential can assert
+ * they agree. Returns undefined when empty (matches the lowered loop's
+ * `donatableInputIds` default). External inputs are derived by set-membership
+ * over the group's covered nodes (mirrors the loop's first-exec dedup — the
+ * donatable SET is identical either way; that agreement is what the differential
+ * proves).
+ */
+function deriveFusedDonatableIds(
+  action: Extract<LoweredAction, { kind: "fused" }>,
+  actionIndex: number,
+  planNodes: LazyIRNode[],
+  livenessLastAction: Map<number, number>,
+  livenessOutputIds: Set<number>,
+): Set<number> | undefined {
+  const groupNodeIds = new Set(
+    action.coveredNodeIndices.map((i) => planNodes[i].id),
+  );
+  let out: Set<number> | undefined;
+  for (const ni of action.coveredNodeIndices) {
+    for (const ref of planNodes[ni].inputs) {
+      if (ref.kind !== "pending") continue;
+      const nid = ref.node.id;
+      if (groupNodeIds.has(nid)) continue; // internal edge, not external
+      if (
+        livenessLastAction.get(nid) === actionIndex &&
+        !livenessOutputIds.has(nid)
+      ) {
+        (out ??= new Set()).add(nid);
+      }
+    }
+  }
+  return out;
+}
+
+/** Set equality for the `[donatable-derive]` differential, treating undefined as
+ *  the empty set (the lowered loop leaves `donatableInputIds` undefined when no
+ *  candidate exists; `deriveFusedDonatableIds` returns undefined likewise). */
+function donatableIdSetsEqual(
+  a: Set<number> | undefined,
+  b: Set<number> | undefined,
+): boolean {
+  const sa = a ?? EMPTY_ID_SET;
+  const sb = b ?? EMPTY_ID_SET;
+  if (sa.size !== sb.size) return false;
+  for (const x of sa) if (!sb.has(x)) return false;
+  return true;
+}
+const EMPTY_ID_SET: ReadonlySet<number> = new Set<number>();
 
 /**
  * The set of node ids whose results must survive past this plan — plan
@@ -2146,6 +2262,7 @@ export async function executeLoweredPlan(
   ) {
     await ensureFusionImports();
     const { reset } = populateCapturesFromIR(
+      plan,
       loweredPlan,
       planNodes,
       backend.name,
@@ -2500,8 +2617,6 @@ export async function executeLoweredPlan(
   let livenessReleaseSchedule: Map<number, number[]> | null = null;
 
   if (enableLivenessRelease) {
-    const nodeIdSet = new Set(planNodes.map((n) => n.id));
-
     // Protected nodes: plan terminals + already-materialized + live RuntimeTensors
     // + cross-plan consumers (see computeLivenessOutputIds — single source with
     // the build-without-execution harvest set).
@@ -2515,22 +2630,9 @@ export async function executeLoweredPlan(
 
     // For each plan node, find the last action that reads it as an input.
     // This operates in ACTION-INDEX space (not plan-step space), which is
-    // correct because actions can cover non-contiguous plan positions.
-    livenessLastAction = new Map<number, number>();
-    for (let ai = 0; ai < loweredPlan.actions.length; ai++) {
-      const actionNodeIndices = getActionNodeIndices(loweredPlan.actions[ai]);
-      for (const ni of actionNodeIndices) {
-        const node = planNodes[ni];
-        for (const ref of node.inputs) {
-          if (ref.kind === "pending" && nodeIdSet.has(ref.node.id)) {
-            const cur = livenessLastAction.get(ref.node.id);
-            if (cur === undefined || ai > cur) {
-              livenessLastAction.set(ref.node.id, ai);
-            }
-          }
-        }
-      }
-    }
+    // correct because actions can cover non-contiguous plan positions. Single
+    // source with the build-from-IR donation capture (`deriveFusedDonatableIds`).
+    livenessLastAction = computeLivenessLastAction(loweredPlan, planNodes);
 
     // Build release schedule: after action[i] completes, release these nodes
     livenessReleaseSchedule = new Map();
@@ -2709,9 +2811,7 @@ export async function executeLoweredPlan(
             donatableInputIds,
             donationSink,
           );
-          (
-            action as { cachedDonatedRecipeIdx?: number }
-          ).cachedDonatedRecipeIdx = donationSink.idx;
+          action.cachedDonatedRecipeIdx = donationSink.idx;
           // [buffer-donation P2] Stash the RAW liveness proof (producers whose
           // last reader is THIS action, not a cross-plan/terminal output) for
           // the plan-build donation edge. Unlike cachedDonatedRecipeIdx (the
@@ -2720,9 +2820,30 @@ export async function executeLoweredPlan(
           // planner OWNS those registry temps and donates them (design §3.5).
           // The generator applies DONATABLE_OPERANDS + shape/dtype + slot-kind
           // gating over it under TORCHLETTE_PLANNER_DONATION.
-          (
-            action as { cachedDonatableIds?: Set<number> }
-          ).cachedDonatableIds = donatableInputIds;
+          //
+          // [donatable-derive] SINGLE-SOURCE-AT-THE-SEAM: the observed set
+          // (`donatableInputIds`, derived from the executed group's external
+          // inputs) must EQUAL the IR-derived set (`deriveFusedDonatableIds`,
+          // the build-from-IR capture's function) — both are pure functions of
+          // the same liveness facts. Assert it here where both run (the lowered
+          // path / eager fallback); on mismatch, log loudly and keep the OBSERVED
+          // set (never widen). This proves the C2 IR-derivation the compiled
+          // path relies on agrees with the observation it replaces.
+          if (livenessLastAction && livenessOutputIds) {
+            const derived = deriveFusedDonatableIds(
+              action,
+              actionIndex,
+              planNodes,
+              livenessLastAction,
+              livenessOutputIds,
+            );
+            if (!donatableIdSetsEqual(donatableInputIds, derived)) {
+              console.warn(
+                `[donatable-derive] DIVERGE action=${actionIndex} nodes=${groupNodes.length}: observed={${donatableInputIds ? [...donatableInputIds].join(",") : ""}} derived={${derived ? [...derived].join(",") : ""}} — keeping observed`,
+              );
+            }
+          }
+          action.cachedDonatableIds = donatableInputIds;
           stats.fusedNodes += groupNodes.length;
           stats.fusionGroups++;
           break;
