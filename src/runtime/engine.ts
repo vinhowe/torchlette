@@ -1171,7 +1171,7 @@ export class RuntimeEngine {
    * the recorded `tensorFromArray` scatter-source from the noted value each
    * replay (clause 3 — LIVE READS). `dst` MUST be a persistent, materializable
    * f32[1]; `LiveScalar.set` notes the host value at this same seam. */
-  setScalarInPlace(dst: Tensor, value: number): Tensor {
+  setScalarInPlace(dst: Tensor, value: number | readonly number[]): Tensor {
     // Deliver `value` into dst's fixed buffer via an in-place, graph-ordered
     // scatter from a per-step `tensorFromArray` source. The scatter's
     // TRUE-IN-PLACE DMA keeps dst's buffer identity stable across record/replay
@@ -1180,7 +1180,8 @@ export class RuntimeEngine {
     // readers, measured on the 124M model). Graph-ordered (clause 1). The
     // step-tape's `scalarDresses` re-dress re-executes this recorded scatter's
     // tensorFromArray source from the noted host value each replay (clause 3 —
-    // LIVE READS). `dst` MUST be a persistent, materializable f32[1].
+    // LIVE READS). `dst` MUST be a persistent, materializable f32[n] (n=1 for lr;
+    // n=2 for Adam's bc=[bc1,bc2], fork C — the length is dst's).
     //
     // Returns the SOURCE as a TRACKED tensor the caller (LiveScalar) must hold
     // until the scatter has certainly executed. Untracked, the source storage
@@ -1189,13 +1190,17 @@ export class RuntimeEngine {
     // DEFERRED boundary commit — reachability destroys the ownerless source
     // in between and the deferred scatter reads a RECLAIMED storage (the
     // setLR-under-ringK2 STRICT transient that kept the scheduler NOSCHED). */
+    const values =
+      typeof value === "number"
+        ? Float32Array.of(value)
+        : Float32Array.from(value);
     const srcNode = createLazyIRNode(
       "tensorFromArray",
       [],
       dst.shape,
       "f32",
       dst.device,
-      { values: Float32Array.of(value), dtype: "f32" },
+      { values, dtype: "f32" },
     );
     const srcT = this.trackNode(srcNode, dst.shape.slice(), dst.device, "f32");
     this._scatterFromNode(dst, srcNode);

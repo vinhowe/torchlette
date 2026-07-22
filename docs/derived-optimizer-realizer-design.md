@@ -530,3 +530,57 @@ bounding host-vs-GPU `exp` agreement stated — do not land fork C on an unnamed
 reassociation. Fork B's mechanism (R1+R2, candidate #1) stays the retained dark path;
 it is proven correct and is the best starting point, but it cannot be the flipped
 default on large-param models.
+
+---
+
+## Fork C — LANDED, R3 FLIPPED, R4 DELETED (2026-07-22)
+
+**The precision blocker CLEARED.** Measured across the trajectory (t=1..50000, both
+betas) with `tools/forkc-precision-probe.ts` (V100 sivri):
+
+- **Named lemma L3 (host-vs-GPU exp, bc-absorbed).** The Horner branch (|y|<0.25) is
+  host-vs-GPU **bit-exact** (ULP=0) — the host f32 mirror (`Math.fround` discipline)
+  matches the GPU tile-IR f32 ops; no divergent FMA contraction on this substrate. The
+  exp branch (|y|≥0.25) diverges by the GPU `exp` intrinsic's accuracy (worst raw 32
+  ULP at t=500 β1 where y=−52.68 and exp≈1.3e-23), BUT that divergence is **absorbed by
+  bc=1−exp(y)**: where exp is least accurate (deep tail) bc saturates to exactly 1.0
+  (error far below the f32 ULP at 1.0); where exp contributes (branch boundary) it is
+  ~1 ULP accurate. **Net: bc agrees host-vs-GPU to ≤ 1 ULP (abs ≤ 2.98e-8) everywhere.**
+- **Propagation.** bc enters ONLY the param update (m_new/v_new are bc-free), so Δm=Δv
+  are **bit-exact (0.0)** and the ≤1-ULP bc divergence yields **Δparam ≤ 5.96e-8**
+  (= 2^-24, one f32 ULP at param scale), wd-mode invariant. This RESTATES the R2 bound
+  2.98e-8 → 5.96e-8 (2×, the trajectory-wide worst vs R2's single STEP=7 point); still
+  ≤1e-6 gate tol and inside the design's ≤1e-7 update-magnitude claim. Lemmas L1/L2
+  (kernel reassociation) are unchanged and still named; L3 is the new host-vs-GPU exp
+  lemma. This is verdict (ii) — a tight named lemma, effectively as good as bit-exact
+  for bc (the authored oracle itself uses the same ~ULP GPU exp intrinsic).
+
+**Mechanism.** `bc=[bc1,bc2]` is computed on the HOST from the JS step counter
+`_tHost` (`Adam._bcHost` → `expm1F32`, the SAME 5-term Horner / exp branch the authored
+kernel emits) and delivered as a `[2]` **LIVE SCALAR** — the `lr` primitive
+(`core/live-scalar.ts`), generalized from f32[1] to f32[n] (one primitive; the length
+is the constructor's). ZERO optimizer-plan expm1 nodes; fork B's ~18-node graph prelude
+(`_biasCorrectionPacked`/`_lnBetas`/`_bc`) is DELETED. The reclaim-boundary quantization
+fork B tripped on is dodged by construction.
+
+**Fork-C generalization touched four files** (the live-delivery seam, all symmetric with
+`lr`): `core/scalar-slots.ts` (slot value `number | readonly number[]`),
+`runtime/engine.ts` `setScalarInPlace` (vector source), `executor/step-tape-replay.ts`
+(vector re-dress), `core/live-scalar.ts` (f32[n]). Adam: `_bcHost` + `_tHost` +
+`_bcLive`, minus `_biasCorrectionPacked`/`_lnBetas`/`_bc`.
+
+**A100 exit gate (dw-2-1, @512, NUM_STEPS=18, authored vs fork-C-derived, same run):**
+
+| model | submits (auth→derived) | peak MB (auth→derived) | verdict |
+|---|---|---|---|
+| distilgpt2 | 8 → **8 EXACT** | 5636.6 → **5636.6 EXACT** | PASS |
+| gpt2-medium | 19 → **19 EXACT** | 16987.9 → **16189.0** (≤16189.0 gate, −800 MB) | PASS |
+
+Medium's fork-B regression (submits 19→20, +800 MB) is GONE; fork C is 19 submits EXACT
+and 800 MB UNDER the current authored default (the reclaim-boundary quantum flips the
+other way — fork C lands on the low warmup transient). Standing gates green with the flag
+ON: `test:gates` 5/5 (compiled==lowered for the fork-C bc live-scalar re-dress),
+`parity-fullstack-tl` both arms ≤6e-6/30 (and fork-C==authored ≤1e-6), `derived-adam-
+parity` Δparam ≤2.98e-8 / Δm=Δv bit-exact, `parity-packed-vs-unpacked` 4/4, 124M
+regression PASS (round 0 bit-exact 9.8089; rounds 3/6/9 within ~3e-4 of the R2 baseline —
+the L3 lemma accumulating over 200 inner steps, flat memory), cpu project clean.

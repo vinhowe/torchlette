@@ -17,15 +17,20 @@
  * sides agree by construction.
  */
 
-const slotValues = new WeakMap<object, number>();
+// A slot value is a single f32 (the LR scheduler's lr, the GradScaler's scale)
+// OR a short f32 vector (Adam's `[2]` bias-correction bc=[bc1,bc2], fork C) —
+// the SAME live-delivery seam carries both; the length is the owner tensor's.
+type SlotValue = number | readonly number[];
+const slotValues = new WeakMap<object, SlotValue>();
 
-/** Record `value` as the current host value of the persistent scalar tensor
- *  `owner` (called by the write's author, e.g. Adam.setLR). */
-export function noteScalarSlotValue(owner: object, value: number): void {
+/** Record `value` as the current host value(s) of the persistent scalar/vector
+ *  tensor `owner` (called by the write's author, e.g. Adam.setLR / bc delivery). */
+export function noteScalarSlotValue(owner: object, value: SlotValue): void {
   slotValues.set(owner, value);
 }
 
-/** The current host value for `owner`, if its author notes values. */
-export function getScalarSlotValue(owner: object): number | undefined {
+/** The current host value(s) for `owner`, if its author notes values. A scalar
+ *  owner returns a `number`; a live-vector owner (Adam bc) returns `number[]`. */
+export function getScalarSlotValue(owner: object): SlotValue | undefined {
   return slotValues.get(owner);
 }

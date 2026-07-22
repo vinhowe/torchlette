@@ -89,19 +89,26 @@ export class Adam {
    *  copy_ scatter + scalar-slots note). Lazily created (device known). */
   private _lrLive: (LiveScalar | null)[];
   /**
-   * R3/fork-B: the derived fused body takes bias correction as a `[2]`
-   * `bc`=[bc1,bc2] DATA input. It rides in a PERSISTENT [2] buffer (`_bc`),
-   * updated IN-PLACE each step by `copy_(_bc, expm1chain)` — the exact `_t`
-   * pattern (buffer-stable → the memory planner pins it; no per-step `cat`
-   * allocation, no fresh buffer identity for the planner to re-converge on).
-   * `_lnBetas` = the persistent [2] constant [ln β1, ln β2] the vectorized
-   * expm1 chain broadcasts `t` against, computing BOTH lanes in one chain
-   * (was two scalar chains + a `cat`). Lazily created (device known on first
-   * step); persisted via registerState so `t`-style adoption holds them across
-   * step boundaries. Only allocated when TORCHLETTE_DERIVED_ADAM is on.
+   * R3/fork-C: the derived fused body takes bias correction as a `[2]`
+   * `bc`=[bc1,bc2] DATA input delivered as a HOST-computed LIVE SCALAR — the
+   * exact primitive `lr` rides (core/live-scalar.ts), a persistent [2] buffer
+   * host-written each step through the graph-ordered in-plan scatter, live under
+   * compiled replay via the scalar-slots re-dress. bc is computed on the HOST
+   * from the JS step counter (`_tHost`) via `_bcHost` (`expm1F32`, the SAME
+   * 5-term Horner / exp branch the authored kernel emits) — so the derived path
+   * adds ZERO optimizer-plan expm1 nodes (fork B's ~18-node graph prelude is
+   * gone; the reclaim-boundary quantization it tripped on gpt2-medium is dodged
+   * by construction). Precision blocker CLEARED: host-vs-GPU bc agrees to ≤1 ULP
+   * (the exp intrinsic's divergence is absorbed by bc=1−exp(y) → saturates to 1
+   * in the deep tail); propagated Δparam ≤5.96e-8, Δm=Δv bit-exact. Lazily
+   * created (device known on first step). Only allocated when
+   * TORCHLETTE_DERIVED_ADAM is on.
    */
-  private _bc: RuntimeTensor | null = null;
-  private _lnBetas: RuntimeTensor | null = null;
+  private _bcLive: LiveScalar | null = null;
+  /** HOST mirror of the shared on-device step counter `t`, advanced in lockstep
+   *  by `_advanceT`. Fork C computes bc from THIS (host expm1F32), so no graph
+   *  read of the device `t` is needed on the derived path. */
+  private _tHost = 0;
   /**
    * Packed foreach state, keyed by group index. While the foreach path is
    * active, m/v live as ONE flat tensor per group (the per-param expAvg
@@ -240,9 +247,8 @@ export class Adam {
     for (const s of this._lrLive) {
       if (s) keep.push(s.tensor);
     }
-    // R3/fork-B derived-path persistent bc buffer + lnBetas constant.
-    if (this._bc) keep.push(this.api._wrapRuntime(this._bc, false));
-    if (this._lnBetas) keep.push(this.api._wrapRuntime(this._lnBetas, false));
+    // R3/fork-C derived-path persistent bc live buffer.
+    if (this._bcLive) keep.push(this._bcLive.tensor);
     return keep;
   }
 
@@ -450,19 +456,30 @@ export class Adam {
     this._advanceT(runtime);
     const tRt = this._tTensor();
 
-    // R2/fork-B: when the DERIVED body is selected, bias correction is computed
-    // GRAPH-SIDE (the same _biasCorrection the foreach/elementwise paths use) and
-    // rides into the kernel as a [2] `bc`=[bc1,bc2] DATA input at the `t` slot —
-    // the in-kernel expm1 prelude is gone. Computed ONCE per step and SHARED by
-    // every param's node (like `t`), so the adam-batch grouping key (shared
-    // input[4] identity) still packs the group. `bc` is a per-step temp (not
-    // persisted); reachability holds it until the adamStep nodes execute, and its
-    // producer subgraph joins the plan and re-executes on replay (reading the
-    // re-advanced `t`) — exactly the foreach path's proven bc-in-plan discipline.
+    // R3/fork-C: when the DERIVED body is selected, bias correction rides into
+    // the kernel as a [2] `bc`=[bc1,bc2] DATA input at the `t` slot, delivered as
+    // a HOST-computed LIVE SCALAR (the `lr` primitive). It is computed on the
+    // HOST from `_tHost` (`_bcHost`) and written into the persistent [2] buffer
+    // via the in-plan graph-ordered scatter — ZERO expm1 graph nodes (fork B's
+    // ~18-node prelude gone). The buffer is SHARED by every param's node (like
+    // `t`/`lr`), so the adam-batch grouping key (shared input[4] identity) still
+    // packs the group; the scatter re-executes under compiled replay from the
+    // re-noted host value (scalar-slots re-dress), exactly the `lr` discipline.
     const derived = ENV.TORCHLETTE_DERIVED_ADAM === "1";
     let biasRt = tRt;
     if (derived) {
-      biasRt = this._biasCorrectionPacked(runtime, tRt);
+      if (!this._bcLive) {
+        // Seed the persistent [2] buffer; `.set()` below records the in-plan
+        // scatter EVERY step (bc changes each step, so — unlike a constant lr —
+        // the scatter must be in the recorded template for the replay re-dress).
+        this._bcLive = new LiveScalar(
+          this.api,
+          [0, 0],
+          this.device as "cpu" | "webgpu",
+        );
+      }
+      this._bcLive.set(this._bcHost());
+      biasRt = this._bcLive.tensor._unwrap();
     }
 
     for (let i = 0; i < this.params.length; i++) {
@@ -545,10 +562,9 @@ export class Adam {
     runtime.registerState(tRt);
     for (const s of this._lrLive)
       if (s) runtime.registerState(s.tensor._unwrap());
-    // Persist the derived-path bc buffer + lnBetas constant (same lazy-mid-step
-    // adoption rationale as t/m/v — buffer-stable across replays).
-    if (this._bc) runtime.registerState(this._bc);
-    if (this._lnBetas) runtime.registerState(this._lnBetas);
+    // Persist the derived-path bc live buffer (same lazy-mid-step adoption
+    // rationale as t/lr/m/v — buffer-stable across replays).
+    if (this._bcLive) runtime.registerState(this._bcLive.tensor._unwrap());
 
     return updated;
   }
@@ -568,6 +584,38 @@ export class Adam {
   private _advanceT(runtime: ReturnType<Torchlette["_runtime"]>): void {
     const t = this._tTensor();
     runtime.copy_(t, runtime.add(t, 1));
+    // Host mirror advanced in lockstep (fork C reads _tHost for host-side bc).
+    this._tHost += 1;
+  }
+
+  /**
+   * Fork C host-side bias correction: bc=[bc1,bc2] = [-expm1(t·lnβ1),
+   * -expm1(t·lnβ2)] computed in f32 (Math.fround discipline) via the SAME
+   * 5-term Horner (|y|<0.25) / exp(y)−1 (else) branch the authored kernel emits
+   * in `emitExpm1` and the graph `_biasCorrection` uses — single source of the
+   * bc formula across all three realizations. `t = _tHost` (the post-advance
+   * shared step counter). Named precision lemma (host-vs-GPU exp, bc-absorbed):
+   * the Horner branch is bit-exact host-vs-GPU; the exp branch's ≤ few-ULP
+   * intrinsic divergence is absorbed by bc=1−exp(y) (saturates to 1.0 in the
+   * deep tail) → bc agrees to ≤1 ULP, Δparam ≤5.96e-8.
+   */
+  private _bcHost(): [number, number] {
+    const f = Math.fround;
+    const expm1F32 = (y: number): number => {
+      if (Math.abs(y) < 0.25) {
+        let r = f(1 / 120);
+        r = f(f(1 / 24) + f(y * r));
+        r = f(f(1 / 6) + f(y * r));
+        r = f(f(1 / 2) + f(y * r));
+        r = f(1 + f(y * r));
+        return f(y * r);
+      }
+      return f(Math.exp(y) - 1);
+    };
+    const t = this._tHost;
+    const bc1 = f(-expm1F32(f(t * f(Math.log(this.beta1)))));
+    const bc2 = f(-expm1F32(f(t * f(Math.log(this.beta2)))));
+    return [bc1, bc2];
   }
 
   /**
@@ -606,56 +654,6 @@ export class Adam {
     const bc1 = runtime.neg(expm1(lnB1));
     const bc2 = runtime.neg(expm1(lnB2));
     return { bc1, bc2 };
-  }
-
-  /**
-   * R3/fork-B packed bias correction. The SAME expm1-form arithmetic as
-   * `_biasCorrection`, but VECTORIZED over a persistent [2] `_lnBetas` constant
-   * so both lanes (bc1, bc2) compute in ONE chain, and the result is written
-   * IN-PLACE into the persistent [2] `_bc` buffer. Returns `_bc` AFTER the
-   * `copy_` (so its lazyRef points at the copy result) — the adamStep nodes
-   * that bind it therefore DEPEND on the update chain (it re-executes on every
-   * compiled replay reading the re-advanced `t`), exactly the `_advanceT` /
-   * post-copy_ discipline. Killing the per-step `cat` (fresh buffer identity)
-   * and one of the two scalar chains is the R3 fix: the planner pins `_bc`, the
-   * prelude stops churning the buffer set that shadowed the +1 submit / +799 MB
-   * warmup peak on gpt2-medium. Numerics are lane-for-lane identical to
-   * `_biasCorrection` (elementwise ops, `t` broadcast over [2]).
-   */
-  private _biasCorrectionPacked(
-    runtime: ReturnType<Torchlette["_runtime"]>,
-    t: RuntimeTensor,
-  ): RuntimeTensor {
-    if (!this._lnBetas) {
-      const lnB1 = Math.fround(Math.log(this.beta1));
-      const lnB2 = Math.fround(Math.log(this.beta2));
-      // Persistent [2] constant [ln β1, ln β2]; materializes once, held by
-      // state — never re-derived (leaf input to the chain, like a param).
-      this._lnBetas = runtime.tensorFromArray(
-        [lnB1, lnB2],
-        [2],
-        this.device,
-        "f32",
-      );
-    }
-    if (!this._bc) {
-      this._bc = runtime.full([2], 0, this.device, "f32");
-    }
-    // Vectorized expm1: y = t * lnBetas (t[1] broadcasts over [2]).
-    const y = runtime.mul(t, this._lnBetas); // ≤ 0, per lane
-    // 5-term Horner series (small-|y| branch).
-    let r: RuntimeTensor = runtime.full([1], 1 / 120, this.device, "f32");
-    r = runtime.add(runtime.mul(r, y), 1 / 24);
-    r = runtime.add(runtime.mul(r, y), 1 / 6);
-    r = runtime.add(runtime.mul(r, y), 1 / 2);
-    r = runtime.add(runtime.mul(r, y), 1);
-    const series = runtime.mul(y, r);
-    const large = runtime.sub(runtime.exp(y), 1);
-    const cond = runtime.lt(runtime.abs(y), 0.25);
-    const bcNew = runtime.neg(runtime.where(cond, series, large)); // [2]
-    // In-place into the persistent buffer; return the post-copy_ ref.
-    runtime.copy_(this._bc, bcNew);
-    return this._bc;
   }
 
   /**
@@ -837,6 +835,7 @@ export class Adam {
     // persistent buffer identity; never replace-and-hold).
     if (this._t)
       runtime.copy_(this._t, runtime.full([1], 0, this.device, "f32"));
+    this._tHost = 0; // fork C host mirror resets with the device counter
     // Packed foreach state is built FROM the per-param state on the next
     // step — dispose it so the reset takes effect there too.
     for (const st of this._foreachState.values()) {

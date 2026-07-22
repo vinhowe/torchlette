@@ -810,7 +810,11 @@ export async function stTryReplay(
     // (measured: sporadic 3e-3..0.07).
     const noted = getScalarSlotValue(d.owner);
     let bytes: Float32Array | undefined =
-      noted !== undefined ? Float32Array.of(noted) : undefined;
+      noted === undefined
+        ? undefined
+        : typeof noted === "number"
+          ? Float32Array.of(noted)
+          : Float32Array.from(noted);
     if (!bytes) {
       const cur = d.owner.lazyRef as { kind: string; node?: LazyIRNode };
       if (cur?.kind === "pending" && cur.node)

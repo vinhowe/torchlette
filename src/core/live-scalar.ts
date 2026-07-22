@@ -40,14 +40,18 @@ import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import { noteScalarSlotValue } from "./scalar-slots";
 
 /**
- * A per-step scalar with a fixed-identity persistent f32[1] tensor, delivered
- * through the graph-ordered in-plan upload channel. Consumers read `.tensor`
- * as an ordinary graph input; the driver calls `.set(v)` each step.
+ * A per-step scalar (or short vector) with a fixed-identity persistent f32[n]
+ * tensor, delivered through the graph-ordered in-plan upload channel. Consumers
+ * read `.tensor` as an ordinary graph input; the driver calls `.set(v)` each
+ * step. n=1 is the LR scheduler's lr / the GradScaler's scale; n=2 is Adam's
+ * host-computed bias-correction bc=[bc1,bc2] (fork C) — one primitive, the
+ * length is the constructor's.
  */
 export class LiveScalar {
-  /** The persistent, buffer-stable f32[1] tensor consumers read. */
+  /** The persistent, buffer-stable f32[n] tensor consumers read. */
   readonly tensor: Tensor;
-  private _value: number;
+  private _value: number | number[];
+  private readonly _len: number;
   // Pin the write chain's short-lived storages across the RUNAHEAD window
   // (the setLR-under-ringK2 STRICT transient that kept the scheduler NOSCHED):
   //  - the scatter SOURCE (setScalarInPlace returns it TRACKED): ownerless it
@@ -65,20 +69,29 @@ export class LiveScalar {
 
   constructor(
     private readonly api: Torchlette,
-    initial: number,
+    initial: number | number[],
     device: "cpu" | "webgpu",
   ) {
-    // full(): a fixed-buffer persistent f32[1]. registerState() declares it REG
-    // state so it survives boundaries (model-level state). Its physical buffer is
-    // created once and written IN PLACE for the scalar's life (clause 2 — FIXED
-    // BUFFER); the value is delivered via setScalarInPlace, so the fillValue never
-    // varies (no template-fingerprint thrash from full()).
-    this.tensor = api.registerState(api.full([1], initial, { device }));
+    // A fixed-buffer persistent f32[n]. registerState() declares it REG state so
+    // it survives boundaries (model-level state). Its physical buffer is created
+    // once and written IN PLACE for the primitive's life (clause 2 — FIXED
+    // BUFFER); the value is delivered via setScalarInPlace. n=1 uses full() (one
+    // fillValue, no template-fingerprint thrash); n>1 seeds distinct lanes via
+    // tensorFromArray, then rides the same in-place delivery.
+    if (typeof initial === "number") {
+      this._len = 1;
+      this.tensor = api.registerState(api.full([1], initial, { device }));
+    } else {
+      this._len = initial.length;
+      this.tensor = api.registerState(
+        api.tensorFromArray(initial, [initial.length], { device }),
+      );
+    }
     this._value = initial;
     noteScalarSlotValue(this.tensor._unwrap(), initial);
   }
 
-  get value(): number {
+  get value(): number | number[] {
     return this._value;
   }
 
@@ -87,7 +100,11 @@ export class LiveScalar {
    * the fixed buffer (clause 1) + a registry note for the replay re-dress
    * (clause 3). No new buffer is minted; consumers read the same fixed buffer.
    */
-  set(v: number): void {
+  set(v: number | number[]): void {
+    if (typeof v !== "number" && v.length !== this._len)
+      throw new Error(
+        `LiveScalar.set: length ${v.length} != tensor length ${this._len}`,
+      );
     this._value = v;
     const rt = this.api._runtime();
     const inner = this.tensor._unwrap();
