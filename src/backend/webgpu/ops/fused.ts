@@ -89,6 +89,43 @@ import {
 // ============================================================================
 
 /**
+ * Variadic in-place aliasing guard (R5b — the variadic buffer-lifetime class).
+ * Given the read_write set `[param, ...states]` and the read-only `gradBuf`,
+ * return one buffer per rw tensor such that all rw buffers are distinct from
+ * `gradBuf` AND from each other (WebGPU forbids rw↔rw and rw↔read aliasing),
+ * copying via `copyTo` on collision. In the real-training case (distinct
+ * persistent buffers) NO copy fires — byte-identical to the prior param/m/v
+ * hand-unrolled guard.
+ */
+function distinctRwBuffers(
+  rwTensors: WebGPUTensor[],
+  gradBuf: GPUBuffer,
+  copyTo: (src: GPUBuffer) => GPUBuffer,
+): GPUBuffer[] {
+  const out: GPUBuffer[] = [];
+  for (const t of rwTensors) {
+    let b = t.buffer;
+    if (b === gradBuf || out.includes(b)) b = copyTo(b);
+    out.push(b);
+  }
+  return out;
+}
+
+/**
+ * Variadic in-place ownership transfer (R5b). For each read_write tensor
+ * (param + optimizer states), decRef its buffer and neuter the old destroy —
+ * the fused kernel wrote the update in place and the fresh result BackendTensor
+ * now owns the buffer. The generalization of the hard-coded param/m/v transfer
+ * to per-optimizer state arity. Idempotent-safe: only decRefs owners.
+ */
+function transferInPlaceOwnership(rwTensors: WebGPUTensor[]): void {
+  for (const t of rwTensors) {
+    if (t.ownsBuffer) bufferPool.decRef(t.buffer);
+    t.destroy = () => {};
+  }
+}
+
+/**
  * Per-item Adam step implementation. Does NOT call flushSharedEncoder — the
  * caller is responsible for ensuring previously-recorded passes that read
  * the param/m/v buffers have been submitted before invoking this. Use
@@ -132,12 +169,16 @@ function adamStepInner(
   trackSharedEncoderWrite(gradT.buffer);
 
   // WebGPU forbids binding the same buffer as read_write at multiple
-  // binding points and forbids read_write ↔ read aliasing. All three of
-  // param/m/v are read_write, grad is read — so each pair must have a
-  // distinct buffer. Pool recycling can cause collisions.
-  let paramBuf = paramT.buffer;
-  let mBuf = mT.buffer;
-  let vBuf = vT.buffer;
+  // binding points and forbids read_write ↔ read aliasing. param and every
+  // state slot (m/v for Adam) are read_write, grad is read — so each rw
+  // buffer must be distinct from grad AND from every other rw buffer. Pool
+  // recycling can cause collisions.
+  //
+  // R5b — the variadic in-place buffer-lifetime class: the guard loops over
+  // the read_write set `[param, ...states]` instead of hard-coding param/m/v,
+  // so a per-optimizer state arity (Lion m, SGD v, SGD none) is handled by the
+  // same code. Byte-identical for Adam (arity 2 → [param, m, v]): with distinct
+  // persistent buffers (the real-training case) NO copies fire.
   const gradBuf = gradT.buffer;
   const bufSize = gradT.size * dtypeBytes(gradT.dtype);
   const copyTo = (src: GPUBuffer): GPUBuffer => {
@@ -154,15 +195,9 @@ function adamStepInner(
     flushSharedEncoder();
     return dst;
   };
-  if (paramBuf === gradBuf || paramBuf === mBuf || paramBuf === vBuf) {
-    paramBuf = copyTo(paramBuf);
-  }
-  if (mBuf === gradBuf || mBuf === vBuf) {
-    mBuf = copyTo(mBuf);
-  }
-  if (vBuf === gradBuf) {
-    vBuf = copyTo(vBuf);
-  }
+  const rwTensors: WebGPUTensor[] = [paramT, mT, vT];
+  const rwBufs = distinctRwBuffers(rwTensors, gradBuf, copyTo);
+  const [paramBuf, mBuf, vBuf] = rwBufs;
 
   const emitF16 = config.emitF16 ?? false;
   const infFlagBuf = (config.infFlagBuffer as GPUBuffer | null) ?? null;
@@ -201,15 +236,10 @@ function adamStepInner(
     f16WeightCache.set(result.paramBuffer, result.paramF16Buffer);
   }
 
-  // param/m/v are all updated in-place — transfer ownership from the old
+  // param + states are all updated in-place — transfer ownership from the old
   // BackendTensors to the results (noop their destroy, decRef their buffers).
   _st = profileSubOpBegin();
-  if (paramT.ownsBuffer) bufferPool.decRef(paramT.buffer);
-  paramT.destroy = () => {};
-  if (mT.ownsBuffer) bufferPool.decRef(mT.buffer);
-  mT.destroy = () => {};
-  if (vT.ownsBuffer) bufferPool.decRef(vT.buffer);
-  vT.destroy = () => {};
+  transferInPlaceOwnership(rwTensors);
   const ret = {
     param: createTensor(
       paramT.shape,
@@ -345,12 +375,7 @@ export function adamStepBatch(items: AdamBatchItem[]): AdamBatchResult[] {
 
         cleanupContiguous([item.grad, gradT]);
 
-        if (paramT.ownsBuffer) bufferPool.decRef(paramT.buffer);
-        paramT.destroy = () => {};
-        if (mT.ownsBuffer) bufferPool.decRef(mT.buffer);
-        mT.destroy = () => {};
-        if (vT.ownsBuffer) bufferPool.decRef(vT.buffer);
-        vT.destroy = () => {};
+        transferInPlaceOwnership([paramT, mT, vT]);
 
         results[i] = {
           param: createTensor(
