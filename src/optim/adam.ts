@@ -89,6 +89,20 @@ export class Adam {
    *  copy_ scatter + scalar-slots note). Lazily created (device known). */
   private _lrLive: (LiveScalar | null)[];
   /**
+   * R3/fork-B: the derived fused body takes bias correction as a `[2]`
+   * `bc`=[bc1,bc2] DATA input. It rides in a PERSISTENT [2] buffer (`_bc`),
+   * updated IN-PLACE each step by `copy_(_bc, expm1chain)` — the exact `_t`
+   * pattern (buffer-stable → the memory planner pins it; no per-step `cat`
+   * allocation, no fresh buffer identity for the planner to re-converge on).
+   * `_lnBetas` = the persistent [2] constant [ln β1, ln β2] the vectorized
+   * expm1 chain broadcasts `t` against, computing BOTH lanes in one chain
+   * (was two scalar chains + a `cat`). Lazily created (device known on first
+   * step); persisted via registerState so `t`-style adoption holds them across
+   * step boundaries. Only allocated when TORCHLETTE_DERIVED_ADAM is on.
+   */
+  private _bc: RuntimeTensor | null = null;
+  private _lnBetas: RuntimeTensor | null = null;
+  /**
    * Packed foreach state, keyed by group index. While the foreach path is
    * active, m/v live as ONE flat tensor per group (the per-param expAvg
    * arrays are consumed at first pack and become stale). Mirrors PyTorch's
@@ -226,6 +240,9 @@ export class Adam {
     for (const s of this._lrLive) {
       if (s) keep.push(s.tensor);
     }
+    // R3/fork-B derived-path persistent bc buffer + lnBetas constant.
+    if (this._bc) keep.push(this.api._wrapRuntime(this._bc, false));
+    if (this._lnBetas) keep.push(this.api._wrapRuntime(this._lnBetas, false));
     return keep;
   }
 
@@ -445,8 +462,7 @@ export class Adam {
     const derived = ENV.TORCHLETTE_DERIVED_ADAM === "1";
     let biasRt = tRt;
     if (derived) {
-      const { bc1, bc2 } = this._biasCorrection(runtime, tRt);
-      biasRt = runtime.cat([bc1, bc2]);
+      biasRt = this._biasCorrectionPacked(runtime, tRt);
     }
 
     for (let i = 0; i < this.params.length; i++) {
@@ -529,6 +545,10 @@ export class Adam {
     runtime.registerState(tRt);
     for (const s of this._lrLive)
       if (s) runtime.registerState(s.tensor._unwrap());
+    // Persist the derived-path bc buffer + lnBetas constant (same lazy-mid-step
+    // adoption rationale as t/m/v — buffer-stable across replays).
+    if (this._bc) runtime.registerState(this._bc);
+    if (this._lnBetas) runtime.registerState(this._lnBetas);
 
     return updated;
   }
@@ -586,6 +606,56 @@ export class Adam {
     const bc1 = runtime.neg(expm1(lnB1));
     const bc2 = runtime.neg(expm1(lnB2));
     return { bc1, bc2 };
+  }
+
+  /**
+   * R3/fork-B packed bias correction. The SAME expm1-form arithmetic as
+   * `_biasCorrection`, but VECTORIZED over a persistent [2] `_lnBetas` constant
+   * so both lanes (bc1, bc2) compute in ONE chain, and the result is written
+   * IN-PLACE into the persistent [2] `_bc` buffer. Returns `_bc` AFTER the
+   * `copy_` (so its lazyRef points at the copy result) — the adamStep nodes
+   * that bind it therefore DEPEND on the update chain (it re-executes on every
+   * compiled replay reading the re-advanced `t`), exactly the `_advanceT` /
+   * post-copy_ discipline. Killing the per-step `cat` (fresh buffer identity)
+   * and one of the two scalar chains is the R3 fix: the planner pins `_bc`, the
+   * prelude stops churning the buffer set that shadowed the +1 submit / +799 MB
+   * warmup peak on gpt2-medium. Numerics are lane-for-lane identical to
+   * `_biasCorrection` (elementwise ops, `t` broadcast over [2]).
+   */
+  private _biasCorrectionPacked(
+    runtime: ReturnType<Torchlette["_runtime"]>,
+    t: RuntimeTensor,
+  ): RuntimeTensor {
+    if (!this._lnBetas) {
+      const lnB1 = Math.fround(Math.log(this.beta1));
+      const lnB2 = Math.fround(Math.log(this.beta2));
+      // Persistent [2] constant [ln β1, ln β2]; materializes once, held by
+      // state — never re-derived (leaf input to the chain, like a param).
+      this._lnBetas = runtime.tensorFromArray(
+        [lnB1, lnB2],
+        [2],
+        this.device,
+        "f32",
+      );
+    }
+    if (!this._bc) {
+      this._bc = runtime.full([2], 0, this.device, "f32");
+    }
+    // Vectorized expm1: y = t * lnBetas (t[1] broadcasts over [2]).
+    const y = runtime.mul(t, this._lnBetas); // ≤ 0, per lane
+    // 5-term Horner series (small-|y| branch).
+    let r: RuntimeTensor = runtime.full([1], 1 / 120, this.device, "f32");
+    r = runtime.add(runtime.mul(r, y), 1 / 24);
+    r = runtime.add(runtime.mul(r, y), 1 / 6);
+    r = runtime.add(runtime.mul(r, y), 1 / 2);
+    r = runtime.add(runtime.mul(r, y), 1);
+    const series = runtime.mul(y, r);
+    const large = runtime.sub(runtime.exp(y), 1);
+    const cond = runtime.lt(runtime.abs(y), 0.25);
+    const bcNew = runtime.neg(runtime.where(cond, series, large)); // [2]
+    // In-place into the persistent buffer; return the post-copy_ ref.
+    runtime.copy_(this._bc, bcNew);
+    return this._bc;
   }
 
   /**

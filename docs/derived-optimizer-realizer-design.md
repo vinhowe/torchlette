@@ -457,29 +457,76 @@ existing C-EXIT A100 measurement. Measured facts, not speculation.
   stream-generate bc alias validated); 124M regression EXACT both states
   ({0:9.81,3:5.92,6:5.15,9:4.64}, memory identical). Net src +108, envFlags +1.
 
-- **R3 — the flip: STOPPED (exit gate NOT met on medium).** A100 (dw-2-1) A/B,
-  derived vs authored, `profile-training` @512, late (steady) steps:
-  - **distil: CLEAN** — peak identical (5636.6 MB), **submits 8→8 EXACT**, speed
-    parity (~60.9 ms), +35 tiny [1]/[2] dispatches (the bc prelude).
-  - **medium: REGRESSED** — **submits 19→20 (+1, STABLE across steps 5–17)** and a
-    **+799 MB warmup peak** (16189→16988 MB); steady-state *current* memory is
-    identical (7246.5 MB) and speed is identical (65.9 ms), but the derived plan
-    settles ~6 steps slower (warmup cur 8707.9 vs 7246.5, +347 warmup dispatches).
-  - **Verdict:** the graph-side bc subgraph (fork B) does NOT pack into the fused
-    optimizer dispatch segment on the larger model — it inserts one submit boundary
-    (and the warmup-peak transient that shadows it). This fails the "submits EXACT"
-    exit gate. The flip is BLOCKED until the bc prelude packs into the optimizer
-    segment without a submit (a planner/fusion-scheduling task, NOT a numerical
-    issue — the trajectory is correct everywhere). No silent drift is passed off as
-    benign: distil is clean, medium regresses on submit-parity, measured on the
-    authoritative A100 box.
+- **R3-FIX — candidate #1 LANDED; flip RE-CONFIRMED STOPPED (named class: reclaim-
+  boundary quantization).** The R3 re-open attempt. Two things settled.
 
-- **R4 — the deletion: NOT REACHED** (depends on R3). The authored body is retained
-  as the differential oracle; `TORCHLETTE_DERIVED_ADAM` stays OFF by default, so the
-  shipping default is unchanged.
+  1. **Candidate #1 landed (persistent `[2]` bc buffer, no per-step `cat`).**
+     `Adam._biasCorrectionPacked` computes bias correction as ONE vectorized `expm1`
+     chain over a persistent `[2]` `_lnBetas` constant (`t` broadcast over `[2]`),
+     writing IN-PLACE into a persistent `[2]` `_bc` buffer via `copy_` — the exact
+     `_t`/lr persistent-state pattern (buffer-stable, post-`copy_` ref so the adamStep
+     nodes depend on it and it re-executes each replay). This replaces R2's two scalar
+     `expm1` chains + `runtime.cat([bc1,bc2])` (fresh buffer identity every step).
+     Effect: the optimizer plan's steady prelude drops from ~35 to ~18 nodes (medium
+     optimizer plan **623→606**), the per-step allocation and buffer churn are gone,
+     numerics UNCHANGED (derived-adam-parity Δparam 2.98e-8, Δm=Δv bit-exact —
+     identical to R2; gates 5/5 both states; fullstack both arms ≤2e-6/30; packed-vs-
+     unpacked 4/4; 124M EXACT with the flag ON). A100 A/B (dw-2-1, @512, steady):
+     **distil CLEAN — submits 8=8 EXACT, peak 5636.6=5636.6 EXACT.** But **medium still
+     submits 19→20, peak 16189→16989** — candidate #1 did NOT cross the gate.
 
-**Re-open condition for R3:** make the `bc` prelude (the `_biasCorrection` +
-`cat([bc1,bc2])` subgraph) schedule inside the optimizer segment's encoder without
-forcing a flush on large-param models, so medium submits return to 19 EXACT. The
-mechanism (R1+R2) is otherwise proven correct and ready; only the large-model
-packing of the prelude blocks the default flip.
+  2. **Root cause of the medium +1 submit / +800 MB, MEASURED (not a packing miss).**
+     The bc subgraph DOES pack — the adamStep batch stays intact (76→76 grouped on
+     distil), the `cat` was never the issue. The real mechanism is **reclaim-boundary
+     quantization**: the lowered plan inserts a reclaim (`flushSharedEncoder` +
+     `flushBufferPool` = one submit) every **300 nodes** (`executor.ts:3821`, hardcoded
+     when liveness-release is on — NOT the `TORCHLETTE_RECLAIM_INTERVAL` env default).
+     Medium's optimizer plan is **586 nodes authored → 1 reclaim** (at node 300);
+     fork-B's ~20-node graph prelude tips it to **606 → 2 reclaims** (nodes 300 AND
+     600). The 2nd reclaim is the +1 submit; its warmup pool-flush placement is the
+     +800 MB transient (steady *current* memory is identical, 7247≈7246). Distil's
+     optimizer plan (172 nodes) never reaches 300 → 0 reclaims → clean regardless.
+     Confirmed by submit-stack attribution: the extra flush is `executor.ts:3221`
+     (`reclaim` action), +1/step on medium.
+  - **The reclaim is LOAD-BEARING — it cannot be suppressed.** A trailing-reclaim
+    guard (skip a reclaim landing within 64 nodes of the plan end — the node-600
+    reclaim is only 6 nodes before the plan-final flush) was implemented, and it DID
+    restore medium to **19 submits EXACT**. But it **regressed steady current memory
+    +1460 MB** (8709 vs 7246, +292 storages, permanent — not a warmup transient):
+    the mid-plan reclaim's `flushSharedEncoder` is what makes nodes 301–600's freed
+    buffers reusable WITHIN the same plan; without it the plan allocates fresh for
+    nodes 601+ and defers promotion a full step. The plan-final `advanceEpoch` flush
+    does NOT recover this (it promotes `pendingRelease` but cannot enable intra-plan
+    reuse after the fact). Guard REVERTED.
+  - **Why the prelude cannot shed the 7 nodes needed (606→≤599).** The ~18 nodes are
+    the two-branch `expm1` (`abs`/`lt`/`where` selecting a 5-term Horner series for
+    small `|y|` vs `exp(y)−1` otherwise) the authored kernel emits IN-KERNEL for free.
+    Both branches are live across the trajectory (bc2 with β2=0.999 needs the series;
+    bc1 with β1=0.9 enters the `exp` branch by t≈3), and the series must match the
+    authored 5-term form bit-exactly (parity oracle). No bit-exact reduction reaches 7
+    nodes. Fork B's graph-side prelude is irreducibly ~18 nodes.
+  - **Verdict:** fork B (bias correction as a graph subgraph) STRUCTURALLY cannot meet
+    the "submits EXACT + peak parity" gate on gpt2-medium — its irreducible prelude
+    tips the optimizer plan across a reclaim-interval boundary, and the resulting
+    reclaim is load-bearing for intra-plan buffer reuse (removing it trades the submit
+    for a larger steady-memory regression). This is NOT numerical (trajectory correct
+    everywhere) and NOT a fusion-packing failure (the batch packs). Re-confirmed STOP.
+
+- **R4 — the deletion: NOT REACHED** (depends on the flip). The authored body is
+  retained as the differential oracle; `TORCHLETTE_DERIVED_ADAM` stays OFF by default,
+  so the shipping default is unchanged. envFlags unchanged (+1 from R2).
+
+**Re-open condition for R3 (revised — the named path is fork C, not more fork-B
+scheduling):** eliminate the graph prelude's plan nodes ENTIRELY by delivering `bc`
+as a host-computed `[2]` **live scalar** (the same primitive `lr` already rides:
+`core/live-scalar.ts` — a persistent buffer host-written per step, graph-ordered,
+replay-safe via the scalar table / TAG_WRITE). Host-side `expm1F32` from the host step
+counter → zero optimizer-plan nodes → medium optimizer plan returns to 586 → submits
+19 EXACT and peak 16189 by construction. The BLOCKER to validate before landing fork C
+is **precision**: `bc` then compares host-`expm1F32` against the authored kernel's
+GPU `exp` intrinsic (not GPU-vs-GPU as today), so the `derived==authored` Δparam parity
+(currently ≤3e-8 via named lemmas L1/L2) must be re-established or a new NAMED lemma
+bounding host-vs-GPU `exp` agreement stated — do not land fork C on an unnamed
+reassociation. Fork B's mechanism (R1+R2, candidate #1) stays the retained dark path;
+it is proven correct and is the best starting point, but it cannot be the flipped
+default on large-param models.
