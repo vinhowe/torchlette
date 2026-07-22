@@ -1,44 +1,26 @@
 /**
- * The Step Object (task #98 PHASE 1 — reify, null-clean).
+ * The Step Object — the step-editor's PARTITION SURFACE (task #98; reduced P4b-R).
  *
- * Normative source: docs/step-object-design.md §2 (the object: two phases,
- * identity/digest §2.2, guards as typed refusals §2.3, invalidation
- * subordination §2.4, the NOT-fields list §2.5) and §6 Phase 1.
+ * Normative source: docs/step-object-design.md §2 (the two-phase schema §2.1, the
+ * partition facet §3.3, guards as typed refusals §2.3).
  *
- * WHAT THIS IS. A whole training (or decode) step is ONE first-class object
- * that exists in TWO phases — a *declared* source form (the boundary contract +
- * dynamic-slot / recompute-segment / partition facets + ring config) and a
- * *witnessed* compiled form (the step-tape skeleton). This module REIFIES that
- * object as a DERIVED union over the existing mechanisms; it does NOT own any
- * state, exactly as islands I0 reified `Partition` (schedule-state P0 discipline:
- * derive/apply side-by-side, byte-identical, zero schema deltas).
+ * WHAT SURVIVES. The step-tape recorder + replay that this module once projected
+ * a witnessed StepObject from were DELETED in P4b-R (the tape added no decode
+ * value and training is served by the whole-step compiler). What remains is the
+ * pole the step-editor binds to: the `StepPartition` facet + its identity digest
+ * (`stepPartitionDigest` / `stepPartitionReproducesPerPlan`), consumed by
+ * `src/schedule/moves/step-edit-channel.ts` (the `StepEditChannel` records edit
+ * REQUESTS against a partition's `boundaryDigest`). The step-DATA type surface
+ * (`StepObject` / `StepDeclaration` / `StepSlotDecl` / `StepSkeletonRef` /
+ * `StepReceipts` / `stepObjectDigest` / the typed `StepRefusalReason`) is retained
+ * as the declarative schema; the tape-consuming CONSTRUCTOR (`deriveStepObject`)
+ * and the tape-agreement assert (`stepObjectDigestMatchesBucket`) were pruned with
+ * the tape.
  *
- * SINGLE SOURCE — WHY NO SECOND OWNER (ruling 1: "no second whole-step mechanism
- * may be born"). The operational mechanisms remain:
- *   - the RECORDER (`src/core/step-tape.ts`): owns the `StepTape` store, the
- *     eligibility diff, the refusal counters. It is the DECLARED-phase authority
- *     (slots, structural signature, epoch, regime) AND the digest source (its
- *     `bucketKey` already IS `hash(structKey) + ordered plan fps`, §2.2).
- *   - the REPLAY layer (`src/executor/step-tape-replay.ts`): owns the `Skeleton`
- *     store. It is the WITNESSED-phase authority (the ordered compiled plans).
- * The StepObject is a READ-ONLY VIEW that projects a facet-keyed identity over
- * those two. `deriveStepObject()` constructs one on demand from the tape state
- * and the live counters; nothing here is authored, mutated, or persisted beyond
- * the caller's local handle. This is the "loop-nest VIEW derived by a canonical
- * ordering rule" pattern (`schedule-state-design.md §0`), one stratum up.
- *
- * PHASE 1 IS NULL-CLEAN. Reifying + consulting the StepObject changes NOTHING
- * behavioral: the tape's `bucketKey`, the capture appKey, and the islands
- * boundaryHash all recompute byte-identically as projections of the one object;
- * command streams are byte-identical on decode + training tapes; digests
- * recompute byte-identical across two runs of the same config (the NULL TEST,
- * §6 Phase 1 gate). Slot NAMES are STABLE across re-witnesses (§10 ruling 1:
- * a slot survives re-witnessing as "the α slot", not "slot #7 of tape 43") —
- * the recorder already keys slots by `<op>:<fpHex>:<pos>[:inputIndex]`, a
- * declaration-stable name; the StepObject exposes it verbatim.
- *
- * SUNSET: this module rides `TORCHLETTE_STEP_TAPE` with the rest of the
- * campaign; it adds NO env flag (§6 Phase 1 gate: "no new env flags").
+ * SINGLE SOURCE. Membership is still owned by the detector (`fusion-detect.ts`
+ * `reifyPartition`); `StepPartition` is a read-only VIEW keyed to it — the
+ * "loop-nest VIEW derived by a canonical ordering rule" pattern. This module owns
+ * no state and adds no env flag.
  */
 
 /** Source class of a dynamic slot (inlined from the deleted step-tape module,

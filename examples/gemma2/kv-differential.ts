@@ -132,7 +132,6 @@ async function main() {
   console.log("cached:  ", JSON.stringify(cached));
   console.log("static:  ", JSON.stringify(stat));
   console.log("taped:   ", JSON.stringify(taped));
-  console.log("[taped] replay stats:", JSON.stringify(api.getStepTapeStats().replay));
   const match =
     JSON.stringify(noCache) === JSON.stringify(cached) &&
     JSON.stringify(noCache) === JSON.stringify(stat) &&
