@@ -433,6 +433,22 @@ export class Adam {
     this._advanceT(runtime);
     const tRt = this._tTensor();
 
+    // R2/fork-B: when the DERIVED body is selected, bias correction is computed
+    // GRAPH-SIDE (the same _biasCorrection the foreach/elementwise paths use) and
+    // rides into the kernel as a [2] `bc`=[bc1,bc2] DATA input at the `t` slot —
+    // the in-kernel expm1 prelude is gone. Computed ONCE per step and SHARED by
+    // every param's node (like `t`), so the adam-batch grouping key (shared
+    // input[4] identity) still packs the group. `bc` is a per-step temp (not
+    // persisted); reachability holds it until the adamStep nodes execute, and its
+    // producer subgraph joins the plan and re-executes on replay (reading the
+    // re-advanced `t`) — exactly the foreach path's proven bc-in-plan discipline.
+    const derived = ENV.TORCHLETTE_DERIVED_ADAM === "1";
+    let biasRt = tRt;
+    if (derived) {
+      const { bc1, bc2 } = this._biasCorrection(runtime, tRt);
+      biasRt = runtime.cat([bc1, bc2]);
+    }
+
     for (let i = 0; i < this.params.length; i++) {
       const param = this.params[i];
       const grad = param.grad?._unwrap() ?? null;
@@ -468,7 +484,7 @@ export class Adam {
           param._unwrap().lazyRef,
           this.expAvg[i].lazyRef,
           this.expAvgSq[i].lazyRef,
-          tRt.lazyRef,
+          biasRt.lazyRef,
           lrRt.lazyRef,
         ],
         param.shape,

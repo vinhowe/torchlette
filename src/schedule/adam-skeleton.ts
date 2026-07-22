@@ -48,6 +48,17 @@ import {
 } from "../backend/webgpu/shape-utils";
 import { reportNoSecondOwner } from "./canonical";
 import { applyMove } from "./moves/moves";
+import { ENV } from "../core/env";
+import {
+  ADAMW_M_NEW,
+  ADAMW_SCALED,
+  ADAMW_V_NEW,
+  type OptTerm,
+} from "../ops/semantic/optimizer";
+import {
+  lowerOptTermToTileIR,
+  type FoldRoleBindings,
+} from "./optterm-fold";
 import type {
   PredicateAstNode,
   ScheduleMove,
@@ -203,7 +214,13 @@ export function realizeAdamStepSpec(
   useVec4: boolean,
   emitF16: boolean,
   emitUnscale: boolean,
+  derived: boolean = ENV.TORCHLETTE_DERIVED_ADAM === "1",
 ): TileKernelSpec {
+  // DERIVED path (R2, fork B): the per-element body is FOLDED from ADAMW_PROGRAM
+  // (lowerOptTermToTileIR), and bias correction rides in as a [2] `bc` DATA input
+  // — the authored opaque-seam assertion does not apply (we are DERIVING, not
+  // authoring a second copy). Gated OFF by default (TORCHLETTE_DERIVED_ADAM).
+  if (derived) return lowerAdamStepBody(useVec4, emitF16, emitUnscale, true);
   const desc: AdamDescriptor = { useVec4, emitF16, emitUnscale };
   return applyAdamSchedule(deriveAdamSkeleton(desc), desc);
 }
@@ -215,8 +232,11 @@ export function generateAdamShaderTileIR(
   useVec4: boolean,
   emitF16: boolean,
   emitUnscale: boolean,
+  derived: boolean = ENV.TORCHLETTE_DERIVED_ADAM === "1",
 ): string {
-  return compileTileKernel(realizeAdamStepSpec(useVec4, emitF16, emitUnscale));
+  return compileTileKernel(
+    realizeAdamStepSpec(useVec4, emitF16, emitUnscale, derived),
+  );
 }
 
 /**
@@ -457,11 +477,19 @@ export function deriveHorizontalPackedAdam(segments: readonly AdamParamSegment[]
 // The horizontal-pack derivation (deriveHorizontalPackedAdam, above) is the
 // DERIVABLE part; this body is the authored per-element update the pack batches.
 
-/** The fused Adam/AdamW body (single WGSL dispatch per param/segment). */
+/** The fused Adam/AdamW body (single WGSL dispatch per param/segment).
+ *
+ * `derived` (R2, fork B): route the per-element arithmetic through the
+ * `OptTerm→tile-IR` fold and take bias correction as a `[2]` `bc=[bc1,bc2]` DATA
+ * input instead of computing it in-kernel from `t` (the `expm1` prelude dies).
+ * The wrapper (grid, f16, unscale/atomic-inf, the L2/decoupled wd branches) is
+ * program-agnostic dispatch policy and stays IDENTICAL across both paths — only
+ * the binding at slot 4 (`t`→`bc`) and the two emit helpers swap. */
 function lowerAdamStepBody(
   useVec4: boolean,
   emitF16: boolean,
   emitUnscale: boolean,
+  derived: boolean = false,
 ): TileKernelSpec {
   const bindings: Record<string, BindingSpec> = {
     grad: { storage: "read", type: "f32" },
@@ -471,8 +499,29 @@ function lowerAdamStepBody(
     // inc-2a: t (step counter) and lr flow as persistent 1-element f32 tensor
     // DATA, not per-step-varying uniforms. The recorder sees stable buffers
     // (TAG_WRITE), which kills the frozen-scalar / volatile-repack class.
-    t: { storage: "read", type: "f32" },
+    // R2/fork-B: the DERIVED body replaces `t` at this same slot with a [2]
+    // `bc`=[bc1,bc2] DATA input (bias correction computed graph-side); it rides
+    // the identical TAG_WRITE channel, so the frozen-scalar class stays closed.
+    ...(derived
+      ? { bc: { storage: "read", type: "f32" } as BindingSpec }
+      : { t: { storage: "read", type: "f32" } as BindingSpec }),
     lr: { storage: "read", type: "f32" },
+  };
+  // Pair the bias-correction + per-element body by `derived` (their `bc` shapes
+  // differ: authored carries {stepSize, epsAdjusted, lr}; derived {bc1, bc2, lr}).
+  const biasCorrection = (ctx: KernelContext): AdamBias =>
+    derived ? emitDerivedBiasCorrection(ctx) : emitBiasCorrection(ctx);
+  const adamScalarBody = (
+    ctx: KernelContext,
+    idx: BlockExpr,
+    gVar: VarHandle,
+    f16: boolean,
+    bc: AdamBias,
+    suffix = "",
+  ): void => {
+    if (derived)
+      emitDerivedAdamScalarBody(ctx, idx, gVar, f16, bc as DerivedBias, suffix);
+    else emitAdamScalarBody(ctx, idx, gVar, f16, bc as AuthoredBias, suffix);
   };
   if (emitF16) {
     bindings.param_f16 = { storage: "read_write", type: "f16" };
@@ -521,10 +570,10 @@ function lowerAdamStepBody(
       enableF16: emitF16,
       autoVectorize: true,
       kernel(ctx) {
-        const bc = emitBiasCorrection(ctx);
+        const bc = biasCorrection(ctx);
         const idx = ctx.elementIndex(WORKGROUP_SIZE, "num_elements");
         const gVar = ctx.emitVar("g", "f32", ctx.load("grad", idx));
-        emitAdamScalarBody(ctx, idx, gVar, emitF16, bc);
+        adamScalarBody(ctx, idx, gVar, emitF16, bc);
       },
     };
   }
@@ -549,7 +598,7 @@ function lowerAdamStepBody(
       const numElements = ctx.uniform("num_elements");
       const gridStride = ctx.uniform("grid_stride");
       const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
-      const bc = emitBiasCorrection(ctx);
+      const bc = biasCorrection(ctx);
 
       if (useVec4) {
         const flatId = ctx.emitLet(
@@ -580,7 +629,7 @@ function lowerAdamStepBody(
         }
         for (let e = 0; e < 4; e++) {
           const off = e === 0 ? base : base.add(ctx.u32(e));
-          emitAdamScalarBody(ctx, off, gVars[e], emitF16, bc, `${e}`);
+          adamScalarBody(ctx, off, gVars[e], emitF16, bc, `${e}`);
         }
       } else {
         const idx = ctx.emitLet(
@@ -603,7 +652,7 @@ function lowerAdamStepBody(
           gVar.set(ctx.f32(0.0));
         });
 
-        emitAdamScalarBody(ctx, idx, gVar, emitF16, bc);
+        adamScalarBody(ctx, idx, gVar, emitF16, bc);
       }
     },
   };
@@ -714,6 +763,117 @@ function emitAdamScalarBody(
   });
 
   // Write outputs
+  ctx.emitStore("param", idx, pNewVar.get());
+  ctx.emitStore("m", idx, mNew);
+  ctx.emitStore("v", idx, vNew);
+
+  if (emitF16) {
+    ctx.emitStore("param_f16", idx, pNewVar.get().toF16());
+  }
+}
+
+// ============================================================================
+// The DERIVED per-element body (R2, fork B) — FOLDED from ADAMW_PROGRAM
+// ============================================================================
+//
+// The authored `emitAdamScalarBody`/`emitBiasCorrection`/`emitExpm1` above are
+// the differential ORACLE (kept until R4). The derived body below re-sources the
+// per-element ARITHMETIC from ADAMW_PROGRAM via the OptTerm→tile-IR fold — the
+// executed kernel becomes a THEOREM of the program (design ruling O1). The
+// wrapper (grid, f16, unscale/atomic-inf) and the runtime L2/decoupled wd
+// branches stay skeleton policy (the fold has no conditional).
+
+/** Authored bias data — the reassociated step-size / adjusted-eps form. */
+interface AuthoredBias {
+  stepSize: BlockExpr;
+  epsAdjusted: BlockExpr;
+  lr: BlockExpr;
+}
+/** Derived (fork B) bias data — bc1/bc2 as DATA roles the fold consumes. */
+interface DerivedBias {
+  bc1: BlockExpr;
+  bc2: BlockExpr;
+  lr: BlockExpr;
+}
+type AdamBias = AuthoredBias | DerivedBias;
+
+/**
+ * fork B: bias correction is DATA. Read bc1/bc2 from the `[2]` `bc` input and
+ * `lr` from the `lr` input; the in-kernel `expm1` prelude is GONE (it moved
+ * graph-side to `Adam._biasCorrection`, feeding the `bc` tensor). Returns the
+ * roles the fold binds — NOT a reassociated step_size (the fold computes m̂/v̂).
+ */
+function emitDerivedBiasCorrection(ctx: KernelContext): DerivedBias {
+  const bc1 = ctx.emitLet("bc1", ctx.load("bc", ctx.u32(0)));
+  const bc2 = ctx.emitLet("bc2", ctx.load("bc", ctx.u32(1)));
+  const lr = ctx.load("lr", ctx.u32(0));
+  return { bc1, bc2, lr };
+}
+
+/**
+ * Emit the Adam per-element update at `idx` with the m'/v'/scaled arithmetic
+ * DERIVED from ADAMW_PROGRAM via `lowerOptTermToTileIR`. Only the L2/decoupled wd
+ * branches (a runtime `decoupled_wd` select the fold cannot express) and the
+ * stores are skeleton policy.
+ *
+ * NOT byte-identical to `emitAdamScalarBody` — two NAMED reassociation lemmas:
+ *   (L1) ADAMW_V_NEW folds (1−β2)·g² as `(g·g)·(1−β2)`; authored is
+ *        `((1−β2)·g)·g`.
+ *   (L2) ADAMW_SCALED divides inside the sqrt — `lr·(m/bc1)/(√(v/bc2)+ε)` —
+ *        whereas authored factors √bc2 out (`step_size = lr·√bc2/bc1`,
+ *        `eps_adj = ε·√bc2`). Mathematically equal; f32 agrees to ≤1e-7.
+ */
+function emitDerivedAdamScalarBody(
+  ctx: KernelContext,
+  idx: BlockExpr,
+  gVar: VarHandle,
+  emitF16: boolean,
+  bc: DerivedBias,
+  suffix = "",
+): void {
+  const p = ctx.emitLet(`p${suffix}`, ctx.load("param", idx));
+  const { beta1, beta2, eps, weightDecay, decoupledWd } = loadAdamUniforms(ctx);
+
+  // L2 weight decay (Adam): grad += wd * param — runtime policy branch.
+  ctx.ifThen(
+    decoupledWd.eq(ctx.u32(0)).and(weightDecay.bitcastTo("u32").gt(ctx.u32(0))),
+    () => {
+      gVar.set(gVar.get().add(weightDecay.mul(p)));
+    },
+  );
+
+  // Role bindings for the fold — the program's roles map to tile-IR values.
+  const roles: Record<string, BlockExpr> = {
+    m: ctx.load("m", idx),
+    v: ctx.load("v", idx),
+    g: gVar.get(),
+    p,
+    beta1,
+    beta2,
+    om_beta1: ctx.f32(1.0).sub(beta1),
+    om_beta2: ctx.f32(1.0).sub(beta2),
+    bc1: bc.bc1,
+    bc2: bc.bc2,
+    lr: bc.lr,
+    eps,
+    wd: weightDecay,
+  };
+  const fold = (t: OptTerm, r: Record<string, BlockExpr>): BlockExpr =>
+    lowerOptTermToTileIR(t, ctx, r as FoldRoleBindings);
+
+  const mNew = ctx.emitLet(`m_new${suffix}`, fold(ADAMW_M_NEW, roles));
+  const vNew = ctx.emitLet(`v_new${suffix}`, fold(ADAMW_V_NEW, roles));
+
+  // p' reads the POST-update moments (the realizer's role binding). ADAMW_SCALED
+  // = lr·(m̂/(√v̂+ε)); the derived p' = p − scaled, then the decoupled branch.
+  const scaled = fold(ADAMW_SCALED, { ...roles, m: mNew, v: vNew });
+  const pNewVar = ctx.emitVar(`p_new${suffix}`, "f32", p.sub(scaled));
+
+  // Decoupled weight decay (AdamW): p -= lr*wd*p — runtime policy branch.
+  ctx.ifThen(decoupledWd.eq(ctx.u32(1)), () => {
+    pNewVar.set(pNewVar.get().sub(bc.lr.mul(weightDecay).mul(p)));
+  });
+
   ctx.emitStore("param", idx, pNewVar.get());
   ctx.emitStore("m", idx, mNew);
   ctx.emitStore("v", idx, vNew);

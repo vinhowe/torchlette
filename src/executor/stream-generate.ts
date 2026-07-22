@@ -4887,6 +4887,8 @@ function generateAdamBatch(
         m: packedSlots[2],
         v: packedSlots[3],
         t: repItem.bufSlots[4],
+        // R2/fork-B alias (see per-item fallback): derived plans name slot-4 `bc`.
+        bc: repItem.bufSlots[4],
         lr: repItem.bufSlots[5],
       },
       infFlag,
@@ -4942,6 +4944,10 @@ function generateAdamBatch(
       m: it.bufSlots[2],
       v: it.bufSlots[3],
       t: it.bufSlots[4], // inc-2a: persistent step counter
+      // R2/fork-B alias: the DERIVED plan names slot-4 `bc` (a [2] bias-correction
+      // DATA tensor) instead of `t`. adamBinding picks whichever the plan's
+      // bindingOrder uses; providing both keeps this seam flag-agnostic.
+      bc: it.bufSlots[4],
       lr: it.bufSlots[5], // inc-2a: persistent learning rate
     };
     // f16 weight output: allocateOutputBuffer(numElements*2) = allocKind 1.
