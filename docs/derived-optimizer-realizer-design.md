@@ -613,3 +613,108 @@ ON: `test:gates` 5/5 (compiled==lowered for the fork-C bc live-scalar re-dress),
 parity` Δparam ≤2.98e-8 / Δm=Δv bit-exact, `parity-packed-vs-unpacked` 4/4, 124M
 regression PASS (round 0 bit-exact 9.8089; rounds 3/6/9 within ~3e-4 of the R2 baseline —
 the L3 lemma accumulating over 200 inner steps, flat memory), cpu project clean.
+
+---
+
+## R5a — the program-roles realizer, LANDED (2026-07-22)
+
+**The mandate clause "adam-skeleton.ts generalizes into a program-roles realizer"
+is DONE.** The fused-optimizer kernel body is now assembled generically from an
+`OptimizerProgram` + a role schema, with zero per-optimizer WGSL.
+
+- **What landed.** `src/schedule/opt-step-realizer.ts` (`lowerOptStepBody(spec)`) —
+  the generic realizer. It builds the kernel STRUCTURE from the spec:
+  bindings `grad·param·<state slots>·<scalar inputs>` (+f16/inf), the declared
+  static-hyper uniforms, the runtime L2 (`g += wd·p`, decoupled_wd==0) and
+  decoupled (`p' -= lr·wd·p`, ==1) weight-decay branches, and the per-element
+  arithmetic FOLDED from `program.stateUpdates` + `paramUpdateNoWd` via
+  `lowerOptTermToTileIR`. The state-read polarity (`paramReadsPostState`) is a spec
+  field (Adam/SGD post-update, Lion old). `src/schedule/opt-step-specs.ts` declares
+  the four specs (Adam/Lion/SGD/SGD+momentum) as DATA — the single source the
+  schedule chokepoint + the differential read.
+- **Deleted (relocated + generalized).** From `adam-skeleton.ts`, ~285 authored
+  lines: `lowerAdamStepBody`, `emitDerivedBiasCorrection`,
+  `emitDerivedAdamScalarBody`, `loadAdamUniforms`, `DerivedBias`. Adam is now a thin
+  spec provider; `realizeAdamStepSpec` delegates to `lowerOptStepBody(ADAM_STEP_SPEC)`.
+- **Adam bit-exact (zero regression).** The generated Adam WGSL is BYTE-IDENTICAL
+  across all 5 variants (vec4×f16×unscale) — verified by diffing against HEAD (empty
+  diff). The fold of `oSub(p, SCALED)` is the same tile-IR as the prior
+  `p.sub(SCALED)`; the uniform block is unchanged (ln_beta1/ln_beta2 retained-but-dead
+  so `setAdamConfigUniforms` is untouched). No named lemma needed — it is the same
+  bytes.
+- **The seam is PROVEN ready for Lion/SGD.** New differential
+  `tools/opt-step-realizer-parity.ts`: it dispatches the realizer's FULL in-place
+  kernel (param/state writes, bc/lr scalar-DATA, both wd branches) for each spec and
+  checks against `evalOptTerm`. Results (V100 sivri): adamw(decoupled) 4.358e-7,
+  adam(L2) 4.444e-7, lion(decoupled) 5.96e-8, lion(wd=0) 5.96e-8, sgd_momentum(L2)
+  1.192e-7, sgd(L2) 5.96e-8, sgd(wd=0) 5.96e-8 — all ≤ the 1e-6 gate. (State inputs
+  are non-negative: Adam's `v` is a sum of squares, so `√(v/bc2)` is defined;
+  negative `v` is UB that diverges between the graph and tile-IR lowerings.)
+- **Gates, all green** (V100 sivri + in-suite): cpu optim+schedule 207/207;
+  optterm-fold-parity all programs (adamw 3.077e-7, sgd/sgd_momentum/lion ~1.2e-7,
+  muon refuses); opt-step-realizer-parity 7/7; test:gates 5/5;
+  parity-packed-vs-unpacked 4/4 (adam maxDiff=0, lion/sgd/muon PASS);
+  packed-optim-flatness FLAT; parity-fullstack-tl both arms 8.583e-6/30; 124M
+  regression PASS (round 0 bit-exact **9.8089**, {3:5.9223, 6:5.1529, 9:4.6398},
+  peak **4906.5 MB** EXACT to R4).
+
+## R5b / R5c — STOP-with-named-class: the variadic in-place buffer-lifetime backend
+
+**The live Lion/SGD FUSED dispatch + the executor de-naming are DEFERRED behind a
+named resisting class.** R5a delivered the realizer (the arithmetic seam) and proved
+it folds Lion/SGD correctly; what remains — routing Lion/SGD through a LIVE fused
+graph op and removing "adam" from the executor's vocabulary — is coupled to a single
+resisting site that the discipline (bit-exact-or-named-lemma + EXACT-A100 +
+serial-GPU, no risky forced totality) does not permit landing in this pass:
+
+**The named class — variadic in-place buffer-lifetime ownership.** Adam's live fused
+path is not just the kernel body (now derived); it is the per-param `adamStep` graph
+op + the executor's `adam-batch` batching + the backend `adamStepBatch`/
+`adamStepInner`/`dispatchAdamStep` chain, all of which HARD-CODE exactly three
+in-place `read_write` outputs (param, m, v) and transfer their buffer OWNERSHIP by
+name (`if (paramT.ownsBuffer) bufferPool.decRef(...)`, the aliasing-distinctness
+guard over param/m/v/grad, the multi-output `[1,2,3]` slot map). Generalizing this to
+per-optimizer state ARITY (Lion `[param,m]`, SGD+momentum `[param,v]`, SGD
+`[param]`) means generalizing per-arity in-place ownership transfer under the shared
+encoder — which is precisely the silent-UAF / pool-double-release class the ledger
+has repeatedly bled on (MEMORY.md: sequential-corruption persistence-UAF,
+pool-double-release, harvest-viewbase-leak). Landing it correctly REQUIRES the full
+A100 exit measurement (distil 8/5636.6, medium 19/16189.0 EXACT), which the
+serial-GPU + remote-A100 gate budget of this pass cannot re-run enough times to
+de-risk. So the honest floor is: land the realizer, prove the seam, name the class.
+
+**The de-naming is coupled to it and cannot be done alone.** The acceptance probe
+`grep -ri adam src/engine src/executor src/backend` currently returns 106 hits across
+~21 files. The functional core (the `adamStep` op string, the `adam-batch` action,
+`AdamStepConfig`/`adamStepBatch`, `IN_PLACE_DST_INPUTS.adamStep: [1,2,3]`, the
+`horizontalPackKey` `[4,5]` case, `NON_CSE_OPS`/`PAYLOAD_HASH_EXEMPT` adamStep) can
+only be re-keyed on STRUCTURE once the op is GENERIC — and making the op generic
+means renaming the op string + the backend op, which drags in the variadic backend
+above. R5b's structural re-keys are individually mechanical (`lowered-plan.ts:530`
+already documents the intended exit: "replace the switch with an op-metadata lookup
+of `sharedOperandInputIndices`"), but they have no green intermediate state without
+the backend generalization landing first.
+
+**The mechanical follow-on (de-risked by R5a).** The next pass executes, in one
+gated commit each:
+1. **Generic config + backend.** `OptStepConfig` (program name/ref + `stateSlots` +
+   `scalarInputs` + hypers + variant flags) replacing `AdamStepConfig`; `dispatchOptStep`
+   loops over `[param, ...states]` for the ownership transfer + aliasing guard
+   (`packed-dispatch.ts` is ALREADY generic — `buffers`/`gatherIndices` are variadic,
+   no change). Gate: Adam A100 8/5636.6 · 19/16189 EXACT + 124M bit-exact.
+2. **Generic op + node creation.** Rename `adamStep`→`optStep`, `adam-batch`→`opt-batch`;
+   `adam.ts`/`lion.ts`/`sgd.ts` create `optStep` nodes carrying their spec's program
+   descriptor (Lion/SGD stop routing through `packOptimizerClass`'s graph cat/narrow
+   and get the fused packed kernel). Re-key the executor sites on payload structure
+   (`IN_PLACE_DST_INPUTS`/multi-output = `[1..1+nState]`; `horizontalPackKey` shared
+   indices = the scalar-input slots). The `ADAM_STEP_SPEC`/`LION_STEP_SPEC`/`SGD_*`
+   specs in `opt-step-specs.ts` are the ready inputs. Gate: acceptance probe → 0
+   functional hits; lion-distil-descent 7.887→4.363; SGD/momentum oracle vs
+   torch.optim; parity-packed-vs-unpacked 4/4; A100 EXACT re-measured.
+3. **Deletion sweep (R5c).** `packOptimizerClass`'s per-param/graph-cat Lion/SGD
+   consumers (`lion.ts` `_stepPacked`/`_stepPerParam` graph chains, `sgd.ts` likewise)
+   collapse to the one spec + `optStep` node; the campaign net turns clearly negative.
+
+The `mm` refusal stays STRUCTURAL (the fold has no elementwise tile-IR target for a
+contraction — Muon's Newton-Schulz refuses at the fold seam by the type system), so
+no name-check is ever added for it.
