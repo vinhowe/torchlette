@@ -42,7 +42,6 @@ import {
   readbackMiss as obsReadbackMiss,
 } from "../executor/observed-liveness";
 import { buildMergedPlan, tagPlanOutputs } from "../executor/plan-builder";
-import { STEP_TAPE_RECORD, stRecordReadback } from "../core/step-tape";
 import { rewritePlan } from "../compiler/rewriter/plan-rewrite";
 import { doubleTransposeRule } from "../compiler/rewriter/rules/double-transpose";
 import { fuseMatmulSumRule } from "../compiler/rewriter/rules/fuse-matmul-sum";
@@ -1706,7 +1705,6 @@ export class RuntimeEngine {
   async cpu(a: Tensor): Promise<number[]> {
     await this.force(a);
     this._observeReadbackSeam(a);
-    if (STEP_TAPE_RECORD) stRecordReadback("read");
     if (this._readHook) return this._readHook(a.backendTensor);
     const backend = this.getBackend(a.device);
     return backend.ops.read(a.backendTensor);
@@ -1734,15 +1732,6 @@ export class RuntimeEngine {
   ): Promise<{ values: Float32Array; indices: Int32Array }> {
     await this.force(a);
     this._observeReadbackSeam(a);
-    // [step-tape 1b] readTopK dispatches backend-direct, OUTSIDE plan replay
-    // (§8.4 item 5) — it is its own tape entry, params included (−1 = full).
-    if (STEP_TAPE_RECORD) {
-      stRecordReadback("topk", {
-        k,
-        offset: opts?.offset ?? 0,
-        length: opts?.length ?? -1,
-      });
-    }
     const backend = this.getBackend(a.device);
     if (!this._readHook && backend.ops.readTopK) {
       return backend.ops.readTopK(a.backendTensor, k, opts);
@@ -1784,7 +1773,6 @@ export class RuntimeEngine {
   async startItemReadback(a: Tensor): Promise<() => Promise<number>> {
     await this.force(a);
     this._observeReadbackSeam(a);
-    if (STEP_TAPE_RECORD) stRecordReadback("item");
     if (this._readHook) {
       const hook = this._readHook;
       const bt = a.backendTensor;

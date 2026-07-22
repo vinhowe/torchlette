@@ -189,7 +189,7 @@ export class GradScaler {
       // cleanup that reclaims nothing, leaking every step's optimizer temporaries
       // (the foreach m/v-chain buffers) → OOM under a lowered recurring plan.
       // No pending boundary (explicit-ceremony loops) → markStep() as before.
-      if (!(await this.api.commitStepBoundaryIfPending(true))) {
+      if (!(await this.api.commitStepBoundaryIfPending())) {
         await this.api.markStep();
       }
       const val = await this._pendingInfBackend?.ops.readAndDestroyInfCount?.(

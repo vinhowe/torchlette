@@ -29,11 +29,6 @@
  */
 
 import { ENV } from "../core/env";
-import {
-  STEP_TAPE_RECORD,
-  stDeclareScalarSlots,
-  stRecordScalarWrite,
-} from "../core/step-tape";
 import type { Backend } from "../backend/types";
 import type { GPUBuffer, GPUDevice } from "../backend/webgpu/gpu-types";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
@@ -135,11 +130,6 @@ export function refreshScalarTable(
 
   // [step-tape 1b] declare the table's positions as value-level coverage
   // (guard 3): a scalar that varies step→step at one of these positions is a
-  // DECLARED slot — the table re-dresses it as data every execution. Scalars
-  // outside the table (or with the kill switch on, where this line is never
-  // reached) correctly stay undeclared and refuse the tape.
-  if (STEP_TAPE_RECORD) stDeclareScalarSlots(slots);
-
   let table = loweredPlan.scalarTable;
   if (!table || table.destroyed) {
     const buffers: GPUBuffer[] = [];
@@ -196,9 +186,6 @@ export function refreshScalarTable(
       scratch[0] = v;
       device.queue.writeBuffer(table.buffers[i], 0, scratch);
       table.values[i] = v;
-      if (STEP_TAPE_RECORD) {
-        stRecordScalarWrite(slots[i].nodeIndex, slots[i].inputIndex, v);
-      }
     }
     map.set(ref, table.storages[i]);
   }

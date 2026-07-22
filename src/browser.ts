@@ -53,6 +53,3 @@ export {
 } from "./runtime/tensor";
 
 // Step-tape observability (§6): guard-miss/hit counters for apps.
-export { stReplayStats } from "./executor/step-tape-replay";
-export { stStats } from "./core/step-tape";
-export { STEP_TAPE_RECORD, STEP_TAPE_REPLAY } from "./core/step-tape";

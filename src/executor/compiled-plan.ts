@@ -19,13 +19,6 @@ import type {
   GPUComputePipeline,
 } from "../backend/webgpu/gpu-types";
 import { ENV } from "../core/env";
-import {
-  STEP_TAPE_RECORD,
-  stInvalidateTemplate,
-  stMarkPlanCompiled,
-  stRecordUniform,
-  stRecordWrite,
-} from "../core/step-tape";
 
 // ============================================================================
 // Slot table
@@ -666,11 +659,6 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
   // Reclaim any previously-parked buffers whose readers have since died,
   // before parking more this pass.
   reclaimParkedLiveBuffers();
-  // [step-tape 1b] guard-4 stub: every compiled-plan invalidation path
-  // funnels through here — cascade to tapes referencing this template.
-  if (STEP_TAPE_RECORD && compiled.tapeFp !== undefined) {
-    stInvalidateTemplate(compiled.tapeFp);
-  }
   // Release the last replay's view-base retains (normally released at the next
   // harvest, which won't happen once the plan is gone). Safe no-op if the base
   // storages were already freed (monotonic ids, rcRelease returns -1).
@@ -886,10 +874,6 @@ export async function executeCompiledPlan(
   const slots: GPUBuffer[] = new Array(compiled.slots.length);
   /** Lazily evaluated once per replay: registry reset since build? */
   let plannerGenStale: boolean | undefined;
-
-  // [step-tape 1b] this plan executes via compiled replay — the step is
-  // tape-eligible (lowered executions have no TAG_WRITE/TAG_UNIFORM stream).
-  if (STEP_TAPE_RECORD) stMarkPlanCompiled();
 
   if (ENV.TORCHLETTE_DEBUG_COMPILED) {
     console.log(
@@ -1343,9 +1327,6 @@ export async function executeCompiledPlan(
               }
               noteVolatileWrite(sbuf);
               device.queue.writeBuffer(sbuf, 0, f32);
-              if (STEP_TAPE_RECORD) {
-                stRecordWrite(cmd.nodeIndex, writeNode, /* stable */ true);
-              }
               writeNode.result = createStorageHandle(
                 writeNode.device,
                 createTensor(
@@ -1374,9 +1355,6 @@ export async function executeCompiledPlan(
                   ? await resultOrPromise
                   : resultOrPromise;
               writeNode.result = createStorageHandle(writeNode.device, result);
-              if (STEP_TAPE_RECORD) {
-                stRecordWrite(cmd.nodeIndex, writeNode, /* stable */ false);
-              }
             }
           }
           slots[cmd.slot] = gpuBuffer(writeNode.result!.backendTensor);
@@ -1422,7 +1400,6 @@ export async function executeCompiledPlan(
           }
           noteVolatileWrite(slots[cmd.slot]);
           device.queue.writeBuffer(slots[cmd.slot], 0, packed);
-          if (STEP_TAPE_RECORD) stRecordUniform(cmd.nodeIndex, node);
           break;
         }
         case TAG_BARRIER: {

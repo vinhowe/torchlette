@@ -44,7 +44,6 @@
  * TORCHLETTE_STEP_TAPE (flag off ⇒ transparent pass-through).
  */
 
-import { STEP_TAPE_VERIFY_N } from "../core/step-tape";
 import type { Torchlette } from "./torchlette";
 import type { Tensor } from "./tensor";
 
@@ -259,13 +258,7 @@ export class CapturedFn {
     this.api._setCaptureTapeContext(appKey, []);
 
     const known = this.expectedUploads.get(appKey);
-    // TAPE_VERIFY=N (§2.4 guard 6, inherited): every Nth call runs the NORMAL
-    // path even when a skeleton is ready — the phase-1 executor seam then
-    // byte-compares the skeleton it WOULD have replayed against the fresh
-    // build (stCaptureCompiledStep's fp + command-stream diff). Shadow mode
-    // (N=1) verifies every captured step.
-    const doVerify =
-      STEP_TAPE_VERIFY_N > 0 && this.stats.calls % STEP_TAPE_VERIFY_N === 0;
+    const doVerify = false;
     const ready =
       !doVerify && known !== undefined && this.api._tapeReadyFor(appKey);
 

@@ -35,31 +35,9 @@ import {
   type AutocastContext,
   createAutocastContext,
 } from "../compiler/amp";
-import { currentEpoch } from "../core/epoch";
+import { WHOLE_STEP_TRACE } from "../core/env";
 import { sizeOf } from "../core/shape";
-import {
-  STEP_TAPE_RECORD,
-  STEP_TAPE_REPLAY,
-  WHOLE_STEP_TRACE,
-  stEndStep,
-  stNoteBoundary,
-  stStats,
-} from "../core/step-tape";
 import { observeStepBoundary } from "../executor/observed-liveness";
-import {
-  stDeclareArgNodes,
-  stDeclareOutputNodes,
-  stMarkBodyBegin,
-  stDropSkeleton,
-  stPromoteEligibleSkeleton,
-  stReplayStats,
-  stSetTapeContext,
-  stTapeReadyFor,
-  stTapeReplayValid,
-  stTryReplay,
-} from "../executor/step-tape-replay";
-import { getNextNodeId } from "../graph/node-factory";
-import type { LazyIRNode } from "../graph/types";
 import { storageTracker } from "../graph/storage-tracker";
 import {
   type EngineTensor,
@@ -296,9 +274,6 @@ export class Torchlette {
   setStepScopedCleanup(enabled: boolean): boolean {
     const prev = this._stepScopedCleanup;
     this._stepScopedCleanup = enabled;
-    if (STEP_TAPE_RECORD && prev !== enabled) {
-      stNoteBoundary("regime-toggle");
-    }
     if (prev && !enabled) {
       // Disarm: drop any implicit end-of-markStep snapshot so a later bare
       // markStep (back on historical semantics) doesn't consume it and
@@ -2070,13 +2045,11 @@ export class Torchlette {
    *  — work the next iteration already built lazily is untouched), fence,
    *  and snapshot persistents for the new step. Mirrors the explicit
    *  endStep(); markStep(); beginStep() sequence. */
-  private async _commitPendingStepBoundary(
-    finalizeRecorderStep = false,
-  ): Promise<void> {
+  private async _commitPendingStepBoundary(): Promise<void> {
     if (this._pendingStepBoundary === null) return;
     const gen = this._pendingStepBoundary;
     this._pendingStepBoundary = null;
-    await this._commitStepBoundaryGen(gen, finalizeRecorderStep);
+    await this._commitStepBoundaryGen(gen);
   }
 
   /**
@@ -2095,18 +2068,10 @@ export class Torchlette {
    * the pure-implied path uses (proven flat by test/implied-step-boundary), and
    * its forceAllPending + fence submit the pending writes exactly as markStep
    * did (so a following inf-flag readback stays valid).
-   *
-   * `finalizeRecorderStep` finalizes the step-tape recorder step (stEndStep +
-   * promote) exactly as markStep does — the caller that REPLACED a markStep
-   * (GradScaler.resolveDeferred) passes true so the recorder still delimits the
-   * step (else stepsObserved collapses to 1 and no tape forms). The default
-   * (false) matches backward()'s implied-boundary commit (stNoteBoundary).
    */
-  async commitStepBoundaryIfPending(
-    finalizeRecorderStep = false,
-  ): Promise<boolean> {
+  async commitStepBoundaryIfPending(): Promise<boolean> {
     if (this._pendingStepBoundary === null) return false;
-    await this._commitPendingStepBoundary(finalizeRecorderStep);
+    await this._commitPendingStepBoundary();
     return true;
   }
 
@@ -2118,10 +2083,7 @@ export class Torchlette {
    *  gen+1..gen+K are protected automatically — the sweep-safety the four
    *  historical loss-overlap failures lacked (they swept by wall-clock step,
    *  not gen). Shared by the implied-boundary commit and the ring's settle. */
-  private async _commitStepBoundaryGen(
-    gen: number,
-    finalizeRecorderStep = false,
-  ): Promise<void> {
+  private async _commitStepBoundaryGen(gen: number): Promise<void> {
     this.runtime.endStep();
     try {
       await awaitDeferredFence();
@@ -2161,24 +2123,6 @@ export class Torchlette {
     // must NOT be classified persistent or they'd never be cleaned up).
     storageTracker.snapshotForStep(gen);
     await this.runtime.beginStep();
-    if (STEP_TAPE_RECORD) {
-      if (finalizeRecorderStep) {
-        // [capture inc-3] The ring's settle is the training step DELIMITER
-        // (KEY FINDING: markStep is what finalizes a recorder step). A deferred
-        // gen-scoped commit must therefore finalize + promote exactly as a
-        // per-step markStep would, or the tape never forms under runahead.
-        stEndStep({
-          opSeq: getNextNodeId(),
-          epoch: currentEpoch(),
-          stepScopedCleanup: this._stepScopedCleanup,
-        });
-        if (STEP_TAPE_REPLAY) stPromoteEligibleSkeleton();
-      } else {
-        // [step-tape 1b] implied boundaries (training loops) are a different
-        // regime than the bare-markStep decode loop — reset the comparator.
-        stNoteBoundary("implied-boundary");
-      }
-    }
   }
 
   /**
@@ -2225,14 +2169,6 @@ export class Torchlette {
     this.runtime.resetCumulativeFusionStats();
     storageTracker.snapshotForStep(gen);
     await this.runtime.beginStep();
-    if (STEP_TAPE_RECORD) {
-      stEndStep({
-        opSeq: getNextNodeId(),
-        epoch: currentEpoch(),
-        stepScopedCleanup: this._stepScopedCleanup,
-      });
-      if (STEP_TAPE_REPLAY) stPromoteEligibleSkeleton();
-    }
     // PER-SETTLE FENCE ISOLATION (inc-3 blocker #2): flush the step's encoded
     // passes so the fence covers them, keep the SHARED single-slot fence issued
     // (non-ring consumers stay byte-identical; its deferredPendingRelease flag
@@ -2367,21 +2303,6 @@ export class Torchlette {
     if (this._stepScopedCleanup) {
       storageTracker.snapshotForStep();
     }
-
-    // [step-tape 1b] markStep IS the step delimiter: finalize the observed
-    // step record (guard-3 eligibility diff against the previous step) with
-    // the guard-1 op-sequence counter and guard-5 epoch/regime bookkeeping.
-    if (STEP_TAPE_RECORD) {
-      stEndStep({
-        opSeq: getNextNodeId(),
-        epoch: currentEpoch(),
-        stepScopedCleanup: this._stepScopedCleanup,
-      });
-      // [step-tape 1c] promote a captured skeleton if the just-ended step
-      // became eligible (two consecutive structurally-identical compiled
-      // steps under one appKey).
-      if (STEP_TAPE_REPLAY) stPromoteEligibleSkeleton();
-    }
   }
 
   /**
@@ -2410,56 +2331,26 @@ export class Torchlette {
   }
 
   // ==========================================================================
-  // Step-tape (phase 1c program-level replay) — docs/staged-execution-phase1.md
+  // Step-tape decode-replay — RETIRED (P4b-R). The tape recorder + replay were
+  // deleted after the decode census proved the default block path tape-neutral
+  // (byte-identical + same submits at tape on/off) and the host residue tape-
+  // free-correct. These methods survive as inert no-ops so `capture()` stays a
+  // transparent pass-through and no caller signature breaks.
   // ==========================================================================
 
-  /** Declare the app-level bucket key + scalar-slot values (α) for the
-   *  UPCOMING decode step. The appKey is the structural declaration (guards
-   *  1/2); scalarValues carry guard-3's value-level coverage. No-op unless
-   *  TORCHLETTE_STEP_TAPE=1. */
-  setTapeContext(appKey: string, scalarValues: number[] = []): void {
-    if (!STEP_TAPE_REPLAY) return;
-    stSetTapeContext(
-      appKey,
-      scalarValues,
-      currentEpoch(),
-      this._stepScopedCleanup,
-    );
+  /** RETIRED no-op (tape deleted). */
+  setTapeContext(_appKey: string, _scalarValues: number[] = []): void {}
+
+  /** RETIRED: no replayable skeleton exists (tape deleted). */
+  tapeReadyFor(_appKey: string): boolean {
+    return false;
   }
 
-  /** Whether a replayable skeleton exists for `appKey`. */
-  tapeReadyFor(appKey: string): boolean {
-    return STEP_TAPE_REPLAY && stTapeReadyFor(appKey);
-  }
-
-  /** Replay the current step's tape (all guards enforced inside). Returns the
-   *  logits tensor on a hit, or null on ANY guard miss (the caller then runs
-   *  the normal path, which re-records). `uploads` are the fresh per-token
-   *  payloads keyed by shape (unique per bucket). */
+  /** RETIRED: never a replay hit (tape deleted); callers run the normal path. */
   async tapeReplay(
-    uploads: Array<{ shape: number[]; values: Float32Array }>,
+    _uploads: Array<{ shape: number[]; values: Float32Array }>,
   ): Promise<Tensor[] | null> {
-    if (!STEP_TAPE_REPLAY) return null;
-    const backend = this.runtime.getBackend("webgpu");
-    const r = await stTryReplay(uploads, backend);
-    if (!r.hit || !r.outputs || r.outputs.length === 0) return null;
-    return r.outputs.map((o) => {
-      const rt = this.runtime.createFromStorageHandle(
-        o.resultHandle,
-        o.shape,
-        o.device,
-        o.dtype,
-      );
-      return this._wrap(rt);
-    });
-  }
-
-  /** Guard-miss observability (§6): merged recorder + replay counters. */
-  getStepTapeStats(): {
-    recorder: ReturnType<typeof stStats>;
-    replay: ReturnType<typeof stReplayStats>;
-  } {
-    return { recorder: stStats(), replay: stReplayStats() };
+    return null;
   }
 
   // ==========================================================================
@@ -2514,83 +2405,31 @@ export class Torchlette {
 
   // --- CapturedFn support seams (used only by src/frontend/capture.ts) ---
 
+  // --- CapturedFn tape seams — RETIRED (P4b-R): all inert no-ops. `_tapeActive`
+  // returns false, so CapturedFn always takes its transparent pass-through and
+  // these are never reached; they survive only to keep capture.ts's signatures.
+
   _tapeActive(): boolean {
-    return STEP_TAPE_REPLAY;
+    return false;
   }
 
-  _setCaptureTapeContext(appKey: string, scalars: number[]): void {
-    if (STEP_TAPE_REPLAY) {
-      stSetTapeContext(
-        appKey,
-        scalars,
-        currentEpoch(),
-        this._stepScopedCleanup,
-      );
-    }
+  _setCaptureTapeContext(_appKey: string, _scalars: number[]): void {}
+
+  _tapeReadyFor(_appKey: string): boolean {
+    return false;
   }
 
-  _tapeReadyFor(appKey: string): boolean {
-    // Validity-checked readiness: capture commits to a hit only if the skeleton
-    // AND its compiled plan are valid, so a post-commit replay decline (which
-    // would strand the captured fn's already-advanced in-place state) cannot
-    // happen in steady state.
-    return STEP_TAPE_REPLAY && stTapeReplayValid(appKey);
-  }
-
-  /** Replay the phase-1 skeleton for the active appKey with fresh uploads (from
-   *  the capture interceptor). Returns the logits tensor on a hit, null on a
-   *  guard miss. */
   async _captureReplay(
-    uploads: Array<{ shape: number[]; values: Float32Array }>,
+    _uploads: Array<{ shape: number[]; values: Float32Array }>,
   ): Promise<Tensor[] | null> {
-    return this.tapeReplay(uploads);
+    return null;
   }
 
-  /** [capture 2b surface 3] Declare the lazy NODES the traced body returned, so
-   *  a multi-plan skeleton harvests them on a hit. The producing node is found
-   *  by identity among the captured candidate plans at promotion. A node with
-   *  no pending producer (already materialized / a plain external) is dropped —
-   *  the skeleton then defaults to last-node-of-last-plan harvest. No-op unless
-   *  replay is active. */
-  _declareCaptureOutputs(results: Tensor[]): void {
-    if (!STEP_TAPE_REPLAY) return;
-    const nodes: LazyIRNode[] = [];
-    for (const t of results) {
-      const ref = (t._unwrap() as unknown as { lazyRef?: unknown }).lazyRef as
-        | { kind?: string; node?: LazyIRNode }
-        | undefined;
-      if (ref?.kind === "pending" && ref.node) nodes.push(ref.node);
-    }
-    stDeclareOutputNodes(nodes);
-  }
+  _declareCaptureOutputs(_results: Tensor[]): void {}
 
-  /** [capture 2b surface 4] Declare the captured-fn tensor ARG nodes (batch
-   *  x/y) so a training skeleton marks only THOSE upload slots warm (re-dressed
-   *  per replay) — internal constant uploads (zeroGrad's `zeros`) keep their
-   *  recorded payload. Args in call order; pending tensorFromArray args only
-   *  (persistent tensor args ride their stable buffers, not upload slots). */
-  _declareCaptureArgNodes(args: unknown[]): void {
-    if (!STEP_TAPE_REPLAY) return;
-    const nodes: LazyIRNode[] = [];
-    for (const a of args) {
-      const t = a as Tensor;
-      if (!t || typeof t !== "object" || !Array.isArray(t.shape)) continue;
-      const ref = (t._unwrap() as unknown as { lazyRef?: unknown }).lazyRef as
-        | { kind?: string; node?: LazyIRNode }
-        | undefined;
-      if (ref?.kind === "pending" && ref.node?.op === "tensorFromArray")
-        nodes.push(ref.node);
-    }
-    stDeclareArgNodes(nodes);
-  }
+  _declareCaptureArgNodes(_args: unknown[]): void {}
 
-  /** [capture 2b] The captured call's body is about to run (trace path):
-   *  candidates accumulated so far this step are driver-level PRE-BODY plans
-   *  (e.g. the scheduler's lr-tensor write forced at the step-opening
-   *  markStep) — never replayed; the driver re-executes them for real. */
-  _markCaptureBodyBegin(): void {
-    if (STEP_TAPE_REPLAY) stMarkBodyBegin();
-  }
+  _markCaptureBodyBegin(): void {}
 
   /** Install the capture interceptor for the duration of one captured call.
    *  Returns a restore fn. Not reentrant (captured calls never nest). */
@@ -2604,9 +2443,7 @@ export class Torchlette {
     };
   }
 
-  _invalidateCapture(appKey: string): void {
-    if (STEP_TAPE_REPLAY) stDropSkeleton(appKey);
-  }
+  _invalidateCapture(_appKey: string): void {}
 
   /** Fresh values of a captured call's TENSOR args that are caller-built
    *  PENDING tensorFromArray uploads (their values read synchronously from the
@@ -2674,15 +2511,10 @@ export class Torchlette {
     this._drainBoundaryDeferred();
     storageTracker.snapshotForStep();
     await this.runtime.beginStep();
-    // [step-tape 1b] explicit ceremony is a different boundary regime than
-    // the bare-markStep loop — reset the consecutive-step comparator
-    // (guard 5); tapes record the regime they were captured under.
-    if (STEP_TAPE_RECORD) stNoteBoundary("beginStep");
   }
 
   endStep(): void {
     this.runtime.endStep();
-    if (STEP_TAPE_RECORD) stNoteBoundary("endStep");
   }
 
   /**

@@ -23,3 +23,11 @@ export const ENV: Record<string, string | undefined> =
 // the supported way to configure flags in the browser.
 const g = globalThis as { __TORCHLETTE_ENV__?: Record<string, string> };
 if (g.__TORCHLETTE_ENV__) Object.assign(ENV, g.__TORCHLETTE_ENV__);
+
+/**
+ * Whole-step trace scope opt-out (the KEPT training-compiler flag; default on).
+ * Relocated here from the deleted step-tape module (P4b-R) — a module-load-time
+ * const so the hot-path check (`_enterWholeStep`) is one boolean test.
+ * SUNSET (per P4b): dies when the eager two-plan path is deleted.
+ */
+export const WHOLE_STEP_TRACE: boolean = ENV.TORCHLETTE_WHOLE_STEP !== "0";

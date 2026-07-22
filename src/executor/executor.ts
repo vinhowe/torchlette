@@ -155,13 +155,6 @@ const IN_PLACE_COMMIT_OPS: ReadonlySet<string> = new Set([
 
 import { crossPlanEdgeHasOtherConsumer } from "../core/cross-plan-edges";
 import {
-  STEP_TAPE_RECORD,
-  STEP_TAPE_REPLAY,
-  stBeginPlan,
-  stDeclareBatchCover,
-  stEndPlan,
-} from "../core/step-tape";
-import {
   assignNodeResult,
   executeOpSync,
   getInputStorage,
@@ -179,7 +172,6 @@ import {
   executeRowProgram,
 } from "./segment-executors";
 import { executePlanSequential } from "./sequential";
-import { stCaptureCompiledStep } from "./step-tape-replay";
 
 // ============================================================================
 // Optimized Execution Types
@@ -3052,14 +3044,6 @@ export async function executeLoweredPlan(
               });
             }
             if (items.length === 0) return;
-            // [step-tape 2b G-cover] declare the batch members' payload
-            // variance as carried by the representative's TAG_UNIFORM repack.
-            // The recorder additionally asserts member↔representative payload
-            // AGREEMENT per compared step, so a member whose config diverges
-            // (per-group hyperparams) refuses loudly instead of replaying the
-            // representative's config silently.
-            if (STEP_TAPE_RECORD)
-              stDeclareBatchCover(executedIdx, firstNodeIdx);
             const results = adamStepBatch(items);
             for (let i = 0; i < nodes.length; i++) {
               const r = results[i];
@@ -3946,57 +3930,18 @@ export async function executePlanOptimized(
     ? undefined
     : ((cachedTemplate ?? fusionAnalysisCache.get(fingerprint.primary))
         ?.bufferArena as BufferArena | undefined);
-  if (!STEP_TAPE_RECORD) {
-    const r = await executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
-      bufferArena,
-      templateFp: fingerprint.primary,
-      refuseCompileHazard: options.refuseCompileHazard,
-    });
-    // [observed-liveness] Tag any compiled plan built this call with its
-    // template fp so future replays stamp harvested results with their
-    // cross-plan identity. No-op unless build-from-IR is active.
-    if (loweredPlan.compiledPlan) {
-      loweredPlan.compiledPlan.templateFp = fingerprint.primary;
-    }
-    return r;
+  const r = await executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
+    bufferArena,
+    templateFp: fingerprint.primary,
+    refuseCompileHazard: options.refuseCompileHazard,
+  });
+  // [observed-liveness] Tag any compiled plan built this call with its
+  // template fp so future replays stamp harvested results with their
+  // cross-plan identity. No-op unless build-from-IR is active.
+  if (loweredPlan.compiledPlan) {
+    loweredPlan.compiledPlan.templateFp = fingerprint.primary;
   }
-  // [step-tape 1b] pure observation: record the plan execution (template id +
-  // payload/scalar image for the guard-3 diff), and stamp the template fp on
-  // the compiled plan so its invalidation cascades to tapes (guard 4).
-  // [step-object phase 6] surface the plan's islands partition-identity token
-  // (I1 boundaryHash — already the detector's, `:259`) so the step object's
-  // partition facet is a read-only projection (no second owner of membership).
-  stBeginPlan(
-    fingerprint.primary,
-    planNodes,
-    cachedTemplate?.partition?.boundaryHash ?? 0,
-  );
-  try {
-    const r = await executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
-      bufferArena,
-      templateFp: fingerprint.primary,
-      refuseCompileHazard: options.refuseCompileHazard,
-    });
-    if (loweredPlan.compiledPlan) {
-      loweredPlan.compiledPlan.tapeFp = fingerprint.primary;
-      loweredPlan.compiledPlan.templateFp = fingerprint.primary;
-    }
-    // [step-tape 1c] capture this NORMAL compiled step as a replay-skeleton
-    // candidate (promoted iff the recorder deems it eligible at markStep) and,
-    // under TAPE_VERIFY, cross-check the skeleton we would have replayed.
-    if (STEP_TAPE_REPLAY && loweredPlan.compiledPlan?.valid && bufferArena) {
-      stCaptureCompiledStep(
-        fingerprint.primary,
-        planNodes,
-        loweredPlan,
-        bufferArena as BufferArena,
-        loweredPlan.compiledPlan.commands,
-      );
-    }
-    return r;
-  } finally {
-    stEndPlan();
-  }
+  return r;
 }
 
 // ============================================================================

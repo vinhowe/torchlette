@@ -59,7 +59,6 @@ export { attnModifierKey } from "./backend/webgpu/attention-kernel";
 // The Step Object (task #98 phase 1): a whole step as first-class data — the
 // DERIVED union of the tape/skeleton facets (docs/step-object-design.md §2).
 export {
-  deriveStepObject,
   REFUSAL_GUARD,
   type StepDeclaration,
   type StepObject,
@@ -69,19 +68,10 @@ export {
   type StepSkeletonRef,
   type StepSlotDecl,
   stepObjectDigest,
-  stepObjectDigestMatchesBucket,
   stepPartitionDigest,
   stepPartitionReproducesPerPlan,
 } from "./core/step-object";
-export {
-  STEP_TAPE_RECORD,
-  STEP_TAPE_REPLAY,
-  stDeriveStepObject,
-  stDeriveStepObjects,
-  stStats,
-} from "./core/step-tape";
 // Step-tape observability (§6): guard-miss/hit counters for apps.
-export { stReplayStats } from "./executor/step-tape-replay";
 export {
   type DeviceKind,
   DisposedTensorError,

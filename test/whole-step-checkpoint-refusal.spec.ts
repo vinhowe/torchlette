@@ -25,7 +25,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { GPT2, type GPT2Config } from "../examples/gpt2/model";
 import { gpuMemoryTracker } from "../src/backend/webgpu/memory-tracker";
-import { WHOLE_STEP_TRACE } from "../src/core/step-tape";
+import { WHOLE_STEP_TRACE } from "../src/core/env";
 import {
   getCompileRefusalCount,
   resetCompileRefusalCount,

@@ -8,7 +8,6 @@ import type {
 } from "../backend/types";
 import { ENV } from "../core/env";
 import { sizeOf } from "../core/shape";
-import { STEP_TAPE_RECORD, stObserveWitnessRead } from "../core/step-tape";
 import {
   createStorageHandle,
   wrapResultAsStorage,
@@ -25,22 +24,6 @@ import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
 import { OP_REGISTRY } from "../ops/registry";
 import { isStepTapeReplayActive } from "./observed-liveness";
 import { lookupScalarStorage } from "./scalar-table";
-
-/**
- * [task #98 phase 4 — WITNESS-TIME HARVEST] Record a cross-plan read of a
- * STAMPED producer result. This is THE seam `observeConsumed` is blind to: a
- * read that resolves through `getInputStorage` (a LOWERED consumer, a
- * persistent-slot bind, a checkpoint-recompute backward read) never reaches the
- * compiled external-slot bind where `observeConsumed` fires. During a recording
- * step the step-tape recorder collects these reads so the WITNESSED harvest set
- * keeps them (the #97 unblock). Gated by STEP_TAPE_RECORD (a single module-load
- * boolean) so the flag-off cost is one branch; the stamp lookup only runs when
- * recording is active. */
-function noteWitnessRead(storage: StorageHandle): void {
-  if (!STEP_TAPE_RECORD) return;
-  const stamp = storage.stamp;
-  if (stamp) stObserveWitnessRead(stamp.fp, stamp.ni, stamp.oi);
-}
 
 /** One-shot flag for the reclaimed-storage-read warning. */
 let _warnedReclaimedRead = false;
@@ -211,7 +194,6 @@ export function getInputStorage(
         console.warn(msg);
       }
     }
-    noteWitnessRead(ref.storage);
     return ref.storage;
   }
   if (ref.kind === "scalar") {
@@ -246,7 +228,6 @@ export function getInputStorage(
         console.warn(msg);
       }
     }
-    noteWitnessRead(sh);
     return sh;
   }
   // [zero-residue fall-through] The producer's result is missing. In a
@@ -265,7 +246,6 @@ export function getInputStorage(
   if (ref.kind === "pending" && backend) {
     const recovered = recomputeMissingResult(ref.node, idx, backend, 0);
     if (recovered) {
-      noteWitnessRead(recovered);
       return recovered;
     }
   }

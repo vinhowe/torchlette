@@ -41,7 +41,9 @@
  * campaign; it adds NO env flag (§6 Phase 1 gate: "no new env flags").
  */
 
-import type { DynamicSlotSource, StepTape } from "./step-tape";
+/** Source class of a dynamic slot (inlined from the deleted step-tape module,
+ *  P4b-R): what per-step-varying value a declared slot delivers. */
+export type DynamicSlotSource = "tokenId" | "upload" | "payload" | "scalar";
 
 // ---------------------------------------------------------------------------
 // §2.3 — Guard semantics as TYPED REFUSALS.
@@ -256,26 +258,6 @@ export function stepObjectDigest(obj: StepObject): string {
   return `b:${structHash}:${fps}`;
 }
 
-/**
- * Pure-projection assertion (§3.1 agreement seam): the StepObject's digest MUST
- * equal the tape's own bucketKey byte-for-byte (the single-source invariant —
- * the object DERIVES its identity from the tape, it does not recompute an
- * independent one). Returns true iff they agree; a false is a reification bug
- * (the object and its source diverged), never a benign difference.
- *
- * NOTE the recorder's bucketKey uses the DEDUPED plan fps in its fp list
- * (`rec.plans.map(pl => hex(pl.fp))` — the plan sequence, which for the tape's
- * own construction is per-plan not deduped-by-template). The StepObject reifies
- * the witnessed phase's ORDERED fps (same list, same order) so the projection is
- * exact. See `deriveStepObject`.
- */
-export function stepObjectDigestMatchesBucket(
-  obj: StepObject,
-  tape: StepTape,
-): boolean {
-  return stepObjectDigest(obj) === tape.bucketKey;
-}
-
 // ---------------------------------------------------------------------------
 // §3.3 — The partition facet: step-level identity + the I1 agreement seam.
 // ---------------------------------------------------------------------------
@@ -332,99 +314,4 @@ export function stepPartitionReproducesPerPlan(
       return false;
   }
   return true;
-}
-
-// ---------------------------------------------------------------------------
-// Derivation (the single-source read-over).
-// ---------------------------------------------------------------------------
-
-/**
- * Project the `StepPartition` from the ordered plan fps + the per-plan islands
- * tokens the recorder captured (`tape.partitionHashes`, from the executor's
- * `PlanPartition.boundaryHash`). The two lists are aligned by plan order; if a
- * token list is missing/short (older tapes, or a plan with no reified partition),
- * the missing token is 0 — a sound null that the phase-6 null test still
- * reproduces (0 == 0). SINGLE SOURCE: no membership is computed here.
- */
-function derivePartition(
-  orderedFps: readonly number[],
-  partitionHashes: readonly number[],
-  device: string,
-): StepPartition {
-  const plans = orderedFps.map((fp, i) => ({
-    fp: fp >>> 0,
-    boundaryHash: (partitionHashes[i] ?? 0) >>> 0,
-  }));
-  return { plans, boundaryDigest: stepPartitionDigest(plans), device };
-}
-
-/**
- * DERIVE a StepObject from a witnessed `StepTape` (the recorder's stored tape)
- * plus the live receipt counters. This is the ONLY constructor — there is no
- * authored path (ruling 1: no second owner). Every field is read from the tape;
- * nothing is recomputed independently of it (the digest, when recomputed, MUST
- * equal `tape.bucketKey` — the pure-projection invariant).
- *
- * The tape's `bucketKey` is `b:<structHashHex>:<fp+fp+…>`. We split it back into
- * the (structHash, orderedFps) pair the StepObject's declaration + witnessed
- * phase carry — the exact inverse of `stEndStep`'s construction, so the
- * round-trip is byte-identical.
- */
-export function deriveStepObject(
-  tape: StepTape,
-  receipts: StepReceipts,
-  /** Device class the partition's legality is keyed to (§2.4 device key;
-   *  islands R2). Defaults to "webgpu" — the recorder only witnesses on the GPU
-   *  path; the field exists so a device change is a BucketMiss (phase-6 §2.4). */
-  device = "webgpu",
-): StepObject {
-  // Split the canonical bucketKey `b:<structHash>:<fps>` — the recorder's own
-  // construction (`step-tape.ts stEndStep`). The struct hash is the second
-  // colon-field; the fps are the remainder (may itself be empty).
-  const rest = tape.bucketKey.startsWith("b:")
-    ? tape.bucketKey.slice(2)
-    : tape.bucketKey;
-  const firstColon = rest.indexOf(":");
-  const structHash = firstColon >= 0 ? rest.slice(0, firstColon) : rest;
-  const fpsField = firstColon >= 0 ? rest.slice(firstColon + 1) : "";
-  const orderedFps =
-    fpsField.length > 0 ? fpsField.split("+").map((h) => parseInt(h, 16)) : [];
-
-  const slots: StepSlotDecl[] = tape.slots.map((s) => ({
-    id: s.id,
-    name: s.name,
-    shape: s.shape,
-    dtype: s.dtype,
-    source: s.source,
-  }));
-
-  const templateIds = [...tape.templateIds];
-
-  const declaration: StepDeclaration = {
-    boundaryStructHash: structHash,
-    slots,
-    // Partition reference: the per-plan boundaryHash projection is ALREADY mixed
-    // into each plan's fp (islands I1); the ordered fps ARE that projection's
-    // reference at step altitude. Phase 6 lifts it to a StepPartition (below).
-    partitionRef: orderedFps,
-    // The `partition` FACET (task #98 phase 6, ruling 4): a read-only view over
-    // the detector's per-plan islands tokens (`tape.partitionHashes`, recorded
-    // from `PlanPartition.boundaryHash`), ALIGNED with the ordered fps. Single
-    // source — the detector owns membership; this projects it per step.
-    partition: derivePartition(orderedFps, tape.partitionHashes ?? [], device),
-    ringRef: null,
-  };
-
-  const skeleton: StepSkeletonRef = {
-    orderedFps,
-    templateIds,
-  };
-
-  return {
-    declaration,
-    skeleton,
-    epoch: tape.epoch,
-    regime: { stepScopedCleanup: tape.regime.stepScopedCleanup },
-    receipts,
-  };
 }
