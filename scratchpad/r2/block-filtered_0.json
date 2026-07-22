@@ -1,0 +1,56 @@
+Creating Qwen3 model: {
+  vocabSize: 151936,
+  hiddenSize: 2048,
+  numLayers: 28,
+  numHeads: 16,
+  numKVHeads: 8,
+  headDim: 128,
+  intermediateSize: 6144,
+  ropeTheta: 1000000,
+  rmsNormEps: 0.000001,
+  maxSeqLen: 256,
+  weightDtype: 'f32'
+}
+Loaded 310 weight tensors from 2 shard(s)
+{
+  "arm": "block-filtered",
+  "STEP_TAPE_RECORD": false,
+  "promptIds": [
+    785,
+    6722,
+    315,
+    9625,
+    374
+  ],
+  "firstAndDecoded": [
+    11,
+    323,
+    279,
+    3146,
+    315,
+    9625,
+    374,
+    304,
+    4505,
+    13,
+    576,
+    6722,
+    315,
+    9856,
+    374,
+    19846,
+    11,
+    323,
+    279,
+    3146,
+    315,
+    9856,
+    374,
+    304
+  ],
+  "submits": 145,
+  "wallMs": 5842,
+  "producers": 0,
+  "convergedTemplates": 0,
+  "uncapturedGpuErrors": 0
+}

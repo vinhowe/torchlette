@@ -10,7 +10,6 @@
  */
 
 import type { DType } from "../backend/types";
-import { TAPE_PROFILE, tpAdd } from "../core/tape-profile";
 import { isViewOp } from "../executor/lowered-plan";
 import type { LazyIRNode, LazyRef } from "../graph/types";
 
@@ -52,14 +51,7 @@ export function runPasses(
 ): Map<string, number> {
   const stats = new Map<string, number>();
   for (const pass of passes) {
-    // [tape-1a] per-pass timing (src/core/tape-profile.ts; sunset: 1c).
-    if (TAPE_PROFILE) {
-      const t0 = performance.now();
-      stats.set(pass.name, pass.run(ctx, bypassed));
-      tpAdd(`pass:${pass.name}`, performance.now() - t0);
-    } else {
-      stats.set(pass.name, pass.run(ctx, bypassed));
-    }
+    stats.set(pass.name, pass.run(ctx, bypassed));
   }
   return stats;
 }
