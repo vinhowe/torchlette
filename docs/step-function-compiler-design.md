@@ -1314,6 +1314,163 @@ not a deletion gate). No REAL failure introduced. No `src/` deletion means the h
 deletion-differential matrix (the `t-d3-remat` / 124M / witness-harvest cells) has nothing
 new to guard beyond the standing green baseline.
 
+### P4b-R status — THE RE-AUDIT: the premise changed; the DEFAULT decode path is now tape-INDEPENDENT (2026-07-22)
+
+*Re-audit against the P4b STOP, prompted by the NEW FACT the P4b stamp predates: the
+unrolled-K BLOCK became the demos' default decode path for greedy + gumbel +
+top-k/top-p (`unrolled-k-decode-design.md` SAMPLER STATUS, 2026-07-21). P4b measured
+the OLD default (the `api.capture` per-token host loop) and correctly found it
+tape-live. This pass re-runs the census over TODAY's default. Measured on sivri
+(V100-SXM3-32GB, the correctness box), node v22 + Dawn/Vulkan vk-shim, device via
+`tools/pick-gpu.sh`, random-init Qwen3 2L/64d, N=40 decode. Probe:
+`tools/t-p4b-r-census.ts` (three arms × STEP_TAPE∈{0,1}); presence control
+`tools/t-p4b-decode-edges.ts` unchanged.*
+
+**THE MEASURED CENSUS.**
+
+| arm | STEP_TAPE | submits | crossPlanEdge.producers | convergedTemplates | tokens vs =0 |
+|---|---|---|---|---|---|
+| block-greedy (DEFAULT) | 0 | 33 | **0** | 2 | — |
+| block-greedy (DEFAULT) | 1 | 33 | **1** | 2 | **byte-identical** |
+| block-filtered top-k+top-p (DEMO sampler) | 0 | 38 | **0** | 2 | — |
+| block-filtered top-k+top-p (DEMO sampler) | 1 | 38 | **1** | 2 | **byte-identical** |
+| host-loop residue (`api.capture`) | 0 | 83 | 0 | 1 | — |
+| host-loop residue (`api.capture`) | 1 | 120 | 0 | 1 | — |
+| orig P4b seam (scatterAdd residue) | 1 | — | **1** | 1 | (presence proof reproduced) |
+
+**THE STRUCTURAL FACT the census proves.** The block path calls `decodeBlock`
+DIRECTLY — it NEVER routes through `api.capture` (generate.ts: `blockK>=2` branch vs
+the `else` capture branch). So the two decode-side subsystems split cleanly:
+
+1. **`observed-liveness.ts` (807) is TAPE-INDEPENDENT and DECODE-LIVE — STOP, unchanged
+   from P4b.** `convergedTemplates=2` on the block at STEP_TAPE **both 0 AND 1**: it is
+   the executor's per-plan harvest (`stampResult`/`observeConsumed` run UNCONDITIONALLY
+   in `compiled-plan.ts` replay, not STEP_TAPE-gated), the machinery that makes ANY
+   build-from-IR compiled replay — training OR decode — work. The block compiles via
+   build-from-IR, which uses the SAME harvest. The §5 "whole-step subsumes the harvest"
+   premise still does not reach decode. **STOP stands, now doubly confirmed (tape-off
+   AND tape-on).**
+
+2. **The TAPE subsystem (`step-tape.ts` 820 / `step-tape-replay.ts` 680 /
+   `cross-plan-edges.ts` 152 / `step-object.ts` 156 / `tape-profile.ts` 18 = ~1826) is
+   NO LONGER a structural consumer of the DEFAULT decode path.** The block (greedy AND
+   filtered) is **byte-identical with identical submit counts** at STEP_TAPE=0 vs =1.
+   The tape provides the block ZERO functional and ZERO performance value. The lone
+   difference — `producers` 0→1 — is a pure SIDE-EFFECT of the demos' vestigial
+   `STEP_TAPE=1` flag: the witness recorder is woven into the executor
+   (`op-dispatch.ts:42 stObserveWitnessRead`) and populates the cross-plan-edge store on
+   any plan when `STEP_TAPE_RECORD` is set, feeding ONLY the `executor.ts:2290` UAF
+   guard — a guard whose entire reason to exist is the edges the recording itself just
+   created (self-referential; at STEP_TAPE=0 there are no edges, no guard, zero
+   uncaptured GPU errors, byte-identical output).
+
+**WHY P4b's tape-live finding was RIGHT THEN and is STALE NOW.** P4b's presence proof
+(`producers=1`) is REPRODUCED here (the scatterAdd `api.capture` seam still gives
+`producers=1`). Nothing about the tape machinery changed. What changed is the DEFAULT
+decode path: at P4b it was the per-token `api.capture` loop (genuinely tape-replay-
+accelerated); today the demos default to the block (`decodeBlock`, tape-independent).
+The `producers=1` P4b booked as "decode is tape-live" is now produced ONLY by the
+vestigial `STEP_TAPE=1` the demos still set — a flag that was load-bearing for the
+per-token replay default and is dead weight for the block.
+
+**THE RESIDUE — none of it structurally needs the tape (crux, task item 2).** The host
+per-token loop survives only as (i) the `UNROLLED_K=0/1` opt-out, (ii) non-static-KV,
+(iii) full-vocab top-p-WITHOUT-top-k. Rulings:
+- **(i) opt-out host loop → DEMOTABLE, correct-and-slow, tape-free.** `api.capture` is a
+  transparent pass-through when the tape is off (`torchlette.ts:2397`); the host loop is
+  then the plain per-plan-compiled per-token loop (itself build-from-IR + observed-
+  liveness, NOT the tape). Correctness never depended on the tape — the tape is optional
+  REPLAY acceleration, and on this measurement it LOSES (STEP_TAPE=1: 120 submits vs =0:
+  83 — the record/guard overhead exceeds any replay win on a warm short run).
+- **(ii) non-static-KV → NOT A REAL CONSUMER.** `generateChat` (qwen3 + gemma2) always
+  passes `staticKV`; there is no shipped non-static decode path.
+- **(iii) full-vocab top-p-without-top-k → the capability ITSELF is unexercised.** BOTH
+  shipped demos bound with a top-k (qwen3 `topK:20 topP:0.95`; gemma2 `topK:40
+  topP:0.95`) → both route through the on-device BLOCK filtered sampler. Nothing routes
+  through the full-vocab-CDF residue.
+- **Net: the shipped demos NEVER hit the host loop by default; and when hit (opt-out /
+  test reference) it is tape-free-correct. No decode path — default or residue —
+  structurally needs the tape.**
+
+**THE MOTHER-GATE RULING (task item 3) — the methodology does NOT need the tape.** The
+block-vs-host differentials (`t-uk-block-diff`, `t-uk-topk-sampler`, `t-uk-gumbel-parity`)
+run the host per-token loop as the reference WITH THE TAPE OFF (grep: no `t-uk-*` gate
+sets `STEP_TAPE` except `t-uk-economics`, a measurement). The differential needs the host
+LOOP, not the step-TAPE; deleting `step-tape*.ts` leaves the host loop intact as the
+plain per-token reference (`api.capture` → pass-through). The P2-donation "an off-arm
+that is a correctness differential is not expired" concern is SATISFIED and RE-ANCHORED:
+`t-uk-block-diff`'s compiled arm already diffs build-from-IR ENABLED vs DISABLED (both ==
+host) — a lowered-block vs compiled-block differential that survives tape deletion.
+
+**VERDICT TABLE (per §5 ledger item, consumer measured TODAY).**
+
+| Ledger item | §5 SLOC | Consumer TODAY (measured) | Class |
+|---|---|---|---|
+| `observed-liveness.ts` | 807 | executor harvest; block `convergedTemplates=2` at tape 0 AND 1 (tape-independent) | **keeps-refusal (STOP)** |
+| `step-tape.ts` | 820 | no structural consumer; block byte-identical + same submits at tape-off; residue tape-free-correct | **deletable-after-named-demotion** |
+| `step-tape-replay.ts` | 680 | replay engaged only by the captured host loop; demos default to block | **deletable-after-named-demotion** |
+| `cross-plan-edges.ts` | 152 | `producers=1` on block ONLY via vestigial demo `STEP_TAPE=1`; =0 flag-off, byte-neutral | **deletable-after-named-demotion** |
+| `tape-profile.ts` | 18 | default-off telemetry woven into 4 hot sites | **deletable-after-named-demotion** |
+| `step-object.ts` | 156 | tape read-projection + `StepEditChannel` (training-side island editor, `index.ts`-exported) | **deletable-after-demotion for the decode half; the `step-edit-channel` consumer must be co-retired (a TRAINING concern, not decode)** |
+
+**HONEST EXECUTABLE-SLOC TOTAL.** Deletable-after-named-demotion (the tape subsystem):
+`step-tape` 820 + `step-tape-replay` 680 + `cross-plan-edges` 152 + `tape-profile` 18 =
+**1670 outright**, + `step-object` 156 gated on co-retiring `step-edit-channel` = up to
+**1826**, + a PORTION of the witness-stamp partial seams in `executor.ts`/
+`compiled-plan.ts` (the `stObserveWitnessRead`/`publishCrossPlanEdges` side falls;
+`observeConsumed`/harvest STAYS with observed-liveness). `observed-liveness.ts` (807) and
+its ~228-SLOC cross-plan-release sub-part STAY (STOP — decode-live + two-plan-eager).
+**Campaign net after this deletion: current +271 vs pre-Everest → roughly −1400…−1550 —
+NET-NEGATIVE, the covenant becomes reachable** (unlike P4b's honest 0-executable STOP).
+
+**WHY RE-OPENING IS LAWFUL (the P4b PERMANENT-POLICY stamp).** The PERMANENT-POLICY
+stamp (b66ead78) governs `CHECKPOINT_EAGER_REFUSAL` + the eager two-plan path — a
+TRAINING silent-corruption hazard — and is UNTOUCHED here. The TAPE deletion was a
+different verdict: P4b STOPPED it as "decode-live," and the RULE it cited is explicitly
+re-openable ("a STOP on a live consumer is honorable; re-open when the consumer is
+absent"). `unrolled-k-decode-design.md`'s P5 checklist DECLARES this exact re-open path
+(remove the consumer FIRST via the cutover, then re-prove absence per-item). This
+re-audit IS that P5 absence re-proof, and it finds the DEFAULT path's consumer absent
+(`producers=0` at tape-off, byte-identical) and the residue tape-free + demo-unexercised.
+The premise the STOP rested on ("decode runs on the tape") was TRUE then and is FALSE now.
+
+**WHAT VIN MUST APPROVE before any deletion executes (nothing deleted in this pass).**
+1. **Re-opening the tape deletion** — the P4b STOP was decode-liveness (re-openable), not
+   the permanent-policy training refusal; lawful to re-open, but deleting ~1800 SLOC of
+   shipped infrastructure is Vin's call.
+2. **Flipping/deleting the demos' `tape-flag.ts`** (`STEP_TAPE=1` → off) — a shipped-
+   config change; MEASURED safe (block byte-identical + same submits + zero GPU errors at
+   tape-off).
+3. **The decode-α gate on a WEIGHTED model** (real qwen3/gemma weights: tape-replay vs
+   plain per-token/per-block tok/s) — the ONE gate this pass could not run (needs the
+   weights, unavailable on this box). The random-init proxy shows the tape adds NO decode
+   value (block irrelevant; host residue LOSES) — but the honest weighted confirmation P4b
+   named remains the entry gate.
+4. **Accepting the residue host loop as correct-and-slow** (tape-free) — it loses its
+   measured-negative replay acceleration; and **co-retiring `step-edit-channel`** (or
+   keeping `step-object.ts` for it) as a separate training-side decision.
+
+**RECOMMENDED DELETION PLAN (future pass, gated on the above approvals).**
+- **Phase R1 — demote the consumer.** Flip `examples/*/tape-flag.ts` to NOT set
+  `STEP_TAPE=1`; re-run `t-p4b-r-census.ts` (expect `producers=0` on the block, already
+  measured) + the browser suite (byte-identical by the tape-off pass-through).
+- **Phase R2 — the weighted decode-α gate.** Tape-replay vs plain per-plan/-block tok/s on
+  real weights; deletion proceeds only if the tape shows no decode win (or the residue is
+  accepted as correct-and-slow).
+- **Phase R3 — per-item deletion, each behind a green parity gate**, in dependency order:
+  `tape-profile.ts` → `cross-plan-edges.ts` → `step-tape-replay.ts` → `step-tape.ts`,
+  then the witness-stamp partial seams; `step-object.ts` only after `step-edit-channel`
+  is co-retired. `observed-liveness.ts` + the two-plan-eager path + `CHECKPOINT_EAGER_
+  REFUSAL` (PERMANENT POLICY, training) are NOT touched.
+- **Gates throughout:** `npm run test:gates` 5/5, `t-uk-block-diff` + `t-uk-topk-sampler`
+  byte-identical (host reference tape-free), `parity-fullstack-tl` both arms, the browser
+  suite, strict-lifetime default, zero uncaptured GPU errors.
+
+*This is a re-opened, deletable verdict — the opposite of P4b's re-confirmed STOP —
+because the load-bearing premise (the default decode path is a tape consumer) is now
+MEASURED false. Nothing is deleted in this pass; the deletion awaits Vin's approval and
+the weighted decode-α gate.*
+
 ### Risks (honest)
 
 - **Plan-builder scale** (P0). Bounded, named, amortized once-per-compile — but the
