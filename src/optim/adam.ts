@@ -101,8 +101,8 @@ export class Adam {
    * by construction). Precision blocker CLEARED: host-vs-GPU bc agrees to ≤1 ULP
    * (the exp intrinsic's divergence is absorbed by bc=1−exp(y) → saturates to 1
    * in the deep tail); propagated Δparam ≤5.96e-8, Δm=Δv bit-exact. Lazily
-   * created (device known on first step). Only allocated when
-   * TORCHLETTE_DERIVED_ADAM is on.
+   * created on first step (device known then); the sole bias-correction path
+   * since R4 (the authored `t`-slot body + the flag are deleted).
    */
   private _bcLive: LiveScalar | null = null;
   /** HOST mirror of the shared on-device step counter `t`, advanced in lockstep
@@ -450,39 +450,32 @@ export class Adam {
   private _stepFused(runtime: ReturnType<Torchlette["_runtime"]>): Tensor[] {
     const updated: Tensor[] = [];
 
-    // inc-2a: advance the SHARED on-device step counter ONCE per step, before
-    // the param loop, so every param's adamStep node reads the post-increment
-    // `t` (the kernel derives bias correction from it). t is advanced in-plan.
+    // inc-2a: advance the SHARED step counter (device `_t` + host `_tHost`) ONCE
+    // per step, before the param loop. `_advanceT` keeps `_tHost` in lockstep;
+    // fork C computes bias correction from `_tHost` (host-side).
     this._advanceT(runtime);
-    const tRt = this._tTensor();
 
-    // R3/fork-C: when the DERIVED body is selected, bias correction rides into
-    // the kernel as a [2] `bc`=[bc1,bc2] DATA input at the `t` slot, delivered as
-    // a HOST-computed LIVE SCALAR (the `lr` primitive). It is computed on the
-    // HOST from `_tHost` (`_bcHost`) and written into the persistent [2] buffer
-    // via the in-plan graph-ordered scatter — ZERO expm1 graph nodes (fork B's
-    // ~18-node prelude gone). The buffer is SHARED by every param's node (like
-    // `t`/`lr`), so the adam-batch grouping key (shared input[4] identity) still
-    // packs the group; the scatter re-executes under compiled replay from the
-    // re-noted host value (scalar-slots re-dress), exactly the `lr` discipline.
-    // R3 FLIP (2026-07-22): fork C is the DEFAULT. Opt out with
-    // TORCHLETTE_DERIVED_ADAM=0 (sunset at R4, when the authored body is deleted).
-    const derived = ENV.TORCHLETTE_DERIVED_ADAM !== "0";
-    let biasRt = tRt;
-    if (derived) {
-      if (!this._bcLive) {
-        // Seed the persistent [2] buffer; `.set()` below records the in-plan
-        // scatter EVERY step (bc changes each step, so — unlike a constant lr —
-        // the scatter must be in the recorded template for the replay re-dress).
-        this._bcLive = new LiveScalar(
-          this.api,
-          [0, 0],
-          this.device as "cpu" | "webgpu",
-        );
-      }
-      this._bcLive.set(this._bcHost());
-      biasRt = this._bcLive.tensor._unwrap();
+    // R4/fork-C: bias correction rides into the kernel as a [2] `bc`=[bc1,bc2]
+    // DATA input at the `bc` slot, delivered as a HOST-computed LIVE SCALAR (the
+    // `lr` primitive). It is computed on the HOST from `_tHost` (`_bcHost`) and
+    // written into the persistent [2] buffer via the in-plan graph-ordered
+    // scatter — ZERO expm1 graph nodes. The buffer is SHARED by every param's
+    // node (like `lr`), so the adam-batch grouping key (shared input[4] identity)
+    // still packs the group; the scatter re-executes under compiled replay from
+    // the re-noted host value (scalar-slots re-dress), exactly the `lr`
+    // discipline. This is the sole path since R4 (authored `t`-slot body deleted).
+    if (!this._bcLive) {
+      // Seed the persistent [2] buffer; `.set()` below records the in-plan
+      // scatter EVERY step (bc changes each step, so — unlike a constant lr —
+      // the scatter must be in the recorded template for the replay re-dress).
+      this._bcLive = new LiveScalar(
+        this.api,
+        [0, 0],
+        this.device as "cpu" | "webgpu",
+      );
     }
+    this._bcLive.set(this._bcHost());
+    const biasRt = this._bcLive.tensor._unwrap();
 
     for (let i = 0; i < this.params.length; i++) {
       const param = this.params[i];
@@ -561,7 +554,7 @@ export class Adam {
     }
 
     // Persist t/lr (lazily materialize mid-step; same rationale as m/v).
-    runtime.registerState(tRt);
+    runtime.registerState(this._tTensor());
     for (const s of this._lrLive)
       if (s) runtime.registerState(s.tensor._unwrap());
     // Persist the derived-path bc live buffer (same lazy-mid-step adoption

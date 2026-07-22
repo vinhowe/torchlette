@@ -569,6 +569,35 @@ fork B tripped on is dodged by construction.
 (vector re-dress), `core/live-scalar.ts` (f32[n]). Adam: `_bcHost` + `_tHost` +
 `_bcLive`, minus `_biasCorrectionPacked`/`_lnBetas`/`_bc`.
 
+### R4 — the deletion (LANDED 2026-07-22)
+
+The authored per-element arithmetic is DELETED — it was the differential oracle for its
+own re-derivation, retired once fork C became the proven default. Deleted from
+`src/schedule/adam-skeleton.ts`: `emitAdamScalarBody`, `emitBiasCorrection`, `emitExpm1`
+(the authored per-element + expm1 bias-correction WGSL), and the dead `adamUpdateBody`
+(exported, no consumer). Collapsed to derived-only: `lowerAdamStepBody` (always binds
+`bc`, always `emitDerivedBiasCorrection`/`emitDerivedAdamScalarBody`), `realizeAdamStepSpec`,
+`generateAdamShaderTileIR` (the `derived` param + branches gone). The
+`TORCHLETTE_DERIVED_ADAM` flag is DELETED (all four reads; envFlags −1). `deriveAdamSkeleton`'s
+refusalReason flips authored→derived (the body is now a theorem of `ADAMW_PROGRAM`); the
+skeleton stays an opaque dispatch wrapper (F3) — `assertAuthoredSeam` is shared with
+attention-skeleton and unchanged.
+
+**Surviving guards** (the deleted authored body was the oracle): the fold-parity
+differential `tools/optterm-fold-parity.ts` (fold == `evalOptTerm` program interpreter;
+adamw 3.077e-7) + `test/schedule/optterm-fold.spec.ts` (catalog). Retargeted: the byte-
+differential `test/schedule/adam-differential.spec.ts` now proves the two entry points
+(schedule chokepoint vs direct generation) agree on the DERIVED body (single-source);
+`test/schedule/derived-adam.spec.ts` asserts the derived kernel's standing structure
+(binds `bc`, no in-kernel expm1). Deleted `tools/derived-adam-parity.ts` (its derived==
+authored oracle is gone). `deriveHorizontalPackedAdam` (the pack derivation) survives —
+separate capability, live spec consumer.
+
+**Gates (R4, derived is the sole path):** cpu optim+schedule 207/207; `test:gates` 5/5;
+`optterm-fold-parity` all programs pass; `parity-fullstack-tl` both arms agree ≤1e-6/30;
+`parity-packed-vs-unpacked` adam maxDiff=0; 124M regression PASS (round 0 bit-exact
+9.8089, flat memory 4906.5 MB). The opt-out `TORCHLETTE_DERIVED_ADAM=0` no longer exists.
+
 **A100 exit gate (dw-2-1, @512, NUM_STEPS=18, authored vs fork-C-derived, same run):**
 
 | model | submits (auth→derived) | peak MB (auth→derived) | verdict |

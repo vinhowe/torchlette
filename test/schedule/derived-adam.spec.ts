@@ -1,19 +1,18 @@
 /**
- * R2 structural gate — the DERIVED fused Adam body (fork B), compile-only (cpu).
+ * Structural gate — the DERIVED fused Adam body (fork C, the SOLE path since R4),
+ * compile-only (cpu). The numeric derived==program differential is the fold-parity
+ * (`tools/optterm-fold-parity.ts`); this cpu gate pins the STRUCTURE the derived
+ * kernel commits to:
  *
- * The numeric derived==authored differential is the GPU tool
- * `tools/derived-adam-parity.ts` (Δparam ≤ ~3e-8, Δm=Δv bit-exact; the two named
- * reassociation lemmas). This cpu gate pins the STRUCTURE fork B commits to:
+ *   (a) the kernel binds a `bc` DATA input (bias correction is DATA, a [2]
+ *       host-computed live scalar) — never a `t` step-counter binding;
+ *   (b) NO in-kernel `expm1` bias-correction prelude — the derived WGSL carries
+ *       none of the Horner-series constants the deleted authored body emitted;
+ *   (c) grad/param/m/v/lr are bound as usual;
  *
- *   (a) the derived kernel binds a `bc` DATA input at the `t` slot (bias
- *       correction is DATA, computed graph-side) — the authored `t` binding is
- *       GONE from the derived body;
- *   (b) the in-kernel `expm1` bias-correction prelude DIES — the derived WGSL
- *       carries none of the Horner-series constants the authored body emits;
- *   (c) the derived body is STRICTLY SMALLER than the authored one (the deleted
- *       prelude + the un-reassociated magnitude);
- *
- * across the full 5-variant corpus (useVec4 × emitF16 × emitUnscale).
+ * across the full 5-variant corpus (useVec4 × emitF16 × emitUnscale). R4
+ * (2026-07-22): the authored body is deleted, so there is nothing to compare
+ * against — this asserts the derived body's standing invariants directly.
  */
 
 import { describe, expect, it } from "vitest";
@@ -35,36 +34,26 @@ const variants: Variant[] = [
 const bindingsOf = (wgsl: string): string[] =>
   [...wgsl.matchAll(/var<storage[^;]*> (\w+)/g)].map((m) => m[1]);
 
-// The 1/120 = 0.0083333 leading Horner coefficient the authored expm1 emits —
-// a distinctive marker of the in-kernel bias-correction prelude.
+// The 1/120 = 0.0083333 leading Horner coefficient the deleted authored expm1
+// prelude emitted — its absence proves bias correction is DATA, not in-kernel.
 const EXPM1_MARKER = "0.00833";
 
-describe("R2 derived fused Adam — structural contract (fork B)", () => {
+describe("derived fused Adam — structural contract (fork C, sole path)", () => {
   for (const v of variants) {
     const key = `${v.useVec4}:${v.emitF16}:${v.emitUnscale}`;
-    it(`[${key}] derived binds bc (not t); authored binds t`, () => {
-      const auth = generateAdamShaderTileIR(v.useVec4, v.emitF16, v.emitUnscale, false);
-      const der = generateAdamShaderTileIR(v.useVec4, v.emitF16, v.emitUnscale, true);
-      const ab = bindingsOf(auth);
+    it(`[${key}] binds bc (not t); grad/param/m/v/lr present`, () => {
+      const der = generateAdamShaderTileIR(v.useVec4, v.emitF16, v.emitUnscale);
       const db = bindingsOf(der);
-      expect(ab).toContain("t");
-      expect(ab).not.toContain("bc");
       expect(db).toContain("bc");
       expect(db).not.toContain("t");
-      // grad/param/m/v/lr are unchanged across both.
       for (const shared of ["grad", "param", "m", "v", "lr"]) {
-        expect(ab).toContain(shared);
         expect(db).toContain(shared);
       }
     });
 
-    it(`[${key}] derived kills the in-kernel expm1 prelude`, () => {
-      const auth = generateAdamShaderTileIR(v.useVec4, v.emitF16, v.emitUnscale, false);
-      const der = generateAdamShaderTileIR(v.useVec4, v.emitF16, v.emitUnscale, true);
-      expect(auth).toContain(EXPM1_MARKER);
+    it(`[${key}] carries no in-kernel expm1 prelude (bias correction is DATA)`, () => {
+      const der = generateAdamShaderTileIR(v.useVec4, v.emitF16, v.emitUnscale);
       expect(der).not.toContain(EXPM1_MARKER);
-      // The derived body is strictly smaller (prelude gone).
-      expect(der.length).toBeLessThan(auth.length);
     });
   }
 });

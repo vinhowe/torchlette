@@ -10,12 +10,7 @@
  */
 
 import { realizeAdamStepSpec } from "../../schedule/adam-skeleton";
-import { ENV } from "../../core/env";
 import type { AdamStepConfig } from "../types";
-
-/** R2/fork-B: whether the fused Adam body is DERIVED from ADAMW_PROGRAM (binds a
- *  `[2]` `bc` DATA input at the `t` slot). Gated OFF by default. */
-const derivedAdam = (): boolean => ENV.TORCHLETTE_DERIVED_ADAM !== "0"; // R3 FLIP: fork C default
 import { allocateOutputBuffer } from "./buffer-arena";
 import { computeFlatChunkLayout } from "./chunked-dispatch";
 import { getMaxStorageBufferBindingSize, isF16Supported } from "./gpu-context";
@@ -52,9 +47,8 @@ function getAdamDispatcher(
   emitF16: boolean,
   emitUnscale: boolean,
 ): TileKernelInstance {
-  // Include the derived bit so an authored and a derived dispatcher never share
-  // a cache slot (they have different bindings — `t` vs `bc`).
-  const key = `${derivedAdam() ? "d" : "a"}:${useVec4}:${emitF16}:${emitUnscale}`;
+  // R4: the body is always derived (bc-slot); one dispatcher family.
+  const key = `d:${useVec4}:${emitF16}:${emitUnscale}`;
   let d = adamDispatchers.get(key);
   if (!d) {
     // Route through the schedule chokepoint: the body LOWERS FROM the schedule
@@ -161,16 +155,15 @@ export function dispatchAdamStep(
   const useVec4 = doUnscale && numElements % 4 === 0;
 
   // Build buffers map — all in-place (param/m/v modified in the same buffer).
-  // R2/fork-B: the DERIVED kernel binds the same slot-4 buffer under the name
-  // `bc` (a [2] bias-correction DATA tensor) instead of `t`. `tBuffer` carries
-  // whichever the caller (adam.ts _stepFused) produced for this flag state.
-  const biasName = derivedAdam() ? "bc" : "t";
+  // R4/fork-C: the derived kernel binds slot 4 under the name `bc` (a [2]
+  // bias-correction DATA tensor, host-computed live scalar). `tBuffer` carries
+  // the [2] bc buffer the caller (adam.ts _stepFused) produced.
   const buffers: Record<string, GPUBuffer> = {
     grad: gradBuffer,
     param: paramBuffer,
     m: mBuffer,
     v: vBuffer,
-    [biasName]: tBuffer,
+    bc: tBuffer,
     lr: lrBuffer,
   };
   if (doF16 && paramF16Out) buffers.param_f16 = paramF16Out;
@@ -221,9 +214,9 @@ export function dispatchAdamStep(
       param: "chunked",
       m: "chunked",
       v: "chunked",
-      // t/lr (or the derived [2] bc/lr) are small shared inputs read at fixed
-      // indices by every chunk — bind whole ("scalar" mode = not chunked).
-      [biasName]: "scalar",
+      // The [2] bc + lr are small shared inputs read at fixed indices by every
+      // chunk — bind whole ("scalar" mode = not chunked).
+      bc: "scalar",
       lr: "scalar",
     };
     if (doF16) modes.param_f16 = "chunked";

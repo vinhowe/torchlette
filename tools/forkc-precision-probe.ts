@@ -6,24 +6,19 @@
  * blocker: the derived==authored parity then compares HOST expm1F32 against the
  * AUTHORED kernel's in-kernel GPU `exp` intrinsic — host-vs-GPU, not GPU-vs-GPU.
  *
- * This probe establishes, across a real trajectory range of t (1..50000) and both
- * betas, whether that comparison is (i) bit-exact in f32 or (ii) bounded by a NAMED
- * host-vs-GPU exp lemma, and PROPAGATES it to Δparam through the ACTUAL Adam kernel.
- *
- * Three measurements, one process:
+ * This probe establishes the NAMED L3 lemma (host-vs-GPU exp, bc-absorbed) across
+ * a real trajectory range of t (1..50000) and both betas:
  *   (A) RAW exp intrinsic: host Math.exp(y) vs GPU exp(y) for y = t·lnβ. Isolates
  *       the only host-vs-GPU divergence source (the Horner branch is pure f32 ops).
- *   (B) bc: host expm1F32 (fround discipline) vs GPU expm1 chain (the graph path
- *       _biasCorrection uses). Per-lane abs/rel + which branch.
- *   (C) PROPAGATED Δparam: the authored Adam kernel (GPU in-kernel bc from t) vs the
- *       derived Adam kernel fed HOST bc — exactly the fork-C parity — across the
- *       t-grid × wd modes. This is the exit-gate number generalized off STEP=7.
+ *   (B) bc: host expm1F32 (fround discipline) vs GPU expm1 chain — per-lane
+ *       abs/rel/ULP + which branch. Verdict: bc agrees to ≤1 ULP everywhere.
+ * (The pre-R4 propagated-Δparam measurement — authored GPU-bc vs derived host-bc,
+ * worst 5.96e-8, Δm=Δv bit-exact — is retired with the authored path; the surviving
+ * numeric guard is tools/optterm-fold-parity.ts.)
  *
  * GPU tool: reserve via tools/pick-gpu.sh. Env: N (param count).
  */
 import { initWebGPU, getWebGPUInitError, webgpuBackend } from "../src/backend/webgpu";
-import { createTileKernelDispatcher } from "../src/backend/webgpu/tile-dispatch";
-import { realizeAdamStepSpec } from "../src/schedule/adam-skeleton";
 import type { WebGPUTensor } from "../src/backend/webgpu/gpu-types";
 
 const N = parseInt(process.env.N ?? "4096", 10);
@@ -32,8 +27,6 @@ const f = Math.fround;
 
 const BETA1 = 0.9;
 const BETA2 = 0.999;
-const EPS = 1e-8;
-const LR = 1e-3;
 const LNB1 = f(Math.log(BETA1));
 const LNB2 = f(Math.log(BETA2));
 
@@ -54,29 +47,12 @@ function expm1F32(y: number): number {
   }
   return f(Math.exp(y) - 1);
 }
-const bcHost = (t: number, lnb: number): number => f(-expm1F32(f(t * lnb)));
 const branch = (t: number, lnb: number): string => (Math.abs(f(t * lnb)) < 0.25 ? "horner" : "exp");
 
-function randData(n: number, seed: number): Float32Array {
-  const out = new Float32Array(n);
-  let s = seed >>> 0;
-  for (let i = 0; i < n; i++) {
-    s = (s * 1664525 + 1013904223) >>> 0;
-    out[i] = (s / 0xffffffff) * 2 - 1;
-  }
-  return out;
-}
 
 const t2 = (data: number[]): WebGPUTensor =>
   webgpuBackend.ops.tensorFromArray(data, [data.length]) as WebGPUTensor;
 
-function baseUniforms(wd: number, dec: number): Record<string, number> {
-  return {
-    num_elements: N, beta1: BETA1, beta2: BETA2, ln_beta1: LNB1, ln_beta2: LNB2,
-    eps: EPS, weight_decay: wd, decoupled_wd: dec,
-    _pad0: 0, _pad1: 0, _pad2: 0, _pad3: 0,
-  };
-}
 
 // ULP distance between two f32 values (via their bit patterns).
 const fbuf = new ArrayBuffer(8);
@@ -163,53 +139,12 @@ async function main(): Promise<void> {
   rows.forEach((s) => log(s));
   log(`  worst bc: abs=${worstBcAbs.toExponential(3)} rel=${worstBcRel.toExponential(3)} ulp=${worstBcUlp}`);
 
-  // ---- (C) PROPAGATED Δparam through the ACTUAL Adam kernel across the t-grid ----
-  log(`\n=== (C) PROPAGATED Δparam: authored (GPU in-kernel bc from t) vs derived (HOST bc) ===`);
-  const grad = Array.from(randData(N, 1));
-  const param = Array.from(randData(N, 2));
-  const mArr = Array.from(randData(N, 3));
-  const vArr = Array.from(randData(N, 4).map((x) => Math.abs(x)));
-
-  const runOne = async (derived: boolean, t: number, wd: number, dec: number) => {
-    const spec = realizeAdamStepSpec(false, false, false, derived);
-    const disp = createTileKernelDispatcher(spec);
-    const g = t2(grad), p = t2(param), mm = t2(mArr), vv = t2(vArr), lr = t2([LR]);
-    const buffers: Record<string, WebGPUTensor["buffer"]> = {
-      grad: g.buffer, param: p.buffer, m: mm.buffer, v: vv.buffer, lr: lr.buffer,
-    };
-    if (derived) buffers.bc = t2([bcHost(t, LNB1), bcHost(t, LNB2)]).buffer;
-    else buffers.t = t2([t]).buffer;
-    disp.dispatch(buffers, baseUniforms(wd, dec));
-    return { param: await readback(p), m: await readback(mm), v: await readback(vv) };
-  };
-  const maxRel = (a: Float32Array, b: Float32Array) => {
-    let mx = 0;
-    for (let i = 0; i < a.length; i++) {
-      const d = Math.abs(a[i]! - b[i]!);
-      mx = Math.max(mx, Math.min(d, d / (Math.abs(a[i]!) + 1e-8)));
-    }
-    return mx;
-  };
-  const cells = [
-    { name: "no-wd", wd: 0, dec: 0 },
-    { name: "L2", wd: 0.1, dec: 0 },
-    { name: "AdamW", wd: 0.1, dec: 1 },
-  ];
-  let worstDp = 0, worstDm = 0, worstDv = 0;
-  const worstAt = { dp: 0, cell: "" };
-  for (const t of T_GRID) {
-    for (const c of cells) {
-      const a = await runOne(false, t, c.wd, c.dec);
-      const d = await runOne(true, t, c.wd, c.dec);
-      const dp = maxRel(a.param, d.param), dm = maxRel(a.m, d.m), dv = maxRel(a.v, d.v);
-      if (dp > worstDp) { worstDp = dp; worstAt.dp = t; worstAt.cell = c.name; }
-      worstDm = Math.max(worstDm, dm); worstDv = Math.max(worstDv, dv);
-      if (t <= 5 || t === 250 || t >= 10000)
-        log(`  t=${String(t).padStart(5)} ${c.name.padEnd(6)} Δparam=${dp.toExponential(2)} Δm=${dm.toExponential(2)} Δv=${dv.toExponential(2)}`);
-    }
-  }
-  log(`\n  WORST over t-grid × wd: Δparam=${worstDp.toExponential(3)} (t=${worstAt.dp}, ${worstAt.cell})  Δm=${worstDm.toExponential(3)}  Δv=${worstDv.toExponential(3)}`);
-  log(`\n=== VERDICT INPUTS: exp-ulp=${worstExpUlp} bc-ulp=${worstBcUlp} bc-rel=${worstBcRel.toExponential(3)} Δparam=${worstDp.toExponential(3)} ===`);
+  // NOTE (R4): the propagated Δparam through the Adam kernel (authored GPU-bc vs
+  // derived host-bc) was measured pre-R4 at worst 5.96e-8 (Δm=Δv bit-exact) — the
+  // authored path is now deleted, so this probe retains the load-bearing L3-lemma
+  // evidence (A) raw exp + (B) bc host-vs-GPU. The surviving numeric guard for the
+  // derived kernel is tools/optterm-fold-parity.ts (fold == program interpreter).
+  log(`\n=== VERDICT INPUTS (L3 lemma): exp-ulp=${worstExpUlp} bc-ulp=${worstBcUlp} bc-abs=${worstBcAbs.toExponential(3)} bc-rel=${worstBcRel.toExponential(3)} ===`);
 }
 
 main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
