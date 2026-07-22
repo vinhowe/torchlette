@@ -636,9 +636,9 @@ describe("Graph Rewrites", () => {
       expect(count).toBe(0);
     });
 
-    it("never eliminates side-output ops (adamStep, fused kernels)", () => {
-      const a1 = createLazyIRNode("adamStep", [], [4], "f32", "cpu");
-      const a2 = createLazyIRNode("adamStep", [], [4], "f32", "cpu");
+    it("never eliminates side-output ops (optStep, fused kernels)", () => {
+      const a1 = createLazyIRNode("optStep", [], [4], "f32", "cpu");
+      const a2 = createLazyIRNode("optStep", [], [4], "f32", "cpu");
 
       const ctx = buildContext([a1, a2]);
       const bypassed = new Set<number>();

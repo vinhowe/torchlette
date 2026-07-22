@@ -100,13 +100,27 @@ export function buildMergedPlan(
   return { nodes: enforceWriteAfterReadOrder(nodes) };
 }
 
-/** In-place ops and the input positions whose refs they OVERWRITE. */
+/** Static in-place ops and the input positions whose refs they OVERWRITE. */
 const IN_PLACE_DST_INPUTS: Record<string, number[]> = {
   stridedScatterCopy: [0],
   stridedScatterAdd: [0],
-  // adamStep updates param/m/v (inputs 1..3) in place; grad (input 0) is read-only.
-  adamStep: [1, 2, 3],
 };
+
+/**
+ * The in-place dst inputs a node OVERWRITES, keyed on STRUCTURE (not the op's
+ * name). `optStep` writes param + every state slot in place — inputs
+ * `[1..1+nState]`, where nState is the optimizer spec's state count read from
+ * the node payload (`OptStepConfig.stateSlots`). grad (input 0) and the scalar-
+ * DATA inputs are read-only. Static ops fall through to `IN_PLACE_DST_INPUTS`.
+ */
+function inPlaceDstInputs(node: LazyIRNode): number[] | undefined {
+  if (node.op === "optStep") {
+    const nState = (node.payload as import("../backend/types").OptStepConfig)
+      .stateSlots.length;
+    return Array.from({ length: 1 + nState }, (_, i) => 1 + i);
+  }
+  return IN_PLACE_DST_INPUTS[node.op];
+}
 
 /**
  * DONATABLE_OPERANDS — the OUT-OF-PLACE analog of IN_PLACE_DST_INPUTS
@@ -154,7 +168,7 @@ export function enforceWriteAfterReadOrder(nodes: LazyIRNode[]): LazyIRNode[] {
   // Fast path: no in-place writers, keep the array untouched.
   let hasInPlace = false;
   for (const n of nodes) {
-    if (IN_PLACE_DST_INPUTS[n.op]) {
+    if (inPlaceDstInputs(n)) {
       hasInPlace = true;
       break;
     }
@@ -231,7 +245,7 @@ export function enforceWriteAfterReadOrder(nodes: LazyIRNode[]): LazyIRNode[] {
     }
   }
   for (let i = 0; i < nodes.length; i++) {
-    const dstInputs = IN_PLACE_DST_INPUTS[nodes[i].op];
+    const dstInputs = inPlaceDstInputs(nodes[i]);
     if (!dstInputs) continue;
     for (const di of dstInputs) {
       const ref = nodes[i].inputs[di];

@@ -203,8 +203,8 @@ import {
   tanh,
 } from "./ops/elementwise";
 import {
-  adamStep,
-  adamStepBatch,
+  optStep,
+  optStepBatch,
   createInfCountBuffer,
   fusedAttentionBackward,
   fusedAttentionForward,
@@ -361,8 +361,8 @@ export const webgpuBackend: FusedBackend & {
     stridedScatterCopy,
     stridedScatterAdd,
     batchedReduction,
-    adamStep,
-    adamStepBatch,
+    optStep,
+    optStepBatch,
     unscaleGrad,
     fusedAttentionForward,
     fusedAttentionBackward,

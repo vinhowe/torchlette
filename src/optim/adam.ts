@@ -1,4 +1,4 @@
-import type { AdamStepConfig, DeviceKind } from "../backend/types";
+import type { OptStepConfig, DeviceKind } from "../backend/types";
 import { ENV } from "../core/env";
 import { LiveScalar } from "../core/live-scalar";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
@@ -15,6 +15,15 @@ import {
   oSub,
   role,
 } from "../ops/semantic/optimizer";
+
+// Structural identity of the fused Adam `optStep` node (R5b de-naming), mirroring
+// ADAM_STEP_SPEC in schedule/opt-step-specs.ts — the SINGLE conceptual source.
+// `stateSlots` is the program's state (`["m","v"]`); `scalarInputs` are the
+// host-computed live scalars (`bc`=[bc1,bc2], `lr`). The backend resolves the
+// realizer by `spec` and binds by the spec's own slots, so any divergence throws
+// at the binding seam (bindingOrder lookup) rather than silently miscomputing.
+const ADAM_STATE_SLOTS: readonly string[] = ADAMW_PROGRAM.state;
+const ADAM_SCALAR_INPUTS: readonly string[] = ["bc", "lr"];
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import {
   type PackedOptState,
@@ -300,7 +309,7 @@ export class Adam {
   hasFusedKernel(): boolean {
     const runtime = this.api._runtime();
     const backend = runtime.getBackend(this.device);
-    return !!backend.ops.adamStep;
+    return !!backend.ops.optStep;
   }
 
   step(): Tensor[] {
@@ -490,23 +499,32 @@ export class Adam {
 
       const gi = this._groupIndex[i];
       const wd = this._getParamWeightDecay(i);
-      // inc-2a: config is FULLY STATIC — no stepSize/lrTimesWd. eps is the
-      // ORIGINAL value; the kernel derives eps*sqrt(bc2) and lr*wd from the
-      // t/lr tensor inputs.
-      const config: AdamStepConfig = {
-        beta1: this.beta1,
-        beta2: this.beta2,
-        eps: this.eps,
-        weightDecay: wd,
+      // The GENERIC OptStepConfig (R5b de-naming): `spec` selects the realizer,
+      // `stateSlots`/`scalarInputs` describe the node's input structure, `hypers`
+      // are the static f32 uniform VALUES. eps is the ORIGINAL value; the kernel
+      // derives eps*sqrt(bc2) and lr*wd from the bc/lr scalar-DATA inputs.
+      // ln_beta1/ln_beta2 are retained-but-dead (byte-stable uniform block).
+      const config: OptStepConfig = {
+        spec: "adamw",
+        stateSlots: ADAM_STATE_SLOTS,
+        scalarInputs: ADAM_SCALAR_INPUTS,
+        hypers: {
+          beta1: this.beta1,
+          beta2: this.beta2,
+          ln_beta1: Math.fround(Math.log(this.beta1)),
+          ln_beta2: Math.fround(Math.log(this.beta2)),
+          eps: this.eps,
+          weight_decay: wd,
+        },
         decoupledWd: this.adamW,
         emitF16: true,
       };
 
-      // inc-2a: 6-input adamStep node [grad, param, m, v, t, lr]. t/lr flow as
-      // persistent tensor DATA (stable buffers → TAG_WRITE, no volatile repack).
+      // 6-input optStep node [grad, param, m, v, bc, lr]. bc/lr flow as
+      // persistent scalar-DATA tensors (stable buffers → TAG_WRITE, no repack).
       const lrRt = this._lrTensor(gi);
       const adamNode = createLazyIRNode(
-        "adamStep",
+        "optStep",
         [
           grad.lazyRef,
           param._unwrap().lazyRef,

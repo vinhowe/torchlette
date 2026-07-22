@@ -49,7 +49,7 @@ export type LazyOpCode =
   // Special
   | "clamp"
   | "transfer"
-  | "adamStep"
+  | "optStep"
   | "unscaleGrad"
   // Fused GPU kernels
   | "fusedAttentionForward"

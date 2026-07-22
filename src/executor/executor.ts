@@ -1,6 +1,6 @@
 import { getBackend } from "../backend/registry";
 import type {
-  AdamStepConfig,
+  OptStepConfig,
   Backend,
   BackendTensor,
   DType,
@@ -148,7 +148,7 @@ import {
  *  state. A plan containing any advances the guard's in-place-committed counter
  *  so a pruned-producer recompute against mutated storages fails loudly. */
 const IN_PLACE_COMMIT_OPS: ReadonlySet<string> = new Set([
-  "adamStep",
+  "optStep",
   "stridedScatterCopy",
   "stridedScatterAdd",
 ]);
@@ -1431,13 +1431,13 @@ function derivedOutputShape(node: LazyIRNode, oi: number): number[] | null {
   if (oi === 0) return node.shape;
   // Multi-output extras present in real plans whose every output has the SAME
   // shape as the primary (= node.shape):
-  //  - adamStep oi 1,2 (m, v) — same shape as the param.
+  //  - optStep oi 1..nState (Adam m, v) — same shape as the param.
   //  - fusedAttentionBackward oi 1,2 (dK, dV) — dQ/dK/dV are all
   //    [batch, heads, seq, headDim] by construction.
   //  - fusedLayerNormBackwardGradWeightBias oi 1 (grad_bias) — grad_weight and
   //    grad_bias are both [featureDim].
   if (
-    node.op === "adamStep" ||
+    node.op === "optStep" ||
     node.op === "fusedAttentionBackward" ||
     node.op === "fusedLayerNormBackwardGradWeightBias"
   ) {
@@ -1977,7 +1977,7 @@ function actionOutputHarvestPairs(
       case "row-program":
         isOutput.add(action.outputNodeIndex);
         break;
-      case "adam-batch":
+      case "opt-batch":
       case "batched-reduction":
         for (const ni of action.nodeIndices) isOutput.add(ni);
         break;
@@ -2991,35 +2991,36 @@ export async function executeLoweredPlan(
           break;
         }
 
-        case "adam-batch": {
+        case "opt-batch": {
           const useSharedEncoder = backend.name === "webgpu";
           if (useSharedEncoder) {
             // Flush the shared encoder BEFORE returning pending-release
             // buffers to the pool — otherwise an encoded-but-not-submitted
-            // command could still be referencing one. backend.ops.adamStepBatch
+            // command could still be referencing one. backend.ops.optStepBatch
             // also flushes internally; this earlier flush exists to make
             // flushBufferPool() safe.
             flushSharedEncoder();
             flushBufferPool();
           }
 
-          const adamBackend =
+          const optBackend =
             getBackend(planNodes[action.nodeIndices[0]].device) ?? backend;
-          const adamStepBatch = adamBackend.ops.adamStepBatch;
-          if (!adamStepBatch) {
+          const optStepBatch = optBackend.ops.optStepBatch;
+          if (!optStepBatch) {
             throw new Error(
-              "adamStepBatch not supported by backend; cannot execute adam-batch action",
+              "optStepBatch not supported by backend; cannot execute opt-batch action",
             );
           }
 
-          // Resolve inputs for every adamStep node, then call the backend op
+          // Resolve inputs for every optStep node, then call the backend op
           // once. The backend handles flushing, packing, and per-item fallback;
           // it returns BackendTensors which we wrap as StorageHandles via the
-          // shared multi-output protocol.
-          await withProfileContext("adamStep", "optimizer.step", async () => {
+          // shared multi-output protocol. Inputs are [grad, param, ...states,
+          // ...scalars]; nState/nScalars come from the payload's spec (STRUCTURE).
+          await withProfileContext("optStep", "optimizer.step", async () => {
             const nodes: LazyIRNode[] = [];
             const inputStorages: StorageHandle[][] = [];
-            const items: import("../backend/types").AdamBatchItem[] = [];
+            const items: import("../backend/types").OptStepBatchItem[] = [];
             let firstNodeIdx = -1;
             const executedIdx: number[] = [];
             for (const nodeIdx of action.nodeIndices) {
@@ -3028,28 +3029,29 @@ export async function executeLoweredPlan(
               if (firstNodeIdx < 0) firstNodeIdx = nodeIdx;
               executedIdx.push(nodeIdx);
               const inputs = node.inputs.map((ref) =>
-                getInputStorage(ref, adamBackend),
+                getInputStorage(ref, optBackend),
               );
-              const config = node.payload as AdamStepConfig;
+              const config = node.payload as OptStepConfig;
+              const nState = config.stateSlots.length;
               nodes.push(node);
               inputStorages.push(inputs);
               items.push({
                 grad: inputs[0].backendTensor,
                 param: inputs[1].backendTensor,
-                m: inputs[2].backendTensor,
-                v: inputs[3].backendTensor,
-                t: inputs[4].backendTensor, // inc-2a: persistent step counter
-                lr: inputs[5].backendTensor, // inc-2a: persistent learning rate
+                states: inputs
+                  .slice(2, 2 + nState)
+                  .map((s) => s.backendTensor),
+                scalars: inputs.slice(2 + nState).map((s) => s.backendTensor),
                 config,
               });
             }
             if (items.length === 0) return;
-            const results = adamStepBatch(items);
+            const results = optStepBatch(items);
             for (let i = 0; i < nodes.length; i++) {
               const r = results[i];
               assignNodeResult(
                 nodes[i],
-                { primary: r.param, extras: [r.m, r.v] },
+                { primary: r.param, extras: r.states },
                 inputStorages[i].map((s) => s.backendTensor),
                 inputStorages[i],
               );
@@ -3132,8 +3134,8 @@ export async function executeLoweredPlan(
           const backendInputs = inputs.map((s) => s.backendTensor);
 
           // Use synchronous dispatch to avoid microtask overhead (~5-15µs/await).
-          // Only adamStep and transfer are truly async; adamStep never reaches
-          // this branch because lowered-plan.ts always emits an adam-batch
+          // Only optStep and transfer are truly async; optStep never reaches
+          // this branch because lowered-plan.ts always emits an opt-batch
           // action for it (see the comment there).
           const resultOrPromise = executeOpSync(node, backendInputs, backend);
           const handlerResult =
@@ -3373,7 +3375,7 @@ function stampLoweredActionOutputs(
       case "row-program":
         isOutput.add(action.outputNodeIndex);
         break;
-      case "adam-batch":
+      case "opt-batch":
       case "batched-reduction":
         for (const ni of action.nodeIndices) isOutput.add(ni);
         break;

@@ -281,12 +281,32 @@ export type FusedRMSNormConfig = {
   eps: number;
 };
 
-export type AdamStepConfig = {
-  beta1: number;
-  beta2: number;
-  /** ORIGINAL (un-adjusted) epsilon. The kernel derives eps*sqrt(bc2). */
-  eps: number;
-  weightDecay: number;
+/**
+ * The GENERIC fused-optimizer step config (derived-optimizer-realizer R5b — the
+ * de-naming). Carries NO optimizer name: the executor/backend key every decision
+ * on STRUCTURE (`spec` selects the realizer; `stateSlots`/`scalarInputs` drive
+ * the in-place dst set, multi-output extras, and the shared-binding pack key).
+ * Adam is one client — `spec:"adamw"`, `stateSlots:["m","v"]`,
+ * `scalarInputs:["bc","lr"]` — reproducing the prior fused Adam BIT-FOR-BIT.
+ */
+export type OptStepConfig = {
+  /** OPT_STEP_SPECS key selecting the program + role schema the backend folds
+   *  into WGSL (`adamw`/`lion`/`sgd`/`sgd_momentum`). Opaque data to the executor
+   *  (fingerprint / payload-hash only). */
+  spec: string;
+  /** Optimizer state slot binding names, in spec order (Adam: `["m","v"]`; SGD+
+   *  momentum: `["v"]`; SGD: `[]`). The in-place dst inputs are `[1..1+nState]`,
+   *  the multi-output extras are the state outputs, and the rw binding set is
+   *  `[param, ...states]` — all derived from THIS, never the op's name. */
+  stateSlots: readonly string[];
+  /** Shared scalar-DATA input binding names, in spec order (Adam: `["bc","lr"]`).
+   *  Each is ONE shared read buffer at input slot `2+nState+i` — the horizontal-
+   *  pack key's shared indices. Host-computed live scalars. */
+  scalarInputs: readonly string[];
+  /** Static f32 hyper uniform VALUES keyed by uniform name (spec.f32Uniforms).
+   *  Adam: beta1/beta2/ln_beta1/ln_beta2/eps/weight_decay. */
+  hypers: Readonly<Record<string, number>>;
+  /** L2 (false) vs decoupled (true) weight-decay branch (the runtime uniform). */
   decoupledWd: boolean;
   emitF16?: boolean;
   /** Gradient inverse scale factor for fused unscale (default 1.0 = no unscaling). */
@@ -294,29 +314,27 @@ export type AdamStepConfig = {
   /** Shared atomic inf-flag buffer for fused unscale inf detection. */
   infFlagBuffer?: unknown;
 };
-// inc-2a: `stepSize` and `lrTimesWd` were RETIRED from AdamStepConfig. The
+// inc-2a: per-step scalars (step_size, lr*wd) were RETIRED from the config. The
 // bias-corrected step size and lr*wd are derived IN-KERNEL from the persistent
-// on-device `t` (step counter) and `lr` tensor inputs — the config is fully
-// static, killing the per-step volatile-uniform repack class.
+// `bc`/`lr` scalar-DATA inputs — the config is fully static, killing the
+// per-step volatile-uniform repack class.
 
-/** One parameter's inputs for a batched Adam step. */
-export type AdamBatchItem = {
+/** One parameter's inputs for a batched fused optimizer step. */
+export type OptStepBatchItem = {
   grad: BackendTensor;
   param: BackendTensor;
-  m: BackendTensor;
-  v: BackendTensor;
-  /** Persistent 1-element f32 step counter (shared across the group's params). */
-  t: BackendTensor;
-  /** Persistent 1-element f32 learning rate (shared across the group's params). */
-  lr: BackendTensor;
-  config: AdamStepConfig;
+  /** Optimizer state operands, in spec order (Adam: [m, v]; SGD+mom: [v]; SGD: []). */
+  states: BackendTensor[];
+  /** Shared scalar-DATA inputs, in spec order (Adam: [bc, lr]). 1-element (lr) or
+   *  small ([2] bc) persistent buffers shared across the group's params. */
+  scalars: BackendTensor[];
+  config: OptStepConfig;
 };
 
-/** Output tensors for one batched Adam item. */
-export type AdamBatchResult = {
+/** Output tensors for one batched optimizer item (param + updated states). */
+export type OptStepBatchResult = {
   param: BackendTensor;
-  m: BackendTensor;
-  v: BackendTensor;
+  states: BackendTensor[];
 };
 
 export interface BackendOps {
@@ -528,24 +546,23 @@ export interface BackendOps {
     dim: number | number[],
     keepdim?: boolean,
   ): BackendTensor[];
-  /** Fused Adam/AdamW optimizer step. Returns updated param, m, v. */
-  adamStep?(
+  /** Fused optimizer step (Adam/Lion/SGD, spec-selected). `states` and `scalars`
+   *  are variadic per the config's spec; returns updated param + states. */
+  optStep?(
     grad: BackendTensor,
     param: BackendTensor,
-    m: BackendTensor,
-    v: BackendTensor,
-    t: BackendTensor,
-    lr: BackendTensor,
-    config: AdamStepConfig,
+    states: BackendTensor[],
+    scalars: BackendTensor[],
+    config: OptStepConfig,
   ):
-    | { param: BackendTensor; m: BackendTensor; v: BackendTensor }
-    | Promise<{ param: BackendTensor; m: BackendTensor; v: BackendTensor }>;
+    | { param: BackendTensor; states: BackendTensor[] }
+    | Promise<{ param: BackendTensor; states: BackendTensor[] }>;
   /**
-   * Batched Adam step: process N adamStep calls in one backend invocation.
+   * Batched optimizer step: process N optStep calls in one backend invocation.
    * Backends are free to fuse same-element-count items into packed kernel
    * dispatches. Returns results in input order.
    */
-  adamStepBatch?(items: AdamBatchItem[]): AdamBatchResult[];
+  optStepBatch?(items: OptStepBatchItem[]): OptStepBatchResult[];
   /** Fused unscale + inf-check + zero-mask for GradScaler.
    *  scaler-as-tensor: `scale` is a persistent 1-element f32 tensor (the
    *  GradScaler's LiveScalar buffer) read LIVE from a storage binding, not a

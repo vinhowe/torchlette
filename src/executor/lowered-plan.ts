@@ -204,10 +204,10 @@ interface LoweredMatmulEpilogueAction {
   };
 }
 
-/** A batch of consecutive adamStep nodes. */
-interface LoweredAdamBatchAction {
-  kind: "adam-batch";
-  /** Plan-node indices for all consecutive adamStep nodes in this batch. */
+/** A batch of consecutive optStep nodes. */
+interface LoweredOptBatchAction {
+  kind: "opt-batch";
+  /** Plan-node indices for all consecutive optStep nodes in this batch. */
   nodeIndices: number[];
 }
 
@@ -268,7 +268,7 @@ export type LoweredAction =
   | LoweredFusedAction
   | LoweredNodeAction
   | LoweredMatmulEpilogueAction
-  | LoweredAdamBatchAction
+  | LoweredOptBatchAction
   | LoweredBatchedReductionAction
   | LoweredReclaimAction
   | LoweredRowProgramAction;
@@ -451,7 +451,7 @@ export function getActionNodeIndices(action: LoweredAction): number[] {
       return action.coveredNodeIndices;
     case "matmul-epilogue":
       return action.coveredNodeIndices;
-    case "adam-batch":
+    case "opt-batch":
       return action.nodeIndices;
     case "batched-reduction":
       return action.nodeIndices;
@@ -526,16 +526,14 @@ import type { LazyIRNode, LazyRef } from "../graph/types";
  * only op-specific datum — the set of input positions that are shared, not
  * per-item. Everything else is derived structurally.
  *
- * NOTE (wart + exit): this lives behind an op-name switch (`adamStep`) because
- * the executor's batched-op plumbing is adam-named today. That is a pre-inc-2a
- * wart; the generic derivation here makes the exit MECHANICAL — replace the
- * switch with an op-metadata lookup of `sharedOperandInputIndices` once
- * horizontal packing is generalized to op-metadata-driven packing (home:
- * #78/#83). inc-2a's static config is exactly what makes the generic predicate
- * sufficient (no per-step payload variance to reconcile).
+ * The shared-operand set is now derived from the payload STRUCTURE (R5b de-
+ * naming): `optStep`'s dispatch-shared inputs are its scalar-DATA slots, which
+ * begin after grad(0), param(1) and the nState state slots — indices
+ * `[2+nState .. 2+nState+nScalars)`. No op-name switch remains; a new fused
+ * optimizer is grouped correctly with zero change here.
  *
  * The executor and stream-generate MUST consume this ONE function (via the
- * `adam-batch` action's nodeIndices it produces) and never recompute a
+ * `opt-batch` action's nodeIndices it produces) and never recompute a
  * grouping decision independently — the single-source-at-the-seam rule.
  */
 export function horizontalPackKey(node: LazyIRNode): string {
@@ -546,9 +544,9 @@ export function horizontalPackKey(node: LazyIRNode): string {
     return `s:${r.value}`;
   };
   // Op-specific datum: which input positions are dispatch-shared (bound once).
-  // For adamStep [grad, param, m, v, t, lr], t (4) and lr (5) are shared.
-  const sharedOperandInputIndices =
-    node.op === "adamStep" ? [4, 5] : ([] as number[]);
+  // Derived structurally: optStep's scalar-DATA slots (Adam states [m,v] +
+  // scalars [bc,lr] → shared indices [4,5]).
+  const sharedOperandInputIndices = sharedOperandInputIndicesOf(node);
   const sharedKey = sharedOperandInputIndices
     .map((i) => refKey(node.inputs[i]))
     .join("|");
@@ -557,6 +555,18 @@ export function horizontalPackKey(node: LazyIRNode): string {
   const cfgKey =
     node.payload !== undefined ? JSON.stringify(node.payload) : "nocfg";
   return `${node.op}|${sharedKey}|${cfgKey}`;
+}
+
+/** The dispatch-shared input positions of a batchable op, keyed on STRUCTURE.
+ *  optStep: its scalar-DATA slots `[2+nState .. 2+nState+nScalars)` (bound once,
+ *  not per-item). All other ops share nothing. */
+function sharedOperandInputIndicesOf(node: LazyIRNode): number[] {
+  if (node.op === "optStep") {
+    const cfg = node.payload as import("../backend/types").OptStepConfig;
+    const nState = cfg.stateSlots.length;
+    return cfg.scalarInputs.map((_, i) => 2 + nState + i);
+  }
+  return [];
 }
 
 /** Default reclaim interval, overridable via TORCHLETTE_RECLAIM_INTERVAL env var. */
@@ -603,7 +613,7 @@ export function buildLoweredPlanFromAnalysis(
 
   if (
     ENV.TORCHLETTE_DEBUG_OPTPLAN &&
-    planNodes.some((n) => n.op === "adamStep")
+    planNodes.some((n) => n.op === "optStep")
   ) {
     console.log(`[optplan] ${planNodes.map((n) => n.op).join(",")}`);
   }
@@ -811,43 +821,43 @@ function emitSequentialActions(
       }
     }
 
-    // Adam batch: collect the CONSECUTIVE run of adamStep nodes.
+    // Optimizer batch: collect the CONSECUTIVE run of optStep nodes.
     //
-    // Always emit an adam-batch action for adamStep, even when there's only
-    // one node. adam-batch routes through backend.ops.adamStepBatch, which
+    // Always emit an opt-batch action for optStep, even when there's only
+    // one node. opt-batch routes through backend.ops.optStepBatch, which
     // returns BackendTensors that the executor wraps via assignNodeResult
     // (the shared multi-output protocol). This ensures node.result and
     // node.results[0] are set together — the historical "Input not ready:
-    // adamStep[0]" bug came from a generic-sequential path that left
+    // optStep[0]" bug came from a generic-sequential path that left
     // node.results[0] = null until a later wrap-and-backfill that wasn't
     // always reached.
     //
     // Adjacency comes from the GENERIC same-op affinity tie-break in the
     // plan builder's scheduling pass (enforceWriteAfterReadOrder): the DFS
     // order interleaves each param's producer (unscaleGrad, clip's
-    // copy-back) with its adamStep, and the scheduler regroups independent
+    // copy-back) with its optStep, and the scheduler regroups independent
     // same-op sequential dispatches adjacently for ANY op — no op-name
-    // whitelist in the executor (the old ADAM_HOISTABLE_OPS hoisting).
-    if (node.op === "adamStep") {
+    // whitelist in the executor.
+    if (node.op === "optStep") {
       // Horizontal-packing group key (single source: `horizontalPackKey`).
-      // The packed fused path binds the DISPATCH-SHARED operands (t, lr) ONCE
+      // The packed fused path binds the DISPATCH-SHARED operands (bc, lr) ONCE
       // for the whole batch and reads the static config from the first item;
-      // only PER-ITEM operands (grad/param/m/v) are scatter/gathered. So a
+      // only PER-ITEM operands (grad/param/states) are scatter/gathered. So a
       // batch may contain only nodes that AGREE on their shared operands and
       // static config. Break the consecutive run on any change.
       const runKey = horizontalPackKey(node);
-      const adamIndices: number[] = [];
+      const optIndices: number[] = [];
       let consumed = 0;
       for (let j = nodeIdx; j < nodes.length; j++) {
         const nj = nodes[j];
-        if (nj.op !== "adamStep") break;
+        if (nj.op !== "optStep") break;
         if (horizontalPackKey(nj) !== runKey) break;
         if (!nj.result) {
-          adamIndices.push(posMap.get(nj.id) as number);
+          optIndices.push(posMap.get(nj.id) as number);
         }
         consumed++;
       }
-      actions.push({ kind: "adam-batch", nodeIndices: adamIndices });
+      actions.push({ kind: "opt-batch", nodeIndices: optIndices });
       maybeReclaim(consumed);
       nodeIdx += consumed - 1;
       continue;

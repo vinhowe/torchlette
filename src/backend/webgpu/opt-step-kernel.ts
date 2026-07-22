@@ -1,16 +1,19 @@
 /**
- * Fused Adam/AdamW Optimizer Kernel
- *
- * A single WGSL compute shader that updates param, m, and v in-place in one
- * dispatch per parameter. Supports both Adam (L2 decay on gradient) and
- * AdamW (decoupled decay on parameter). grad is read-only; param/m/v are
- * read_write (each thread touches only its own index → no cross-thread race).
+ * Fused optimizer-step kernel dispatch (derived-optimizer-realizer R5b — the
+ * de-naming). A single WGSL compute shader updates param + optimizer state
+ * in-place in one dispatch per parameter. grad is read-only; param and every
+ * state slot are read_write (each thread touches only its own index → no
+ * cross-thread race). The kernel BODY is folded from the optimizer's program
+ * spec (`realizeOptStepSpec` — the schedule chokepoint); this file carries NO
+ * optimizer name, keying every decision on `OptStepConfig` structure
+ * (`spec`/`stateSlots`/`scalarInputs`/`hypers`). Adam is one client
+ * (`spec:"adamw"`, states `[m,v]`, scalars `[bc,lr]`), reproduced bit-for-bit.
  *
  * Handles large buffers (>maxStorageBufferBindingSize) via tile-IR dispatchChunked.
  */
 
-import { realizeAdamStepSpec } from "../../schedule/adam-skeleton";
-import type { AdamStepConfig } from "../types";
+import { realizeOptStepSpec } from "../../schedule/opt-step-specs";
+import type { OptStepConfig } from "../types";
 import { allocateOutputBuffer } from "./buffer-arena";
 import { computeFlatChunkLayout } from "./chunked-dispatch";
 import { getMaxStorageBufferBindingSize, isF16Supported } from "./gpu-context";
@@ -24,39 +27,27 @@ import {
 import { onTeardown, trackSharedEncoderWrite } from "./webgpu-state";
 
 // ============================================================================
-// Adam kernel body — ABSORBED into the schedule module (§7 P4 cutover-flip)
-// ============================================================================
-//
-// The fused-Adam kernel body (makeAdamStepSpec + its per-element update helpers)
-// was RELOCATED into src/schedule/adam-skeleton.ts, where the ScheduleState now
-// OWNS the kernel structure. The dispatcher below routes through
-// `realizeAdamStepSpec` (the schedule chokepoint) — the schedule object is the
-// sole WGSL writer at the dispatch seam. The retired `makeAdamStepSpec` factory
-// (and its emitExpm1 / emitBiasCorrection / emitAdamScalarBody helpers) are gone;
-// the byte differential (test/schedule/adam-differential.spec.ts) guards the LIVE
-// path.
-
-// ============================================================================
-// Dispatcher Cache (keyed by variant: vec4 × f16 × unscale)
+// Dispatcher Cache (keyed by spec + variant: vec4 × f16 × unscale)
 // ============================================================================
 
-const adamDispatchers = new Map<string, TileKernelInstance>();
+const optStepDispatchers = new Map<string, TileKernelInstance>();
 
-function getAdamDispatcher(
+function getOptStepDispatcher(
+  spec: string,
   useVec4: boolean,
   emitF16: boolean,
   emitUnscale: boolean,
 ): TileKernelInstance {
-  // R4: the body is always derived (bc-slot); one dispatcher family.
-  const key = `d:${useVec4}:${emitF16}:${emitUnscale}`;
-  let d = adamDispatchers.get(key);
+  const key = `${spec}:${useVec4}:${emitF16}:${emitUnscale}`;
+  let d = optStepDispatchers.get(key);
   if (!d) {
-    // Route through the schedule chokepoint: the body LOWERS FROM the schedule
-    // object (the cutover-flip); realizeAdamStepSpec is the sole WGSL writer.
+    // Route through the schedule chokepoint: the body FOLDS from the optimizer
+    // program spec (realizeOptStepSpec → lowerOptStepBody); the schedule is the
+    // sole WGSL writer at the dispatch seam.
     d = createTileKernelDispatcher(
-      realizeAdamStepSpec(useVec4, emitF16, emitUnscale),
+      realizeOptStepSpec(spec, useVec4, emitF16, emitUnscale),
     );
-    adamDispatchers.set(key, d);
+    optStepDispatchers.set(key, d);
   }
   return d;
 }
@@ -65,37 +56,29 @@ function getAdamDispatcher(
 // Dispatch
 // ============================================================================
 
-interface AdamStepResult {
+interface OptStepResult {
   paramBuffer: GPUBuffer;
-  mBuffer: GPUBuffer;
-  vBuffer: GPUBuffer;
+  /** Updated state buffers, in spec order (Adam: [m, v]). In-place → same input buffers. */
+  stateBuffers: GPUBuffer[];
   paramF16Buffer?: GPUBuffer;
 }
 
 /**
- * Write the STATIC Adam config uniforms. inc-2a: every field here is now
- * step-invariant — beta1/beta2, eps (ORIGINAL, un-adjusted), weight_decay,
- * decoupled_wd, and the precomputed ln(beta) constants (f64→f32 on the CPU;
- * the in-kernel expm1-form bias correction derives bc1/bc2/step_size/
- * epsAdjusted from the on-device `t` and `lr` tensor inputs). The retired
- * per-step fields (step_size, lr_times_wd) and their volatile-repack are gone:
- * the config buffer is bound once and never rewritten across replays.
- * `invScale` remains a per-step value for the fused-unscale path (GradScaler
- * uses graph-level unscaleGrad, so nothing engages that path here).
+ * Write the STATIC optimizer config uniforms. Every field is step-invariant: the
+ * spec's f32 hyper VALUES (`config.hypers`, e.g. Adam beta1/beta2/ln_beta1/
+ * ln_beta2/eps/weight_decay), the L2-vs-decoupled `decoupled_wd` branch, and (for
+ * the fused-unscale path) `inv_scale`. The bias-corrected step size + lr*wd are
+ * derived IN-KERNEL from the `bc`/`lr` scalar-DATA inputs, so the config buffer is
+ * bound once and never rewritten across replays (no volatile repack).
  */
-function setAdamConfigUniforms(
+function setOptStepConfigUniforms(
   uniforms: Record<string, number>,
-  config: AdamStepConfig,
+  config: OptStepConfig,
   doUnscale: boolean,
 ): void {
-  uniforms.beta1 = config.beta1;
-  uniforms.beta2 = config.beta2;
-  // Precompute ln(beta) in f64 then narrow to f32 (Math.fround) so the static
-  // uniform matches the Gate-2 emulation's `f(Math.log(beta))` exactly.
-  uniforms.ln_beta1 = Math.fround(Math.log(config.beta1));
-  uniforms.ln_beta2 = Math.fround(Math.log(config.beta2));
-  uniforms.eps = config.eps;
-  uniforms.weight_decay = config.weightDecay;
+  for (const [name, value] of Object.entries(config.hypers)) {
+    uniforms[name] = value;
+  }
   uniforms.decoupled_wd = config.decoupledWd ? 1 : 0;
   if (doUnscale) {
     uniforms.inv_scale = config.invScale ?? 1.0;
@@ -103,24 +86,23 @@ function setAdamConfigUniforms(
 }
 
 /**
- * Dispatch the fused Adam/AdamW kernel.
+ * Dispatch the fused optimizer-step kernel.
  *
  * Uses tile-IR dispatchChunked for buffers exceeding maxStorageBufferBindingSize.
- * When infFlagBuffer is provided, uses fused unscale+inf-check variants
- * that multiply grad by invScale and detect non-finite values.
+ * When infFlagBuffer is provided, uses fused unscale+inf-check variants that
+ * multiply grad by invScale and detect non-finite values. `stateBuffers` and
+ * `scalarBuffers` are bound by the spec's `stateSlots` / `scalarInputs` names.
  */
-export function dispatchAdamStep(
+export function dispatchOptStep(
   gradBuffer: GPUBuffer,
   paramBuffer: GPUBuffer,
-  mBuffer: GPUBuffer,
-  vBuffer: GPUBuffer,
-  tBuffer: GPUBuffer,
-  lrBuffer: GPUBuffer,
+  stateBuffers: GPUBuffer[],
+  scalarBuffers: GPUBuffer[],
   numElements: number,
-  config: AdamStepConfig,
+  config: OptStepConfig,
   emitF16 = false,
   infFlagBuffer: GPUBuffer | null = null,
-): AdamStepResult {
+): OptStepResult {
   // Only emit f16 if requested AND the device actually supports shader-f16
   const doF16 = emitF16 && isF16Supported();
   const doUnscale = infFlagBuffer !== null;
@@ -136,12 +118,10 @@ export function dispatchAdamStep(
   let _st = profileSubOpBegin();
   trackSharedEncoderWrite(gradBuffer);
   trackSharedEncoderWrite(paramBuffer);
-  trackSharedEncoderWrite(mBuffer);
-  trackSharedEncoderWrite(vBuffer);
-  // t/lr are read-only 1-element inputs — track so the pool won't hand them
-  // back for output allocation within this shared-encoder scope.
-  trackSharedEncoderWrite(tBuffer);
-  trackSharedEncoderWrite(lrBuffer);
+  for (const b of stateBuffers) trackSharedEncoderWrite(b);
+  // Scalar-DATA inputs are read-only small shared bindings — track so the pool
+  // won't hand them back for output allocation within this shared-encoder scope.
+  for (const b of scalarBuffers) trackSharedEncoderWrite(b);
 
   // Allocate f16 output buffer if needed.
   let paramF16Out: GPUBuffer | null = null;
@@ -149,23 +129,22 @@ export function dispatchAdamStep(
     paramF16Out = allocateOutputBuffer(numElements * f16BytesPerElement);
     trackSharedEncoderWrite(paramF16Out);
   }
-  profileSubOpEnd("adam.allocBufs", _st);
+  profileSubOpEnd("optStep.allocBufs", _st);
 
   // Vec4 coalescing for unscale path (non-unscale uses autoVectorize)
   const useVec4 = doUnscale && numElements % 4 === 0;
 
-  // Build buffers map — all in-place (param/m/v modified in the same buffer).
-  // R4/fork-C: the derived kernel binds slot 4 under the name `bc` (a [2]
-  // bias-correction DATA tensor, host-computed live scalar). `tBuffer` carries
-  // the [2] bc buffer the caller (adam.ts _stepFused) produced.
+  // Build buffers map — grad(read) · param(rw) · state slots(rw) · scalar inputs(read).
   const buffers: Record<string, GPUBuffer> = {
     grad: gradBuffer,
     param: paramBuffer,
-    m: mBuffer,
-    v: vBuffer,
-    bc: tBuffer,
-    lr: lrBuffer,
   };
+  config.stateSlots.forEach((slot, i) => {
+    buffers[slot] = stateBuffers[i];
+  });
+  config.scalarInputs.forEach((name, i) => {
+    buffers[name] = scalarBuffers[i];
+  });
   if (doF16 && paramF16Out) buffers.param_f16 = paramF16Out;
   if (doUnscale && infFlagBuffer) buffers.inf_flag = infFlagBuffer;
 
@@ -173,7 +152,7 @@ export function dispatchAdamStep(
   const uniforms: Record<string, number> = {
     num_elements: numElements,
   };
-  setAdamConfigUniforms(uniforms, config, doUnscale);
+  setOptStepConfigUniforms(uniforms, config, doUnscale);
   if (doUnscale) {
     // Unscale path needs grid_stride for manual 2D indexing
     const epa = doF16 ? 128 : 64;
@@ -199,12 +178,7 @@ export function dispatchAdamStep(
     uniforms._pad3 = 0;
   }
 
-  const dispatcher = getAdamDispatcher(useVec4, doF16, doUnscale);
-
-  // inc-2a: the config is fully STATIC now (bias correction is derived
-  // in-kernel from the t/lr tensor DATA inputs), so there is NO volatile
-  // repack — the config buffer is bound once and never rewritten across
-  // compiled-plan replays. The retired volatile-repack closure lived here.
+  const dispatcher = getOptStepDispatcher(config.spec, useVec4, doF16, doUnscale);
 
   _st = profileSubOpBegin();
   if (needsChunking) {
@@ -212,13 +186,11 @@ export function dispatchAdamStep(
     const modes: Record<string, "scalar" | "chunked"> = {
       grad: "chunked",
       param: "chunked",
-      m: "chunked",
-      v: "chunked",
-      // The [2] bc + lr are small shared inputs read at fixed indices by every
-      // chunk — bind whole ("scalar" mode = not chunked).
-      bc: "scalar",
-      lr: "scalar",
     };
+    for (const slot of config.stateSlots) modes[slot] = "chunked";
+    // Scalar-DATA inputs are small shared buffers read at fixed indices by every
+    // chunk — bind whole ("scalar" mode = not chunked).
+    for (const name of config.scalarInputs) modes[name] = "scalar";
     if (doF16) modes.param_f16 = "chunked";
     if (doUnscale) modes.inf_flag = "scalar";
 
@@ -237,13 +209,12 @@ export function dispatchAdamStep(
   } else {
     dispatcher.dispatch(buffers, uniforms);
   }
-  profileSubOpEnd("adam.dispatch", _st);
+  profileSubOpEnd("optStep.dispatch", _st);
 
-  // param/m/v are all updated in-place — return the same input buffers.
-  const result: AdamStepResult = {
+  // param + states are all updated in-place — return the same input buffers.
+  const result: OptStepResult = {
     paramBuffer,
-    mBuffer,
-    vBuffer,
+    stateBuffers,
   };
   if (paramF16Out) {
     result.paramF16Buffer = paramF16Out;
@@ -252,18 +223,18 @@ export function dispatchAdamStep(
 }
 
 /**
- * Stage-4 plan/encode: the adam-step dispatch plan (non-f16 path used by the
+ * Stage-4 plan/encode: the opt-step dispatch plan (non-f16 path used by the
  * packed optimizer), derived from the SAME dispatcher instance + uniform
- * mapping dispatchAdamStep uses. Returns null on the f16 / chunked routes.
- * The binding order is [grad, param, m, v, t, lr, (inf_flag?), config].
+ * mapping dispatchOptStep uses. Returns null on the f16 / chunked routes.
+ * The binding order is [grad, param, ...states, ...scalars, (inf_flag?), config].
  *
- * inc-2a: config is fully STATIC (bias correction derived in-kernel from the
- * t/lr tensor inputs), so there is NO volatilePack — the generated stream
- * binds the config buffer once (no TAG_UNIFORM repack).
+ * The config is fully STATIC (bias correction derived in-kernel from the bc/lr
+ * scalar-DATA inputs), so there is NO volatilePack — the generated stream binds
+ * the config buffer once (no TAG_UNIFORM repack).
  */
-export function planAdamStepDispatch(
+export function planOptStepDispatch(
   numElements: number,
-  config: AdamStepConfig,
+  config: OptStepConfig,
   infFlagBuffer: GPUBuffer | null,
   emitF16 = false,
 ): {
@@ -279,7 +250,7 @@ export function planAdamStepDispatch(
   const doUnscale = infFlagBuffer !== null;
   const useVec4 = doUnscale && numElements % 4 === 0;
   const uniforms: Record<string, number> = { num_elements: numElements };
-  setAdamConfigUniforms(uniforms, config, doUnscale);
+  setOptStepConfigUniforms(uniforms, config, doUnscale);
   if (doUnscale) {
     const epa = doF16 ? 128 : 64;
     const workItems = useVec4 ? Math.ceil(numElements / 4) : numElements;
@@ -295,7 +266,7 @@ export function planAdamStepDispatch(
     uniforms._pad2 = 0;
     uniforms._pad3 = 0;
   }
-  const dispatcher = getAdamDispatcher(useVec4, doF16, doUnscale);
+  const dispatcher = getOptStepDispatcher(config.spec, useVec4, doF16, doUnscale);
   return {
     plan: dispatcher.plan(uniforms),
     doUnscale,
@@ -307,8 +278,8 @@ export function planAdamStepDispatch(
 /**
  * Reset all module-local mutable state (dispatcher cache).
  */
-export function resetAdamKernelState(): void {
-  for (const d of adamDispatchers.values()) d.reset();
-  adamDispatchers.clear();
+export function resetOptStepKernelState(): void {
+  for (const d of optStepDispatchers.values()) d.reset();
+  optStepDispatchers.clear();
 }
-onTeardown(resetAdamKernelState);
+onTeardown(resetOptStepKernelState);

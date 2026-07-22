@@ -21,7 +21,8 @@ import {
   SGD_MOMENTUM_PROGRAM,
   SGD_PROGRAM,
 } from "../ops/semantic/optimizer";
-import type { OptStepRealizerSpec } from "./opt-step-realizer";
+import type { TileKernelSpec } from "../backend/webgpu/tile-ir";
+import { lowerOptStepBody, type OptStepRealizerSpec } from "./opt-step-realizer";
 
 /**
  * AdamW/Adam. bc=[bc1,bc2] + lr are scalar-DATA inputs (host-computed live
@@ -95,3 +96,27 @@ export const OPT_STEP_SPECS: Record<string, OptStepRealizerSpec> = {
   sgd_momentum: SGD_MOMENTUM_STEP_SPEC,
   sgd: SGD_STEP_SPEC,
 };
+
+/**
+ * The GENERIC fused-optimizer realizer entry (derived-optimizer-realizer R5b) —
+ * the de-named dispatch chokepoint the WebGPU backend routes through. Resolves
+ * the spec by name (`OptStepConfig.spec`) and folds its body via the program-
+ * roles realizer. For `adamw` this returns byte-for-byte the prior
+ * `realizeAdamStepSpec` output (both are `lowerOptStepBody(ADAM_STEP_SPEC,…)`);
+ * the schedule keeps `realizeAdamStepSpec`/the authored-seam differential as the
+ * Adam-specific single-source guard. The backend never names an optimizer — it
+ * passes `config.spec` through.
+ */
+export function realizeOptStepSpec(
+  specName: string,
+  useVec4: boolean,
+  emitF16: boolean,
+  emitUnscale: boolean,
+): TileKernelSpec {
+  const spec = OPT_STEP_SPECS[specName];
+  if (!spec)
+    throw new Error(
+      `realizeOptStepSpec: unknown optimizer spec '${specName}' (expected one of ${Object.keys(OPT_STEP_SPECS).join(", ")}).`,
+    );
+  return lowerOptStepBody(spec, useVec4, emitF16, emitUnscale);
+}

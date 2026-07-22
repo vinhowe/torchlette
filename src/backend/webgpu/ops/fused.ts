@@ -1,5 +1,5 @@
 /**
- * Fused kernel wrappers and I/O ops: adamStep, unscaleGrad, fusedCrossEntropy,
+ * Fused kernel wrappers and I/O ops: optStep, unscaleGrad, fusedCrossEntropy,
  * fusedLayerNorm, fusedAttention, read, waitForGPU, mulScalarInPlace.
  */
 import { ENV } from "../../../core/env";
@@ -53,8 +53,8 @@ import {
   dispatchPackedOptimizer,
   type PackedOptimizerItem,
 } from "../../../optim/packed-dispatch";
-import type { AdamBatchItem, AdamBatchResult } from "../../types";
-import { dispatchAdamStep as dispatchAdamStepKernel } from "../adam-kernel";
+import type { OptStepBatchItem, OptStepBatchResult } from "../../types";
+import { dispatchOptStep as dispatchOptStepKernel } from "../opt-step-kernel";
 import {
   dispatchFlashAttentionBackwardD as dispatchFABwdDKernel,
   dispatchFlashAttentionBackwardDKV as dispatchFABwdDKVKernel,
@@ -85,7 +85,7 @@ import {
 } from "../unscale-kernel";
 
 // ============================================================================
-// Fused Adam/AdamW Step
+// Fused Optimizer Step (Adam/Lion/SGD — spec-driven, R5b de-naming)
 // ============================================================================
 
 /**
@@ -126,30 +126,27 @@ function transferInPlaceOwnership(rwTensors: WebGPUTensor[]): void {
 }
 
 /**
- * Per-item Adam step implementation. Does NOT call flushSharedEncoder — the
- * caller is responsible for ensuring previously-recorded passes that read
- * the param/m/v buffers have been submitted before invoking this. Use
- * `adamStep` (which flushes once per call) for standalone calls; use
- * `adamStepBatch` (which flushes once per batch) for grouped calls.
+ * Per-item fused optimizer step implementation. Does NOT call flushSharedEncoder
+ * — the caller is responsible for ensuring previously-recorded passes that read
+ * the param/state buffers have been submitted before invoking this. Use
+ * `optStep` (which flushes once per call) for standalone calls; use
+ * `optStepBatch` (which flushes once per batch) for grouped calls. `states` and
+ * `scalars` are variadic per the config's spec (Adam: states [m,v], scalars [bc,lr]).
  */
-function adamStepInner(
+function optStepInner(
   grad: BackendTensor,
   param: BackendTensor,
-  m: BackendTensor,
-  v: BackendTensor,
-  t: BackendTensor,
-  lr: BackendTensor,
-  config: import("../../types").AdamStepConfig,
-): { param: BackendTensor; m: BackendTensor; v: BackendTensor } {
+  states: BackendTensor[],
+  scalars: BackendTensor[],
+  config: import("../../types").OptStepConfig,
+): { param: BackendTensor; states: BackendTensor[] } {
   let _st = profileSubOpBegin();
   const gradT = asContiguous(grad);
   const paramT = asContiguous(param);
-  const mT = asContiguous(m);
-  const vT = asContiguous(v);
-  // t/lr are read-only 1-element inputs — resolve their buffers (contiguous).
-  const tT = asContiguous(t);
-  const lrT = asContiguous(lr);
-  profileSubOpEnd("adam.ensureContig", _st);
+  const stateTs = states.map((s) => asContiguous(s));
+  // scalars (bc/lr) are read-only shared inputs — resolve their buffers.
+  const scalarTs = scalars.map((s) => asContiguous(s));
+  profileSubOpEnd("optStep.ensureContig", _st);
 
   // Evict stale f16 cache entry for the old param buffer before dispatch.
   // Use deferred destruction since the old f16 buffer may still be referenced
@@ -160,25 +157,25 @@ function adamStepInner(
     bufferPool.deferredDestroy(oldF16, oldF16.size);
     f16WeightCache.delete(paramT.buffer);
   }
-  profileSubOpEnd("adam.f16evict", _st);
+  profileSubOpEnd("optStep.f16evict", _st);
 
-  // Re-protect adam's input buffers in the write set.
+  // Re-protect the optimizer's input buffers in the write set.
   trackSharedEncoderWrite(paramT.buffer);
-  trackSharedEncoderWrite(mT.buffer);
-  trackSharedEncoderWrite(vT.buffer);
+  for (const s of stateTs) trackSharedEncoderWrite(s.buffer);
   trackSharedEncoderWrite(gradT.buffer);
+  for (const s of scalarTs) trackSharedEncoderWrite(s.buffer);
 
   // WebGPU forbids binding the same buffer as read_write at multiple
   // binding points and forbids read_write ↔ read aliasing. param and every
-  // state slot (m/v for Adam) are read_write, grad is read — so each rw
-  // buffer must be distinct from grad AND from every other rw buffer. Pool
-  // recycling can cause collisions.
+  // state slot are read_write, grad is read — so each rw buffer must be
+  // distinct from grad AND from every other rw buffer. Pool recycling can
+  // cause collisions.
   //
   // R5b — the variadic in-place buffer-lifetime class: the guard loops over
   // the read_write set `[param, ...states]` instead of hard-coding param/m/v,
-  // so a per-optimizer state arity (Lion m, SGD v, SGD none) is handled by the
-  // same code. Byte-identical for Adam (arity 2 → [param, m, v]): with distinct
-  // persistent buffers (the real-training case) NO copies fire.
+  // so a per-optimizer state arity (Adam [m,v], Lion [m], SGD+mom [v], SGD [])
+  // is handled by the same code. With distinct persistent buffers (the real-
+  // training case) NO copies fire — byte-identical to the prior hand-unroll.
   const gradBuf = gradT.buffer;
   const bufSize = gradT.size * dtypeBytes(gradT.dtype);
   const copyTo = (src: GPUBuffer): GPUBuffer => {
@@ -195,21 +192,20 @@ function adamStepInner(
     flushSharedEncoder();
     return dst;
   };
-  const rwTensors: WebGPUTensor[] = [paramT, mT, vT];
+  const rwTensors: WebGPUTensor[] = [paramT, ...stateTs];
   const rwBufs = distinctRwBuffers(rwTensors, gradBuf, copyTo);
-  const [paramBuf, mBuf, vBuf] = rwBufs;
+  const paramBuf = rwBufs[0];
+  const stateBufs = rwBufs.slice(1);
 
   const emitF16 = config.emitF16 ?? false;
   const infFlagBuf = (config.infFlagBuffer as GPUBuffer | null) ?? null;
   const numElements = gradT.size;
 
-  const result = dispatchAdamStepKernel(
+  const result = dispatchOptStepKernel(
     gradBuf,
     paramBuf,
-    mBuf,
-    vBuf,
-    tT.buffer,
-    lrT.buffer,
+    stateBufs,
+    scalarTs.map((t) => t.buffer),
     numElements,
     config,
     emitF16,
@@ -225,11 +221,11 @@ function adamStepInner(
   }
 
   cleanupContiguous([grad, gradT]);
-  // t/lr are persistent optimizer state owned by the caller — only free the
-  // contiguous COPY if asContiguous made one (cleanupContiguous no-ops when
-  // tT===t). The original t/lr buffers are never destroyed here.
-  cleanupContiguous([t, tT]);
-  cleanupContiguous([lr, lrT]);
+  // scalars (bc/lr) are persistent optimizer state owned by the caller — only
+  // free the contiguous COPY if asContiguous made one (cleanupContiguous no-ops
+  // when the copy === original). The originals are never destroyed here.
+  for (let i = 0; i < scalars.length; i++)
+    cleanupContiguous([scalars[i], scalarTs[i]]);
 
   // Cache the f16 param buffer (keyed by the param buffer, same as before)
   if (result.paramF16Buffer) {
@@ -248,76 +244,73 @@ function adamStepInner(
       0,
       paramT.dtype,
     ),
-    m: createTensor(mT.shape, result.mBuffer, undefined, 0, mT.dtype),
-    v: createTensor(vT.shape, result.vBuffer, undefined, 0, vT.dtype),
+    states: stateTs.map((st, i) =>
+      createTensor(st.shape, result.stateBuffers[i], undefined, 0, st.dtype),
+    ),
   };
-  profileSubOpEnd("adam.createTensor", _st);
+  profileSubOpEnd("optStep.createTensor", _st);
   return ret;
 }
 
-export async function adamStep(
+export async function optStep(
   grad: BackendTensor,
   param: BackendTensor,
-  m: BackendTensor,
-  v: BackendTensor,
-  t: BackendTensor,
-  lr: BackendTensor,
-  config: import("../../types").AdamStepConfig,
-): Promise<{ param: BackendTensor; m: BackendTensor; v: BackendTensor }> {
-  // Suppress memory limit checks for the entire adam step.
-  // During optimizer steps, old param/m/v buffers haven't been released yet
+  states: BackendTensor[],
+  scalars: BackendTensor[],
+  config: import("../../types").OptStepConfig,
+): Promise<{ param: BackendTensor; states: BackendTensor[] }> {
+  // Suppress memory limit checks for the entire optimizer step.
+  // During optimizer steps, old param/state buffers haven't been released yet
   // while new output buffers are allocated — temporary 2x peak is expected.
   gpuMemoryTracker.suppressLimitCheck();
   try {
-    // Flush shared encoder before dispatching the Adam kernel.
+    // Flush shared encoder before dispatching the optimizer kernel.
     // The forward/backward pass may have used param buffers as read-only
-    // inputs in compute passes. The Adam kernel binds param as read_write,
+    // inputs in compute passes. The kernel binds param as read_write,
     // which conflicts within the same command encoder synchronization scope.
     // Flushing ensures prior passes are submitted before the in-place writes.
     flushSharedEncoder();
-    return adamStepInner(grad, param, m, v, t, lr, config);
+    return optStepInner(grad, param, states, scalars, config);
   } finally {
     gpuMemoryTracker.unsuppressLimitCheck();
   }
 }
 
 /**
- * Batched Adam step. Groups same-element-count items into packed dispatches
- * (one kernel per size class instead of one per param), with per-item fallback
- * via `adamStepInner` for any items not handled by packing. The shared encoder
- * is flushed exactly ONCE for the whole batch, not per item.
+ * Batched fused optimizer step. Groups same-element-count items into packed
+ * dispatches (one kernel per size class instead of one per param), with per-item
+ * fallback via `optStepInner` for any items not handled by packing. The shared
+ * encoder is flushed exactly ONCE for the whole batch, not per item.
  *
  * Returns results in the same order as `items`.
  */
-export function adamStepBatch(items: AdamBatchItem[]): AdamBatchResult[] {
+export function optStepBatch(items: OptStepBatchItem[]): OptStepBatchResult[] {
   if (items.length === 0) return [];
   gpuMemoryTracker.suppressLimitCheck();
   try {
     // Single flush before any item — all items share one logical batch.
     flushSharedEncoder();
 
-    const results: Array<AdamBatchResult | null> = new Array(items.length).fill(
-      null,
-    );
+    const results: Array<OptStepBatchResult | null> = new Array(
+      items.length,
+    ).fill(null);
 
     // Try packed dispatch for groups of size ≥ 2 with the same element count.
     // dispatchPackedOptimizer requires items.length > 1 to even attempt.
-    // TORCHLETTE_PACKED_ADAM=0: measurement kill switch (per-item dispatches,
+    // TORCHLETTE_PACKED_OPT=0: measurement kill switch (per-item dispatches,
     // still one flush per batch) — quantifies what packing is worth.
-    if (items.length > 1 && ENV.TORCHLETTE_PACKED_ADAM !== "0") {
+    if (items.length > 1 && ENV.TORCHLETTE_PACKED_OPT !== "0") {
       // Pre-resolve contiguous tensors per item, evict f16 caches, build the
       // packed item descriptors. We hold onto the contiguous tensors so the
-      // fallback path can claim ownership uniformly with adamStepInner.
+      // fallback path can claim ownership uniformly with optStepInner.
       const contig: Array<{
         gradT: WebGPUTensor;
         paramT: WebGPUTensor;
-        mT: WebGPUTensor;
-        vT: WebGPUTensor;
+        stateTs: WebGPUTensor[];
       }> = items.map((item) => ({
         gradT: asContiguous(item.grad),
         paramT: asContiguous(item.param),
-        mT: asContiguous(item.m),
-        vT: asContiguous(item.v),
+        stateTs: item.states.map((s) => asContiguous(s)),
       }));
 
       for (const { paramT } of contig) {
@@ -328,54 +321,56 @@ export function adamStepBatch(items: AdamBatchItem[]): AdamBatchResult[] {
         }
       }
 
+      // Packed roles: grad · param · state slots (the chunked buffers). Scalar-
+      // DATA inputs (bc/lr) are 1-/2-element shared bindings — NOT scatter/
+      // gathered; bound ONCE via the dispatch closure.
       const packedItems: PackedOptimizerItem[] = contig.map((c) => ({
-        buffers: [c.gradT.buffer, c.paramT.buffer, c.mT.buffer, c.vT.buffer],
+        buffers: [c.gradT.buffer, c.paramT.buffer, ...c.stateTs.map((t) => t.buffer)],
         numElements: c.gradT.size,
       }));
 
-      // Packed kernel uses the FIRST item's config AND the FIRST item's t/lr
-      // tensors. This is SOUND because the executor's adam-batch grouping key
-      // (inc-2a) breaks the batch on lr-tensor identity: every item in one
-      // batch shares the same static config AND the same persistent t/lr
-      // tensors by construction. t/lr are 1-element shared bindings — they are
-      // NOT scatter/gathered (packed-dispatch assumes per-item numElements
-      // sizing); they are bound ONCE via the dispatch closure.
+      // Packed kernel uses the FIRST item's config AND the FIRST item's scalars.
+      // This is SOUND because the executor's opt-batch grouping key breaks the
+      // batch on scalar-tensor identity: every item in one batch shares the same
+      // static config AND the same persistent scalar tensors by construction.
       const config = items[0].config;
       const infFlagBuffer = (config.infFlagBuffer as GPUBuffer | null) ?? null;
-      const tBuf = (asContiguous(items[0].t) as WebGPUTensor).buffer;
-      const lrBuf = (asContiguous(items[0].lr) as WebGPUTensor).buffer;
+      const scalarBufs = items[0].scalars.map(
+        (s) => (asContiguous(s) as WebGPUTensor).buffer,
+      );
+      const nState = config.stateSlots.length;
+      // gather param(1) + state slots (2..1+nState) back into original buffers.
+      const gatherIndices = Array.from({ length: 1 + nState }, (_, i) => 1 + i);
 
       const handled = dispatchPackedOptimizer({
         items: packedItems,
-        gatherIndices: [1, 2, 3], // gather param, m, v back into original buffers
+        gatherIndices,
         dispatch(packed, totalElements) {
-          dispatchAdamStepKernel(
+          dispatchOptStepKernel(
             packed[0],
             packed[1],
-            packed[2],
-            packed[3],
-            tBuf,
-            lrBuf,
+            packed.slice(2, 2 + nState),
+            scalarBufs,
             totalElements,
             config,
             false,
             infFlagBuffer,
           );
         },
-        label: "packedAdam",
+        label: "packedOptStep",
       });
 
-      // For items handled by packed dispatch: param/m/v buffers were updated
+      // For items handled by packed dispatch: param/state buffers were updated
       // in place via the gather copy. Transfer ownership from the input BTs
-      // to fresh BTs wrapping the same buffers — same pattern adamStepInner
+      // to fresh BTs wrapping the same buffers — same pattern optStepInner
       // uses for its single-item path.
       for (const i of handled) {
-        const { gradT, paramT, mT, vT } = contig[i];
+        const { gradT, paramT, stateTs } = contig[i];
         const item = items[i];
 
         cleanupContiguous([item.grad, gradT]);
 
-        transferInPlaceOwnership([paramT, mT, vT]);
+        transferInPlaceOwnership([paramT, ...stateTs]);
 
         results[i] = {
           param: createTensor(
@@ -385,31 +380,30 @@ export function adamStepBatch(items: AdamBatchItem[]): AdamBatchResult[] {
             0,
             paramT.dtype,
           ),
-          m: createTensor(mT.shape, mT.buffer, undefined, 0, mT.dtype),
-          v: createTensor(vT.shape, vT.buffer, undefined, 0, vT.dtype),
+          states: stateTs.map((st) =>
+            createTensor(st.shape, st.buffer, undefined, 0, st.dtype),
+          ),
         };
       }
     }
 
     // Fallback path: for items not handled by packed dispatch (or all items
-    // when items.length === 1), call adamStepInner per item. The encoder was
-    // already flushed at the top, so adamStepInner skipping its own flush is
+    // when items.length === 1), call optStepInner per item. The encoder was
+    // already flushed at the top, so optStepInner skipping its own flush is
     // exactly what we want.
     for (let i = 0; i < items.length; i++) {
       if (results[i] !== null) continue;
       const item = items[i];
-      results[i] = adamStepInner(
+      results[i] = optStepInner(
         item.grad,
         item.param,
-        item.m,
-        item.v,
-        item.t,
-        item.lr,
+        item.states,
+        item.scalars,
         item.config,
       );
     }
 
-    return results as AdamBatchResult[];
+    return results as OptStepBatchResult[];
   } finally {
     gpuMemoryTracker.unsuppressLimitCheck();
   }

@@ -1741,15 +1741,17 @@ export function computePlanFingerprint(
  * Ops whose payloads (or specific fields) are EXCLUDED from the template
  * fingerprint because their per-step variation is already delivered to
  * executions as data, not baked into cached artifacts:
- * - adamStep / unscaleGrad: configs repacked per execution via TAG_UNIFORM;
+ * - optStep / unscaleGrad: configs repacked per execution via TAG_UNIFORM;
  *   getConfigBuffer's byte-compare guard invalidates if a varying config
- *   ever lacks a repack.
+ *   ever lacks a repack. (optStep's config is fully static post-fork-C, but the
+ *   exemption is retained: the payload carries the per-step-varying bc/lr as
+ *   scalar-DATA inputs, not baked into the fingerprint.)
  * - tensorFromArray `values`: re-executed per replay (TAG_WRITE).
  * - rand/randn/bernoulli `seed`: creation ops re-execute with the CURRENT
  *   node's payload each step (verified: fresh, replay-identical RNG).
  */
 const PAYLOAD_HASH_EXEMPT: Record<string, "ALL" | Set<string>> = {
-  adamStep: "ALL",
+  optStep: "ALL",
   unscaleGrad: "ALL",
   tensorFromArray: new Set(["values"]),
   rand: new Set(["seed"]),

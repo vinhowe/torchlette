@@ -18,7 +18,7 @@
  * identity resolves through the same caches.
  */
 
-import { planAdamStepDispatch } from "../backend/webgpu/adam-kernel";
+import { planOptStepDispatch } from "../backend/webgpu/opt-step-kernel";
 import {
   type AttentionStepPlan,
   planFlashAttentionBackward,
@@ -578,10 +578,10 @@ export function generateStream(
         coveredActions++;
         break;
       }
-      case "adam-batch": {
+      case "opt-batch": {
         const ab = action as { nodeIndices: number[] };
         const gen = backend
-          ? generateAdamBatch(
+          ? generateOptBatch(
               ab,
               planNodes,
               slots,
@@ -591,11 +591,11 @@ export function generateStream(
             )
           : "no-backend";
         if (typeof gen === "string") {
-          miss(`adam-batch[${gen}]`);
+          miss(`opt-batch[${gen}]`);
           for (const ni of ab.nodeIndices) phantom(planNodes[ni], ni);
           break;
         }
-        // Leading barrier (executor recordBarrier before adamStepBatch) lives
+        // Leading barrier (executor recordBarrier before optStepBatch) lives
         // in the flat stream only — non-node-attributed, not segment-checked.
         commands.push({ tag: TAG_BARRIER });
         for (const c of gen.commands) {
@@ -609,9 +609,9 @@ export function generateStream(
           commands: gen.commands,
         });
         for (const o of gen.outputs) {
-          // adamStep is multi-output (param oi0, m oi1, v oi2). Primary → the
-          // node→slot + buffer→slot channels; m/v extras → the extra channel so
-          // the harvest can carry persistent optimizer state across steps.
+          // optStep is multi-output (param oi0, state slots oi1..nState). Primary
+          // → the node→slot + buffer→slot channels; state extras → the extra
+          // channel so the harvest can carry persistent optimizer state across steps.
           if (o.outputIndex === 0) {
             mapNodeResult(planNodes[o.nodeIndex], o.slot, bufferToSlot);
             nodeSlot.set(o.nodeIndex, o.slot);
@@ -4710,18 +4710,18 @@ function generateFused(
 }
 
 /**
- * adam-batch generator. Mirrors the executor's adam-batch action exactly:
- * adamStepBatch packs same-element-count params (dispatchPackedOptimizer)
- * then falls back to per-item dispatch for the rest, ALL recorded under the
- * first node's index (one segment). Per packed group: scatter copies
- * (item buffers → cached packed buffers at offset), one volatile-uniform
- * packed adam dispatch, gather copies (packed → item buffers). Per fallback
- * item: an in-place adam dispatch (no alloc, non-f16). Shares the packed
- * grouping (planPackedGroups), packed buffers (lookupPackedBuffers), and
- * adam dispatch plan (planAdamStepDispatch) with the executor — no
- * reimplementation drift. Bails on f16 / chunked / non-contiguous.
+ * opt-batch generator. Mirrors the executor's opt-batch action exactly:
+ * optStepBatch packs same-element-count params (dispatchPackedOptimizer) then
+ * falls back to per-item dispatch for the rest, ALL recorded under the first
+ * node's index (one segment). Per packed group: scatter copies (item buffers →
+ * cached packed buffers at offset), one packed opt-step dispatch, gather copies
+ * (packed → item buffers). Per fallback item: an in-place opt-step dispatch (no
+ * alloc, non-f16). Shares the packed grouping (planPackedGroups), packed buffers
+ * (lookupPackedBuffers), and dispatch plan (planOptStepDispatch) with the
+ * executor — no reimplementation drift. Variadic over the config's spec (nState
+ * state slots + nScalars scalar-DATA inputs). Bails on f16 / chunked / non-contig.
  */
-function generateAdamBatch(
+function generateOptBatch(
   action: { nodeIndices: number[] },
   planNodes: LazyIRNode[],
   slots: SlotSource[],
@@ -4738,14 +4738,15 @@ function generateAdamBatch(
   const device = (backend as { device?: GPUDevice }).device;
   if (!device) return "no-device";
 
-  // Resolve each adamStep node's [grad, param, m, v, t, lr]: buffer, slot, size.
-  // inc-2a: t (slot 4) and lr (slot 5) are 1-element persistent tensor DATA
-  // inputs (NOT scatter/gathered — they are shared bindings bound once).
+  // Resolve each optStep node's [grad, param, ...states, ...scalars]: slot + size.
+  // The state slots (rw) are scatter/gathered; the scalar-DATA inputs (bc/lr)
+  // are shared bindings bound once. Arity + role split come from the payload spec.
   interface Item {
     nodeIndex: number;
-    bufSlots: [Slot, Slot, Slot, Slot, Slot, Slot];
+    bufSlots: Slot[];
     numElements: number;
-    config: import("../backend/types").AdamStepConfig;
+    config: import("../backend/types").OptStepConfig;
+    nState: number;
   }
   const itemList: Item[] = [];
   // The recording dispatched every node whose result was unset at that time;
@@ -4756,9 +4757,12 @@ function generateAdamBatch(
   const firstNodeIndex = action.nodeIndices[0];
   for (const nodeIdx of action.nodeIndices) {
     const node = planNodes[nodeIdx];
-    if (node.inputs.length !== 6) return "arity";
-    // adam-batch needs only the input SLOTS + element count — never the
-    // input buffers (planAdamStepDispatch reads neither, the scatter/gather
+    const config = node.payload as import("../backend/types").OptStepConfig;
+    const nState = config.stateSlots.length;
+    const nScalar = config.scalarInputs.length;
+    if (node.inputs.length !== 2 + nState + nScalar) return "arity";
+    // opt-batch needs only the input SLOTS + element count — never the
+    // input buffers (planOptStepDispatch reads neither, the scatter/gather
     // copies key on slots). So resolve slots LOGICALLY (resolveRefSlot
     // handles liveness-released grads via the node→slot channel) and take
     // the element count from the node shape. getInputStorage is avoided
@@ -4774,9 +4778,10 @@ function generateAdamBatch(
     }
     itemList.push({
       nodeIndex: nodeIdx,
-      bufSlots: bufSlots as [Slot, Slot, Slot, Slot, Slot, Slot],
+      bufSlots,
       numElements: sizeOf(node.shape),
-      config: node.payload as import("../backend/types").AdamStepConfig,
+      config,
+      nState,
     });
   }
   if (itemList.length === 0) return "no-items";
@@ -4784,41 +4789,34 @@ function generateAdamBatch(
   const commands: GpuCommand[] = [];
   const outputs: Array<{ nodeIndex: number; outputIndex: number; slot: Slot }> =
     [];
-  // adamStep is multi-output: param (oi 0), m (oi 1), v (oi 2). All three are
-  // updated IN PLACE — the node's result reuses the param/m/v INPUT slot
-  // (bufSlots = [grad, param, m, v]). The harvest needs slots for ALL three or
-  // the persistent m/v optimizer state can't be carried across steps (the
-  // genOk bail that kept backward+optimizer plans on the recorded path).
+  // optStep is multi-output: param (oi 0), state slots (oi 1..nState). All are
+  // updated IN PLACE — the node's result reuses the param/state INPUT slot
+  // (bufSlots = [grad, param, ...states]). The harvest needs slots for ALL of
+  // them or the persistent state can't be carried across steps (the genOk bail
+  // that kept backward+optimizer plans on the recorded path).
   for (const it of itemList) {
-    outputs.push({
-      nodeIndex: it.nodeIndex,
-      outputIndex: 0,
-      slot: it.bufSlots[1],
-    });
-    outputs.push({
-      nodeIndex: it.nodeIndex,
-      outputIndex: 1,
-      slot: it.bufSlots[2],
-    });
-    outputs.push({
-      nodeIndex: it.nodeIndex,
-      outputIndex: 2,
-      slot: it.bufSlots[3],
-    });
+    for (let oi = 0; oi <= it.nState; oi++) {
+      outputs.push({
+        nodeIndex: it.nodeIndex,
+        outputIndex: oi,
+        slot: it.bufSlots[1 + oi],
+      });
+    }
   }
 
   // PACKED groups (planPackedGroups mirrors dispatchPackedOptimizer's
   // element-count grouping + memory sub-batching), then per-item fallback.
-  // planPackedGroups reads only numElements + buffers.length (4 for Adam —
-  // grad/param/m/v; t/lr are 1-element shared bindings, NOT packed).
+  // planPackedGroups reads only numElements + buffers.length (2+nState —
+  // grad/param/states; scalar-DATA inputs are shared bindings, NOT packed).
+  // The grouping key guarantees a consistent nState within each group.
   const packItems = itemList.map((it) => ({
-    buffers: it.bufSlots.slice(0, 4) as unknown as GPUBuffer[],
+    buffers: it.bufSlots.slice(0, 2 + it.nState) as unknown as GPUBuffer[],
     numElements: it.numElements,
   }));
   const groups = planPackedGroups(packItems);
   const handled = new Set<number>();
 
-  const adamBinding = (
+  const optBinding = (
     plan: import("../backend/webgpu/tile-dispatch").TileKernelPlan,
     named: Record<string, Slot>,
     infFlag: unknown | null,
@@ -4840,20 +4838,43 @@ function generateAdamBatch(
     return out;
   };
 
+  // Build the named slot map for an item's roles: grad · param · state slots ·
+  // scalar-DATA inputs. `paramStateSlots` supplies the (possibly packed) buffers
+  // for grad/param/states; the scalar inputs are always the item's own shared slots.
+  const buildNamed = (
+    it: Item,
+    paramStateSlots: Slot[],
+  ): Record<string, Slot> => {
+    const named: Record<string, Slot> = {
+      grad: paramStateSlots[0],
+      param: paramStateSlots[1],
+    };
+    it.config.stateSlots.forEach((slot, i) => {
+      named[slot] = paramStateSlots[2 + i];
+    });
+    it.config.scalarInputs.forEach((name, i) => {
+      named[name] = it.bufSlots[2 + it.nState + i];
+    });
+    return named;
+  };
+
   for (const g of groups) {
     const numElements = g.numElements;
     const totalElements = numElements * g.indices.length;
     const elementBytes = numElements * 4;
     const alignedBytes = alignBufferSize(totalElements * 4);
-    const packed = lookupPackedBuffers(4, alignedBytes);
+    const repItem = itemList[g.indices[0]];
+    const nState = repItem.nState;
+    const nRole = 2 + nState;
+    const packed = lookupPackedBuffers(nRole, alignedBytes);
     if (!packed) return "packed-buffers-missing";
     const packedSlots = packed.map((b) =>
       bufferSlot(b as unknown, "persistent"),
     );
-    // Scatter: each item's [grad,param,m,v] → packed[b] at i*elementBytes.
+    // Scatter: each item's [grad,param,...states] → packed[b] at i*elementBytes.
     for (let i = 0; i < g.indices.length; i++) {
       const it = itemList[g.indices[i]];
-      for (let b = 0; b < 4; b++) {
+      for (let b = 0; b < nRole; b++) {
         commands.push({
           tag: TAG_COPY,
           src: it.bufSlots[b],
@@ -4864,38 +4885,27 @@ function generateAdamBatch(
         });
       }
     }
-    // Packed dispatch (first item's config; the packed path forces
-    // emitF16=false — dispatchAdamStepKernel(...,false,...)).
-    const cfg = itemList[g.indices[0]].config;
+    // Packed dispatch (first item's config; the packed path forces emitF16=false).
+    const cfg = repItem.config;
     const infFlag = (cfg.infFlagBuffer as unknown) ?? null;
-    const planned = planAdamStepDispatch(
+    const planned = planOptStepDispatch(
       totalElements,
       cfg,
       infFlag as GPUBuffer | null,
       false,
     );
-    if (!planned) return "adam-plan-null";
-    // inc-2a: t/lr are the group representative's 1-element persistent slots
+    if (!planned) return "opt-plan-null";
+    // The scalar-DATA inputs (bc/lr) are the group representative's shared slots
     // (bound ONCE for the packed dispatch — the grouping key guarantees every
-    // item in this group shares the same t/lr tensors).
-    const repItem = itemList[g.indices[0]];
-    const bindings = adamBinding(
+    // item in this group shares the same scalar tensors).
+    const bindings = optBinding(
       planned.plan,
-      {
-        grad: packedSlots[0],
-        param: packedSlots[1],
-        m: packedSlots[2],
-        v: packedSlots[3],
-        t: repItem.bufSlots[4],
-        // R2/fork-B alias (see per-item fallback): derived plans name slot-4 `bc`.
-        bc: repItem.bufSlots[4],
-        lr: repItem.bufSlots[5],
-      },
+      buildNamed(repItem, packedSlots),
       infFlag,
     );
-    if (!bindings) return "adam-bind-null";
-    // inc-2a: config is STATIC (bias correction derived in-kernel from t/lr) —
-    // NO TAG_UNIFORM repack. The config buffer is bound once via adamBinding
+    if (!bindings) return "opt-bind-null";
+    // The config is STATIC (bias correction derived in-kernel from bc/lr) — NO
+    // TAG_UNIFORM repack. The config buffer is bound once via optBinding
     // (name === null → planned.plan.configBuffer, baked at plan() time).
     commands.push({
       tag: TAG_DISPATCH,
@@ -4905,10 +4915,13 @@ function generateAdamBatch(
       gy: planned.plan.grid[1],
       gz: planned.plan.grid[2],
     });
-    // Gather: packed[b] at offset → item buffers, for b in [1,2,3].
+    // Gather: packed[b] at offset → item buffers, for the IN-PLACE outputs
+    // param(1) + state slots(2..1+nState) — i.e. b in [1, 1+nState]. grad(0) is
+    // read-only (not gathered). (Off-by-one here silently dropped the last state
+    // slot's write-back → stale optimizer state at scale.)
     for (let i = 0; i < g.indices.length; i++) {
       const it = itemList[g.indices[i]];
-      for (const b of [1, 2, 3]) {
+      for (let b = 1; b < nRole; b++) {
         commands.push({
           tag: TAG_COPY,
           src: packedSlots[b],
@@ -4922,34 +4935,23 @@ function generateAdamBatch(
     }
   }
 
-  // Fallback: per-item adam dispatch (adamStepInner). In-place param/m/v —
+  // Fallback: per-item opt-step dispatch (optStepInner). In-place param/states —
   // no alloc — UNLESS config.emitF16 (large weights kept in f16 for the
   // forward pass): then a param_f16 OUTPUT buffer is allocated (kind 1) and
-  // bound. Matches adamStepInner's `emitF16 = config.emitF16 ?? false`.
+  // bound. Matches optStepInner's `emitF16 = config.emitF16 ?? false`.
   for (let idx = 0; idx < itemList.length; idx++) {
     if (handled.has(idx)) continue;
     const it = itemList[idx];
     const infFlag = (it.config.infFlagBuffer as unknown) ?? null;
     const emitF16 = (it.config as { emitF16?: boolean }).emitF16 ?? false;
-    const planned = planAdamStepDispatch(
+    const planned = planOptStepDispatch(
       it.numElements,
       it.config,
       infFlag as GPUBuffer | null,
       emitF16,
     );
-    if (!planned) return "adam-plan-null";
-    const named: Record<string, Slot> = {
-      grad: it.bufSlots[0],
-      param: it.bufSlots[1],
-      m: it.bufSlots[2],
-      v: it.bufSlots[3],
-      t: it.bufSlots[4], // inc-2a: persistent step counter
-      // R2/fork-B alias: the DERIVED plan names slot-4 `bc` (a [2] bias-correction
-      // DATA tensor) instead of `t`. adamBinding picks whichever the plan's
-      // bindingOrder uses; providing both keeps this seam flag-agnostic.
-      bc: it.bufSlots[4],
-      lr: it.bufSlots[5], // inc-2a: persistent learning rate
-    };
+    if (!planned) return "opt-plan-null";
+    const named = buildNamed(it, it.bufSlots);
     // f16 weight output: allocateOutputBuffer(numElements*2) = allocKind 1.
     if (planned.doF16) {
       const f16Slot = slots.length;
@@ -4963,8 +4965,8 @@ function generateAdamBatch(
       });
       named.param_f16 = f16Slot;
     }
-    const bindings = adamBinding(planned.plan, named, infFlag);
-    if (!bindings) return "adam-bind-null";
+    const bindings = optBinding(planned.plan, named, infFlag);
+    if (!bindings) return "opt-bind-null";
     // inc-2a: STATIC config — no TAG_UNIFORM repack (see packed path above).
     commands.push({
       tag: TAG_DISPATCH,

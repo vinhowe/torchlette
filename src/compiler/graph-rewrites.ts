@@ -227,7 +227,7 @@ const NON_CSE_OPS = new Set([
   "fusedRMSNormBackwardGradWeight",
   "fusedCrossEntropyForward",
   "fusedCrossEntropyBackward",
-  "adamStep",
+  "optStep",
   "stridedScatterCopy",
   "stridedScatterAdd",
   "unscaleGrad",

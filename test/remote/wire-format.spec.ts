@@ -222,7 +222,7 @@ describe("remote wire format: structural round-trip", () => {
     assertRoundTripEquivalent({ nodes: [a, b, mm, bias, bi, g, c] });
   });
 
-  it("adamStep config payload (without infFlagBuffer)", () => {
+  it("optStep config payload (without infFlagBuffer)", () => {
     const node = makeNodeFactory();
     const param = node("tensorFromArray", [], [128], "f32", {
       values: new Float32Array(128).fill(0.5),
@@ -233,18 +233,24 @@ describe("remote wire format: structural round-trip", () => {
     const m = node("zeros", [], [128]);
     const v = node("zeros", [], [128]);
     const adam = node(
-      "adamStep",
+      "optStep",
       [pending(param), pending(grad), pending(m), pending(v)],
       [128],
       "f32",
       {
-        beta1: 0.9,
-        beta2: 0.999,
-        stepSize: 3e-4,
-        eps: 1e-8,
-        weightDecay: 0.01,
-        lrTimesWd: 0.01 * 3e-4,
+        spec: "adamw",
+        stateSlots: ["m", "v"],
+        scalarInputs: ["bc", "lr"],
+        hypers: {
+          beta1: 0.9,
+          beta2: 0.999,
+          ln_beta1: Math.fround(Math.log(0.9)),
+          ln_beta2: Math.fround(Math.log(0.999)),
+          eps: 1e-8,
+          weight_decay: 0.01,
+        },
         decoupledWd: true,
+        emitF16: true,
       },
     );
     assertRoundTripEquivalent({ nodes: [param, grad, m, v, adam] });

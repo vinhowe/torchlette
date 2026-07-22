@@ -1,6 +1,6 @@
 import { getBackend } from "../backend/registry";
 import type {
-  AdamStepConfig,
+  OptStepConfig,
   Backend,
   BackendTensor,
   DeviceKind,
@@ -589,31 +589,31 @@ function executeGenericOp(
   return fn(...args) as BackendTensor;
 }
 
-/** adamStep is async + multi-output (param, m, v). */
-function executeAdamStep(
+/** optStep is async + multi-output (param + state slots). Inputs are
+ *  [grad, param, ...states, ...scalars]; nState comes from the payload spec. */
+function executeOptStep(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
 ): Promise<MultiOutputResult> {
-  assertOpSupported("adamStep", backend.ops.adamStep);
-  const payload = requirePayload<AdamStepConfig>(node);
+  assertOpSupported("optStep", backend.ops.optStep);
+  const payload = requirePayload<OptStepConfig>(node);
+  const nState = payload.stateSlots.length;
   return (async () => {
-    const adamResult = await backend.ops.adamStep!(
+    const result = await backend.ops.optStep!(
       backendInputs[0],
       backendInputs[1],
-      backendInputs[2],
-      backendInputs[3],
-      backendInputs[4], // t
-      backendInputs[5], // lr
+      backendInputs.slice(2, 2 + nState),
+      backendInputs.slice(2 + nState),
       payload,
     );
-    // Return all three outputs explicitly. The wrapper at the call site
-    // (assignNodeResult) handles wrapping the param into an owning
-    // StorageHandle and creating storage handles for m/v in one place,
+    // Return all outputs explicitly (param + states). The wrapper at the call
+    // site (assignNodeResult) handles wrapping the param into an owning
+    // StorageHandle and creating storage handles for the states in one place,
     // so node.result and node.results[0] are guaranteed to agree.
     return {
-      primary: adamResult.param,
-      extras: [adamResult.m, adamResult.v],
+      primary: result.param,
+      extras: result.states,
     };
   })();
 }
@@ -763,8 +763,8 @@ function buildOpTable(): Map<string, OpHandler> {
     );
   });
 
-  // adamStep: special-cased (async, side outputs, markReachable)
-  t.set("adamStep", executeAdamStep);
+  // optStep: special-cased (async, side outputs, markReachable)
+  t.set("optStep", executeOptStep);
 
   return t;
 }
