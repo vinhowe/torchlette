@@ -45,8 +45,8 @@ KEPT.** See the diagnosis section at the bottom.
 | Flag | Default / opt-out | src read | Why it stays |
 |---|---|---|---|
 | `TORCHLETTE_COMPILED_PLAN` | on; `=0` = lowered reference | `executor.ts:711,2051` | Lowered control arm of `parity-fullstack-tl.ts` + `compiled-plan-parity.spec.ts` gate. Explicitly NOT in sunset scope (docs/stage4). |
-| `TORCHLETTE_STEP_TAPE` | off (opt-in); `record`/`1` | `step-tape.ts:68,70` | Campaign flag; soak NOT declared complete. Load-bearing ON/OFF differential (`t-uk-economics.ts`); shipped `=1` decode config. |
-| `TORCHLETTE_WHOLE_STEP` | on since 2026-07-19; `=0` = eager | `step-tape.ts:103` | Opt-out IS the eager semantic reference the differential gates compare against. Soak "days old"; sunset deferred (re-ruled PERMANENT POLICY, docs/step-function-compiler-design). |
+| ~~`TORCHLETTE_STEP_TAPE`~~ | **DELETED (P4b-R, 2026-07-22)** | — | The step-tape recorder + replay were deleted after the decode census + weighted decode-α gate proved the tape adds zero decode value (block byte-identical + same submits at tape on/off; host residue tape-free-correct). The flag and its `record`/`1`/`STRICT`/`VERIFY` family are gone. |
+| `TORCHLETTE_WHOLE_STEP` | on since 2026-07-19; `=0` = eager | `env.ts` (`WHOLE_STEP_TRACE`) | Opt-out IS the eager semantic reference the differential gates compare against. Soak "days old"; sunset deferred (re-ruled PERMANENT POLICY, docs/step-function-compiler-design). **Relocated from step-tape.ts to env.ts in P4b-R — it never belonged to the tape.** |
 | `TORCHLETTE_STRICT_LIFETIME` | throw; `=0` = warn (soak) | `op-dispatch.ts:57`, `schedule/canonical.ts:579` | **STOP** — soak due ~2026-08 but blocked by a whole-step remat GC race (diagnosis below). Also coupled to the young whole-step soak. |
 | `TORCHLETTE_ARENA_LIVENESS` | bounded arena; `=0` = legacy unbudgeted | `buffer-arena.ts:324` | `=0` used by 124M A/B tools; legacy-arena escape hatch still referenced. |
 | `TORCHLETTE_MEMORY_PLANNER` | on; `=0` disables compiled replay | `buffer-arena.ts:348` | `=0` = lowered-wholesale reference (dynamic replay leaks). |
@@ -69,8 +69,7 @@ KEPT.** See the diagnosis section at the bottom.
 `TORCHLETTE_PROFILE`, `TORCHLETTE_PROFILE_JSON`, `TORCHLETTE_STRICT_GPU`,
 `TORCHLETTE_RC_TRACE`, `TORCHLETTE_SCHEDULER_AUDIT`, `TORCHLETTE_TRACE_EPOCHS`,
 `TORCHLETTE_MEASURE_D5`, `TORCHLETTE_AUTOTUNE`, `TORCHLETTE_LOG_REWRITES`,
-`TORCHLETTE_LOG_DSL`, `TORCHLETTE_TAPE_PROFILE`, `TORCHLETTE_TAPE_VERIFY`,
-`TORCHLETTE_STRICT_TAPE`, `TORCHLETTE_BUF_DEBUG`, and the `TORCHLETTE_DEBUG_*`
+`TORCHLETTE_LOG_DSL`, `TORCHLETTE_BUF_DEBUG`, and the `TORCHLETTE_DEBUG_*`
 family: `DEBUG_COMPILED`, `DEBUG_FUSION`, `DEBUG_WRITES`, `DEBUG_SCALARS`,
 `DEBUG_REBIND`, `DEBUG_SLOT`, `DEBUG_SLOTS`, `DEBUG_READSLOTS`, `DEBUG_HARVEST`,
 `DEBUG_HARVEST_ALL`, `DEBUG_SHAPE`, `DEBUG_OPMATCH`, `DEBUG_SHARED_ENCODER`,
@@ -81,7 +80,8 @@ family: `DEBUG_COMPILED`, `DEBUG_FUSION`, `DEBUG_WRITES`, `DEBUG_SCALARS`,
 
 Each was cross-checked against the authoritative `ENV.TORCHLETTE_*` read set
 (`grep -rhoE 'ENV\.(TORCHLETTE_[A-Z_]+)' src`) — none is an orphaned hook.
-Note: `TAPE_PROFILE`/`TAPE_VERIFY`/`STRICT_TAPE` sunset rides `STEP_TAPE`.
+Note: `TAPE_PROFILE` / `TAPE_VERIFY` / `STRICT_TAPE` were DELETED with the
+step-tape (P4b-R, 2026-07-22) — they rode `STEP_TAPE` and died with it.
 
 ## Config / infra (KEEP)
 

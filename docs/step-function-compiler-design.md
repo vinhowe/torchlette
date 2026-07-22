@@ -1471,6 +1471,46 @@ because the load-bearing premise (the default decode path is a tape consumer) is
 MEASURED false. Nothing is deleted in this pass; the deletion awaits Vin's approval and
 the weighted decode-α gate.*
 
+### P4b-R EXECUTED — the phased R1→R3 deletion LANDED (2026-07-22, Vin-approved)
+
+Vin approved the phased R1→R3 execution. Landed on the worktree branch, one commit
+per phase:
+
+- **R1 — demote the consumer.** The editor-surface HARD GATE PASSED (import-graph +
+  runtime probe `tools/t-editor-tape-independence.ts`): `StepEditChannel` /
+  `examples/schedule-editor` do NOT transitively require the tape (the editor needs
+  only the `StepPartition` interface; `examples/schedule-editor` is standalone). Both
+  demo `tape-flag.ts` files flipped `STEP_TAPE=1`→unset. Census reproduced (V100):
+  block-greedy + block-filtered BYTE-IDENTICAL at tape 0 vs 1, same submits,
+  `producers` 0→1 (vestigial), zero GPU errors.
+- **R2 — the WEIGHTED decode-α gate.** Real Qwen3-1.7B (the demo model), 3 arms ×
+  STEP_TAPE{0,1}: block arms byte-identical + submits 145==145 (no tape value); host
+  residue byte-identical but submits 175→**196** (tape LOSES on its own replay path).
+  Coherent generations confirmed. The re-audit's random-init finding held on real
+  weights.
+- **R3 — the deletion.** `tape-profile.ts` → the step-tape recorder + replay engine
+  (`step-tape.ts` + `step-tape-replay.ts`) → `cross-plan-edges.ts` reduced to its two
+  inert read-stubs, each behind a green parity gate. `WHOLE_STEP_TRACE` relocated to
+  `env.ts` (it never belonged to the tape). `step-object.ts` KEPT (its tape-projection
+  half pruned; the editor's `StepPartition` surface untouched). `observed-liveness.ts`
+  BYTE-UNTOUCHED (asserted by git diff vs the pre-campaign HEAD). Env flags
+  `STEP_TAPE` / `TAPE_VERIFY` / `STRICT_TAPE` / `TAPE_PROFILE` DIED.
+
+**The census's one miss, caught by a gate (then cleared).** A concurrent 6-spec GPU
+batch tripped `whole-step-checkpoint-refusal` on the strict-lifetime reclaimed-read
+guard — investigated per the STOP discipline and proven a CONTENTION FALSE POSITIVE
+(3/3 green isolated; `STEP_TAPE_RECORD` is default-off so the witness-harvest seam was
+already inert on the shipped path). Not a real consumer.
+
+**Training provably untouched:** `parity-fullstack-tl` compiled-vs-lowered maxAbsDiff
+**4.29e-6** over 30 checkpointed+autocast+scaler+clip+AdamW steps; the 124M regression
+PASSED round-0 **9.8089** (exact) / 3 5.9225 / 6 5.1522 / 9 4.6387, memory flat.
+
+**Covenant reckoning.** `src/` code-only SLOC **69198 → 67204 = −1994** (pre-campaign
+`74d0456a` → the deletion HEAD); files 205→202; exports 25→20; env flags 68→65. The
+covenant is now NET-NEGATIVE — P4b's honest 0-executable STOP is superseded because the
+premise it rested on (the default decode path is a tape consumer) became measured-false.
+
 ### Risks (honest)
 
 - **Plan-builder scale** (P0). Bounded, named, amortized once-per-compile — but the
