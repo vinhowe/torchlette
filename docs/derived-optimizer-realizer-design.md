@@ -433,3 +433,53 @@ whereas chain-packing's larger deletion is STOPPED. The platonic win here is
 can express an in-place multi-buffer packed elementwise kernel") is proven by the
 LIVE shipping Adam kernel, which is exactly that. The memory exit number is the
 existing C-EXIT A100 measurement. Measured facts, not speculation.
+
+---
+
+## Implementation status (R1–R4) — updated 2026-07-22
+
+- **R1 — the fold, dark: LANDED.** `src/schedule/optterm-fold.ts`
+  (`lowerOptTermToTileIR`), the structural sibling of `evalOptTerm`; `mm` refuses
+  structurally via the existing `OptimizerPackRefusal`. Gates:
+  `test/schedule/optterm-fold.spec.ts` (catalog, 7/7) + `tools/optterm-fold-parity.ts`
+  (fold-compiled kernel == `evalOptTensor`, ≤1e-6: adamw 3.08e-7, sgd/sgd_momentum/lion
+  ~1.2e-7; muon refuses). Net src +77.
+
+- **R2 — derived Adam behind `TORCHLETTE_DERIVED_ADAM` (fork B): LANDED, flag OFF.**
+  The fused body folds `ADAMW_M_NEW/V_NEW/SCALED`; `bc1`/`bc2` ride in as a `[2]`
+  `bc` DATA input REPLACING `t` at input slot 4 (node arity kept at 6 → every
+  executor/replay/batch seam structurally unchanged), so the in-kernel `expm1`
+  prelude dies. Two NAMED reassociation lemmas (L1 `(g·g)·(1−β2)`; L2 divide-inside-
+  sqrt vs the authored √bc2-factored step_size). Gates: authored byte-differential
+  INTACT (`adam-differential` 13/13); `tools/derived-adam-parity.ts` derived==authored
+  Δparam ≤2.98e-8, Δm=Δv bit-exact; `fused-vs-elementwise` 12/12 BOTH flag states;
+  `test:gates` 5/5 BOTH (compiled==lowered for the derived path — bc-in-plan +
+  stream-generate bc alias validated); 124M regression EXACT both states
+  ({0:9.81,3:5.92,6:5.15,9:4.64}, memory identical). Net src +108, envFlags +1.
+
+- **R3 — the flip: STOPPED (exit gate NOT met on medium).** A100 (dw-2-1) A/B,
+  derived vs authored, `profile-training` @512, late (steady) steps:
+  - **distil: CLEAN** — peak identical (5636.6 MB), **submits 8→8 EXACT**, speed
+    parity (~60.9 ms), +35 tiny [1]/[2] dispatches (the bc prelude).
+  - **medium: REGRESSED** — **submits 19→20 (+1, STABLE across steps 5–17)** and a
+    **+799 MB warmup peak** (16189→16988 MB); steady-state *current* memory is
+    identical (7246.5 MB) and speed is identical (65.9 ms), but the derived plan
+    settles ~6 steps slower (warmup cur 8707.9 vs 7246.5, +347 warmup dispatches).
+  - **Verdict:** the graph-side bc subgraph (fork B) does NOT pack into the fused
+    optimizer dispatch segment on the larger model — it inserts one submit boundary
+    (and the warmup-peak transient that shadows it). This fails the "submits EXACT"
+    exit gate. The flip is BLOCKED until the bc prelude packs into the optimizer
+    segment without a submit (a planner/fusion-scheduling task, NOT a numerical
+    issue — the trajectory is correct everywhere). No silent drift is passed off as
+    benign: distil is clean, medium regresses on submit-parity, measured on the
+    authoritative A100 box.
+
+- **R4 — the deletion: NOT REACHED** (depends on R3). The authored body is retained
+  as the differential oracle; `TORCHLETTE_DERIVED_ADAM` stays OFF by default, so the
+  shipping default is unchanged.
+
+**Re-open condition for R3:** make the `bc` prelude (the `_biasCorrection` +
+`cat([bc1,bc2])` subgraph) schedule inside the optimizer segment's encoder without
+forcing a flush on large-param models, so medium submits return to 19 EXACT. The
+mechanism (R1+R2) is otherwise proven correct and ready; only the large-model
+packing of the prelude blocks the default flip.
