@@ -15,7 +15,7 @@ import type { AdamStepConfig } from "../types";
 
 /** R2/fork-B: whether the fused Adam body is DERIVED from ADAMW_PROGRAM (binds a
  *  `[2]` `bc` DATA input at the `t` slot). Gated OFF by default. */
-const derivedAdam = (): boolean => ENV.TORCHLETTE_DERIVED_ADAM === "1";
+const derivedAdam = (): boolean => ENV.TORCHLETTE_DERIVED_ADAM !== "0"; // R3 FLIP: fork C default
 import { allocateOutputBuffer } from "./buffer-arena";
 import { computeFlatChunkLayout } from "./chunked-dispatch";
 import { getMaxStorageBufferBindingSize, isF16Supported } from "./gpu-context";

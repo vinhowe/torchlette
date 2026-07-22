@@ -51,10 +51,14 @@ describe("P4 fused-Adam byte differential (authored / opaque)", () => {
     it(`adamStep [${adamCacheKey(desc)}]`, () => {
       // The LIVE path IS the schedule chokepoint now (the cutover-flip): the
       // dispatcher routes through realizeAdamStepSpec / generateAdamShaderTileIR.
+      // R3 FLIP (2026-07-22): fork C (derived) is now the default, so pin
+      // derived=false here — this spec guards the AUTHORED byte-differential,
+      // which stays armed until R4 deletes the authored body.
       const live = generateAdamShaderTileIR(
         desc.useVec4,
         desc.emitF16,
         desc.emitUnscale,
+        false,
       );
       const derived = compileTileKernel(
         applyAdamSchedule(deriveAdamSkeleton(desc), desc),

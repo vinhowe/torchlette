@@ -465,7 +465,9 @@ export class Adam {
     // `t`/`lr`), so the adam-batch grouping key (shared input[4] identity) still
     // packs the group; the scatter re-executes under compiled replay from the
     // re-noted host value (scalar-slots re-dress), exactly the `lr` discipline.
-    const derived = ENV.TORCHLETTE_DERIVED_ADAM === "1";
+    // R3 FLIP (2026-07-22): fork C is the DEFAULT. Opt out with
+    // TORCHLETTE_DERIVED_ADAM=0 (sunset at R4, when the authored body is deleted).
+    const derived = ENV.TORCHLETTE_DERIVED_ADAM !== "0";
     let biasRt = tRt;
     if (derived) {
       if (!this._bcLive) {

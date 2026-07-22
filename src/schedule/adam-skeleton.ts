@@ -214,7 +214,7 @@ export function realizeAdamStepSpec(
   useVec4: boolean,
   emitF16: boolean,
   emitUnscale: boolean,
-  derived: boolean = ENV.TORCHLETTE_DERIVED_ADAM === "1",
+  derived: boolean = ENV.TORCHLETTE_DERIVED_ADAM !== "0", // R3 FLIP: fork C default
 ): TileKernelSpec {
   // DERIVED path (R2, fork B): the per-element body is FOLDED from ADAMW_PROGRAM
   // (lowerOptTermToTileIR), and bias correction rides in as a [2] `bc` DATA input
@@ -232,7 +232,7 @@ export function generateAdamShaderTileIR(
   useVec4: boolean,
   emitF16: boolean,
   emitUnscale: boolean,
-  derived: boolean = ENV.TORCHLETTE_DERIVED_ADAM === "1",
+  derived: boolean = ENV.TORCHLETTE_DERIVED_ADAM !== "0", // R3 FLIP: fork C default
 ): string {
   return compileTileKernel(
     realizeAdamStepSpec(useVec4, emitF16, emitUnscale, derived),
