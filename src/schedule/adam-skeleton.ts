@@ -34,31 +34,11 @@
  */
 
 import { compileTileKernel } from "../backend/webgpu/tile-compiler";
-import type {
-  BindingSpec,
-  BlockExpr,
-  KernelContext,
-  TileKernelSpec,
-  UniformType,
-  VarHandle,
-} from "../backend/webgpu/tile-ir";
-import {
-  F32_ONE_BITS,
-  MAX_WORKGROUPS_PER_DIM,
-  WORKGROUP_SIZE,
-} from "../backend/webgpu/shape-utils";
+import type { TileKernelSpec } from "../backend/webgpu/tile-ir";
 import { reportNoSecondOwner } from "./canonical";
 import { applyMove } from "./moves/moves";
-import {
-  ADAMW_M_NEW,
-  ADAMW_SCALED,
-  ADAMW_V_NEW,
-  type OptTerm,
-} from "../ops/semantic/optimizer";
-import {
-  lowerOptTermToTileIR,
-  type FoldRoleBindings,
-} from "./optterm-fold";
+import { lowerOptStepBody } from "./opt-step-realizer";
+import { ADAM_STEP_SPEC } from "./opt-step-specs";
 import type {
   PredicateAstNode,
   ScheduleMove,
@@ -398,315 +378,36 @@ export function deriveHorizontalPackedAdam(segments: readonly AdamParamSegment[]
   };
 }
 
+
 // ============================================================================
-// The ABSORBED authored fused-Adam kernel body (§7 P4 cutover-flip)
+// The Adam spec for the PROGRAM-ROLES REALIZER (R5a)
 // ============================================================================
 //
-// The fused-Adam kernel body — RELOCATED from adam-kernel.ts `makeAdamStepSpec` —
-// so the schedule module is the SOLE owner of the Adam kernel structure at the
-// live dispatch seam (`realizeAdamStepSpec`). The bias-corrected step-size
-// (expm1-form bias correction from the on-device t/lr tensor inputs), the
-// L2/decoupled weight-decay branches, and the atomic-guarded unscale vec4 path
-// LOWER FROM here now. BYTE-IDENTICAL to the retired factory (the 5-variant
-// differential is the safety net). The skeleton STAYS opaque (F3): the per-element
-// update is a locked numeric formula, but the body it names lives here — one owner.
-// The horizontal-pack derivation (deriveHorizontalPackedAdam, above) is the
-// DERIVABLE part; this body is the authored per-element update the pack batches.
+// R5a (2026-07-22): the fused-Adam kernel body was GENERALIZED off Adam. The
+// per-element arithmetic that used to live here (lowerAdamStepBody +
+// emitDerivedBiasCorrection + emitDerivedAdamScalarBody + loadAdamUniforms) now
+// lives in the generic program-roles realizer (opt-step-realizer.ts): it assembles
+// a fused-optimizer kernel from ANY OptimizerProgram + a role schema by folding the
+// program's state updates + param update via the OptTerm→tile-IR fold. Adam becomes
+// a thin SPEC provider — the executed kernel is bit-for-bit the prior derived body
+// (the fold of `oSub(p, SCALED)` is the same tile-IR as the prior `p.sub(SCALED)`;
+// same uniform block, same op order). The realizer is the ONE seam Lion/SGD plug
+// into for their fused kernels (design ruling O1, §3.4 "one seam, four clients").
+//
+// bias correction rides in as a `[2]` `bc` DATA input (fork C: a host-computed live
+// scalar); `lr` as a `[1]` DATA input (the live-scalar seam). The static hypers stay
+// UNIFORMS (ln_beta1/ln_beta2 retained though dead so the setAdamConfigUniforms
+// block is byte-unchanged). Surviving guards: the fold-parity differential
+// (optterm-fold) + the realizer-parity differential (opt-step-realizer-parity).
 
-/** The fused Adam/AdamW body (single WGSL dispatch per param/segment).
- *
- * `derived` (R2, fork B): route the per-element arithmetic through the
- * `OptTerm→tile-IR` fold and take bias correction as a `[2]` `bc=[bc1,bc2]` DATA
- * input instead of computing it in-kernel from `t` (the `expm1` prelude dies).
- * The wrapper (grid, f16, unscale/atomic-inf, the L2/decoupled wd branches) is
- * program-agnostic dispatch policy and stays IDENTICAL across both paths — only
- * the binding at slot 4 (`t`→`bc`) and the two emit helpers swap. */
+/** The fused Adam/AdamW body — DELEGATED to the generic program-roles realizer
+ *  over ADAM_STEP_SPEC. Reproduces the prior derived body bit-for-bit. The wrapper
+ *  (grid, f16, unscale/atomic-inf, the L2/decoupled wd branches) is the realizer's
+ *  program-agnostic dispatch policy. */
 function lowerAdamStepBody(
   useVec4: boolean,
   emitF16: boolean,
   emitUnscale: boolean,
 ): TileKernelSpec {
-  const bindings: Record<string, BindingSpec> = {
-    grad: { storage: "read", type: "f32" },
-    param: { storage: "read_write", type: "f32" },
-    m: { storage: "read_write", type: "f32" },
-    v: { storage: "read_write", type: "f32" },
-    // inc-2a: lr flows as a persistent 1-element f32 tensor DATA, not a
-    // per-step-varying uniform. The recorder sees stable buffers (TAG_WRITE),
-    // which kills the frozen-scalar / volatile-repack class. R3/fork-C: bias
-    // correction rides at the `bc` slot as a `[2]` `bc`=[bc1,bc2] DATA input
-    // (host-computed live scalar), the identical TAG_WRITE channel.
-    bc: { storage: "read", type: "f32" },
-    lr: { storage: "read", type: "f32" },
-  };
-  const biasCorrection = (ctx: KernelContext): DerivedBias =>
-    emitDerivedBiasCorrection(ctx);
-  const adamScalarBody = (
-    ctx: KernelContext,
-    idx: BlockExpr,
-    gVar: VarHandle,
-    f16: boolean,
-    bc: DerivedBias,
-    suffix = "",
-  ): void => {
-    emitDerivedAdamScalarBody(ctx, idx, gVar, f16, bc, suffix);
-  };
-  if (emitF16) {
-    bindings.param_f16 = { storage: "read_write", type: "f16" };
-  }
-  if (emitUnscale) {
-    bindings.inf_flag = { storage: "atomic", type: "u32" };
-  }
-
-  // Build uniforms. inc-2a: the config is now FULLY STATIC — beta1/beta2/
-  // eps(orig)/weight_decay/decoupled_wd never vary per step. ln_beta1/ln_beta2
-  // are precomputed f64->f32 on the CPU and used by the in-kernel expm1-form
-  // bias correction (bc = -expm1(t*lnBeta)); they replace the retired
-  // step_size / lr_times_wd per-step fields.
-  const uniforms: Record<string, UniformType> = {
-    beta1: "f32",
-    beta2: "f32",
-    ln_beta1: "f32",
-    ln_beta2: "f32",
-    eps: "f32",
-    weight_decay: "f32",
-    decoupled_wd: "u32",
-    num_elements: "u32",
-  };
-  if (emitUnscale) {
-    // Unscale path keeps grid_stride for manual 2D indexing (atomics prevent auto-vec4)
-    uniforms.grid_stride = "u32";
-    uniforms.inv_scale = "f32";
-    uniforms._pad0 = "u32";
-    uniforms._pad1 = "u32";
-  } else {
-    // Non-unscale: compiler handles 2D grid via flatGlobalId, no grid_stride needed
-    uniforms._pad0 = "u32";
-    uniforms._pad1 = "u32";
-    uniforms._pad2 = "u32";
-    uniforms._pad3 = "u32";
-  }
-
-  // Non-unscale path: pure elementwise, auto-vectorized by the compiler.
-  // Unscale path: atomics prevent auto-vec4, so manual vec4 with grid_stride.
-  if (!emitUnscale) {
-    return {
-      name: `adamStep${emitF16 ? "F16" : ""}`,
-      workgroupSize: WORKGROUP_SIZE,
-      bindings,
-      uniforms,
-      enableF16: emitF16,
-      autoVectorize: true,
-      kernel(ctx) {
-        const bc = biasCorrection(ctx);
-        const idx = ctx.elementIndex(WORKGROUP_SIZE, "num_elements");
-        const gVar = ctx.emitVar("g", "f32", ctx.load("grad", idx));
-        adamScalarBody(ctx, idx, gVar, emitF16, bc);
-      },
-    };
-  }
-
-  // Unscale path: manual vec4 with per-element inf checks + atomicMax
-  return {
-    name: `adamStepUnscale${emitF16 ? "F16" : ""}${useVec4 ? "Vec4" : ""}`,
-    workgroupSize: WORKGROUP_SIZE,
-    bindings,
-    uniforms,
-    enableF16: emitF16,
-    grid: (u) => {
-      const workItems = useVec4
-        ? Math.ceil(u.num_elements / 4)
-        : u.num_elements;
-      const wg = Math.ceil(workItems / WORKGROUP_SIZE);
-      if (wg <= MAX_WORKGROUPS_PER_DIM) return [wg];
-      const x = Math.min(wg, MAX_WORKGROUPS_PER_DIM);
-      return [x, Math.ceil(wg / x)];
-    },
-    kernel(ctx) {
-      const numElements = ctx.uniform("num_elements");
-      const gridStride = ctx.uniform("grid_stride");
-      const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
-      const bc = biasCorrection(ctx);
-
-      if (useVec4) {
-        const flatId = ctx.emitLet(
-          "flatId",
-          ctx.globalId(0).add(ctx.globalId(1).mul(gridStride)),
-        );
-        const base = ctx.emitLet("base", flatId.mul(ctx.u32(4)));
-        ctx.ifThen(base.ge(numElements), () => {
-          ctx.emitReturn();
-        });
-
-        // Load and unscale 4 grads, check each for inf/nan
-        const gVars: VarHandle[] = [];
-        for (let e = 0; e < 4; e++) {
-          const off = e === 0 ? base : base.add(ctx.u32(e));
-          const gVar = ctx.emitVar(
-            `g${e}`,
-            "f32",
-            ctx.load("grad", off).mul(invScale),
-          );
-          gVars.push(gVar);
-          const bits = gVar.get().bitcastTo("u32");
-          const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xff));
-          ctx.ifThen(exponent.eq(ctx.u32(0xff)), () => {
-            ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
-            gVar.set(ctx.f32(0.0));
-          });
-        }
-        for (let e = 0; e < 4; e++) {
-          const off = e === 0 ? base : base.add(ctx.u32(e));
-          adamScalarBody(ctx, off, gVars[e], emitF16, bc, `${e}`);
-        }
-      } else {
-        const idx = ctx.emitLet(
-          "idx",
-          ctx.globalId(0).add(ctx.globalId(1).mul(gridStride)),
-        );
-        ctx.ifThen(idx.ge(numElements), () => {
-          ctx.emitReturn();
-        });
-
-        const gVar = ctx.emitVar(
-          "g",
-          "f32",
-          ctx.load("grad", idx).mul(invScale),
-        );
-        const bits = gVar.get().bitcastTo("u32");
-        const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xff));
-        ctx.ifThen(exponent.eq(ctx.u32(0xff)), () => {
-          ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
-          gVar.set(ctx.f32(0.0));
-        });
-
-        adamScalarBody(ctx, idx, gVar, emitF16, bc);
-      }
-    },
-  };
-}
-
-// ----------------------------------------------------------------------------
-// Adam update logic (shared between scalar and vec4 paths) — RELOCATED from
-// adam-kernel.ts (the body's single-source per-element update).
-// ----------------------------------------------------------------------------
-
-function loadAdamUniforms(ctx: KernelContext) {
-  return {
-    beta1: ctx.uniform("beta1").bitcastTo("f32"),
-    beta2: ctx.uniform("beta2").bitcastTo("f32"),
-    lnBeta1: ctx.uniform("ln_beta1").bitcastTo("f32"),
-    lnBeta2: ctx.uniform("ln_beta2").bitcastTo("f32"),
-    eps: ctx.uniform("eps").bitcastTo("f32"),
-    weightDecay: ctx.uniform("weight_decay").bitcastTo("f32"),
-    decoupledWd: ctx.uniform("decoupled_wd"),
-  };
-}
-
-// ============================================================================
-// The DERIVED per-element body (R2 fork B / R3 fork C) — FOLDED from ADAMW_PROGRAM
-// ============================================================================
-//
-// R4 (2026-07-22): the authored per-element arithmetic (emitAdamScalarBody,
-// emitBiasCorrection, emitExpm1) is DELETED — it was the differential oracle for
-// its own re-derivation, retired once fork C became the proven default. The body
-// below re-sources the per-element ARITHMETIC from ADAMW_PROGRAM via the
-// OptTerm→tile-IR fold — the executed kernel is a THEOREM of the program (design
-// ruling O1). bias correction rides in as a `[2]` `bc` DATA input (fork C: a
-// host-computed live scalar). The wrapper (grid, f16, unscale/atomic-inf) and the
-// runtime L2/decoupled wd branches stay skeleton policy (the fold has no
-// conditional). Surviving guard: the fold-parity differential (optterm-fold).
-
-/** Derived bias data — bc1/bc2 as DATA roles the fold consumes. */
-interface DerivedBias {
-  bc1: BlockExpr;
-  bc2: BlockExpr;
-  lr: BlockExpr;
-}
-
-/**
- * fork B: bias correction is DATA. Read bc1/bc2 from the `[2]` `bc` input and
- * `lr` from the `lr` input; the in-kernel `expm1` prelude is GONE (it moved
- * graph-side to `Adam._biasCorrection`, feeding the `bc` tensor). Returns the
- * roles the fold binds — NOT a reassociated step_size (the fold computes m̂/v̂).
- */
-function emitDerivedBiasCorrection(ctx: KernelContext): DerivedBias {
-  const bc1 = ctx.emitLet("bc1", ctx.load("bc", ctx.u32(0)));
-  const bc2 = ctx.emitLet("bc2", ctx.load("bc", ctx.u32(1)));
-  const lr = ctx.load("lr", ctx.u32(0));
-  return { bc1, bc2, lr };
-}
-
-/**
- * Emit the Adam per-element update at `idx` with the m'/v'/scaled arithmetic
- * DERIVED from ADAMW_PROGRAM via `lowerOptTermToTileIR`. Only the L2/decoupled wd
- * branches (a runtime `decoupled_wd` select the fold cannot express) and the
- * stores are skeleton policy.
- *
- * The named reassociation lemmas the derived body carries (vs the now-deleted
- * authored form the fold was validated against at R2/R3):
- *   (L1) ADAMW_V_NEW folds (1−β2)·g² as `(g·g)·(1−β2)`; authored was
- *        `((1−β2)·g)·g`.
- *   (L2) ADAMW_SCALED divides inside the sqrt — `lr·(m/bc1)/(√(v/bc2)+ε)` —
- *        whereas authored factors √bc2 out (`step_size = lr·√bc2/bc1`,
- *        `eps_adj = ε·√bc2`). Mathematically equal; f32 agrees to ≤1e-7.
- */
-function emitDerivedAdamScalarBody(
-  ctx: KernelContext,
-  idx: BlockExpr,
-  gVar: VarHandle,
-  emitF16: boolean,
-  bc: DerivedBias,
-  suffix = "",
-): void {
-  const p = ctx.emitLet(`p${suffix}`, ctx.load("param", idx));
-  const { beta1, beta2, eps, weightDecay, decoupledWd } = loadAdamUniforms(ctx);
-
-  // L2 weight decay (Adam): grad += wd * param — runtime policy branch.
-  ctx.ifThen(
-    decoupledWd.eq(ctx.u32(0)).and(weightDecay.bitcastTo("u32").gt(ctx.u32(0))),
-    () => {
-      gVar.set(gVar.get().add(weightDecay.mul(p)));
-    },
-  );
-
-  // Role bindings for the fold — the program's roles map to tile-IR values.
-  const roles: Record<string, BlockExpr> = {
-    m: ctx.load("m", idx),
-    v: ctx.load("v", idx),
-    g: gVar.get(),
-    p,
-    beta1,
-    beta2,
-    om_beta1: ctx.f32(1.0).sub(beta1),
-    om_beta2: ctx.f32(1.0).sub(beta2),
-    bc1: bc.bc1,
-    bc2: bc.bc2,
-    lr: bc.lr,
-    eps,
-    wd: weightDecay,
-  };
-  const fold = (t: OptTerm, r: Record<string, BlockExpr>): BlockExpr =>
-    lowerOptTermToTileIR(t, ctx, r as FoldRoleBindings);
-
-  const mNew = ctx.emitLet(`m_new${suffix}`, fold(ADAMW_M_NEW, roles));
-  const vNew = ctx.emitLet(`v_new${suffix}`, fold(ADAMW_V_NEW, roles));
-
-  // p' reads the POST-update moments (the realizer's role binding). ADAMW_SCALED
-  // = lr·(m̂/(√v̂+ε)); the derived p' = p − scaled, then the decoupled branch.
-  const scaled = fold(ADAMW_SCALED, { ...roles, m: mNew, v: vNew });
-  const pNewVar = ctx.emitVar(`p_new${suffix}`, "f32", p.sub(scaled));
-
-  // Decoupled weight decay (AdamW): p -= lr*wd*p — runtime policy branch.
-  ctx.ifThen(decoupledWd.eq(ctx.u32(1)), () => {
-    pNewVar.set(pNewVar.get().sub(bc.lr.mul(weightDecay).mul(p)));
-  });
-
-  ctx.emitStore("param", idx, pNewVar.get());
-  ctx.emitStore("m", idx, mNew);
-  ctx.emitStore("v", idx, vNew);
-
-  if (emitF16) {
-    ctx.emitStore("param_f16", idx, pNewVar.get().toF16());
-  }
+  return lowerOptStepBody(ADAM_STEP_SPEC, useVec4, emitF16, emitUnscale);
 }
