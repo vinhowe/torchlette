@@ -911,104 +911,53 @@ class StorageTracker {
   }
 
   /**
-   * Instance-boundary teardown (a NEW engine is being constructed). The
-   * storage tracker + refcount registry are MODULE-GLOBAL singletons shared
-   * across every RuntimeEngine in the process; a previous engine's residual
-   * storages linger in `allStorages` with their owning tensors still alive
-   * (model params, optimizer m/v, lr tensors) until JavaScript GC collects
-   * them — at an UNPREDICTABLE time DURING the next engine's training run. On
-   * collection, the WeakRef scan in destroyUnreachable() releases the claim,
-   * the storage's `bt.destroy()` runs, and its buffer is `bufferPool.release()`d
-   * back into the SHARED pool MID-STEP of the live run — the exact
-   * "released-to-pool mid-step" corruption class (CLAUDE.md WebGPU Buffer Pool
-   * Invariants). The live run then acquires that buffer for a fresh tensor and
-   * either reads stale data or has its data destroyed under it. Symptom: the
-   * second-and-later training run in one process sporadically (GC-timing
-   * dependent) diverges from step ~0 (task #84; the executor template cache got
-   * the analogous instance-boundary reset — clearTemplateCacheForNewEngine —
-   * for the SAME cross-instance-interference reason, but the storage tracker
-   * was missed).
+   * INVARIANT: constructing a NEW engine starts from a storage tracker holding
+   * NONE of the previous engine's state — every residual storage, owner-set
+   * entry, REG membership, and step snapshot is dropped — so nothing the dead
+   * engine created can be reaped MID-STEP of the live run.
    *
-   * The fix: at construction, quiescently tear down every residual storage NOW
-   * (before the new engine does any work), so their buffers are released to the
-   * pool at a safe boundary, never mid-step of the live run. Must be called
-   * only when the backend is live (a buffer pool exists to release into) and
-   * before the new engine allocates anything. Idempotent; safe with an empty
-   * tracker (no residue). Asserts the tracker is empty afterward — a nonzero
-   * residual would mean a storage escaped teardown and could still leak into
-   * the next run (the guard that catches future regressions of this class).
+   * Enforced by: this method, called at construction before the new engine
+   * allocates anything (backend must be live). The storage tracker + refcount
+   * registry are MODULE-GLOBAL singletons shared across every RuntimeEngine in
+   * the process, so without this reset a previous engine's still-live wrappers
+   * (params / m·v / lr) get GC-collected at an unpredictable time DURING the next
+   * run — the WeakRef scan then `bt.destroy()`s and `bufferPool.release()`s their
+   * buffer back into the SHARED pool mid-step (the "released-to-pool mid-step"
+   * corruption class — CLAUDE.md WebGPU Buffer Pool Invariants), a buffer the
+   * live run has already acquired. Idempotent; asserts the tracker is empty
+   * afterward (the regression guard).
+   *
+   * History: task #84 — the second-and-later run in one process diverged
+   * GC-sporadically from step ~0; the executor template cache got the analogous
+   * clearTemplateCacheForNewEngine for the same cross-instance class. Two prior
+   * mis-attributions (gen-perturbation / runahead gen-scoping) were falsified —
+   * it reproduces deterministically, engine #0 OK / engine #1+ throw
+   * (tools/t-second-engine-overfit-probe.ts). See task #70 D3/D4, #74.
    */
   disposeAllForNewEngine(): void {
-    // ORPHAN the previous engine's residual storages — do NOT destroy them, and
-    // do NOT touch the refcount registry. Mechanism, precisely:
-    //
-    // A previous engine's tensor WRAPPERS are still live JS objects (its
-    // model/opt went out of scope but GC has not run) with live rc. The
-    // corruption (#84) was: when GC finally collected one of those wrappers
-    // DURING the next engine's step, the tracker's owner-SET scan in
-    // destroyUnreachable() (or the wrapper's FinalizationRegistry) released the
-    // claim, the storage's `bt.destroy()` ran, and its buffer was
-    // `bufferPool.release()`d back into the SHARED pool MID-STEP of the live run
-    // — the "released-to-pool mid-step" class — where the live run had already
-    // acquired it. Second-and-later runs diverged, GC-timing-sporadically.
-    //
-    // Forgetting the storages HERE (dropping their ids from allStorages +
-    // the owner sets) breaks that path at its root: destroyUnreachable() no
-    // longer iterates them, so their `bt.destroy()` is never called and their
-    // buffers are never returned to the pool — they are orphaned (leaked for the
-    // process lifetime, but a NEW engine means the OLD one is finished; this is
-    // a bounded one-time-per-construction leak, the same one-live-engine-at-a-
-    // time contract clearTemplateCacheForNewEngine already assumes).
-    //
-    // Deliberately NOT done here: (a) destroying the buffers (they'd be re-pooled
-    // now AND destroyed again by the still-live wrapper's later GC — a
-    // double-release; measured to make the next run diverge deterministically);
-    // (b) rcReset() (the rc registry is keyed by storage id and the previous
-    // engine's ids never collide with the next engine's monotonic ids, so its
-    // entries are inert; wiping it wholesale instead nulls the CURRENT engine's
-    // live scalars' refcounts on later constructions — the shape-[1] `_t`/`lr`
-    // reclaimed-read STRICT_LIFETIME throw). The orphaned ids' lingering rc
-    // entries are harmless: the wrapper's FR does `rcRelease` on an id whose
-    // storage we already forgot, which never reaches destroyStorageIds.
-    //
-    // Root cause of #84: this instance-boundary teardown was simply ABSENT — the
-    // executor template cache got clearTemplateCacheForNewEngine for the
-    // identical cross-instance-interference reason, but the storage tracker was
-    // never given the analogous reset.
+    // ORPHAN the residue (drop ids from allStorages + owner sets); do NOT
+    // destroy the buffers and do NOT touch the refcount registry:
+    //   • destroying the buffers would re-pool them now AND let the still-live
+    //     wrapper's later GC destroy them again — a double-release, measured to
+    //     make the next run diverge deterministically.
+    //   • rcReset() would null the CURRENT engine's live scalars' refcounts on a
+    //     later construction (the shape-[1] `_t`/`lr` reclaimed-read
+    //     STRICT_LIFETIME throw). Orphaned ids' lingering rc entries are inert —
+    //     ids are monotonic (no collision) and the wrapper's FR rcReleases an id
+    //     whose storage we already forgot, never reaching destroyStorageIds.
+    // Bounded one-time-per-construction leak: a NEW engine means the OLD one is
+    // finished (the one-live-engine-at-a-time contract).
     this.allStorages.clear();
     this._ownerSet.clear();
-    // Clear REG (registered state, task #70 D3): a new engine must not inherit
-    // the dead engine's registered module/optimizer state — the same
-    // cross-instance-interference class disposeAllForNewEngine exists for (#84,
-    // #74). A WeakSet cannot be iterated to clear; rebuild it empty. The dead
-    // engine's wrappers are going out of scope (its model/opt is finished), so
-    // their membership is dropped wholesale here; a lingering-but-live dead-engine
-    // wrapper cannot re-register (the engine is done). This is the doc §D3
-    // "cross-engine behavior" contract.
+    // Clear REG (registered state, #70 D3) + the step snapshot (#70 D4): a new
+    // engine must inherit neither the dead engine's registered module/optimizer
+    // state nor its stale snapshot WeakSet. The inherited non-null snapshot is
+    // the sharpest failure — the new engine's first implied-boundary
+    // releaseStepTemps runs against it and reaps the live step-0 forward
+    // activation (owners=1, snap=false) → a [lifetime] reclaimed-read throw at
+    // the optimizer's force. WeakSets cannot be iterated to clear; rebuild empty
+    // (dead-engine wrappers are out of scope and cannot re-register).
     this._registeredState = new WeakSet<object>();
-    // Clear the step snapshot (task #70 D4 — the row-8 root cause). A fresh
-    // process starts with `_stepStartTensors === null`, and releaseStepTemps is a
-    // NO-OP while null (it reaps nothing until the first snapshotForStep). The
-    // SECOND engine in a process must start from that same null state — otherwise
-    // it inherits the DEAD engine's stale snapshot WeakSet (which contains none of
-    // the new engine's tensors), so the new engine's very first implied-boundary
-    // releaseStepTemps runs against that stale snapshot and reaps the new engine's
-    // live step-0 forward activation (owners=1, snap=false) → a [lifetime]
-    // reclaimed-read throw when the optimizer force reads it.
-    //
-    // This is the gpt2-memorization overfit FP (indictment row 8): it is the
-    // SECOND-ENGINE-IN-PROCESS class (#84), NOT a gen-perturbation. The D1 and D2
-    // attributions ("concurrent test perturbs the SHARED generation counter" /
-    // "runahead gen-scoping") were BOTH wrong — the reaped storage is at
-    // maxGen=0/stamp=0, a clean FIRST boundary, and it reproduces DETERMINISTICALLY
-    // in a single process with no parallelism: engine #0 OK, engine #1+ throw
-    // (tools/t-second-engine-overfit-probe.ts). The first engine never hit it
-    // because its snapshot was still null on its first boundary; the second engine
-    // inherited engine #0's stale non-null snapshot. The honesty invariant of this
-    // campaign: the differential surfaced that both prior attributions were wrong,
-    // and D4 records the correction rather than shipping the mis-located fix (a
-    // per-engine `_stepGen` counter was prototyped, measured NULL against this
-    // repro, and reverted — the stale snapshot was the whole bug).
     this._stepStartTensors = null;
     if (this.allStorages.size !== 0) {
       throw new Error(

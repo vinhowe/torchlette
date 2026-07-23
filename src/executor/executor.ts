@@ -736,28 +736,21 @@ const buildReaches = new Map<number, number>();
 const buildFailures = new Map<number, number>();
 const BUILD_FAILURE_MEMO = 4;
 
-// [D3 checkpoint-arena compile refusal — TRANSITION SCAFFOLDING, SUNSET-BOUND]
-// The single typed reason a build-from-IR-ELIGIBLE plan is nonetheless kept
-// lowered by design. It fires ONLY for plans built during a checkpointed EAGER
-// (two-plan) backward force — the b66ead78 hazard `setBufferArenaDisabled`
-// exists to prevent: a compiled forward plan (arena-on) reclaims activations a
-// SEPARATE checkpoint-recompute plan still needs → silent corruption
-// (docs/step-function-compiler-design.md P3 "ROOT-CAUSED"). Before CE-from-IR
-// coverage these plans stayed lowered by ACCIDENT (their CE-narrow operand was
-// uncovered); covering CE removes that accidental safety and unmasks the hazard
-// in the eager reference. The refusal restores "eager checkpoint plans stay
-// lowered" AS A DECLARATION rather than a coverage side effect. Scoped to the
-// hazard class precisely via a live per-force engine signal (NOT node flags,
-// NOT "anything checkpoint-flavored"): the WHOLE-STEP remat merged plan — one
-// plan the planner packs the recompute into — is NOT built under this signal,
-// so it compiles. The production trainer's arena bypass (the
-// `setBufferArenaDisabled(true)` call + its opt-out env flag) is already DELETED
-// (2026-07-19, THE BYPASS DEATH pass) — `WebGPUGPT2Trainer` runs its checkpointed
-// step under whole-step remat; this refusal is what makes the residual EAGER
-// (flag-off) checkpoint step sound (arena ON, plans lowered). SUNSET: this refusal
-// + the engine's `setBufferArenaDisabled` method (still driven by the D3
-// measurement tool's `bypass` arm) die together when whole-step training defaults
-// and the two-plan eager checkpoint path is deleted (P4).
+// INVARIANT: every plan built during a checkpointed EAGER (two-plan) backward
+// force stays LOWERED — never compiled — by declaration, not by coverage
+// accident. (A compiled arena-on forward plan would reclaim activations that the
+// SEPARATE checkpoint-recompute plan still needs → silent corruption.)
+// Enforced by: the per-force `refuseCompileHazard` signal → replayPathFor
+// returns "lowered" for these plans (the single typed refusal reason below).
+// Scoped precisely to the eager two-plan force via a LIVE engine signal (NOT
+// node flags, NOT "anything checkpoint-flavored"), so the WHOLE-STEP remat
+// merged plan — one plan the planner packs the recompute into — is exempt and
+// still compiles.
+// History: the b66ead78 hazard, docs/step-function-compiler-design.md P3;
+// covering CE-from-IR removed the accidental safety `setBufferArenaDisabled` had
+// provided (the arena bypass itself was deleted 2026-07-19). SUNSET-BOUND: this
+// refusal + `setBufferArenaDisabled` die together when whole-step training
+// defaults and the two-plan eager checkpoint path is deleted (P4).
 export const CHECKPOINT_EAGER_REFUSAL = "checkpoint-eager-two-plan-force";
 let compileRefusalCount = 0;
 /** Test/diag: number of build-from-IR-eligible plans declined by the D3
