@@ -1237,6 +1237,34 @@ export async function awaitDeferredFence(): Promise<void> {
 }
 
 /**
+ * Assert that no deferred GPU fence is still outstanding — i.e. the shared
+ * single-slot fence has been issued AND awaited (or was never issued) before a
+ * step-scoped demotion sweep runs. This promotes the "quiesce (fence) BEFORE the
+ * demotion sweep" invariant (CLAUDE.md buffer-pool invariant; the "used in
+ * submit while destroyed" silent-corruption class) from call-ordering PROSE to a
+ * deterministic CPU throw. `deferredPendingRelease` is the single source: set
+ * true in `issueDeferredFence`, cleared in `awaitDeferredFence` after the fence
+ * resolves. In CPU-only mode `issueDeferredFence` no-ops (no gpuContext) so the
+ * flag stays false and this never fires.
+ *
+ * NOT for the runahead-ring settle path (`_deferBoundaryCommit`): that awaits an
+ * ISOLATED fence and leaves the SHARED slot pointing at a NEWER step's un-awaited
+ * fence by design, so `deferredPendingRelease` is legitimately true there. Only
+ * call this at the shared-fence-quiesced sweep sites (markStep, the implied
+ * boundary commit).
+ */
+export function assertQuiesced(context: string): void {
+  if (fenceState.deferredPendingRelease) {
+    throw new Error(
+      `[quiesce] demotion sweep (${context}) entered with a deferred GPU fence ` +
+        `still outstanding — the step's submits are un-fenced, so destroying ` +
+        `their buffers would poison the pending submit ("used in submit while ` +
+        `destroyed"). Fence (issue+await) BEFORE the sweep.`,
+    );
+  }
+}
+
+/**
  * [inc-3 runahead ring] Capture an ISOLATED fence promise covering exactly the
  * work submitted so far, WITHOUT touching the shared single-slot fence state
  * (`fenceState` is untouched — non-ring paths stay byte-identical) and WITHOUT

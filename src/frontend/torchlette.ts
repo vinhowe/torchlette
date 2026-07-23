@@ -21,6 +21,7 @@ import {
   setAutotuneEnabled,
 } from "../backend/webgpu";
 import {
+  assertQuiesced,
   awaitDeferredFence,
   captureIsolatedFence,
   issueDeferredFence,
@@ -2109,6 +2110,9 @@ export class Torchlette {
     } catch {
       // CPU-only usage.
     }
+    // Quiesce-before-demotion is now a deterministic throw, not just ordering:
+    // the fence above must have been awaited before this sweep destroys buffers.
+    assertQuiesced("_commitStepBoundaryGen");
     storageTracker.destroyUnreachable();
     storageTracker.releaseStepTemps(gen);
     storageTracker.destroyUnreachable();
@@ -2270,6 +2274,10 @@ export class Torchlette {
     this._drainBoundaryDeferred();
 
     // Step 3: Destroy all storages with rc <= 0.
+    // Quiesce-before-demotion is a deterministic throw here: Step 0 awaited any
+    // prior deferred fence and no new one is issued until Step 4, so the sweep
+    // runs with nothing un-fenced.
+    assertQuiesced("markStep");
     storageTracker.destroyUnreachable();
 
     // Step 3.5: Release refs for step-scoped temporaries, then destroy.
