@@ -8,16 +8,9 @@
  * creating a unified kernel representation for future optimization passes.
  */
 
-import { ENV } from "../../core/env";
 import { sizeOf } from "../../core/shape";
 import { SOFTPLUS_DEF, UNARY_DEFS } from "../../ops/semantic/catalog";
 import { GELU_ERF_DEF, GELU_TANH_DEF } from "../../ops/semantic/composite";
-import {
-  ERF_A,
-  ERF_P,
-  GELU_SQRT_2_OVER_PI,
-  GELU_TANH_C,
-} from "../../ops/semantic/erf";
 import type { Expr } from "../../ops/semantic/expr";
 import type { DType } from "../types";
 import { lowerExprToTileIR } from "./expr-tile-fold";
@@ -39,13 +32,14 @@ import {
 } from "./tile-ir";
 
 /**
- * COMPOSITE-CLOSURE F2 / A2 — the forward-activation WGSL body DERIVES from its
- * `Expr` definition via `lowerExprToTileIR` (the fold), behind
- * `TORCHLETTE_DERIVED_ACTIVATION` (born off; soak → default at A3 → the hand
- * bodies + flag are removed). While the flag is off the hand switch body runs
- * and is the differential oracle (tools/expr-fold-parity.ts); the fold is
- * byte-identical for every activation except gelu_erf (1 f32 ULP, the L-EXPR
- * lemma). Its single-source `Expr` per activation op-name:
+ * COMPOSITE-CLOSURE F2 / A3 — the forward-activation WGSL body DERIVES from its
+ * `Expr` definition via `lowerExprToTileIR` (the fold). The soak flag has fired
+ * (soak → default → removed): the fold is now the SOLE realization and the hand
+ * switch bodies (relu/sigmoid/silu/softplus/gelu/gelu_tanh/gelu_erf) are DELETED.
+ * The `Expr → BlockExpr` fold is byte-identical to the deleted bodies for every
+ * activation except gelu_erf (1 f32 ULP, the named L-EXPR reassociation lemma);
+ * the surviving guard is tools/expr-fold-parity.ts. Its single-source `Expr` per
+ * activation op-name:
  */
 const ACTIVATION_EXPR: Readonly<Record<string, Expr>> = {
   relu: unaryDefExpr("relu"),
@@ -63,10 +57,6 @@ function unaryDefExpr(name: string): Expr {
   return d.expr;
 }
 
-function useDerivedActivation(): boolean {
-  return ENV.TORCHLETTE_DERIVED_ACTIVATION === "1";
-}
-
 // ============================================================================
 // Op mapping: OP_REGISTRY op name → tile-IR BlockExpr operations
 // ============================================================================
@@ -81,9 +71,9 @@ export function applyFusedOp(
 ): BlockExpr {
   const a = inputs[0];
 
-  // A2: route the forward-activation body through the derived fold when enabled.
-  // The hand switch cases below stay as the flag-off differential oracle.
-  if (useDerivedActivation() && op in ACTIVATION_EXPR) {
+  // The forward-activation body DERIVES from its `Expr` definition (F2/A3) — one
+  // fold, no hand WGSL. Single source: ACTIVATION_EXPR.
+  if (op in ACTIVATION_EXPR) {
     return lowerExprToTileIR(ACTIVATION_EXPR[op], ctx, { x: a });
   }
 
@@ -134,55 +124,8 @@ export function applyFusedOp(
     case "mod":
       return a.mod(inputs[1]);
 
-    // -- Composite activations (built from primitives) --
-    case "relu":
-      return a.gt(ctx.f32(0)).select(a, ctx.f32(0));
-
-    case "sigmoid":
-      // 1 / (1 + exp(-x))
-      return ctx.f32(1).div(ctx.f32(1).add(a.neg().exp()));
-
-    case "silu":
-      // x / (1 + exp(-x))
-      return a.div(ctx.f32(1).add(a.neg().exp()));
-
-    case "softplus":
-      // log(1 + exp(x))
-      return ctx.f32(1).add(a.exp()).log();
-
-    case "gelu":
-    case "gelu_tanh": {
-      // x * 0.5 * (1 + tanh(clamp(√(2/π) * (x + 0.044715 * x^3), -10, 10)))
-      const x3 = a.mul(a).mul(a);
-      const inner = ctx
-        .f32(GELU_SQRT_2_OVER_PI)
-        .mul(a.add(ctx.f32(GELU_TANH_C).mul(x3)));
-      // clamp via min/max
-      const clamped = inner.max(ctx.f32(-10)).min(ctx.f32(10));
-      return a.mul(ctx.f32(0.5)).mul(ctx.f32(1).add(clamped.tanh()));
-    }
-
-    case "gelu_erf": {
-      // x * 0.5 * (1 + erf(x / sqrt(2)))
-      // Abramowitz & Stegun polynomial approximation for erf
-      const [a1, a2, a3, a4, a5] = ERF_A;
-      const ax = a.abs().mul(ctx.f32(Math.SQRT1_2)); // |x| / sqrt(2)
-      const t = ctx.f32(1).div(ctx.f32(1).add(ctx.f32(ERF_P).mul(ax)));
-      const poly = ctx
-        .f32(a5)
-        .mul(t)
-        .add(ctx.f32(a4))
-        .mul(t)
-        .add(ctx.f32(a3))
-        .mul(t)
-        .add(ctx.f32(a2))
-        .mul(t)
-        .add(ctx.f32(a1))
-        .mul(t);
-      const erfAbs = ctx.f32(1).sub(poly.mul(ax.neg().mul(ax).exp()));
-      const erf = a.sign().mul(erfAbs);
-      return a.mul(ctx.f32(0.5)).mul(ctx.f32(1).add(erf));
-    }
+    // Composite activations (relu/sigmoid/silu/softplus/gelu/gelu_tanh/gelu_erf)
+    // DERIVE via the fold above (ACTIVATION_EXPR) — their hand WGSL is DELETED.
 
     // -- Comparisons (return f32 0.0/1.0) --
     case "eq":

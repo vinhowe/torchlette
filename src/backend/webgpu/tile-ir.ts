@@ -60,11 +60,6 @@ import {
   F32_POS_MAX,
   MAX_WORKGROUPS_PER_DIM,
 } from "./shape-utils";
-// The erf polynomial coefficients are single-sourced (Crystal Campaign 3, P2 —
-// the erf triplication's death). This WGSL emit REFERENCES the one source; the
-// same `ERF_A`/`ERF_P` feed the CPU reference (`erfApprox`) and the runtime
-// grad-graph realization (emit-rt). No 2nd owner of the polynomial.
-import { ERF_A, ERF_P } from "../../ops/semantic/erf";
 
 // ============================================================================
 // IR Node Types
@@ -1214,19 +1209,6 @@ export class BlockExpr {
     return this._unaryOp("sign");
   }
 
-  /** Sigmoid activation: 1 / (1 + exp(-x)). Compound — no new IR node. */
-  sigmoid(): BlockExpr {
-    const one = new BlockExpr(
-      makeNode<ConstNode>({
-        kind: "const",
-        value: 1.0,
-        valueType: "scalar",
-        dataType: "f32",
-      }),
-    );
-    return one.div(one.add(this.neg().exp()));
-  }
-
   /** Clamp x to [lo, hi]. Compound — uses max(lo, min(x, hi)). */
   clamp(lo: BlockExpr | number, hi: BlockExpr | number): BlockExpr {
     return this.max(lo).min(hi);
@@ -1247,30 +1229,6 @@ export class BlockExpr {
   /** Floor division (truncated toward negative infinity). For unsigned, same as div. Compound. */
   floorDiv(other: BlockExpr | number): BlockExpr {
     return this.div(other).floor();
-  }
-
-  /** Approximate erf(x) using Abramowitz & Stegun (max error ~1.5e-7). Compound. */
-  erf(): BlockExpr {
-    // erf(x) = sign(x) * (1 - poly(t) * exp(-x²))
-    // where t = 1/(1 + p*|x|), poly = a1*t + a2*t² + a3*t³ + a4*t⁴ + a5*t⁵
-    const one = new BlockExpr(resolveArg(1.0));
-    const signX = this.sign();
-    const absX = this.abs();
-    const [a1, a2, a3, a4, a5] = ERF_A;
-    const t = one.div(one.add(absX.mul(ERF_P)));
-    // Horner: ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
-    const inner = t
-      .mul(a5)
-      .add(a4)
-      .mul(t)
-      .add(a3)
-      .mul(t)
-      .add(a2)
-      .mul(t)
-      .add(a1);
-    const poly = inner.mul(t);
-    const expTerm = absX.neg().mul(absX).exp(); // exp(-x²)
-    return signX.mul(one.sub(poly.mul(expTerm)));
   }
 
   pow(other: BlockExpr | number) {

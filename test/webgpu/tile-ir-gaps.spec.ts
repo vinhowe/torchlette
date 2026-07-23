@@ -20,6 +20,16 @@ import {
   initWebGPU,
   syncWebGPU,
 } from "../../src/backend/webgpu";
+// sigmoid/erf DERIVE via the fold (COMPOSITE-CLOSURE F2/A3 — the BlockExpr
+// compound methods were deleted; the fold is the single source).
+import { lowerExprToTileIR } from "../../src/backend/webgpu/expr-tile-fold";
+import { UNARY_DEFS } from "../../src/ops/semantic/catalog";
+import { erf as erfExpr, x as XEXPR } from "../../src/ops/semantic/expr";
+
+const SIGMOID_DEF = UNARY_DEFS.find((d) => d.name === "sigmoid");
+if (!SIGMOID_DEF) throw new Error("no sigmoid UNARY_DEF");
+const SIGMOID_EXPR = SIGMOID_DEF.expr;
+
 import type {
   GPUBuffer,
   GPUDevice,
@@ -1856,7 +1866,7 @@ describe("Triton Gap: sigmoid/clamp/fma/erf (WGSL)", () => {
           "output",
           gid.lt(ctx.uniform("N")),
           gid,
-          val.sigmoid(),
+          lowerExprToTileIR(SIGMOID_EXPR, ctx, { x: val }),
         );
       },
     };
@@ -1904,7 +1914,12 @@ describe("Triton Gap: sigmoid/clamp/fma/erf (WGSL)", () => {
       kernel(ctx) {
         const gid = ctx.globalId(0);
         const val = ctx.load("input", gid);
-        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, val.erf());
+        ctx.guardedStore(
+          "output",
+          gid.lt(ctx.uniform("N")),
+          gid,
+          lowerExprToTileIR(erfExpr(XEXPR), ctx, { x: val }),
+        );
       },
     };
     const wgsl = compileTileKernel(spec);
@@ -2346,7 +2361,7 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
           "output",
           gid.lt(ctx.uniform("N")),
           gid,
-          ctx.load("input", gid).sigmoid(),
+          lowerExprToTileIR(SIGMOID_EXPR, ctx, { x: ctx.load("input", gid) }),
         );
       },
     };
@@ -2399,7 +2414,7 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
           "output",
           gid.lt(ctx.uniform("N")),
           gid,
-          ctx.load("input", gid).erf(),
+          lowerExprToTileIR(erfExpr(XEXPR), ctx, { x: ctx.load("input", gid) }),
         );
       },
     };

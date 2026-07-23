@@ -1,26 +1,20 @@
 /**
- * COMPOSITE-CLOSURE F2 / A1 — the `Expr → tile-IR` FOLD vs the HAND activation
- * WGSL body (`applyFusedOp` / `BlockExpr`). The load-bearing A1 claim: the fold
- * (`lowerExprToTileIR`) and the hand DSL bodies are two derivations of ONE `Expr`
- * definition, so they must AGREE. For each activation this script builds ONE
- * kernel that computes BOTH the fold output and the hand output over the SAME
- * random `x`, dispatches on the GPU, and asserts:
+ * COMPOSITE-CLOSURE F2 — the `Expr → tile-IR` FOLD parity guard (the SURVIVING
+ * gate after A3 deleted the hand WGSL bodies). Both `lowerExprToTileIR` (the GPU
+ * fold) and `evalScalar` (the CPU reference interpreter, interpret.ts) are
+ * derivations of ONE `Expr` definition, so the GPU-realized activation must agree
+ * with its CPU meaning — the "single source at seams; assert agreement" principle
+ * applied to the forward activation body. For each activation this script
+ * dispatches the fold kernel on the GPU and compares against the CPU `evalScalar`
+ * of the SAME `Expr`, ULP-bounded across the CPU↔GPU transcendental seam.
  *
- *   byte-where-identical (delta 0)  — relu/sigmoid/silu/softplus/gelu_tanh/erf
- *                                     (identical algebra → identical WGSL)
- *   L-EXPR reassociation lemma      — gelu_erf: the fold computes erf(x·c) (erf
- *                                     takes its own abs → abs(x·c)) while the hand
- *                                     body folds abs into the scale (abs(x)·c);
- *                                     equal in exact arithmetic, MEASURED 1.19e-7
- *                                     = 1 f32 ULP. This is the one named
- *                                     fp-reassociation delta (L1/L2/L3 discipline).
- *   gelu clamp-drop safe            — gelu_tanh: fold (no clamp) vs hand (clamp
- *                                     ±10) is BYTE-IDENTICAL even over the wide
- *                                     range: tanh saturates identically where the
- *                                     clamp would engage (design §4.4, P2 precedent).
+ * (History: at A1/A2 this probe compared the fold against the HAND `applyFusedOp`
+ * body and MEASURED byte-identity for relu/sigmoid/silu/softplus/gelu_tanh/erf
+ * and 1 f32 ULP for gelu_erf — the named L-EXPR reassociation lemma. After A3 the
+ * hand bodies are gone; the CPU interpreter is the enduring reference.)
  *
  * GPU tool: reserve a device via tools/pick-gpu.sh, run serial-exclusive. Env:
- *   N (default 8192), TOL (default 2e-7 = 1 ULP + margin), LO/HI (range -12..12).
+ *   N (default 8192), TOL (default 1e-5, the CPU↔GPU seam), LO/HI (range -12..12).
  */
 
 import {
@@ -29,21 +23,20 @@ import {
   webgpuBackend,
 } from "../src/backend/webgpu";
 import { lowerExprToTileIR } from "../src/backend/webgpu/expr-tile-fold";
-import { applyFusedOp } from "../src/backend/webgpu/fusion-tile-ir";
 import type { WebGPUTensor } from "../src/backend/webgpu/gpu-types";
 import { compileTileKernel } from "../src/backend/webgpu/tile-compiler";
 import { createTileKernelDispatcher } from "../src/backend/webgpu/tile-dispatch";
 import type {
-  BlockExpr,
   KernelContext,
   TileKernelSpec,
 } from "../src/backend/webgpu/tile-ir";
 import { SOFTPLUS_DEF, UNARY_DEFS } from "../src/ops/semantic/catalog";
 import { GELU_ERF_DEF, GELU_TANH_DEF } from "../src/ops/semantic/composite";
 import { type Expr, erf, x as X } from "../src/ops/semantic/expr";
+import { evalScalar } from "../src/ops/semantic/interpret";
 
 const N = parseInt(process.env.N ?? "8192", 10);
-const TOL = parseFloat(process.env.TOL ?? "2e-7");
+const TOL = parseFloat(process.env.TOL ?? "1e-5");
 const LO = parseFloat(process.env.LO ?? "-12");
 const HI = parseFloat(process.env.HI ?? "12");
 
@@ -55,21 +48,14 @@ const byName = (n: string): Expr => {
   return d.expr;
 };
 
-/** Each cell: the fold's Expr + the hand op-name for `applyFusedOp` (or a
- *  BlockExpr thunk for `erf`, which has no applyFusedOp case). */
-type Cell = {
-  name: string;
-  expr: Expr;
-  hand: string | ((x: BlockExpr) => BlockExpr);
-};
-const CELLS: Cell[] = [
-  { name: "relu", expr: byName("relu"), hand: "relu" },
-  { name: "sigmoid", expr: byName("sigmoid"), hand: "sigmoid" },
-  { name: "silu", expr: byName("silu"), hand: "silu" },
-  { name: "softplus", expr: SOFTPLUS_DEF.expr, hand: "softplus" },
-  { name: "gelu_tanh", expr: GELU_TANH_DEF.expr, hand: "gelu" },
-  { name: "gelu_erf", expr: GELU_ERF_DEF.expr, hand: "gelu_erf" },
-  { name: "erf", expr: erf(X), hand: (x) => x.erf() },
+const CELLS: { name: string; expr: Expr }[] = [
+  { name: "relu", expr: byName("relu") },
+  { name: "sigmoid", expr: byName("sigmoid") },
+  { name: "silu", expr: byName("silu") },
+  { name: "softplus", expr: SOFTPLUS_DEF.expr },
+  { name: "gelu_tanh", expr: GELU_TANH_DEF.expr },
+  { name: "gelu_erf", expr: GELU_ERF_DEF.expr },
+  { name: "erf", expr: erf(X) },
 ];
 
 function randData(n: number, seed: number): Float32Array {
@@ -82,7 +68,10 @@ function randData(n: number, seed: number): Float32Array {
   return out;
 }
 
-async function checkCell(cell: Cell): Promise<{ ok: boolean; max: number }> {
+async function checkCell(cell: {
+  name: string;
+  expr: Expr;
+}): Promise<{ ok: boolean; max: number }> {
   const WG = 64;
   const spec: TileKernelSpec = {
     name: `foldparity_${cell.name}`,
@@ -90,7 +79,6 @@ async function checkCell(cell: Cell): Promise<{ ok: boolean; max: number }> {
     bindings: {
       x: { storage: "read", type: "f32" },
       out_fold: { storage: "read_write", type: "f32" },
-      out_hand: { storage: "read_write", type: "f32" },
     },
     uniforms: { size: "u32" },
     grid: (u: Record<string, number>) => [Math.ceil((u.size ?? 0) / WG)],
@@ -98,13 +86,11 @@ async function checkCell(cell: Cell): Promise<{ ok: boolean; max: number }> {
       const idx = ctx.globalId(0);
       ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
       const xv = ctx.load("x", idx);
-      const fold = lowerExprToTileIR(cell.expr, ctx, { x: xv });
-      const hand =
-        typeof cell.hand === "string"
-          ? applyFusedOp(ctx, cell.hand, [xv])
-          : cell.hand(xv);
-      ctx.emitStore("out_fold", idx, fold);
-      ctx.emitStore("out_hand", idx, hand);
+      ctx.emitStore(
+        "out_fold",
+        idx,
+        lowerExprToTileIR(cell.expr, ctx, { x: xv }),
+      );
     },
   };
   compileTileKernel(spec);
@@ -117,21 +103,20 @@ async function checkCell(cell: Cell): Promise<{ ok: boolean; max: number }> {
   const foldBuf = webgpuBackend.ops.tensorFromArray(new Array(N).fill(0), [
     N,
   ]) as WebGPUTensor;
-  const handBuf = webgpuBackend.ops.tensorFromArray(new Array(N).fill(0), [
-    N,
-  ]) as WebGPUTensor;
-
   dispatcher.dispatch(
-    { x: xBuf.buffer, out_fold: foldBuf.buffer, out_hand: handBuf.buffer },
+    { x: xBuf.buffer, out_fold: foldBuf.buffer },
     { size: N },
   );
-
   const fold = await webgpuBackend.ops.read(foldBuf);
-  const hand = await webgpuBackend.ops.read(handBuf);
+
+  // CPU reference: evalScalar of the SAME Expr (the single meaning), f32-rounded.
+  const env = { x: 0, y: 0, g: 0 };
   let max = 0;
   for (let i = 0; i < N; i++) {
-    const d = Math.abs(fold[i] - hand[i]);
-    const rel = d / (Math.abs(hand[i]) + 1e-6);
+    env.x = xData[i];
+    const ref = Math.fround(evalScalar(cell.expr, env));
+    const d = Math.abs(fold[i] - ref);
+    const rel = d / (Math.abs(ref) + 1e-6);
     max = Math.max(max, Math.min(d, rel));
   }
   return { ok: max <= TOL, max };
@@ -144,9 +129,8 @@ async function main(): Promise<void> {
   let allOk = true;
   for (const cell of CELLS) {
     const { ok, max } = await checkCell(cell);
-    const kind = max === 0 ? "byte-identical" : "reassociated";
     log(
-      `${cell.name.padEnd(10)} max=${max.toExponential(3)} ${kind.padEnd(14)} ${ok ? "PASS" : "FAIL"} (tol=${TOL})`,
+      `${cell.name.padEnd(10)} fold-GPU vs interpret-CPU max=${max.toExponential(3)} ${ok ? "PASS" : "FAIL"} (tol=${TOL})`,
     );
     if (!ok) allOk = false;
   }
