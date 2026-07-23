@@ -2041,6 +2041,86 @@ function actionOutputHarvestPairs(
 // "survivor" prune deterministically crashes on the shared node.
 
 /**
+ * How a lowered plan executes THIS call — the one place the fresh-eyes stall
+ * ("I could not state what runs on step 2 in one sentence") is made stateable.
+ * `reason` is a legible witness for the decision, never a control signal — the
+ * `path` is the whole contract.
+ *
+ *  • "compiled-replay" — a valid compiled plan exists AND the arena/planned-
+ *    replay preconditions hold: replay the recorded GPU command stream (FAST
+ *    PATH). The steady state for every recurring template (step 2+).
+ *  • "build-from-ir"   — first execution of a compilable template with no
+ *    compiled plan yet: build the compiled plan from the lowered IR, then
+ *    replay it. May still FALL THROUGH to lowered if generation comes back
+ *    uncovered (a runtime outcome, not a decision) — the verdict names the
+ *    ATTEMPT.
+ *  • "lowered"         — the reference/interpreter path: opt-out, non-webgpu,
+ *    no arena, a scalar-adapt in flight, a checkpoint-eager compile refusal,
+ *    or a template memoised uncoverable. Always correct (no wrong-not-slow).
+ */
+type ReplayPath =
+  | { path: "compiled-replay"; reason: string }
+  | { path: "build-from-ir"; reason: string }
+  | { path: "lowered"; reason: string };
+
+/**
+ * Decide how `executeLoweredPlan` runs this call. PURE: it consumes the already-
+ * computed branch preconditions and mutates nothing (the refusal-counter /
+ * buildReaches bookkeeping stays with the caller). The compiled-replay and
+ * build-from-IR conditions are mutually exclusive by construction — replay needs
+ * `compiledPlan.valid`, build-from-IR needs `!compiledPlan` — so checking replay
+ * first cannot double-select, and build-from-IR ⟹ hasArena (its eligibility
+ * already required the arena), so the caller's later redundant arena guard is
+ * subsumed here.
+ */
+function replayPathFor(d: {
+  compiledReplayReady: boolean;
+  buildFromIREligible: boolean;
+  refuseCompileHazard: boolean;
+  memoUncoverable: boolean;
+  hasArena: boolean;
+}): ReplayPath {
+  if (d.compiledReplayReady) {
+    return {
+      path: "compiled-replay",
+      reason: "valid compiled plan + arena + planned-replay ok",
+    };
+  }
+  if (
+    d.buildFromIREligible &&
+    !d.refuseCompileHazard &&
+    !d.memoUncoverable &&
+    d.hasArena
+  ) {
+    return {
+      path: "build-from-ir",
+      reason: "first exec of a compilable template — build compiled plan from IR",
+    };
+  }
+  // Lowered — name WHY (most specific first).
+  if (!d.buildFromIREligible) {
+    return {
+      path: "lowered",
+      reason:
+        "not build-from-IR eligible (opt-out / non-webgpu / no arena / scalar-adapt pending / compiled plan present but replay preconditions unmet)",
+    };
+  }
+  if (d.refuseCompileHazard) {
+    return {
+      path: "lowered",
+      reason: "checkpoint-eager compile refusal (D3 hazard)",
+    };
+  }
+  if (d.memoUncoverable) {
+    return {
+      path: "lowered",
+      reason: "template memoised uncoverable (BUILD_FAILURE_MEMO)",
+    };
+  }
+  return { path: "lowered", reason: "fallthrough to lowered" };
+}
+
+/**
  * @param plan - The original execution plan
  * @param planNodes - Reordered plan nodes (from template.finalPerm)
  * @param loweredPlan - The cached lowered plan from the template
@@ -2154,23 +2234,66 @@ export async function executeLoweredPlan(
     scalarAdaptPending = true;
   }
 
+  // ── THE replay-path decision (fresh-eyes stall #5: "what runs on step 2?") ─
+  // Compute every branch precondition ONCE, then let replayPathFor name the
+  // verdict. The three execution blocks below select on `replay.path`; the
+  // per-template bookkeeping (compileRefusalCount, buildReaches, buildFailures)
+  // stays here — the verdict is pure.
+  //
+  // compiledReplayReady = the FAST-PATH precondition: a valid compiled plan AND
+  // the arena/planned-replay environment. Liveness-aware arena reuses one buffer
+  // across positions, so compiled replay needs planned mode (the memory planner
+  // derives a lifetime-split buffer assignment per plan).
+  const compiledReplayReady =
+    !!loweredPlan.compiledPlan?.valid &&
+    useTopLevelSharedEncoder &&
+    !!options.bufferArena &&
+    ENV.TORCHLETTE_COMPILED_PLAN !== "0" &&
+    (!arenaLivenessEnabled() || compiledPlannedEnabled());
+  // build-from-IR eligibility: first execution of a compilable template (no
+  // compiled plan yet) on the webgpu arena path, unless a scalar-adapt is in
+  // flight (that must run ONE lowered execution to adapt the recipe first). THE
+  // (only) compiled build source; opt-out TORCHLETTE_COMPILED_PLAN=0 stays on
+  // the lowered path (buildFromIRActive).
+  const buildFromIREligible =
+    !scalarAdaptPending &&
+    buildFromIRActive() &&
+    backend.name === "webgpu" &&
+    useTopLevelSharedEncoder &&
+    !!options.bufferArena &&
+    !loweredPlan.compiledPlan &&
+    (!arenaLivenessEnabled() || compiledPlannedEnabled());
+  // [failed-generation-tax memo] A template that has missed coverage
+  // BUILD_FAILURE_MEMO times will not become coverable mid-process — skip the
+  // build block (and its full generateStream walk) and run lowered directly.
+  const memoUncoverable =
+    options.templateFp !== undefined &&
+    (buildFailures.get(options.templateFp) ?? 0) >= BUILD_FAILURE_MEMO;
+  const replay = replayPathFor({
+    compiledReplayReady,
+    buildFromIREligible,
+    refuseCompileHazard: !!options.refuseCompileHazard,
+    memoUncoverable,
+    hasArena: !!options.bufferArena,
+  });
+
   // =========================================================================
   // FAST PATH: Compiled Plan Execution
   // =========================================================================
-  // If we have a valid compiled plan, execute it directly.
-  // The compiled plan is a flat sequence of GPU primitives (alloc, dispatch,
-  // copy, write, barrier) with abstract slot indices instead of concrete buffers.
-  // Compiled plan: enabled by default. Disable with TORCHLETTE_COMPILED_PLAN=0.
-  if (
-    loweredPlan.compiledPlan?.valid &&
-    useTopLevelSharedEncoder &&
-    options.bufferArena &&
-    ENV.TORCHLETTE_COMPILED_PLAN !== "0" &&
-    // Liveness-aware arena reuses one buffer across multiple positions, so
-    // compiled replay needs planned mode (the memory planner derives a
-    // lifetime-split buffer assignment per plan).
-    (!arenaLivenessEnabled() || compiledPlannedEnabled())
-  ) {
+  // Replay the compiled plan directly: a flat sequence of GPU primitives
+  // (alloc, dispatch, copy, write, barrier) with abstract slot indices instead
+  // of concrete buffers. Enabled by default; disable with
+  // TORCHLETTE_COMPILED_PLAN=0 (folded into compiledReplayReady above).
+  if (replay.path === "compiled-replay") {
+    // Narrowing: compiled-replay ⟹ compiledReplayReady ⟹ both are defined.
+    // Unreachable; the throw only re-narrows the types the verdict already
+    // established (the inline `compiledPlan?.valid && bufferArena` guard used to
+    // narrow these; the named verdict subsumes it).
+    if (!loweredPlan.compiledPlan || !options.bufferArena) {
+      throw new Error(
+        "[executor] unreachable: compiled-replay verdict without a compiled plan / arena",
+      );
+    }
     if (ENV.TORCHLETTE_DEBUG_COMPILED) {
       console.log(
         `[exec] COMPILED nodes=${planNodes.length} cmds=${loweredPlan.compiledPlan.commands.length}`,
@@ -2226,14 +2349,10 @@ export async function executeLoweredPlan(
   // through to the lowered path with zero residue — so the opt-out behaviour
   // and the fallback are byte-identical to the unmodified normal path, and an
   // uncovered plan simply runs lowered every execution.
-  const buildFromIREligible =
-    !scalarAdaptPending &&
-    buildFromIRActive() &&
-    backend.name === "webgpu" &&
-    useTopLevelSharedEncoder &&
-    !!options.bufferArena &&
-    !loweredPlan.compiledPlan &&
-    (!arenaLivenessEnabled() || compiledPlannedEnabled());
+  // (buildFromIREligible / memoUncoverable are computed up front with the
+  // replay-path decision — see replayPathFor. The bookkeeping side effects stay
+  // here: the refusal counter below, and buildReaches/buildFailures inside.)
+  //
   // [D3 checkpoint-arena refusal — SUNSET-BOUND] Decline compilation for EVERY
   // plan built during a checkpointed EAGER step (forward+loss + backward +
   // optimizer) — the b66ead78 hazard. It must be ALL-OR-NOTHING per step: a
@@ -2247,18 +2366,15 @@ export async function executeLoweredPlan(
   if (buildFromIREligible && options.refuseCompileHazard) {
     compileRefusalCount++;
   }
-  // [failed-generation-tax memo] A template that has missed coverage
-  // BUILD_FAILURE_MEMO times will not become coverable mid-process — skip the
-  // build block (and its full generateStream walk) and run lowered directly.
-  const memoUncoverable =
-    options.templateFp !== undefined &&
-    (buildFailures.get(options.templateFp) ?? 0) >= BUILD_FAILURE_MEMO;
-  if (
-    buildFromIREligible &&
-    !options.refuseCompileHazard &&
-    !memoUncoverable &&
-    options.bufferArena
-  ) {
+  if (replay.path === "build-from-ir") {
+    // Narrowing: build-from-ir ⟹ buildFromIREligible ⟹ options.bufferArena
+    // defined (unreachable throw; the old `&& options.bufferArena` in the block
+    // condition narrowed this — the named verdict subsumes it).
+    if (!options.bufferArena) {
+      throw new Error(
+        "[executor] unreachable: build-from-ir verdict without an arena",
+      );
+    }
     await ensureFusionImports();
     const { reset } = populateCapturesFromIR(
       plan,
