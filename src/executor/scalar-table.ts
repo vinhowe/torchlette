@@ -128,8 +128,6 @@ export function refreshScalarTable(
   const device = (backend as Backend & { device?: GPUDevice }).device;
   if (!device) return; // non-WebGPU backends keep the legacy full() path
 
-  // [step-tape 1b] declare the table's positions as value-level coverage
-  // (guard 3): a scalar that varies step→step at one of these positions is a
   let table = loweredPlan.scalarTable;
   if (!table || table.destroyed) {
     const buffers: GPUBuffer[] = [];

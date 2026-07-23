@@ -180,11 +180,6 @@ let claimMisses = 0;
 let pinnedTemplates = 0;
 let prunedPairsRemoved = 0;
 let retiredTemplates = 0;
-/** [D5] Observation-recording calls skipped on the captured (declared-boundary
- *  replay) path — the retired watcher's per-replay bookkeeping, now reclaimed.
- *  Telemetry only; a nonzero value means a warm capture is deriving, not
- *  observing. */
-let capturedRecordSkips = 0;
 
 /** Executor callback: invalidate a template's compiled plan by fingerprint
  *  (the module can't import executor.ts — circular). */
@@ -226,26 +221,6 @@ export function setObservedLivenessEnabled(on: boolean): void {
 }
 export function isObservedLivenessEnabled(): boolean {
   return enabled;
-}
-
-/** [2b §5 declared-lifetime dividend] True while a MULTI-plan step TAPE replays
- *  its plan sequence. Inside a captured training step the whole step's dataflow
- *  is DECLARED, so the observation-layer's per-handle liveness verdicts do not
- *  apply to cross-plan reads: (a) the stage-3 B clear-at-release must not fire
- *  (a last-reader plan overlaying a claimed released external mid-replay would
- *  strand the next replay's read); (b) a cross-plan buffer produced by an
- *  earlier plan (or a lowered backward segment) and re-bound by the planner is
- *  reachable for the whole replay even though its RECORDING-era storage handle
- *  was demoted at the recording markStep — the destroyed-handle lifetime guard
- *  is a false positive here (correctness proven: captured trajectory tracks the
- *  uncaptured control WITHIN the cross-run fp-noise floor). Both are suppressed
- *  only for the duration of the replay; outside it the guards are unchanged. */
-let stTapeReplayActive = false;
-export function setStepTapeReplayActive(on: boolean): void {
-  stTapeReplayActive = on;
-}
-export function isStepTapeReplayActive(): boolean {
-  return stTapeReplayActive;
 }
 
 // ── [D5 stage-1] Watcher-cost measurement (the §5 re-open condition) ──────────
@@ -319,13 +294,6 @@ export function resetObservedLiveness(): void {
   pinnedTemplates = 0;
   prunedPairsRemoved = 0;
   retiredTemplates = 0;
-  capturedRecordSkips = 0;
-}
-
-/** [D5] How many observation-recording calls were skipped on the captured path
- *  (the reclaimed watcher cost). */
-export function getCapturedRecordSkips(): number {
-  return capturedRecordSkips;
 }
 
 function obs(fp: number): TemplateObs {
@@ -406,40 +374,6 @@ export function noteInPlaceCommit(): void {
 
 // ── Stamp / observe ──────────────────────────────────────────────────────────
 
-/**
- * [D5 — THE DECLARED-LIFETIME DIVIDEND, step-object phase 7 / ruling 2]
- * Watcher-cost reclaimed: the observation RECORDING is RETIRED on the captured
- * path. Inside a declared step-tape replay the whole step's dataflow is DECLARED
- * — cross-plan liveness DERIVES from `crossPlanEdges(v)` + the declared boundary
- * survivors, so the per-step observation (stamp enrollment → survival scan →
- * convergence feed → overlay-release) recovers nothing.
- *
- * The D5 stage-1 measurement (`tools/t-d5-watcher-cost.ts`) proved the dividend
- * is FREE on the captured path: the convergence machinery the predicates gate
- * NEVER activates under step-tape replay (a warm tape stops executing lowered,
- * so no template reaches the K_HYSTERESIS stable executed steps convergence
- * requires — measured convergedTemplates=0 / releasableMB=0 / zero predicate
- * prunes across distil{ckpt on/off} and gpt2-medium, even over 60 steps / 56
- * hits). The claim seam (`releasableLastReader`, `prunedHarvest`) is therefore
- * dormant on the captured path by construction, and the overlay-release
- * application + the read guards were already suppressed there
- * (`compiled-plan.ts` / `op-dispatch.ts` `isStepTapeReplayActive()`). Retiring
- * the recording changes NO decision — it only stops paying the per-replay
- * bookkeeping (the survival scan's `storageTracker.isDestroyed` per stamped
- * result, the growing `everSurvived`/`everReadback`/`everAliased`/`needed` sets).
- *
- * NOT a global deletion: the UNCAPTURED path keeps the full observation layer.
- * There the same measurement found `everSurvived` LOAD-BEARING — it carries one
- * real prune the derived guards (`graphHeldAt` + `crossPlanEdgeHasOtherConsumer`)
- * miss: the `[1,S,vocab]` CE-logits boundary survivor, a value that survives the
- * step with NO cross-plan consumer edge (declared-live under capture, but only
- * observation-visible without a declaration). So the retirement is captured-path
- * only. Strict-lifetime stays armed as the wrong-derivation detector.
- */
-function capturedPathRetired(): boolean {
-  return stTapeReplayActive;
-}
-
 /** Stamp a harvested result and enroll it for the survival scan. checkId
  *  follows the view-base chain so an in-place param VIEW is judged by the
  *  persistent buffer owner, not the per-replay view handle (which dies at
@@ -451,11 +385,6 @@ export function stampResult(
   oi: number,
 ): void {
   if (!enabled) return;
-  // [D5] Captured-path retirement: derived, not observed (see above).
-  if (capturedPathRetired()) {
-    capturedRecordSkips++;
-    return;
-  }
   const stamp: ResultStamp = { fp, ni, oi };
   sh.stamp = stamp;
   stepStamped.push({ shId: sh.id, checkId: sh.baseStorageId ?? sh.id, stamp });
@@ -470,9 +399,6 @@ export function observeConsumed(
   consumerFp?: number,
 ): void {
   if (!enabled) return;
-  // [D5] Captured-path retirement: cross-plan consumption is a derived edge
-  // (crossPlanEdges), not an observed one, inside a declared boundary.
-  if (capturedPathRetired()) return;
   const stamp = storage.stamp;
   if (!stamp) return;
   addNeeded(stamp.fp, stamp.ni, stamp.oi, "c");
@@ -494,9 +420,6 @@ export function observeConsumed(
  */
 export function observeReadback(storage: StorageHandle): void {
   if (!enabled) return;
-  // [D5] Captured-path retirement: a captured step's readbacks are the DECLARED
-  // ring outputs (loss / diagnostics) — enumerated by the tape, not observed.
-  if (capturedPathRetired()) return;
   const stamp = storage.stamp;
   if (!stamp) return;
   addNeeded(stamp.fp, stamp.ni, stamp.oi, "r");
@@ -534,9 +457,6 @@ export function readbackMiss(
  *  replay-harvest chokepoint (every alias flows through it). */
 export function noteAliasedBase(stamp: ResultStamp): void {
   if (!enabled) return;
-  // [D5] Captured-path retirement: aliasing is STATICALLY VISIBLE in the
-  // recorded plan sequence inside a declared boundary — derived, not observed.
-  if (capturedPathRetired()) return;
   obs(stamp.fp).everAliased.add(key(stamp.ni, stamp.oi));
 }
 

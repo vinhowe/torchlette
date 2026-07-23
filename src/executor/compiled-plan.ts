@@ -250,10 +250,6 @@ export interface CompiledPlan {
    *  teardown. Tracked here so teardown unpins+frees them (they are outside the
    *  arena/pool). */
   _constFillBufs?: GPUBuffer[];
-  /** [step-tape 1b] Template fingerprint, stamped by the executor when
-   *  recording (TORCHLETTE_STEP_TAPE=record) so plan invalidation cascades
-   *  to tapes referencing this template (guard 4). Absent when off. */
-  tapeFp?: number;
   /** [observed-liveness] Template fingerprint, stamped by the executor whenever
    *  a compiled plan is built. The replay-harvest chokepoint stamps each
    *  harvested result (templateFp, nodeIndex, oi) for cross-plan liveness
@@ -302,7 +298,6 @@ import type { LazyIRNode, StorageHandle } from "../graph/types";
 import { PlannerRegistry, planMemory } from "./memory-planner";
 import {
   guardMiss,
-  isStepTapeReplayActive,
   noteAliasedBase,
   observeConsumed,
   registerPrunedExecution,
@@ -1600,7 +1595,7 @@ export async function executeCompiledPlan(
     // the miss is attributed + revocable). All: mark the storage handle
     // releasedOverlay so materialized-ref reads and readbacks hit the
     // [lifetime] warn / STRICT throw.
-    if (compiled._claimedExternal && !isStepTapeReplayActive()) {
+    if (compiled._claimedExternal) {
       for (const c of compiled._claimedExternal) {
         const src = compiled.slots[c.slot];
         if (src?.kind !== "external") continue;

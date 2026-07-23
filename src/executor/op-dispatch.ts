@@ -22,7 +22,6 @@ import {
 import { storageTracker } from "../graph/storage-tracker";
 import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
 import { OP_REGISTRY } from "../ops/registry";
-import { isStepTapeReplayActive } from "./observed-liveness";
 import { lookupScalarStorage } from "./scalar-table";
 
 /** One-shot flag for the reclaimed-storage-read warning. */
@@ -150,15 +149,7 @@ export function getInputStorage(
     // code still holds; the buffer is back in the pool and may carry another
     // op's data). Throws by DEFAULT (task #73); TORCHLETTE_STRICT_LIFETIME=0
     // downgrades to warn-only during the soak window (opt-out sunsets ~2026-08).
-    // [2b §5] Inside a multi-plan TAPE replay the whole step's dataflow is
-    // DECLARED: cross-plan buffers re-bound by the planner are reachable for
-    // the replay even though their recording-era handle was demoted at the
-    // recording markStep. The per-handle liveness verdicts (releasedOverlay,
-    // isDestroyed) are observation-layer facts that the declaration supersedes
-    // — correctness proven by trajectory parity within the fp-noise floor. Skip
-    // both guards during the replay; outside it they are unchanged.
-    const declaredReplay = isStepTapeReplayActive();
-    if (ref.storage.releasedOverlay && !declaredReplay) {
+    if (ref.storage.releasedOverlay) {
       const msg =
         `[lifetime] reading step-globally RELEASED storage id=${ref.storage.id} ` +
         `(shape=${JSON.stringify(ref.storage.backendTensor.shape)}). Its registry entry was ` +
@@ -172,7 +163,6 @@ export function getInputStorage(
     }
     if (
       storageTracker.isDestroyed(ref.storage.id) &&
-      !declaredReplay &&
       // Re-derived from the derived model (task #70 D4): a reclaimed view whose
       // live base shares its buffer is a kept holder (nonWrapperRetain /
       // _liveViewBases), not a UAF. First-class query on the tracker that owns
