@@ -718,3 +718,27 @@ gated commit each:
 The `mm` refusal stays STRUCTURAL (the fold has no elementwise tile-IR target for a
 contraction — Muon's Newton-Schulz refuses at the fold seam by the type system), so
 no name-check is ever added for it.
+
+---
+
+## R5 finale commit 1 — MERGED under the quantum-aware re-gate (2026-07-23)
+
+The de-naming commit's medium warmup peak (16989.3 vs the ≤16189.0 gate) was
+attributed: **a V8 GC-cadence artifact, not structural.** The lowered plans are
+byte-identical (same nodes, same reclaim@298/297 positions); the flip is whether
+warmup arena buffers (fence-gated deferredDestroy + FinalizationRegistry
+backstop) die before or during the cutover burst — GC-gated. Symmetric proof:
+base reaches the HIGH quantum and branch reaches the LOW quantum under trivial
+neutral perturbations (--max-semi-space-size, dead code); the oscillation is
+non-monotonic on both trees. The original ≤16189.0 exit asserted a GC-timing
+accident that main itself achieves only by luck.
+
+**The re-gate (standing):** warmup peak is gated WITHIN ONE reclaim quantum
+(≤ ~16989), with steady-state byte-parity + submits-exact + trajectory-bit-exact
+carrying the real load. Steady state: 7247.9 MB / 3334 allocs / 19 submits
+byte-identical.
+
+**Named follow-on campaign (fenced, not opportunistic):** make warmup cutover
+buffer reclaim GC-independent (deterministic), collapsing both quanta to one
+value. It touches the arena/wrapper-lifecycle area with a documented
+training-freeze bug history — its own design + gates when funded.
