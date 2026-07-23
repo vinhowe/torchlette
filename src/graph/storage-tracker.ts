@@ -157,6 +157,37 @@ class StorageTracker {
     return live;
   }
 
+  /**
+   * Does storage s still have a LIVE DURABLE owner — a wrapper that is a kept
+   * holder in the derived model (REGISTERED state, step-snapshot persistent,
+   * graph-retention clone, or sidecar pin)? Such a wrapper POINTING AT s makes s
+   * the CURRENT storage of long-lived state, so s is live whatever its rc says.
+   *
+   * This is the derived owner-set model (task #70 D2 — the authoritative liveness
+   * source, rc being explicitly unsound: a single wrapper holds ctor+materialize
+   * rc=2) extended to the ONE site that still trusted rc alone: destruction.
+   * `destroyUnreachable` reaps at rc≤0, and the fused Adam boundary transiently
+   * leaves a freshly-superseded PARAM/state storage at rc≤0 while its registered
+   * wrapper still points at it (the whole-step persistence-UAF: the param is read
+   * by the next step's forward, its buffer already reclaimed). A wrapper that
+   * MOVED off s (fused _updateLazyRef → untrackTensor) is no longer in W(s), so an
+   * OLD storage after a legitimate state replacement has no durable owner and is
+   * still destroyed — only a storage a live durable wrapper STILL points at is
+   * protected. Mirrors `_derived`'s keptHolder minus the rc gate (the rc gate is
+   * exactly what we are correcting here).
+   */
+  private _hasLiveDurableOwner(storageId: number): boolean {
+    for (const w of this._liveOwners(storageId)) {
+      if (this._registeredState.has(w)) return true;
+      if (this._stepStartTensors?.has(w) === true) return true;
+      if ((w as { _graphRetained?: boolean })._graphRetained === true)
+        return true;
+      if ((w as { _sidecarShare?: boolean })._sidecarShare === true)
+        return true;
+    }
+    return false;
+  }
+
   /** The set of storage ids that are the BASE of at least one live view (each
    *  such view holds an rc-retain on its base that releaseStepTemps neither sees
    *  nor releases). Computed ONCE per releaseStepTemps sweep and passed to
@@ -434,7 +465,17 @@ class StorageTracker {
 
       const toDestroy: number[] = [];
       for (const [id] of this.allStorages) {
-        if (rcGet(id) <= 0 && !protectedBases.has(id)) {
+        if (
+          rcGet(id) <= 0 &&
+          !protectedBases.has(id) &&
+          // A storage a live durable wrapper (registered / snapshot-persistent /
+          // graph-held / sidecar) still points at is the CURRENT storage of
+          // long-lived state — live whatever rc says (the whole-step fused-Adam
+          // persistence-UAF, where a superseded param sits at rc≤0 while its
+          // registered wrapper still reads it next step). Owner-set liveness (D2)
+          // over rc, at the last rc-only site.
+          !this._hasLiveDurableOwner(id)
+        ) {
           toDestroy.push(id);
         }
       }
