@@ -1,9 +1,49 @@
 import type { AttnModifierSpec } from "../backend/types";
+import { ENV } from "../core/env";
 import { sizeOf } from "../core/shape";
+import {
+  type CompositeDef,
+  LAYERNORM_DEF,
+  RMSNORM_DEF,
+  vjpComposition,
+} from "../ops/semantic";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import { applyAutocastImpl, autocastCastImpl } from "./autocast";
 import type { Tensor } from "./tensor";
 import type { Torchlette } from "./torchlette";
+
+/**
+ * COMPOSITE-CLOSURE C2 — route a CPU / non-fused composite backward through the
+ * DERIVED reference (`vjpComposition`, F1) instead of a hand closure. Behind
+ * `TORCHLETTE_DERIVED_COMPOSITE_BWD` (born off, soak → default at C3 → the hand
+ * closure + flag are removed). While the flag is off the hand closure runs and
+ * is the differential oracle; the C2 gate proves BOTH flag states == torch.
+ *
+ * The softmax closure is deliberately NOT routed: the C1 cost probe measured the
+ * derived softmax backward heavier (22 vs 13 nodes, ~1.1x), so per the design's
+ * T1 gate it stays hand and the derived form is reference-only.
+ */
+export function useDerivedCompositeBwd(): boolean {
+  return ENV.TORCHLETTE_DERIVED_COMPOSITE_BWD === "1";
+}
+
+/** Realize a composite's derived VJP over `rt` and return grads in role order. */
+function derivedCompositeGrads(
+  torch: Torchlette,
+  def: CompositeDef,
+  grad: RuntimeTensor,
+  dim: number,
+  roleInputs: Readonly<Record<string, number | RuntimeTensor>>,
+  outRoles: readonly string[],
+): RuntimeTensor[] {
+  const grads = vjpComposition(def, torch.runtime, dim, roleInputs, grad);
+  return outRoles.map((r) => {
+    const g = grads[r];
+    if (g === undefined)
+      throw new Error(`derivedCompositeGrads: ${def.name} missing role '${r}'`);
+    return g;
+  });
+}
 
 /**
  * Softmax along a dimension.
@@ -223,6 +263,20 @@ export function rmsnormImpl(
     result,
     [x, weight],
     (grad, getSaved) => {
+      if (useDerivedCompositeBwd()) {
+        return derivedCompositeGrads(
+          torch,
+          RMSNORM_DEF,
+          grad,
+          normalizedDim,
+          {
+            x: getSaved(0)._unwrap(),
+            w: getSaved(1)._unwrap(),
+            eps,
+          },
+          ["x", "w"],
+        );
+      }
       return rmsnormBackwardImpl(
         torch,
         grad,
@@ -679,6 +733,23 @@ function layernormBackwardImpl(
       gradWeightTensor,
       lastDimSize,
     );
+  } else if (useDerivedCompositeBwd()) {
+    // CPU derived path (C2): the layernorm VJP is the reverse pass over
+    // LAYERNORM_DEF — one theorem, no hand `gradVar`/`gradMean` expansion.
+    const savedBias = getSaved(2);
+    [gradX, gradWeight, gradBias] = derivedCompositeGrads(
+      torch,
+      LAYERNORM_DEF,
+      grad,
+      normalizedDim,
+      {
+        x: savedX._unwrap(),
+        w: savedWeight._unwrap(),
+        b: savedBias._unwrap(),
+        eps,
+      },
+      ["x", "w", "b"],
+    ) as [RuntimeTensor, RuntimeTensor, RuntimeTensor];
   } else {
     // CPU decomposed path
     const recomputeMean = torch.runtime.mean(savedX._unwrap(), {
