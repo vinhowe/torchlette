@@ -532,10 +532,25 @@ because its kernel is fused into the online-softmax lemma.
 
 ## 12. Taste-calls (flagged for Vin — genuinely unresolvable from code/measurement)
 
-- **T1 — the C2 softmax deletion.** Whether to delete the CPU softmax closure or keep it
-  reference-only turns on the C1 cost-probe number, which does not exist until C1 lands. The
-  *design* is decided (gate the deletion on measured node-count parity); the *outcome* is a
-  measurement, not a taste-call — flagged only so the phase can stop cleanly either way.
+- **T1 — the C2 softmax deletion. RESOLVED-BY-LEMMA (2026-07-23).** The C1 cost probe
+  measured the derived reverse-mode softmax backward heavier than the hand-collapsed closed
+  form (22 vs 13 nodes), so C2 correctly KEPT the collapsed form rather than routing softmax
+  through `vjpComposition`. But "kept" is not "trusted hand code": the collapsed VJP
+  `y ⊙ (g − Σ⟨g,y⟩)` now stops being an imperative closure in `decomposed-ops.ts` and becomes
+  a **DECLARED SIMPLIFICATION LEMMA** — `SOFTMAX_BWD_LEMMA` in `composite.ts`, stated once as
+  a `CompNode` composition DATA (`SimplificationLemma`), realized by the (now memoized)
+  `interpretComposition`. It reuses `SOFTMAX_DEF.root` as `y` (single source for the forward)
+  and emits the exact op sequence — max, sub, exp, sum, div, mul, sum, sub, mul — of the
+  deleted closure (**byte-identical executed graph**, a relocation-with-status-change, not a
+  numeric change). Its **proof obligation** — equality to the honest
+  `vjpComposition(SOFTMAX_DEF)` within the L-COMP bound — is the permanent machine-checked
+  witness (`semantic-composite-backward.spec` cell (3), plus the frontend face in cell (2)).
+  This is the same pattern as the `detach` lemma (§3.2) and the fused-kernel assertions (§7):
+  a stated fact relocated from code into the semantic stratum. The census
+  (`tools/semantic-census.sh`) now verifies the lemma DECLARATION exists and that softmax
+  routes through it (no `softmaxResult` hand arithmetic), replacing the hand-code whitelist.
+  With this, **no hand composite backward arithmetic survives in the semantic frame** — the
+  T1 asterisk on §10's closure claim is discharged.
 - **T2 — the optional torch-SDPA oracle (§5).** Adding a torch-refereed SDPA gradcheck is a
   one-gate hardening of the attention fence, orthogonal to closure. Recommend landing it (it
   is cheap and upgrades a byte-differential to a numeric referee), but it is genuinely

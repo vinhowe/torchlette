@@ -128,16 +128,22 @@ const cr = (op: CompReduceOp, a: CompNode, detach = false): CompNode => ({
 });
 
 const IN_X = cin("x");
+const IN_G = cin("g"); // the upstream cotangent role (backward lemmas only)
 
 // softmax = exp(x − max(x)) / sum(exp(x − max(x)))   (max/sum along dim).
 // The `max`-shift is DETACHED (F1 §3.2 lemma): its gradient is provably zero by
 // softmax's shift-invariance, so the reverse pass drops it and the derived
 // backward structurally matches the hand closed form (no argmax mask-scatter).
+// `SM_EXP` is authored as ONE shared node so a memoized realizer folds `exp`
+// (and the whole `x − max` shift) exactly once — this is what lets the softmax
+// backward LEMMA (below) reuse `SOFTMAX_DEF.root` as `y` and still realize
+// byte-identically to the deleted hand closure (which computed `exp` once).
 const SM_SHIFTED = cb("sub", IN_X, cr("max", IN_X, true));
+const SM_EXP = cu("exp", SM_SHIFTED);
 export const SOFTMAX_DEF: CompositeDef = {
   name: "softmax",
   roles: ["x"],
-  root: cb("div", cu("exp", SM_SHIFTED), cr("sum", cu("exp", SM_SHIFTED))),
+  root: cb("div", SM_EXP, cr("sum", SM_EXP)),
 };
 
 // log_softmax = (x − max) − log(sum(exp(x − max)))   (the log-sum-exp form)
@@ -216,6 +222,56 @@ export const REDUCTION_COMPOSITE_DEFS: readonly CompositeDef[] = [
   RMSNORM_DEF,
   LAYERNORM_DEF,
   CROSS_ENTROPY_DEF,
+];
+
+// ===========================================================================
+// SIMPLIFICATION LEMMAS (COMPOSITE-CLOSURE T1) — a composite backward whose
+// hand-collapsed closed form is CHEAPER than the honest reverse-mode graph
+// `vjpComposition` would emit, DECLARED as data instead of trusted as hand code.
+// A lemma is the composite-frame analogue of the `detach` annotation (§3.2): a
+// stated fact about the math relocated out of imperative code into the stratum.
+// It carries its own PROOF OBLIGATION — the collapsed `root` must equal
+// `vjpComposition(simplifies)` within the L-COMP reassociation bound — with the
+// derived reverse-mode graph as the permanent machine-checked witness.
+// ===========================================================================
+
+/** A declared backward simplification lemma (design §3.2, T1 ruling). */
+export interface SimplificationLemma {
+  /** The lemma's own name (e.g. "softmax_backward"). */
+  name: string;
+  /**
+   * Input roles the collapsed VJP consumes: the saved forward operand(s) `x`
+   * (to recompute intermediates for checkpointing) + the upstream cotangent `g`.
+   */
+  roles: readonly string[];
+  /** The collapsed VJP as a composition term (DATA — schema-gated). */
+  root: CompNode;
+  /** The forward `CompositeDef.name` this is the proven backward of. */
+  simplifies: string;
+  /** Where the proof obligation (lemma == vjpComposition) is machine-checked. */
+  provenIn: string;
+}
+
+// softmax backward = y ⊙ (g − Σ_dim(y ⊙ g)),  y = softmax(x).
+// The hand-collapsed closed form the C1 cost probe KEPT (13 nodes vs the honest
+// reverse-mode graph's 22): it STOPS being trusted hand code in decomposed-ops.ts
+// and becomes DATA here. `y` reuses `SOFTMAX_DEF.root` (single source for the
+// forward); the shared `SM_EXP` node means a memoized realizer folds the whole
+// forward recompute once, so `interpretComposition(SOFTMAX_BWD_LEMMA, …)` emits
+// the exact op sequence — max, sub, exp, sum, div, mul, sum, sub, mul — of the
+// deleted hand closure (byte-identical). Proof obligation: == vjpComposition.
+const SM_Y = SOFTMAX_DEF.root;
+export const SOFTMAX_BWD_LEMMA: SimplificationLemma = {
+  name: "softmax_backward",
+  roles: ["x", "g"],
+  root: cb("mul", SM_Y, cb("sub", IN_G, cr("sum", cb("mul", SM_Y, IN_G)))),
+  simplifies: "softmax",
+  provenIn: "test/oracle/semantic-composite-backward.spec.ts (L-COMP)",
+};
+
+/** The declared simplification-lemma catalog (schema-gated DATA). */
+export const SIMPLIFICATION_LEMMAS: readonly SimplificationLemma[] = [
+  SOFTMAX_BWD_LEMMA,
 ];
 
 const COMP_KINDS = new Set(["in", "kc", "u", "b", "r", "gi"]);

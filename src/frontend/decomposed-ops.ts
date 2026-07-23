@@ -2,8 +2,10 @@ import type { AttnModifierSpec } from "../backend/types";
 import { sizeOf } from "../core/shape";
 import {
   type CompositeDef,
+  interpretComposition,
   LAYERNORM_DEF,
   RMSNORM_DEF,
+  SOFTMAX_BWD_LEMMA,
   vjpComposition,
 } from "../ops/semantic";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
@@ -21,8 +23,13 @@ import type { Torchlette } from "./torchlette";
  * (semantic-composite-backward.spec) and the fused GPU kernels are asserted
  * against the SAME reference (composite-fused-vs-derived.spec).
  *
- * The softmax closure stays hand (C1 T1: the derived softmax backward measured
- * heavier — 22 vs 13 nodes — so the derived form is reference-only there).
+ * The softmax backward is the DECLARED SIMPLIFICATION LEMMA `SOFTMAX_BWD_LEMMA`
+ * (T1, RESOLVED-BY-LEMMA 2026-07-23): the collapsed closed form the C1 cost probe
+ * kept (13 nodes vs the reverse-mode graph's 22) STOPPED being trusted hand code
+ * and became data in the semantic stratum, realized here byte-identically via the
+ * memoized composition interpreter. Its proof obligation — equality to the honest
+ * `vjpComposition(SOFTMAX_DEF)` — is the permanent machine-checked witness
+ * (semantic-composite-backward.spec, L-COMP).
  */
 
 /** Realize a composite's derived VJP over `rt` and return grads in role order. */
@@ -79,49 +86,21 @@ export function softmaxImpl(torch: Torchlette, a: Tensor, dim: number): Tensor {
   const result = torch.runtime.div(exps, sumResult);
 
   const tensorsToSave = a.requiresGrad ? [castA] : [];
-  // Softmax backward: grad_input = softmax * (grad_output - sum(softmax * grad_output, dim, keepdim=true))
+  // Softmax backward = the DECLARED simplification lemma (SOFTMAX_BWD_LEMMA):
+  //   grad_input = y ⊙ (g − Σ(y ⊙ g)),  y = softmax(savedA) (recomputed for
+  //   checkpointing). The memoized interpreter folds the shared forward `y` once,
+  //   so this emits max, sub, exp, sum, div, mul, sum, sub, mul — byte-identical
+  //   to the deleted hand closure. Proof obligation: == vjpComposition(SOFTMAX_DEF)
+  //   (semantic-composite-backward.spec, L-COMP).
   return torch._wrapWithGrad(
     result,
     [a],
-    (grad, getSaved) => {
-      // Recompute softmax from saved input for checkpointing support
-      const savedA = getSaved(0);
-      const savedMax = torch.runtime.max(savedA._unwrap(), {
-        dim: normalizedDim,
-        keepdim: true,
-      });
-      if (typeof savedMax === "number") {
-        throw new Error(
-          "softmax backward: max with keepdim=true should return tensor",
-        );
-      }
-      const savedShifted = torch.runtime.sub(savedA._unwrap(), savedMax);
-      const savedExps = torch.runtime.exp(savedShifted);
-      const savedSum = torch.runtime.sum(savedExps, {
-        dim: normalizedDim,
-        keepdim: true,
-      });
-      if (typeof savedSum === "number") {
-        throw new Error(
-          "softmax backward: sum with keepdim=true should return tensor",
-        );
-      }
-      const softmaxResult = torch.runtime.div(savedExps, savedSum);
-
-      const softmaxMulGrad = torch.runtime.mul(softmaxResult, grad);
-      const sumGradResult = torch.runtime.sum(softmaxMulGrad, {
-        dim: normalizedDim,
-        keepdim: true,
-      });
-      if (typeof sumGradResult === "number") {
-        throw new Error(
-          "softmax backward: sum with keepdim=true should return tensor",
-        );
-      }
-      const gradMinusSum = torch.runtime.sub(grad, sumGradResult);
-      const gradInput = torch.runtime.mul(softmaxResult, gradMinusSum);
-      return [gradInput];
-    },
+    (grad, getSaved) => [
+      interpretComposition(SOFTMAX_BWD_LEMMA, torch.runtime, normalizedDim, {
+        x: getSaved(0)._unwrap(),
+        g: grad,
+      }),
+    ],
     tensorsToSave,
   );
 }

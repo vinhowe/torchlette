@@ -9,9 +9,10 @@
 # What it proves:
 #   F1 — no hand composite backward ARITHMETIC in decomposed-ops.ts (the derived
 #        `vjpComposition` is the CPU reference; the fused GPU kernels are asserted
-#        against it by composite-fused-vs-derived.spec). The softmax CPU closure
-#        is the ONE documented T1 deferral (the C1 cost probe measured its derived
-#        form heavier — 22 vs 13 nodes — so it stays hand, derived reference-only).
+#        against it by composite-fused-vs-derived.spec). The softmax backward — the
+#        one T1 case the C1 cost probe kept collapsed (13 vs 22 nodes) — is now a
+#        DECLARED SIMPLIFICATION LEMMA (SOFTMAX_BWD_LEMMA), data in the stratum with
+#        vjpComposition as its machine-checked witness, NOT trusted hand code.
 #   F2 — no activation BODY in fusion-tile-ir.ts / tile-ir.ts; every activation is
 #        `lowerExprToTileIR(DEF.expr, …)`.
 #   Whitelisted exclusions (each named + fenced in docs/composite-closure-design.md):
@@ -58,9 +59,22 @@ else
   bad "F1: no derivedCompositeGrads route in $DECOMP"
 fi
 
-# T1 deferral: the softmax closure is the ONE documented hand composite backward.
-if grep -q "grad_input = softmax" "$DECOMP" || grep -q "softmaxResult" "$DECOMP"; then
-  ok "F1: softmax closure present (documented C1/T1 deferral — derived reference-only)"
+# T1 (RESOLVED-BY-LEMMA 2026-07-23): softmax backward is no longer hand code — it
+# is the DECLARED simplification lemma SOFTMAX_BWD_LEMMA (composite.ts), routed
+# from decomposed-ops with NO imperative collapse arithmetic. Verify BOTH: the
+# lemma is declared as data, and the frontend consumes it (no `softmaxResult`).
+if grep -q "SOFTMAX_BWD_LEMMA" src/ops/semantic/composite.ts; then
+  ok "F1/T1: softmax backward declared as data (SOFTMAX_BWD_LEMMA)"
+else
+  bad "F1/T1: SOFTMAX_BWD_LEMMA declaration missing in composite.ts"
+fi
+# `softmaxMulGrad` was the UNIQUE variable of the deleted backward collapse — its
+# absence proves the hand arithmetic is gone (the surviving `softmaxResult` at the
+# attention CPU fallback is a FORWARD softmax call, not backward arithmetic).
+if grep -q "SOFTMAX_BWD_LEMMA" "$DECOMP" && ! grep -q "softmaxMulGrad" "$DECOMP"; then
+  ok "F1/T1: softmax backward routes through the lemma (no hand backward-collapse arithmetic)"
+else
+  bad "F1/T1: softmax backward still hand-written (softmaxMulGrad) or not routed through the lemma"
 fi
 
 # --- F2: the activation WGSL bodies are gone ----------------------------------

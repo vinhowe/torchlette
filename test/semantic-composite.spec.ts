@@ -19,6 +19,7 @@ import {
   LOG_SOFTMAX_DEF,
   REDUCTION_COMPOSITE_DEFS,
   RMSNORM_DEF,
+  SIMPLIFICATION_LEMMAS,
   SOFTMAX_DEF,
 } from "../src/ops/semantic";
 import { Torchlette } from "../src/frontend/torchlette";
@@ -110,6 +111,10 @@ describe("Semantic derivation — P2 reduction composites (Probe-4 reference)", 
   it("schema gate: every reduction-composite term is DATA", () => {
     for (const d of REDUCTION_COMPOSITE_DEFS) {
       expect(() => assertNoCompositionBody(d.root)).not.toThrow();
+    }
+    // The declared simplification lemmas (softmax backward, T1) are DATA too.
+    for (const l of SIMPLIFICATION_LEMMAS) {
+      expect(() => assertNoCompositionBody(l.root)).not.toThrow();
     }
     // A smuggled JS-body leaf must be unconstructible.
     expect(() =>

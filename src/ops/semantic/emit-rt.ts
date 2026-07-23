@@ -238,15 +238,32 @@ export function makeUnaryGrad(def: ElementwiseDef): UnaryGradFn {
 // reference, met at the schedule-state `SemanticRegionUid` seam.
 // ----------------------------------------------------------------------------
 
-/** Interpret a composition over `rt`, reducing along `dim`. `inputs` supplies the
- *  named roles (tensor operands + the scalar `eps`). */
+/**
+ * Interpret a composition over `rt`, reducing along `dim`. `inputs` supplies the
+ * named roles (tensor operands + the scalar `eps` + a backward lemma's cotangent
+ * `g`). The param is the structural minimum (`name`+`root`) so it realizes both a
+ * forward `CompositeDef` and a backward `SimplificationLemma` (design §3.2, T1).
+ *
+ * Nodes are MEMOIZED by identity: a shared sub-term (the softmax `SM_EXP`, a
+ * backward lemma's reused `y = SOFTMAX_DEF.root`) folds exactly ONCE, so the
+ * realized graph is a DAG, not a re-expanded tree. This is what makes
+ * `SOFTMAX_BWD_LEMMA` realize byte-identically to the deleted hand closure.
+ */
 export function interpretComposition(
-  def: CompositeDef,
+  def: { name: string; root: CompNode },
   rt: RuntimeEngine,
   dim: number,
   inputs: Readonly<Record<string, RtVal>>,
 ): RuntimeTensor {
+  const memo = new Map<CompNode, RtVal>();
   const go = (n: CompNode): RtVal => {
+    const hit = memo.get(n);
+    if (hit !== undefined) return hit;
+    const v = goCore(n);
+    memo.set(n, v);
+    return v;
+  };
+  const goCore = (n: CompNode): RtVal => {
     switch (n.k) {
       case "in": {
         const v = inputs[n.role];

@@ -24,9 +24,11 @@ import { describe, test } from "vitest";
 import { Torchlette } from "../../src";
 import {
   CROSS_ENTROPY_DEF,
+  interpretComposition,
   LAYERNORM_DEF,
   LOG_SOFTMAX_DEF,
   RMSNORM_DEF,
+  SOFTMAX_BWD_LEMMA,
   SOFTMAX_DEF,
   vjpComposition,
 } from "../../src/ops/semantic";
@@ -255,6 +257,10 @@ describe("vjpComposition == hand VJP (named reassociation bound L-COMP)", () => 
   }
 
   for (const { batch, label } of SHAPES) {
+    // NOTE (T1, 2026-07-23): the frontend `api.softmax` backward is now the
+    // DECLARED lemma `SOFTMAX_BWD_LEMMA` (no longer a hand closure), so this cell
+    // is one face of the lemma's proof obligation — the lemma (reached through the
+    // frontend) == vjpComposition. Cell (3) asserts the same directly on the data.
     test(`softmax ${label}`, async () => {
       const rows = 4;
       const cols = 6;
@@ -354,6 +360,39 @@ describe("vjpComposition == hand VJP (named reassociation bound L-COMP)", () => 
       assertClose(dX, handX, BOUND, BOUND, "layernorm dX");
       assertClose(dW, handW, BOUND, BOUND, "layernorm dW");
       assertClose(dB, handB, BOUND, BOUND, "layernorm dB");
+    });
+  }
+});
+
+// ===========================================================================
+// (3) THE LEMMA CELL — the DECLARED simplification lemma (SOFTMAX_BWD_LEMMA,
+// COMPOSITE-CLOSURE T1) realized DIRECTLY from the semantic stratum == the honest
+// reverse-mode `vjpComposition(SOFTMAX_DEF)`, within L-COMP. This is the lemma's
+// standing proof obligation asserted on the DATA itself (independent of the
+// frontend), pinning the collapsed closed form the softmax backward now emits.
+// ===========================================================================
+
+describe("SOFTMAX_BWD_LEMMA == vjpComposition (T1 lemma proof obligation)", () => {
+  const BOUND = 1e-5;
+  for (const { batch, label } of SHAPES) {
+    test(`softmax_backward lemma ${label}`, async () => {
+      const rows = 4;
+      const cols = 6;
+      const shape = [...batch, rows, cols];
+      const dim = shape.length - 1;
+      const xV = rand(prod(shape), 91);
+      const gV = rand(prod(shape), 92);
+      const x = api.tensorFromArray(xV, shape)._unwrap();
+      const g = api.tensorFromArray(gV, shape)._unwrap();
+      const lemma = interpretComposition(SOFTMAX_BWD_LEMMA, rt, dim, { x, g });
+      const derived = vjpComposition(SOFTMAX_DEF, rt, dim, { x }, g);
+      assertClose(
+        await read(lemma),
+        await read(derived.x),
+        BOUND,
+        BOUND,
+        "lemma dX",
+      );
     });
   }
 });
