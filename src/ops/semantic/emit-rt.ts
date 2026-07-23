@@ -15,11 +15,34 @@
 import type { RuntimeEngine } from "../../runtime/engine";
 import type { Tensor as RuntimeTensor } from "../../runtime/tensor";
 import type { BinaryTTGradFn, UnaryGradFn } from "../registry";
-import { vjpBinary, vjpUnary } from "./adjoint";
+import { deriv, normalize, vjpBinary, vjpUnary } from "./adjoint";
 import type { ElementwiseDef } from "./catalog";
-import type { CompNode, CompositeDef } from "./composite";
+import type {
+  CompBinary,
+  CompNode,
+  CompositeDef,
+  CompUnary,
+} from "./composite";
 import { ERF_A, ERF_P } from "./erf";
-import type { Expr } from "./expr";
+import {
+  add,
+  div as divE,
+  type Expr,
+  exp as expE,
+  log as logE,
+  mul as mulE,
+  neg as negE,
+  recip as recipE,
+  sqrt as sqrtE,
+  sub as subE,
+  x as xE,
+  y as yE,
+} from "./expr";
+import {
+  broadcastOverDims,
+  realizeIndexAdjoint,
+  reduceToShape,
+} from "./index-map";
 
 type RtVal = number | RuntimeTensor;
 
@@ -312,6 +335,268 @@ export function interpretComposition(
     return v;
   };
   return asTensor(go(def.root));
+}
+
+// ----------------------------------------------------------------------------
+// The CompNode-adjoint pass (F1, design §3) — reverse-mode VJP over the SAME
+// `CompNode` composition the forward is authored from. It threads an upstream
+// cotangent `ḡ` from `def.root` back to each input role, accumulating where a
+// role is used more than once. It builds NO new chain rule, NO transpose, NO
+// reduction fact — it COMPOSES three existing engines (design §3.1):
+//   - `deriv` + `normalize` + `emit` (adjoint.ts) for the u/b elementwise local
+//     factor (the same chain rule the elementwise VJPs already use);
+//   - `broadcastOverDims` (index-map) for the sum/mean reduce-transpose, scaled
+//     by the mean's 1/N (the reduction gradKind);
+//   - `reduceToShape` (index-map) for the broadcast-transpose that reduces each
+//     cotangent back to its operand's own shape (the §11.1 broadcast-adjoint
+//     trap — never hand-rolled here);
+//   - `realizeIndexAdjoint` (index-map) `scatterZeros` for the `gi` gather
+//     transpose (CE's `softmax − onehot`).
+// The `max`-reduce is the detached stability shift (§3.2 lemma) — its gradient is
+// provably zero and dropped; a non-detached (load-bearing) max is out of scope
+// (§3.3) and refused.
+// ----------------------------------------------------------------------------
+
+/** CompUnary → its `Expr` over `x` (so its local derivative REUSES `deriv`). */
+function compUnaryExpr(op: CompUnary): Expr {
+  switch (op) {
+    case "exp":
+      return expE(xE);
+    case "log":
+      return logE(xE);
+    case "sqrt":
+      return sqrtE(xE);
+    case "rsqrt":
+      return recipE(sqrtE(xE));
+    case "neg":
+      return negE(xE);
+  }
+}
+
+/** CompBinary → its `Expr` over `x`,`y` (so its partials REUSE `deriv`). */
+function compBinaryExpr(op: CompBinary): Expr {
+  switch (op) {
+    case "add":
+      return add(xE, yE);
+    case "sub":
+      return subE(xE, yE);
+    case "mul":
+      return mulE(xE, yE);
+    case "div":
+      return divE(xE, yE);
+  }
+}
+
+/**
+ * Reverse-mode VJP over a `CompositeDef`: realize the input-role gradients over
+ * `rt` given the saved operand roles (`inputs`) and the upstream cotangent
+ * `gbar` (shape = the forward output). Returns `{ role → gradTensor }` for every
+ * tensor-valued role reached (scalar roles like `eps` and the index role carry
+ * no gradient). This is the composite analogue of `makeUnaryGrad` — the backward
+ * sibling of `interpretComposition`.
+ */
+export function vjpComposition(
+  def: CompositeDef,
+  rt: RuntimeEngine,
+  dim: number,
+  inputs: Readonly<Record<string, RtVal>>,
+  gbar: RuntimeTensor,
+): Record<string, RuntimeTensor> {
+  // --- Forward pass, memoized by node identity (shared subterms fold once). ---
+  const fwd = new Map<CompNode, RtVal>();
+  const forward = (n: CompNode): RtVal => {
+    const hit = fwd.get(n);
+    if (hit !== undefined) return hit;
+    const v = forwardCore(n);
+    fwd.set(n, v);
+    return v;
+  };
+  const forwardT = (n: CompNode): RuntimeTensor => {
+    const v = forward(n);
+    if (typeof v === "number") {
+      throw new Error(
+        "vjpComposition: expected a tensor sub-term but it folded to a scalar.",
+      );
+    }
+    return v;
+  };
+  const forwardCore = (n: CompNode): RtVal => {
+    switch (n.k) {
+      case "in": {
+        const v = inputs[n.role];
+        if (v === undefined)
+          throw new Error(
+            `vjpComposition: ${def.name} references role '${n.role}' but it was not provided.`,
+          );
+        return v;
+      }
+      case "kc":
+        return n.v;
+      case "u": {
+        const a = forwardT(n.a);
+        switch (n.op) {
+          case "exp":
+            return rt.exp(a);
+          case "log":
+            return rt.log(a);
+          case "sqrt":
+            return rt.sqrt(a);
+          case "rsqrt":
+            return rt.rsqrt(a);
+          case "neg":
+            return rt.neg(a);
+        }
+        break;
+      }
+      case "b": {
+        const a = forward(n.a);
+        const b = forward(n.b);
+        switch (n.op) {
+          case "add":
+            return rt.add(a, b);
+          case "sub":
+            return rt.sub(a, b);
+          case "mul":
+            return rt.mul(a, b);
+          case "div":
+            return rt.div(a, b);
+        }
+        break;
+      }
+      case "r": {
+        const a = forwardT(n.a);
+        const opts = { dim, keepdim: true } as const;
+        const res =
+          n.op === "sum"
+            ? rt.sum(a, opts)
+            : n.op === "max"
+              ? rt.max(a, opts)
+              : rt.mean(a, opts);
+        if (typeof res === "number")
+          throw new Error("vjpComposition: keepdim reduce returned a scalar.");
+        return res;
+      }
+      case "gi": {
+        const a = forwardT(n.a);
+        const index = inputs[n.indexRole];
+        if (index === undefined || typeof index === "number")
+          throw new Error(
+            `vjpComposition: ${def.name} gather references index role '${n.indexRole}' but no index tensor was provided.`,
+          );
+        return rt.gather(a, index, { dim });
+      }
+    }
+    throw new Error(`vjpComposition: unhandled node ${JSON.stringify(n)}`);
+  };
+
+  // --- Reverse-topological order (post-order DFS, reversed → parents first). ---
+  const order: CompNode[] = [];
+  const seen = new Set<CompNode>();
+  const visit = (n: CompNode): void => {
+    if (seen.has(n)) return;
+    seen.add(n);
+    switch (n.k) {
+      case "u":
+      case "r":
+        visit(n.a);
+        break;
+      case "b":
+        visit(n.a);
+        visit(n.b);
+        break;
+      case "gi":
+        visit(n.a);
+        break;
+    }
+    order.push(n);
+  };
+  visit(def.root);
+  order.reverse();
+
+  // --- Cotangent sweep. ---
+  const cot = new Map<CompNode, RuntimeTensor>();
+  const grads: Record<string, RuntimeTensor> = {};
+  cot.set(def.root, gbar);
+
+  // Push a contribution into a child, reduced back to the child's own forward
+  // shape (the broadcast-transpose) — never hand-rolled, always `reduceToShape`.
+  const push = (child: CompNode, contrib: RuntimeTensor): void => {
+    const target = forward(child);
+    if (typeof target === "number") return; // const / eps: no gradient sink
+    const reduced = reduceToShape(rt, contrib, target.shape);
+    const prev = cot.get(child);
+    cot.set(child, prev === undefined ? reduced : rt.add(prev, reduced));
+  };
+
+  // Local elementwise factor via the SAME `deriv`+`normalize`+`emit` engine the
+  // elementwise VJPs use — `xE`/`yE` bind to the operands' forward values.
+  const localFactor = (defExpr: Expr, wrt: "x" | "y", env: RtLeaves): RtVal =>
+    emit(normalize(deriv(defExpr, wrt)), rt, env);
+
+  for (const n of order) {
+    const g = cot.get(n);
+    if (g === undefined) continue; // no cotangent reached this node
+    switch (n.k) {
+      case "in": {
+        if (typeof forward(n) === "number") break; // scalar role: no grad
+        grads[n.role] =
+          grads[n.role] === undefined ? g : rt.add(grads[n.role], g);
+        break;
+      }
+      case "kc":
+        break;
+      case "u": {
+        const aVal = forward(n.a);
+        const factor = localFactor(compUnaryExpr(n.op), "x", {
+          x: () => aVal,
+        });
+        push(n.a, asTensor(rt.mul(g, factor)));
+        break;
+      }
+      case "b": {
+        const aVal = forward(n.a);
+        const bVal = forward(n.b);
+        const env: RtLeaves = { x: () => aVal, y: () => bVal };
+        const be = compBinaryExpr(n.op);
+        push(n.a, asTensor(rt.mul(g, localFactor(be, "x", env))));
+        push(n.b, asTensor(rt.mul(g, localFactor(be, "y", env))));
+        break;
+      }
+      case "r": {
+        if (n.op === "max") {
+          // The detached stability shift (§3.2) — grad provably zero, dropped.
+          if (n.detach !== true)
+            throw new Error(
+              "vjpComposition: a load-bearing (non-detached) `max`-reduce needs the " +
+                "argmax mask-scatter VJP, which is out of scope (§3.3). Annotate the " +
+                "reduce `detach:true` iff its gradient is provably zero.",
+            );
+          break;
+        }
+        const aShape = forwardT(n.a).shape;
+        let back = broadcastOverDims(rt, g, aShape, [dim], true);
+        if (n.op === "mean") {
+          const nRed = aShape[dim < 0 ? dim + aShape.length : dim];
+          back = rt.mul(back, 1 / nRed);
+        }
+        push(n.a, back);
+        break;
+      }
+      case "gi": {
+        const aShape = forwardT(n.a).shape;
+        const index = inputs[n.indexRole] as RuntimeTensor;
+        const scattered = realizeIndexAdjoint(
+          rt,
+          { k: "scatterZeros", dim, inShape: aShape },
+          g,
+          { index },
+        );
+        push(n.a, asTensor(scattered as RuntimeTensor));
+        break;
+      }
+    }
+  }
+  return grads;
 }
 
 /** Derive a `BinaryTTGradFn` from a definition (design S2). */

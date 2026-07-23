@@ -21,8 +21,8 @@
  */
 
 import type { ElementwiseDef } from "./catalog";
-import { add, c, erf, type Expr, mul, tanh, x } from "./expr";
 import { GELU_SQRT_2_OVER_PI, GELU_TANH_C } from "./erf";
+import { add, c, type Expr, erf, mul, tanh, x } from "./expr";
 
 const HALF = c(0.5);
 const ONE = c(1);
@@ -87,7 +87,14 @@ export type CompNode =
   | { k: "kc"; v: number } // a constant
   | { k: "u"; op: CompUnary; a: CompNode }
   | { k: "b"; op: CompBinary; a: CompNode; b: CompNode }
-  | { k: "r"; op: CompReduceOp; a: CompNode } // reduce along dim, keepdim=true
+  // reduce along dim, keepdim=true. `detach: true` marks a reduce whose gradient
+  // is provably zero and is DROPPED by the reverse pass (F1 §3.2 lemma): the
+  // softmax/log_softmax stability `max`-shift is `x − max(x).detach()` — softmax
+  // is shift-invariant (Σ of the shifted cotangent is 0), so the argmax
+  // mask-scatter VJP is provably inert and encoded away as DATA, exactly as
+  // PyTorch subtracts `max.detach()`. This is the ONLY admitted simplification
+  // (a stated fact about the math, not a rewrite of convenience).
+  | { k: "r"; op: CompReduceOp; a: CompNode; detach?: boolean }
   // gather-at-index — the P4 INDEX-SPACE bridge: select `a`'s values at the
   // integer indices carried by the `indexRole` tensor, along the composition's
   // `dim`. Its adjoint is the index algebra's gather transpose (scatter/onehot),
@@ -113,12 +120,20 @@ const cb = (op: CompBinary, a: CompNode, b: CompNode): CompNode => ({
   a,
   b,
 });
-const cr = (op: CompReduceOp, a: CompNode): CompNode => ({ k: "r", op, a });
+const cr = (op: CompReduceOp, a: CompNode, detach = false): CompNode => ({
+  k: "r",
+  op,
+  a,
+  ...(detach ? { detach: true } : {}),
+});
 
 const IN_X = cin("x");
 
-// softmax = exp(x − max(x)) / sum(exp(x − max(x)))   (max/sum along dim)
-const SM_SHIFTED = cb("sub", IN_X, cr("max", IN_X));
+// softmax = exp(x − max(x)) / sum(exp(x − max(x)))   (max/sum along dim).
+// The `max`-shift is DETACHED (F1 §3.2 lemma): its gradient is provably zero by
+// softmax's shift-invariance, so the reverse pass drops it and the derived
+// backward structurally matches the hand closed form (no argmax mask-scatter).
+const SM_SHIFTED = cb("sub", IN_X, cr("max", IN_X, true));
 export const SOFTMAX_DEF: CompositeDef = {
   name: "softmax",
   roles: ["x"],

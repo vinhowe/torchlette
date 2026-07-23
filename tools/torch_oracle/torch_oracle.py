@@ -302,6 +302,74 @@ def run_case(case):
             "grads": [tensor_payload(x.grad)],
         }
 
+    # Composite VJP oracles (COMPOSITE-CLOSURE F1/C1): each takes an EXPLICIT
+    # upstream gradient as its LAST input, so the VJP is (output * g).sum()
+    # backward — non-degenerate (softmax's g=ones case gives an all-zero grad,
+    # a useless referee). The derived `vjpComposition` is checked against these.
+    if op == "softmax_vjp":
+        x = inputs[0].float().requires_grad_(True)
+        g = inputs[-1].float()
+        dim = option(options, "dim", -1)
+        output = F.softmax(x, dim=dim)
+        (output * g).sum().backward()
+        return {
+            "output": tensor_payload(output),
+            "grads": [tensor_payload(x.grad)],
+        }
+
+    if op == "log_softmax_vjp":
+        x = inputs[0].float().requires_grad_(True)
+        g = inputs[-1].float()
+        dim = option(options, "dim", -1)
+        output = F.log_softmax(x, dim=dim)
+        (output * g).sum().backward()
+        return {
+            "output": tensor_payload(output),
+            "grads": [tensor_payload(x.grad)],
+        }
+
+    if op == "rmsnorm_vjp":
+        x = inputs[0].float().requires_grad_(True)
+        w = inputs[1].float().requires_grad_(True)
+        g = inputs[-1].float()
+        eps = option(options, "eps", 1e-6)
+        inv = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+        output = x * inv * w
+        (output * g).sum().backward()
+        return {
+            "output": tensor_payload(output),
+            "grads": [tensor_payload(x.grad), tensor_payload(w.grad)],
+        }
+
+    if op == "layernorm_vjp":
+        x = inputs[0].float().requires_grad_(True)
+        w = inputs[1].float().requires_grad_(True)
+        b = inputs[2].float().requires_grad_(True)
+        g = inputs[-1].float()
+        eps = option(options, "eps", 1e-5)
+        output = F.layer_norm(x, [x.shape[-1]], w, b, eps)
+        (output * g).sum().backward()
+        return {
+            "output": tensor_payload(output),
+            "grads": [
+                tensor_payload(x.grad),
+                tensor_payload(w.grad),
+                tensor_payload(b.grad),
+            ],
+        }
+
+    if op == "cross_entropy_vjp":
+        logits = inputs[0].float().requires_grad_(True)
+        targets = inputs[1].to(torch.long)
+        g = inputs[-1].float()
+        # per-sample loss (reduction='none') — the composition's per-sample term.
+        loss = F.cross_entropy(logits, targets, reduction="none")
+        (loss * g).sum().backward()
+        return {
+            "output": tensor_payload(loss),
+            "grads": [tensor_payload(logits.grad)],
+        }
+
     # Embedding forward only (for step-by-step debugging)
     if op == "embedding_forward":
         input_tokens = inputs[0].to(torch.long)  # [batch, seq]
