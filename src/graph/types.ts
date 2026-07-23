@@ -65,6 +65,24 @@ export type LazyOpCode =
   | "fusedRoPE"
   | "deviceTopK";
 
+/**
+ * Metadata-only view ops: their output is a pure view of the input (no GPU
+ * dispatch; the output layout derives from the base buffer + params). This is
+ * the SINGLE SOURCE for the executor's "is this a pure view?" predicate — it
+ * was duplicated in lowered-plan.ts and stream-generate.ts, and the
+ * stream-generate copy had DRIFTED four phantom entries (`view`, `squeeze`,
+ * `unsqueeze`, `broadcastTo`) that are frontend method names, NOT LazyOpCodes:
+ * the frontend lowers view/squeeze/unsqueeze → `reshape` and broadcastTo →
+ * `expand`, so those strings never appear as `node.op`. The `satisfies` clause
+ * makes every member a checked LazyOpCode so the set can never drift a phantom
+ * again. (Distinct, deliberately-different view-op sets — CONTIGUOUS_VIEW_OPS,
+ * FORMAT_TRANSPARENT_VIEW_OPS, VIEW_META_OPS — encode other properties and are
+ * NOT this set.)
+ */
+export const VIEW_OPS: ReadonlySet<string> = new Set(
+  ["reshape", "transpose", "permute", "expand", "narrow"] satisfies LazyOpCode[],
+);
+
 export interface StorageHandle {
   id: number;
   device: DeviceKind;

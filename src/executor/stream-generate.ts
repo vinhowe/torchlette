@@ -94,6 +94,7 @@ import type {
 import { planUnscaleGradDispatch } from "../backend/webgpu/unscale-kernel";
 import { checkContiguous, sizeOf } from "../core/shape";
 import type { LazyIRNode, StorageHandle } from "../graph/types";
+import { VIEW_OPS } from "../graph/types";
 import {
   lookupPackedBuffers,
   planPackedGroups,
@@ -732,19 +733,11 @@ function mapNodeResult(
   bufferToSlot.set(gpuBuffer(node.result.backendTensor) as unknown, slot);
 }
 
-/** View ops whose output layout is NOT derivable from shape alone —
- *  metadata synthesis for liveness-released producers excludes them. */
-const VIEW_OPS = new Set([
-  "reshape",
-  "view",
-  "transpose",
-  "permute",
-  "expand",
-  "narrow",
-  "squeeze",
-  "unsqueeze",
-  "broadcastTo",
-]);
+// VIEW_OPS (metadata-only view ops — layout NOT derivable from shape alone, so
+// metadata synthesis for liveness-released producers excludes them) is
+// single-sourced in graph/types.ts, imported above. The local copy here had
+// drifted four phantom entries (view/squeeze/unsqueeze/broadcastTo) that are
+// frontend method names, never LazyOpCodes.
 
 function contiguousStrides(shape: number[]): number[] {
   const s = new Array<number>(shape.length);

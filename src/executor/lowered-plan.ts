@@ -315,14 +315,8 @@ const DATA_SOURCE_OPS: ReadonlySet<string> = new Set([
   "bernoulli",
 ]);
 
-/** View ops that produce views (no GPU dispatch, metadata only). */
-const VIEW_OPS: ReadonlySet<string> = new Set([
-  "reshape",
-  "transpose",
-  "permute",
-  "expand",
-  "narrow",
-]);
+// VIEW_OPS (metadata-only view ops) is single-sourced in graph/types.ts —
+// imported at the bottom of this file with the other graph types.
 
 /**
  * Sequential ops that use encoder copy commands (copyBufferToBuffer) alongside
@@ -512,6 +506,7 @@ import type {
   RowProgramMatch,
 } from "../compiler/row-program-types";
 import type { LazyIRNode, LazyRef } from "../graph/types";
+import { VIEW_OPS } from "../graph/types";
 
 /**
  * HORIZONTAL-PACKING GROUP KEY — the single source of truth for "may these
