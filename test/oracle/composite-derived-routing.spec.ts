@@ -1,23 +1,19 @@
 /**
- * COMPOSITE-CLOSURE F1 / C2 — the CPU derived-routing gate.
+ * COMPOSITE-CLOSURE F1 / C3 — the landed CPU derived-backward gate.
  *
- * C2 routes the rmsnorm / layernorm CPU backwards through the derived
- * `vjpComposition` (F1) behind `TORCHLETTE_DERIVED_COMPOSITE_BWD`. This gate
- * proves BOTH flag states are correct and mutually consistent:
+ * The rmsnorm / layernorm CPU backwards now DERIVE unconditionally through
+ * `vjpComposition` (F1) — the C2 soak flag has fired and the hand closures are
+ * deleted. This gate is the landed-path referee: the frontend op's CPU backward
+ * (now the derived VJP) == torch autograd, with a non-degenerate upstream
+ * gradient, 2-D and batched.
  *
- *   - flag OFF (hand closure)  == torch autograd  (the incumbent oracle)
- *   - flag ON  (derived VJP)   == torch autograd  (the construction proof, landed)
- *   - derived == hand          within the named reassociation bound L-COMP
- *
- * The softmax closure is NOT routed (C1 T1: derived is heavier), so it is absent
- * here — its derived form is checked reference-only in
- * semantic-composite-backward.spec.ts.
+ * softmax is absent (C1 T1: its derived backward measured heavier, so it stays
+ * hand and is checked reference-only in semantic-composite-backward.spec).
  */
 
-import { afterEach, describe, test } from "vitest";
+import { describe, test } from "vitest";
 
 import { Torchlette } from "../../src";
-import { ENV } from "../../src/core/env";
 import type { Tensor } from "../../src/frontend/tensor";
 import { assertClose } from "../helpers/assertions";
 import { runTorchOracleBackwardBatch } from "./torch-oracle";
@@ -40,18 +36,13 @@ async function readGrad(p: Tensor) {
   return { shape: p.grad.shape, values: await p.grad.cpu() };
 }
 
-afterEach(() => {
-  ENV.TORCHLETTE_DERIVED_COMPOSITE_BWD = undefined;
-});
-
 const SHAPES: { batch: number[]; label: string }[] = [
   { batch: [], label: "2D" },
   { batch: [2], label: "batched" },
 ];
-const BOUND = 1e-5;
 const TOL = 2e-4;
 
-describe("C2 — rmsnorm CPU backward routes derived (both flag states)", () => {
+describe("C3 — rmsnorm CPU backward derives (== torch)", () => {
   for (const { batch, label } of SHAPES) {
     test(label, async () => {
       const rows = 4;
@@ -62,17 +53,11 @@ describe("C2 — rmsnorm CPU backward routes derived (both flag states)", () => 
       const wV = rand(cols, 103);
       const gV = rand(prod(shape), 105);
 
-      const run = async (derived: boolean) => {
-        ENV.TORCHLETTE_DERIVED_COMPOSITE_BWD = derived ? "1" : undefined;
-        const x = api.tensorFromArray(xV, shape, { requiresGrad: true });
-        const w = api.tensorFromArray(wV, [cols], { requiresGrad: true });
-        const out = api.rmsnorm(x, w, eps);
-        await out.backward(api.tensorFromArray(gV, shape));
-        return { dX: await readGrad(x), dW: await readGrad(w) };
-      };
+      const x = api.tensorFromArray(xV, shape, { requiresGrad: true });
+      const w = api.tensorFromArray(wV, [cols], { requiresGrad: true });
+      const out = api.rmsnorm(x, w, eps);
+      await out.backward(api.tensorFromArray(gV, shape));
 
-      const hand = await run(false);
-      const derived = await run(true);
       const [oracle] = await runTorchOracleBackwardBatch([
         {
           op: "rmsnorm_vjp",
@@ -85,18 +70,13 @@ describe("C2 — rmsnorm CPU backward routes derived (both flag states)", () => 
           options: { eps },
         },
       ]);
-
-      assertClose(hand.dX, oracle.grads[0], TOL, TOL, "hand dX");
-      assertClose(hand.dW, oracle.grads[1], TOL, TOL, "hand dW");
-      assertClose(derived.dX, oracle.grads[0], TOL, TOL, "derived dX");
-      assertClose(derived.dW, oracle.grads[1], TOL, TOL, "derived dW");
-      assertClose(derived.dX, hand.dX, BOUND, BOUND, "derived==hand dX");
-      assertClose(derived.dW, hand.dW, BOUND, BOUND, "derived==hand dW");
+      assertClose(await readGrad(x), oracle.grads[0], TOL, TOL, "dX");
+      assertClose(await readGrad(w), oracle.grads[1], TOL, TOL, "dW");
     });
   }
 });
 
-describe("C2 — layernorm CPU backward routes derived (both flag states)", () => {
+describe("C3 — layernorm CPU backward derives (== torch)", () => {
   for (const { batch, label } of SHAPES) {
     test(label, async () => {
       const rows = 4;
@@ -108,22 +88,12 @@ describe("C2 — layernorm CPU backward routes derived (both flag states)", () =
       const bV = rand(cols, 115);
       const gV = rand(prod(shape), 117);
 
-      const run = async (derived: boolean) => {
-        ENV.TORCHLETTE_DERIVED_COMPOSITE_BWD = derived ? "1" : undefined;
-        const x = api.tensorFromArray(xV, shape, { requiresGrad: true });
-        const w = api.tensorFromArray(wV, [cols], { requiresGrad: true });
-        const b = api.tensorFromArray(bV, [cols], { requiresGrad: true });
-        const out = api.layernorm(x, w, b, eps);
-        await out.backward(api.tensorFromArray(gV, shape));
-        return {
-          dX: await readGrad(x),
-          dW: await readGrad(w),
-          dB: await readGrad(b),
-        };
-      };
+      const x = api.tensorFromArray(xV, shape, { requiresGrad: true });
+      const w = api.tensorFromArray(wV, [cols], { requiresGrad: true });
+      const b = api.tensorFromArray(bV, [cols], { requiresGrad: true });
+      const out = api.layernorm(x, w, b, eps);
+      await out.backward(api.tensorFromArray(gV, shape));
 
-      const hand = await run(false);
-      const derived = await run(true);
       const [oracle] = await runTorchOracleBackwardBatch([
         {
           op: "layernorm_vjp",
@@ -137,16 +107,9 @@ describe("C2 — layernorm CPU backward routes derived (both flag states)", () =
           options: { eps },
         },
       ]);
-
-      assertClose(hand.dX, oracle.grads[0], TOL, TOL, "hand dX");
-      assertClose(hand.dW, oracle.grads[1], TOL, TOL, "hand dW");
-      assertClose(hand.dB, oracle.grads[2], TOL, TOL, "hand dB");
-      assertClose(derived.dX, oracle.grads[0], TOL, TOL, "derived dX");
-      assertClose(derived.dW, oracle.grads[1], TOL, TOL, "derived dW");
-      assertClose(derived.dB, oracle.grads[2], TOL, TOL, "derived dB");
-      assertClose(derived.dX, hand.dX, BOUND, BOUND, "derived==hand dX");
-      assertClose(derived.dW, hand.dW, BOUND, BOUND, "derived==hand dW");
-      assertClose(derived.dB, hand.dB, BOUND, BOUND, "derived==hand dB");
+      assertClose(await readGrad(x), oracle.grads[0], TOL, TOL, "dX");
+      assertClose(await readGrad(w), oracle.grads[1], TOL, TOL, "dW");
+      assertClose(await readGrad(b), oracle.grads[2], TOL, TOL, "dB");
     });
   }
 });

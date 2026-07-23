@@ -1,5 +1,4 @@
 import type { AttnModifierSpec } from "../backend/types";
-import { ENV } from "../core/env";
 import { sizeOf } from "../core/shape";
 import {
   type CompositeDef,
@@ -13,19 +12,18 @@ import type { Tensor } from "./tensor";
 import type { Torchlette } from "./torchlette";
 
 /**
- * COMPOSITE-CLOSURE C2 — route a CPU / non-fused composite backward through the
- * DERIVED reference (`vjpComposition`, F1) instead of a hand closure. Behind
- * `TORCHLETTE_DERIVED_COMPOSITE_BWD` (born off, soak → default at C3 → the hand
- * closure + flag are removed). While the flag is off the hand closure runs and
- * is the differential oracle; the C2 gate proves BOTH flag states == torch.
+ * COMPOSITE-CLOSURE C3 — the CPU / non-fused composite backwards DERIVE through
+ * the reverse-mode reference (`vjpComposition`, F1) instead of a hand closure.
+ * The C2 soak flag has fired (soak → default → removed): the derived path is now
+ * the sole CPU realization for rmsnorm / layernorm, and the hand
+ * `rmsnormBackwardImpl` / `layernormBackwardImpl` CPU branch are DELETED. The
+ * derived VJP is pinned by torch
+ * (semantic-composite-backward.spec) and the fused GPU kernels are asserted
+ * against the SAME reference (composite-fused-vs-derived.spec).
  *
- * The softmax closure is deliberately NOT routed: the C1 cost probe measured the
- * derived softmax backward heavier (22 vs 13 nodes, ~1.1x), so per the design's
- * T1 gate it stays hand and the derived form is reference-only.
+ * The softmax closure stays hand (C1 T1: the derived softmax backward measured
+ * heavier — 22 vs 13 nodes — so the derived form is reference-only there).
  */
-export function useDerivedCompositeBwd(): boolean {
-  return ENV.TORCHLETTE_DERIVED_COMPOSITE_BWD === "1";
-}
 
 /** Realize a composite's derived VJP over `rt` and return grads in role order. */
 function derivedCompositeGrads(
@@ -259,98 +257,29 @@ export function rmsnormImpl(
   // output = normalized * weight
   const result = torch.runtime.mul(normalized, weight._unwrap());
 
+  // CPU backward DERIVES (COMPOSITE-CLOSURE C3): one reverse pass over
+  // RMSNORM_DEF, not a hand closed form. The hand `rmsnormBackwardImpl`
+  // (`inv_rms·(g·w − norm·mean(g·w·norm))`, `dW=Σ(g·norm)`) is DELETED — the
+  // derived VJP is pinned by torch (semantic-composite-backward.spec) and the
+  // fused GPU kernel is asserted against it (composite-fused-vs-derived.spec).
   return torch._wrapWithGrad(
     result,
     [x, weight],
-    (grad, getSaved) => {
-      if (useDerivedCompositeBwd()) {
-        return derivedCompositeGrads(
-          torch,
-          RMSNORM_DEF,
-          grad,
-          normalizedDim,
-          {
-            x: getSaved(0)._unwrap(),
-            w: getSaved(1)._unwrap(),
-            eps,
-          },
-          ["x", "w"],
-        );
-      }
-      return rmsnormBackwardImpl(
+    (grad, getSaved) =>
+      derivedCompositeGrads(
         torch,
+        RMSNORM_DEF,
         grad,
-        getSaved,
         normalizedDim,
-        lastDimSize,
-        rank,
-        eps,
-      );
-    },
+        {
+          x: getSaved(0)._unwrap(),
+          w: getSaved(1)._unwrap(),
+          eps,
+        },
+        ["x", "w"],
+      ),
     tensorsToSave,
   );
-}
-
-/** Shared backward for RMSNorm. Decomposed computation. */
-function rmsnormBackwardImpl(
-  torch: Torchlette,
-  grad: RuntimeTensor,
-  getSaved: (i: number) => Tensor,
-  normalizedDim: number,
-  _lastDimSize: number,
-  rank: number,
-  eps = 1e-6,
-): RuntimeTensor[] {
-  const savedX = getSaved(0);
-  const savedWeight = getSaved(1);
-
-  // Recompute inv_rms from saved x
-  const x = savedX._unwrap();
-  const xSq = torch.runtime.mul(x, x);
-  const meanSq = torch.runtime.mean(xSq, { dim: normalizedDim, keepdim: true });
-  if (typeof meanSq === "number") {
-    throw new Error("rmsnorm backward: mean should return tensor");
-  }
-  const meanSqPlusEps = torch.runtime.add(meanSq, eps);
-  const invRms = torch.runtime.rsqrt(meanSqPlusEps);
-  const normalized = torch.runtime.mul(x, invRms); // x * inv_rms
-
-  // gradWeight = sum(grad * normalized, batch dims)
-  const sumDims = Array.from({ length: rank - 1 }, (_, i) => i);
-  let gradWeightReduced = torch.runtime.mul(grad, normalized);
-  for (let i = sumDims.length - 1; i >= 0; i--) {
-    const sumResult = torch.runtime.sum(gradWeightReduced, {
-      dim: sumDims[i],
-      keepdim: false,
-    });
-    if (typeof sumResult === "number") {
-      throw new Error(
-        "rmsnorm backward: sum for gradWeight should return tensor",
-      );
-    }
-    gradWeightReduced = sumResult;
-  }
-
-  // gradX: d/dx (x * inv_rms * weight) where inv_rms = rsqrt(mean(x²) + eps)
-  // = weight * inv_rms * (grad - normalized * mean(grad * normalized, dim=-1, keepdim=true))
-  const gradTimesWeight = torch.runtime.mul(grad, savedWeight._unwrap());
-  const gradDotNorm = torch.runtime.mul(gradTimesWeight, normalized);
-  const meanGradDotNorm = torch.runtime.mean(gradDotNorm, {
-    dim: normalizedDim,
-    keepdim: true,
-  });
-  if (typeof meanGradDotNorm === "number") {
-    throw new Error("rmsnorm backward: mean should return tensor");
-  }
-  const gradX = torch.runtime.mul(
-    invRms,
-    torch.runtime.sub(
-      gradTimesWeight,
-      torch.runtime.mul(normalized, meanGradDotNorm),
-    ),
-  );
-
-  return [gradX, gradWeightReduced];
 }
 
 /**
@@ -733,10 +662,12 @@ function layernormBackwardImpl(
       gradWeightTensor,
       lastDimSize,
     );
-  } else if (useDerivedCompositeBwd()) {
-    // CPU derived path (C2): the layernorm VJP is the reverse pass over
-    // LAYERNORM_DEF — one theorem, no hand `gradVar`/`gradMean` expansion.
-    const savedBias = getSaved(2);
+  } else {
+    // CPU backward DERIVES (COMPOSITE-CLOSURE C3): the layernorm VJP is one
+    // reverse pass over LAYERNORM_DEF. The hand naive `gradVar`/`gradMean`
+    // expansion is DELETED — the derived VJP is pinned by torch
+    // (semantic-composite-backward.spec) and the fused GPU kernel is asserted
+    // against the SAME derived reference (composite-fused-vs-derived.spec).
     [gradX, gradWeight, gradBias] = derivedCompositeGrads(
       torch,
       LAYERNORM_DEF,
@@ -745,97 +676,11 @@ function layernormBackwardImpl(
       {
         x: savedX._unwrap(),
         w: savedWeight._unwrap(),
-        b: savedBias._unwrap(),
+        b: getSaved(2)._unwrap(),
         eps,
       },
       ["x", "w", "b"],
     ) as [RuntimeTensor, RuntimeTensor, RuntimeTensor];
-  } else {
-    // CPU decomposed path
-    const recomputeMean = torch.runtime.mean(savedX._unwrap(), {
-      dim: normalizedDim,
-      keepdim: true,
-    });
-    if (typeof recomputeMean === "number") {
-      throw new Error("layernorm backward: mean should return tensor");
-    }
-    const recomputeCentered = torch.runtime.sub(
-      savedX._unwrap(),
-      recomputeMean,
-    );
-    const recomputeCenteredSq = torch.runtime.mul(
-      recomputeCentered,
-      recomputeCentered,
-    );
-    const recomputeVariance = torch.runtime.mean(recomputeCenteredSq, {
-      dim: normalizedDim,
-      keepdim: true,
-    });
-    if (typeof recomputeVariance === "number") {
-      throw new Error("layernorm backward: variance mean should return tensor");
-    }
-    const recomputeVarPlusEps = torch.runtime.add(recomputeVariance, eps);
-    const recomputeStd = torch.runtime.sqrt(recomputeVarPlusEps);
-    const recomputeNormalized = torch.runtime.div(
-      recomputeCentered,
-      recomputeStd,
-    );
-
-    const sumDims = Array.from({ length: rank - 1 }, (_, i) => i);
-
-    // Single multi-dim reduction instead of sequential per-dim loop.
-    // For rank-3 [batch, seq, dim] → [dim], this is 1 dispatch instead of 2.
-    gradBias = torch.runtime.sum(grad, {
-      dim: sumDims,
-      keepdim: false,
-    }) as Tensor;
-
-    gradWeight = torch.runtime.sum(
-      torch.runtime.mul(grad, recomputeNormalized),
-      { dim: sumDims, keepdim: false },
-    ) as Tensor;
-
-    // Decomposed gradX for CPU
-    const gradNormalized = torch.runtime.mul(grad, savedWeight._unwrap());
-    const gradCentered = torch.runtime.div(gradNormalized, recomputeStd);
-
-    const gradNormCentered = torch.runtime.mul(
-      gradNormalized,
-      recomputeCentered,
-    );
-    const sumGradNormCentered = torch.runtime.sum(gradNormCentered, {
-      dim: normalizedDim,
-      keepdim: true,
-    });
-    if (typeof sumGradNormCentered === "number") {
-      throw new Error("layernorm backward: sum should return tensor");
-    }
-    const varStd = torch.runtime.mul(recomputeVarPlusEps, recomputeStd);
-    const gradVariance = torch.runtime.mul(
-      -0.5,
-      torch.runtime.div(sumGradNormCentered, varStd),
-    );
-
-    const gradCenteredFromVar = torch.runtime.div(
-      torch.runtime.mul(torch.runtime.mul(2, gradVariance), recomputeCentered),
-      lastDimSize,
-    );
-
-    const totalGradCentered = torch.runtime.add(
-      gradCentered,
-      gradCenteredFromVar,
-    );
-    const sumTotalGradCentered = torch.runtime.sum(totalGradCentered, {
-      dim: normalizedDim,
-      keepdim: true,
-    });
-    if (typeof sumTotalGradCentered === "number") {
-      throw new Error("layernorm backward: sum should return tensor");
-    }
-    const gradMean = torch.runtime.neg(
-      torch.runtime.div(sumTotalGradCentered, lastDimSize),
-    );
-    gradX = torch.runtime.add(totalGradCentered, gradMean);
   }
 
   return [gradX, gradWeight, gradBias];
