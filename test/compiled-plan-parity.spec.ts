@@ -27,6 +27,7 @@ import { execFile } from "node:child_process";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { beforeAll, describe, expect, it } from "vitest";
+import { initialLossBand } from "../tools/parity-sanity";
 import { canUseWebGPU } from "./helpers/webgpu";
 
 const execFileP = promisify(execFile);
@@ -57,7 +58,11 @@ async function runTool(
       // Non-zero exit with output is a real result (the tool ran, signalled
       // failure) — return it; only retry true spawn/transient failures.
       if (typeof err.code === "number" && (err.stdout || err.stderr)) {
-        return { stdout: err.stdout ?? "", stderr: err.stderr ?? "", code: err.code };
+        return {
+          stdout: err.stdout ?? "",
+          stderr: err.stderr ?? "",
+          code: err.code,
+        };
       }
       if (attempt >= 4) throw e;
       await new Promise((r) => setTimeout(r, 2500 * (attempt + 1)));
@@ -71,7 +76,8 @@ function parseLosses(stdout: string): number[] {
     .split("\n")
     .reverse()
     .find((l) => l.trim().startsWith('{"losses"'));
-  if (!line) throw new Error(`no losses JSON in probe output:\n${stdout.slice(-500)}`);
+  if (!line)
+    throw new Error(`no losses JSON in probe output:\n${stdout.slice(-500)}`);
   return (JSON.parse(line) as { losses: number[] }).losses;
 }
 
@@ -85,10 +91,16 @@ describe("compiled-plan correctness gates", () => {
     "compiled-plan trajectory == lowered trajectory (full inner step)",
     async () => {
       if (!webgpu) return;
-      const def = parseLosses((await runTool(PARITY_PROBE, { STEPS: "12" })).stdout);
+      const def = parseLosses(
+        (await runTool(PARITY_PROBE, { STEPS: "12" })).stdout,
+      );
       const lowered = parseLosses(
-        (await runTool(PARITY_PROBE, { STEPS: "12", TORCHLETTE_COMPILED_PLAN: "0" }))
-          .stdout,
+        (
+          await runTool(PARITY_PROBE, {
+            STEPS: "12",
+            TORCHLETTE_COMPILED_PLAN: "0",
+          })
+        ).stdout,
       );
       expect(def.length).toBe(12);
       expect(lowered.length).toBe(12);
@@ -98,7 +110,35 @@ describe("compiled-plan correctness gates", () => {
       }
       // Compiled replay and the lowered path must agree to fp noise; a frozen
       // per-step uniform (step_size/inv_scale/LR) would diverge over steps.
-      expect(maxDiff, `compiled vs lowered max |Δloss|=${maxDiff}`).toBeLessThan(1e-3);
+      expect(
+        maxDiff,
+        `compiled vs lowered max |Δloss|=${maxDiff}`,
+      ).toBeLessThan(1e-3);
+
+      // ABSOLUTE-SANITY cell (the device-2 / mutual-corruption blind spot).
+      // The Δ check above is a DIFFERENTIAL: it is blind to a fault that moves
+      // BOTH arms the same way — a wrong gelu/norm backward that compounds
+      // identically under compiled and lowered explodes the loss to ~1e4 while
+      // |Δloss| stays tiny, and a dropped-submit device freezes both arms at
+      // ~0. Either passes the differential. Assert the trajectory itself lands
+      // in the ln(V)-derived band (probe VOCAB=256) on EVERY step, on BOTH
+      // arms: a >1e4 explosion or a ~0 collapse now FAILS THE BUILD. This is
+      // the cell the composite-closure fullstack divergence report named as
+      // missing — the differential must also assert sane absolute values.
+      const [lo, hi] = initialLossBand(256); // [~3.05, ~7.55] around ln(256)
+      for (const [arm, traj] of [
+        ["compiled", def],
+        ["lowered", lowered],
+      ] as const) {
+        for (let i = 0; i < traj.length; i++) {
+          const v = traj[i];
+          expect(
+            Number.isFinite(v) && v >= lo && v <= hi,
+            `${arm} loss[${i}]=${v} outside sane band [${lo.toFixed(2)}, ${hi.toFixed(2)}] ` +
+              `(explosion/collapse the differential is blind to)`,
+          ).toBe(true);
+        }
+      }
     },
     TIMEOUT,
   );

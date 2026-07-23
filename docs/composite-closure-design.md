@@ -551,3 +551,43 @@ its forward is authored from (F1), and each forward activation body cannot be st
 fold of the *same* `Expr` its CPU reference derives from (F2) — such that no hand copy of the
 backward or the WGSL survives outside the three named exclusions (attention, rope,
 pow-variable) — then the meaning is still written twice and the campaign has not closed.
+
+---
+
+## 14. Post-landing verification (2026-07-23, DIVERGENCE-FIX pass)
+
+The campaign was flagged at orchestrator verification with a reported fullstack
+divergence (`tools/parity-fullstack-tl.ts` exploding 10.83 → 22176 by step 29,
+"reproduced twice on V100") plus one reported CPU-project failure. A dedicated
+bisect/root-cause pass **could not reproduce either** and found the campaign
+numerically sound. Findings, all numbers read from the losses JSON directly:
+
+- **Divergence NOT reproducible.** `parity-fullstack-tl.ts` was run 6+ times across
+  three physical V100s, both arms (compiled default + `TORCHLETTE_COMPILED_PLAN=0`),
+  on BOTH the cherry-picked target tree (legibility base + C1–A3) AND the original
+  campaign branch worktree. Every run: `losses[0]=10.8282`, `losses[14]=9.3553`,
+  `losses[29]≈7.9023` — healthy, and bit-identical (to fp noise) to the pre-campaign
+  baseline. The reported 22176 explosion matches the documented device-taint /
+  dropped-submit signature that `parity-sanity.ts`'s loss[0]-only check misses
+  mid-trajectory (the "device-2 lesson"); it is not produced by any C1–A3 code path.
+- **Why C2/C3 cannot move this trajectory.** C2/C3 change ONLY the *CPU-device*
+  rmsnorm/layernorm backward; the WebGPU fused kernels are byte-untouched (asserted by
+  `composite-fused-vs-derived.spec.ts`, 3/3). The fullstack parity trainer runs on
+  WebGPU, so C2/C3 are inert to it. A2/A3 DO change the GPU forward-activation WGSL via
+  the Expr fold, yet the trajectory stays bit-identical — the fold is correct for
+  gelu/gelu_tanh/gelu_erf at training scale.
+- **All gates green on the target tree:** cpu project 1590 passed / 0 failed
+  (oracle exported — the reported CPU failure did not reproduce); `test:gates` 5/5;
+  `composite-fused-vs-derived` 3/3; `semantic-census.sh` GREEN; 124M regression
+  round0=9.8089 (baseline 9.81, bit-exact), 3/6/9=5.9217/5.1542/4.6406 (all within the
+  V100 band), memory growth 0.0 MB; strict `[lifetime]` default, zero throws.
+- **Landed vs reverted:** NOTHING reverted — F1 (C1–C3) and F2 (A1–A3) are sound and
+  stay. The hand VJPs / DSL bodies remain deleted; the census whitelist is unchanged.
+- **The one real gap the report correctly named — closed.** The in-suite gate #1
+  (`compiled-plan-parity.spec.ts`) was a pure *differential* (compiled == lowered) and
+  was blind to a fault that moves BOTH arms identically — exactly a smooth loss
+  explosion or a dropped-submit collapse. Added an **absolute-sanity cell**: every step
+  of BOTH arms must land in the `ln(V)`-derived band (`initialLossBand(256)` ≈
+  [3.05, 7.55]); a >1e4 explosion or ~0 collapse now FAILS THE BUILD. This is the
+  "differential must also assert sane absolute values" cell the report asked for,
+  gating the class in-suite forever.
