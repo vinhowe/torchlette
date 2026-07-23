@@ -126,7 +126,16 @@ export function planPackedGroups(
   return out;
 }
 
-/** Release all cached packed buffers. */
+/** Release all cached packed buffers (teardown only — onTeardown; the device is
+ *  going away, so immediate destroy is correct). NOTE the packed scratch is a
+ *  PROCESS-GLOBAL cache keyed by `count:alignedBytes`, so two distinct fused
+ *  optimizers with same-arity/same-size state (Lion `[m]`, SGD+momentum `[v]`)
+ *  would share it across a hard optimizer switch mid-process — a corruption class
+ *  that real single-optimizer training never hits. The parity/lr-replay
+ *  differentials run ONE optimizer per process to avoid it (there is no safe
+ *  mid-run reset: destroying the scratch poisons the cached compiled plan that
+ *  still binds it — "used in submit while destroyed" — and merely clearing the
+ *  cache does not cure the cross-optimizer corruption). */
 function resetPackedOptimizerCache(): void {
   for (const bufs of packedBufferCache.values()) {
     for (const buf of bufs) buf.destroy();

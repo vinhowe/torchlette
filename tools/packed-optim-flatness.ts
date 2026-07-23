@@ -1,8 +1,9 @@
 /**
  * Packed-optimizer memory FLATNESS gate (buffer-donation design P1, §2 / §5).
  *
- * The packed foreach optimizer path (`packOptimizerProgram`) is default-on for
- * Lion/SGD and reached for Adam via `TORCHLETTE_FUSED_ADAM=0`. It MUST reach a
+ * The fused optimizer path is default-on for Lion/SGD (the generic `optStep`
+ * kernel, derived-optimizer-realizer R5c); Adam's packed foreach path is reached
+ * via `TORCHLETTE_FUSED_ADAM=0`. It MUST reach a
  * flat steady state: storage count and GPU peak/current must PLATEAU across
  * steps, not climb monotonically. The §2 leak — the unpack `reshape(narrow(...))`
  * materializations were never disposed, leaking ~1 full-param buffer per param

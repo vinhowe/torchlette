@@ -68,7 +68,7 @@ import {
 import { storageTracker } from "../src/graph/storage-tracker";
 import { type Tensor, Torchlette } from "../src/frontend/torchlette";
 import { checkpoint, crossEntropy } from "../src/nn";
-import { Adam, GradScaler } from "../src/optim";
+import { Adam, GradScaler, Lion, SGD } from "../src/optim";
 
 // ============================================================================
 // Configuration
@@ -294,10 +294,24 @@ async function main() {
   model.train();
   console.log("Model loaded.\n");
 
-  const optimizer = new Adam(model.parameters(), { lr: 1e-4 }, api);
-  const useAMP =
-    isF16Supported() && process.env.TORCHLETTE_PROF_AMP !== "0";
-  const scaler = useAMP ? new GradScaler(api, { initScale: 1024.0 }) : null;
+  // OPT selects the optimizer to profile (default adam). Lion/SGD (derived-
+  // optimizer-realizer R5c) run the fused optStep path and, by convention here,
+  // WITHOUT the GradScaler (they are typically used without AMP loss scaling) —
+  // the scaler stays Adam's. The forward's autocast is unchanged either way.
+  const OPT = (process.env.OPT ?? "adam").toLowerCase();
+  const optimizer =
+    OPT === "lion"
+      ? new Lion(model.parameters(), { lr: 1e-4 }, api)
+      : OPT === "sgd"
+        ? new SGD(model.parameters(), { lr: 1e-4, momentum: 0.9 }, api)
+        : new Adam(model.parameters(), { lr: 1e-4 }, api);
+  // Autocast (f16 forward) applies to ALL optimizers for a fair speed/memory
+  // baseline; only Adam carries the GradScaler (loss scaling + inf-check) — Lion/
+  // SGD run autocast WITHOUT a scaler (fine for an 18-step profiling run).
+  const useAMP = isF16Supported() && process.env.TORCHLETTE_PROF_AMP !== "0";
+  const scaler =
+    useAMP && OPT === "adam" ? new GradScaler(api, { initScale: 1024.0 }) : null;
+  console.log(`Optimizer: ${OPT}`);
   console.log(
     `AMP (f16): ${useAMP ? "enabled" : "disabled (shader-f16 not available)"}`,
   );

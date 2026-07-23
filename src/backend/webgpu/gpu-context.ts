@@ -630,7 +630,8 @@ export async function syncWebGPU(): Promise<void> {
  */
 export function destroyWebGPU(): void {
   if (!gpuContext) return;
-  // Destroy cached f16 weight buffers
+  // Destroy cached f16 weight buffers (teardown — the device is going away, so
+  // immediate destroy is correct; no pending submit survives device destruction).
   for (const buf of f16WeightCache.values()) {
     buf.destroy();
   }

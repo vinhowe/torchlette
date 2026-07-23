@@ -1,15 +1,25 @@
+import type { OptStepConfig } from "../backend/types";
 import { ENV } from "../core/env";
+import { LiveScalar } from "../core/live-scalar";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
+import { createLazyIRNode } from "../graph/node-factory";
+import { createPendingRef } from "../graph/types";
 import {
   SGD_MOMENTUM_PROGRAM,
   SGD_PROGRAM,
 } from "../ops/semantic/optimizer";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
-import {
-  type PackedOptState,
-  packOptimizerClass,
-} from "./pack-optimizer";
 import { validateOptimizerParams } from "./validate";
+
+// Structural identity of the fused SGD `optStep` nodes (derived-optimizer-realizer
+// R5c), mirroring SGD_MOMENTUM_STEP_SPEC / SGD_STEP_SPEC in
+// schedule/opt-step-specs.ts. With momentum the state is the velocity `v`
+// (SGD_MOMENTUM_PROGRAM); without it there is no state (plain SGD). L2 weight
+// decay folds into `g` via the realizer's `decoupled_wd==0` branch — so
+// `decoupledWd` is always false. lr is the only scalar-DATA input.
+const SGD_MOMENTUM_STATE_SLOTS: readonly string[] = SGD_MOMENTUM_PROGRAM.state; // ["v"]
+const SGD_STATE_SLOTS: readonly string[] = SGD_PROGRAM.state; // []
+const SGD_SCALAR_INPUTS: readonly string[] = ["lr"];
 
 export type SGDOptions = {
   lr: number;
@@ -38,8 +48,15 @@ export class SGD {
   private _groups: ResolvedSGDGroup[];
   private _groupIndex: number[];
   private velocity: Array<RuntimeTensor | null>;
-  /** Packed foreach state, keyed by param-group index (chain-packing P2). */
-  private _packState = new Map<number, PackedOptState[]>();
+  /**
+   * Per-group learning rate as a persistent on-device LIVE SCALAR
+   * (core/live-scalar.ts) — the SAME primitive Adam's lr rides. The fused
+   * `optStep` kernel reads it as scalar-DATA (a stable f32[1] buffer written
+   * IN-PLACE per step), so an LR schedule flows through compiled replay as DATA
+   * (the historical lr=1.0 frozen-scalar bug class is structurally impossible).
+   * Created eagerly (device known at ctor); only read on the fused path.
+   */
+  private _lrLive: (LiveScalar | null)[];
 
   constructor(
     params: Tensor[] | SGDParamGroup[],
@@ -94,18 +111,53 @@ export class SGD {
     }
 
     this.velocity = new Array(flatParams.length).fill(null);
+    this._lrLive = this._groups.map(
+      (g) => new LiveScalar(engine, g.lr, device as "cpu" | "webgpu"),
+    );
   }
 
   getParams(): Tensor[] {
     return this.params.slice();
   }
 
+  /** The live lr scalar for a group (created on demand). */
+  private _lrScalar(gi: number): LiveScalar {
+    let s = this._lrLive[gi];
+    if (!s) {
+      s = new LiveScalar(
+        this.api,
+        this._groups[gi].lr,
+        this.device as "cpu" | "webgpu",
+      );
+      this._lrLive[gi] = s;
+    }
+    return s;
+  }
+
+  /** The persistent lr tensor (runtime) for a group — read by the fused optStep
+   *  kernel as scalar-DATA. */
+  private _lrTensor(gi: number): RuntimeTensor {
+    return this._lrScalar(gi).tensor._unwrap();
+  }
+
+  /** Check whether the fused optimizer kernel is available on this backend. */
+  hasFusedKernel(): boolean {
+    const backend = this.api._runtime().getBackend(this.device);
+    return !!backend.ops.optStep;
+  }
+
   getLR(): number {
     return this._groups[0].lr;
   }
 
+  /** Set learning rate for all groups. Writes the persistent lr LiveScalar
+   *  IN-PLACE so a compiled replay sees the new value as DATA (the LR-schedule-
+   *  exactness seam; the historical lr=1.0 bug class). */
   setLR(lr: number): void {
-    for (const g of this._groups) g.lr = lr;
+    for (let gi = 0; gi < this._groups.length; gi++) {
+      this._groups[gi].lr = lr;
+      this._lrScalar(gi).set(lr);
+    }
   }
 
   getParamGroupLRs(): number[] {
@@ -114,6 +166,7 @@ export class SGD {
 
   setGroupLR(groupIndex: number, lr: number): void {
     this._groups[groupIndex].lr = lr;
+    this._lrScalar(groupIndex).set(lr);
   }
 
   get numGroups(): number {
@@ -122,12 +175,19 @@ export class SGD {
 
   step(): Tensor[] {
     const runtime = this.api._runtime();
-    // Packed path (chain-packing P2): one flat chain per isomorphism class via
-    // packOptimizerProgram (the SAME SGD program the per-param path interprets).
-    // Opt out with TORCHLETTE_PACK_OPTIM=0; a single param has no class to pack.
+    // Path selection (pinned by tools/parity-packed-vs-unpacked.ts):
+    //  - fused optStep kernel: the WebGPU default — SGD(+momentum) folded into the
+    //    generic program-roles realizer (opt-step-realizer.ts), one DMA-packed
+    //    in-place dispatch per size class. Requires >1 param.
+    //  - per-param: the reference definition AND the CPU / non-fused fallback AND
+    //    the TORCHLETTE_PACK_OPTIM=0 opt-out (the differential's unpacked arm).
     let updated: Tensor[];
-    if (ENV.TORCHLETTE_PACK_OPTIM !== "0" && this.params.length > 1) {
-      updated = this._stepPacked(runtime);
+    if (
+      ENV.TORCHLETTE_PACK_OPTIM !== "0" &&
+      this.params.length > 1 &&
+      this.hasFusedKernel()
+    ) {
+      updated = this._stepFused(runtime);
     } else {
       updated = this._stepPerParam(runtime);
     }
@@ -138,54 +198,94 @@ export class SGD {
   }
 
   /**
-   * Packed SGD step: group grad-bearing params by isomorphism class (param
-   * group → shared lr/wd), then emit ONE flat chain per class. With momentum the
-   * velocity is packed state (SGD_MOMENTUM_PROGRAM, v' read POST-copy_); without
-   * it, a stateless `p' = p − lr·g` (SGD_PROGRAM). L2 weight decay folds into `g`
-   * (adjustGrad) — the realizer's policy, matching the per-param path.
+   * Fused SGD step: one generic `optStep` node per grad-bearing param, folded
+   * from SGD_MOMENTUM_PROGRAM (with momentum) or SGD_PROGRAM (without) by the
+   * program-roles realizer (design ruling O1). The node carries the de-named
+   * `OptStepConfig`; the executor batches same-size nodes into ONE packed DMA
+   * dispatch and the backend derives every in-place / ownership decision from the
+   * config's STRUCTURE (stateSlots `["v"]` with momentum, `[]` without). L2 weight
+   * decay folds into `g` (the realizer's `decoupled_wd==0` branch), matching the
+   * per-param path; lr rides as scalar-DATA.
    */
-  private _stepPacked(runtime: ReturnType<Torchlette["_runtime"]>): Tensor[] {
+  private _stepFused(runtime: ReturnType<Torchlette["_runtime"]>): Tensor[] {
     const updated: Tensor[] = [];
     const hasMomentum = this.momentum !== 0;
-    const program = hasMomentum ? SGD_MOMENTUM_PROGRAM : SGD_PROGRAM;
-    const groups = new Map<number, number[]>();
     for (let i = 0; i < this.params.length; i++) {
-      updated.push(this.params[i]);
-      const grad = this.params[i].grad?._unwrap() ?? null;
-      if (!grad) continue;
-      if (hasMomentum && !this.velocity[i])
-        this.velocity[i] = runtime.registerState(
-          runtime.zeros(this.params[i].shape, this.device),
-        );
+      const param = this.params[i];
+      const grad = param.grad?._unwrap() ?? null;
+      if (!grad) {
+        updated.push(param);
+        continue;
+      }
+
       const gi = this._groupIndex[i];
-      const list = groups.get(gi);
-      if (list) list.push(i);
-      else groups.set(gi, [i]);
-    }
-    for (const [gi, idxs] of groups) {
-      const group = this._groups[gi];
-      const wd = group.weightDecay;
-      const st = packOptimizerClass(
-        runtime,
-        {
-          program,
-          items: idxs.map((i) => ({
-            id: i,
-            param: this.params[i]._unwrap(),
-            grad: this.params[i].grad!._unwrap(),
-            state: hasMomentum ? [this.velocity[i]!] : [],
-          })),
-          sharedRoles: { lr: group.lr, mu: this.momentum },
-          // L2 folds wd into g (affects the velocity too, matching the per-param
-          // path); the param term carries no wd.
-          adjustGrad:
-            wd !== 0 ? (rt, g, p) => rt.add(g, rt.mul(p, wd)) : undefined,
-          paramReadsPostState: true,
-        },
-        this._packState.get(gi),
+      const wd = this._groups[gi].weightDecay;
+
+      // Lazy persistent velocity (momentum only). registerState adopts it into
+      // the step snapshot (the silent-UAF discipline). The optStep kernel writes
+      // `v` IN PLACE and the backend transfers its buffer ownership to the fresh
+      // output at execution — never replace-and-hold.
+      let v: RuntimeTensor | null = null;
+      if (hasMomentum) {
+        v = this.velocity[i];
+        if (!v) {
+          v = runtime.registerState(runtime.zeros(param.shape, this.device));
+          this.velocity[i] = v;
+        }
+      }
+
+      // emitF16:false — do NOT dual-write the f16 param shadow (unlike Adam); the
+      // autocast forward recasts f32→f16 (as SGD's graph-cat predecessor did). A
+      // per-step wash (the packed dispatch is emitF16=false regardless), and
+      // dual-writing is incompatible with the differential's cross-optimizer
+      // cache-reset (the shadow is an arena buffer bound by the persistent forward
+      // compiled plan — see the note in lion.ts).
+      const config: OptStepConfig = hasMomentum
+        ? {
+            spec: "sgd_momentum",
+            stateSlots: SGD_MOMENTUM_STATE_SLOTS,
+            scalarInputs: SGD_SCALAR_INPUTS,
+            hypers: { mu: this.momentum, weight_decay: wd },
+            decoupledWd: false,
+            emitF16: false,
+          }
+        : {
+            spec: "sgd",
+            stateSlots: SGD_STATE_SLOTS,
+            scalarInputs: SGD_SCALAR_INPUTS,
+            hypers: { weight_decay: wd },
+            decoupledWd: false,
+            emitF16: false,
+          };
+
+      // Node inputs [grad, param, (v,) lr]. lr flows as a persistent scalar-DATA
+      // tensor (stable buffer → TAG_WRITE, no repack).
+      const lrRt = this._lrTensor(gi);
+      const inputs = hasMomentum
+        ? [grad.lazyRef, param._unwrap().lazyRef, v!.lazyRef, lrRt.lazyRef]
+        : [grad.lazyRef, param._unwrap().lazyRef, lrRt.lazyRef];
+      const node = createLazyIRNode(
+        "optStep",
+        inputs,
+        param.shape,
+        "f32",
+        this.device,
+        config,
       );
-      this._packState.set(gi, st);
+
+      // param (output 0) — and v (output 1) when momentum is on — point at the
+      // node's in-place results.
+      param._unwrap()._updateLazyRef(createPendingRef(node, 0));
+      if (hasMomentum && v) {
+        v._updateLazyRef(createPendingRef(node, 1));
+        runtime.registerState(v);
+      }
+      updated.push(param);
     }
+
+    // Persist the live lr scalar buffers across the step boundary.
+    for (const s of this._lrLive)
+      if (s) runtime.registerState(s.tensor._unwrap());
     return updated;
   }
 

@@ -742,3 +742,145 @@ byte-identical.
 buffer reclaim GC-independent (deterministic), collapsing both quanta to one
 value. It touches the arena/wrapper-lifecycle area with a documented
 training-freeze bug history — its own design + gates when funded.
+
+---
+
+## R5c — LIVE FUSED Lion/SGD + the deletion (LANDED 2026-07-23)
+
+The campaign's last move: with the executor de-named (R5b: generic `optStep`,
+`OptStepConfig`, `opt-step-kernel.ts`, variadic in-place ownership backend) and
+the realizer proven to fold all four programs (R5a), Lion and SGD now CREATE the
+generic `optStep` node on their default WebGPU path — they get the fused,
+DMA-packed, in-place kernel they never had (they ran `packOptimizerClass` graph
+cat/narrow chains). Adam remains bit-identical (untouched).
+
+**What landed (`src/optim/lion.ts`, `src/optim/sgd.ts`).**
+- `Lion._stepFused` / `SGD._stepFused` build the `optStep` node from
+  `LION_STEP_SPEC` / `SGD_MOMENTUM_STEP_SPEC` / `SGD_STEP_SPEC` — `spec` +
+  `stateSlots` (Lion `["m"]`, SGD+mom `["v"]`, SGD `[]`) + `scalarInputs`
+  (`["lr"]`) + static hypers. The executor/backend derive every in-place /
+  ownership / pack-key decision from that STRUCTURE (R5b). Node inputs are
+  `[grad, param, ...state, lr]`; outputs are `[param, ...state]`.
+- **LiveScalar lr, mirroring Adam's `_lrLive` EXACTLY** — a persistent per-group
+  `LiveScalar` (`core/live-scalar.ts`) created at ctor; `setLR`/`setGroupLR` write
+  it IN-PLACE; the fused kernel reads it as scalar-DATA. The frozen-scalar class
+  is structurally impossible; an LR schedule flows as DATA through compiled
+  replay. Gate: `tools/lr-schedule-replay-optim.ts` (cosine lr, compiled-vs-lowered
+  ≤1e-5/30) — **lion 0.0, sgd 0.0 EXACT** (each run in its own process; see below).
+- **`registerState` on every state slot** (the UAF surface): copy-in-place /
+  properly-registered replacement, never replace-and-hold — the persistence-
+  contract discipline verbatim. The just-landed owner-set guard (`a5ae8783`) is
+  the backstop, not the mechanism; the wiring is correct under the rc model
+  (memory FLAT, strict `[lifetime]` zero throws).
+- **`emitF16:false` for Lion/SGD (NOT dual-writing the f16 shadow — unlike Adam).**
+  Their graph-cat predecessor never wrote a shadow; the autocast forward recasts
+  f32→f16. This is a per-step WASH on speed — the packed dispatch hardcodes
+  `emitF16=false`, so only size-unique SINGLETON params would ever get a kernel
+  shadow, and the ~45 ms Adam vs ~119 ms Lion/SGD A100 distil forward is the
+  GradScaler's async loss-readback OVERLAP in Adam's harness (Lion/SGD run without
+  a scaler), NOT emitF16 (measured: `true` vs `false` are the same ~119 ms) and NOT
+  an optimizer property (the optimizer PHASE is ~1 ms for all three).
+  **`emitF16:true` was TRIED and REVERTED** — it is fundamentally incompatible with
+  the differential's cross-arm cache reset: the f16 shadow is an ARENA buffer bound
+  by the PERSISTENT model-forward compiled plan (recorded in arm 1, replayed in arm
+  2), and to invalidate it you must destroy it — but `deferredDestroy` SKIPS arena
+  buffers (can't invalidate) while an immediate `buf.destroy()` poisons the plan's
+  next replay (strict-mode "used in submit while destroyed", the fence-gated-
+  destruction class). `emitF16:false` sidesteps this entirely (no shadow → nothing
+  to invalidate). Adam keeps `emitF16:true` — its foreach/per-param differential
+  arms never populate a kernel shadow, so it does not hit this.
+
+**The R5c deletion (named).** `Lion._stepPacked` and `SGD._stepPacked` (the
+`packOptimizerClass` graph cat→interp→narrow→copy_ chains, ~48 + ~43 SLOC + their
+`_packState` fields and `PackedOptState`/`packOptimizerClass` imports) are DELETED
+— the fused kernel IS the packed realization, so their default-path consumer is
+gone. **Survivors, with reason:**
+- **`packOptimizerClass` / `pack-optimizer.ts` / `splitPackItems` (C3 browser
+  class-split): KEPT** — Adam's foreach path (`Adam._foreachGroupStep`) is a live
+  consumer (`TORCHLETTE_FUSED_ADAM=0`, and the `parity-packed-vs-unpacked` Adam
+  arm). The graph-cat machinery survives; only Lion/SGD's *use* of it dies.
+- **`Lion._stepPerParam` / `SGD._stepPerParam`: KEPT** — the reference definition,
+  the CPU / non-fused fallback, and the `TORCHLETTE_PACK_OPTIM=0` unpacked arm of
+  `parity-packed-vs-unpacked` (the differential's surviving reference).
+- **`TORCHLETTE_PACK_OPTIM` ROLE CHANGED** (env-flag-ledger updated): it now
+  selects fused-`optStep` vs the per-param reference (was graph-cat vs per-param).
+
+**The parity differential, restructured (task-sanctioned).** With the default arm
+now fused, `parity-packed-vs-unpacked` compares FUSED-vs-per-param across the
+compiled threshold. Two honest adjustments, both named:
+1. **ONE optimizer per process** (the differential compares packed-vs-unpacked
+   WITHIN one optimizer, so a single OPT suffices; the standing gate runs `OPTS=
+   adam|lion|sgd|muon` as SEPARATE invocations). Running two DISTINCT fused
+   optimizers in one process shares process-global caches across a hard optimizer
+   switch — the packed DMA scratch is keyed `count:alignedBytes`, so Lion `[m]`
+   and SGD+mom `[v]` (both 3-buffer) collide and the second arm corrupts (~O(1) at
+   ~step 3). There is NO safe mid-run reset (a `resetPackedOptimizerCache` mid-run
+   call was TRIED and REVERTED): DESTROYING the scratch poisons the cached compiled
+   plan that still binds it — strict-mode "used in submit while destroyed", the
+   fence-gated-destruction class — while merely CLEARING the cache does not cure
+   the corruption (the fix earlier came from the destroy side-effect, not the
+   clear). Real single-optimizer training never switches; each optimizer alone
+   (both arms) is clean under `TORCHLETTE_STRICT_GPU=1`. The lr-replay tool is
+   likewise one-optimizer-per-process (its two arms are compiled-vs-lowered of the
+   SAME optimizer, so scratch reuse across them is normal/safe).
+2. **Lion tolerance 5e-4** — a NAMED FOLD REASSOCIATION LEMMA (L-Lion), not a bug:
+   the fused decoupled-wd term is `(p−lr·sign(c))−lr·wd·p` (the realizer's runtime
+   branch, byte-shared with Adam) vs the per-param `p−(lr·sign(c)+lr·wd·p)`, plus
+   om_beta = `f32(1)−β` vs a JS `1−β` scalar (≤1-ULP). Bounded ≤5.96e-8/element
+   (`opt-step-realizer-parity`), it trajectory-amplifies over 30 near-flat
+   (lr=1e-4) steps to ~1.2e-4 — the SAME class as the accepted Adam 124M "rounds
+   3/6/9 within 3e-4". SGD has no reassociation (L2 folds into g identically in
+   both arms) → stays at the tight 1e-4 default. Muon/Adam arms → 0.0 (refusal /
+   foreach both same-association).
+
+**`mm` refusal** stays STRUCTURAL — Muon's Newton-Schulz has no elementwise
+tile-IR target; its AdamW sub-instance rides the fused Adam path for free
+(`muon-pack-refusal` 4/4). No name-check.
+
+**A100 exit table (dw-2-1, CUDA_VISIBLE_DEVICES=0, @512, NUM_STEPS=18, LATE
+steps, autocast on; Adam carries the GradScaler, Lion/SGD run without one).**
+
+| opt · model | submits/step | peak MB | steady cur MB | opt phase | verdict |
+|---|---|---|---|---|---|
+| **adam** · distil | **8** | **5636.6** | 2112.5 | ~1 ms | UNCHANGED (EXACT) |
+| **adam** · medium | **19** | **16189.0** | **7247.9** | ~1-2 ms | UNCHANGED (EXACT) |
+| lion · distil | 8 | 4779.9 | 1492.4 | ~0-1 ms | NEW — ≤Adam, flat |
+| lion · medium | 18 | 14748.3 | 5434.9 | ~1 ms | NEW — ≤Adam, flat |
+| sgd · distil | 8 | 4779.9 | 1492.4 | ~0-1 ms | NEW — ≤Adam, flat |
+| sgd · medium | 18 | 14748.3 | 5434.9 | ~1 ms | NEW — ≤Adam, flat |
+
+Measured with the FINAL code (`emitF16:false` for Lion/SGD). Adam is byte-EXACT to
+the R4/R5a baseline (distil 8/5636.6; medium 19/16189.0, steady 7247.9). Lion/SGD
+get **8/18 submits (≤ Adam's 8/19 — one fewer optimizer batch on medium, fewer
+state slots), peak 4779.9/14748.3 MB (BELOW Adam — one state slot vs Adam's two,
+and no persistent f16 shadow), memory FLAT** (storages/peak/current plateau,
+PendingDestroy 0). The optimizer PHASE is ~1 ms for all three. (The whole-step
+wall ms/step is higher for Lion/SGD than Adam, but that is the GradScaler's async
+loss-readback OVERLAP lowering Adam's ATTRIBUTED forward time — a harness feature,
+not an optimizer cost; quantifying any residual is a follow-on.)
+
+**Gates (V100 sivri unless noted):** `parity-packed-vs-unpacked` per-optimizer
+(adam 0, lion 1.18e-4/tol 5e-4, sgd 7.6e-6, muon 0) — each `TORCHLETTE_STRICT_GPU=1`
+CLEAN, Lion 5/5 + SGD 5/5 consecutive strict-green (+ adam/muon); `opt-step-
+realizer-parity` 7/7 (strict); `optterm-fold-parity` all (muon refuses, strict);
+`packed-optim-flatness` FLAT (lion+sgd); `lion-distil-descent` 7.887→4.363;
+`lr-schedule-replay-optim` lion/sgd 0.0 compiled-vs-lowered (strict); SGD oracle vs
+torch.optim 8/8 (cpu); cpu optim+schedule 207/207; `test:gates` 5/5; `parity-
+fullstack-tl` compiled-vs-lowered 5.7e-6/30 (Adam unchanged); `whole-step-
+checkpoint-refusal` 10×; 124M regression round 0 bit-exact 9.8089, 3/6/9 within
+tol, peak 4906.5 MB FLAT (EXACT to R4/R5a); `test/webgpu/` 753/753 GPU-exclusive.
+
+**Strict-mode bug found + fixed (post-initial-commit).** The initial R5c tools
+added a mid-run `resetPackedOptimizerCache()` / `resetF16WeightCache()` that called
+`buf.destroy()` IMMEDIATELY between differential arms — poisoning the persistent
+model-forward compiled plan that still bound those buffers (`TORCHLETTE_STRICT_GPU=1`
+"used in submit while destroyed", the fence-gated-destruction class; intermittent in
+non-strict, so the initial runs "passed" by luck). ROOT-CAUSED with
+`TORCHLETTE_DEBUG_DESTROY_STACK_MB`: a mid-run destroy has NO safe form here — the
+scratch is owned by a cached compiled plan (deferredDestroy skips arena/pinned;
+untracked-defer + clear-only both fail — the earlier "fix" was the destroy SIDE
+EFFECT, not the clear). Real fix: the differential is inherently one-optimizer (it
+compares packed-vs-unpacked WITHIN an optimizer), so ALL reset machinery is DELETED
+and the tools run ONE optimizer per process — each strict-clean. `emitF16:false`
+(reverted from an attempted `true`) removes the f16 shadow entirely, so there is
+nothing to invalidate across arms. Zero mid-run `buf.destroy()` remains.

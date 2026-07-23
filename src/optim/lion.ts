@@ -18,9 +18,12 @@
  * at the step boundary's `forceAllPending`, exactly as SGD's velocity copy_ is).
  */
 
-import type { DeviceKind } from "../backend/types";
+import type { DeviceKind, OptStepConfig } from "../backend/types";
 import { ENV } from "../core/env";
+import { LiveScalar } from "../core/live-scalar";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
+import { createLazyIRNode } from "../graph/node-factory";
+import { createPendingRef } from "../graph/types";
 import {
   evalOptTensor,
   LION_M_NEW,
@@ -32,14 +35,18 @@ import {
   role,
 } from "../ops/semantic/optimizer";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
-import {
-  type PackedOptState,
-  packOptimizerClass,
-} from "./pack-optimizer";
 import { validateOptimizerParams } from "./validate";
 
 /** The wd=0 param-update term `p' = p − lr·sign(c)` (no full-size `+0` at wd=0). */
 const LION_P_NO_WD = oSub(role("p"), LION_STEP);
+
+// Structural identity of the fused Lion `optStep` node (derived-optimizer-realizer
+// R5c), mirroring LION_STEP_SPEC in schedule/opt-step-specs.ts — the SINGLE
+// conceptual source. Lion's state is the single β2-EMA `m`; lr is its only scalar-
+// DATA input (no bias correction). The backend resolves the realizer by `spec` and
+// binds by these slots, so any divergence throws at the binding seam.
+const LION_STATE_SLOTS: readonly string[] = LION_PROGRAM.state; // ["m"]
+const LION_SCALAR_INPUTS: readonly string[] = ["lr"];
 
 export type LionOptions = {
   lr: number;
@@ -72,8 +79,15 @@ export class Lion {
   private _groupIndex: number[];
   /** Per-param β2-EMA momentum `m`. Lazily created (persistent state). */
   private momentum: Array<RuntimeTensor | null>;
-  /** Packed foreach state, keyed by param-group index (chain-packing P2). */
-  private _packState = new Map<number, PackedOptState[]>();
+  /**
+   * Per-group learning rate as a persistent on-device LIVE SCALAR
+   * (core/live-scalar.ts) — the SAME primitive Adam's lr rides. The fused
+   * `optStep` kernel reads it as scalar-DATA (a stable f32[1] buffer written
+   * IN-PLACE per step), so an LR schedule flows through compiled replay as DATA
+   * (the frozen-scalar class is structurally impossible). Created eagerly (device
+   * known at ctor); only materialized/read on the fused path.
+   */
+  private _lrLive: (LiveScalar | null)[];
 
   constructor(
     params: Tensor[] | LionParamGroup[],
@@ -133,18 +147,53 @@ export class Lion {
     }
 
     this.momentum = new Array(flatParams.length).fill(null);
+    this._lrLive = this._groups.map(
+      (g) => new LiveScalar(engine, g.lr, device as "cpu" | "webgpu"),
+    );
   }
 
   getParams(): Tensor[] {
     return this.params.slice();
   }
 
+  /** The live lr scalar for a group (created on demand). */
+  private _lrScalar(gi: number): LiveScalar {
+    let s = this._lrLive[gi];
+    if (!s) {
+      s = new LiveScalar(
+        this.api,
+        this._groups[gi].lr,
+        this.device as "cpu" | "webgpu",
+      );
+      this._lrLive[gi] = s;
+    }
+    return s;
+  }
+
+  /** The persistent lr tensor (runtime) for a group — read by the fused optStep
+   *  kernel as scalar-DATA. */
+  private _lrTensor(gi: number): RuntimeTensor {
+    return this._lrScalar(gi).tensor._unwrap();
+  }
+
+  /** Check whether the fused optimizer kernel is available on this backend. */
+  hasFusedKernel(): boolean {
+    const backend = this.api._runtime().getBackend(this.device);
+    return !!backend.ops.optStep;
+  }
+
   getLR(): number {
     return this._groups[0].lr;
   }
 
+  /** Set learning rate for all groups. Writes the persistent lr LiveScalar
+   *  IN-PLACE so a compiled replay sees the new value as DATA (the LR-schedule-
+   *  exactness seam). */
   setLR(lr: number): void {
-    for (const g of this._groups) g.lr = lr;
+    for (let gi = 0; gi < this._groups.length; gi++) {
+      this._groups[gi].lr = lr;
+      this._lrScalar(gi).set(lr);
+    }
   }
 
   getParamGroupLRs(): number[] {
@@ -153,6 +202,7 @@ export class Lion {
 
   setGroupLR(groupIndex: number, lr: number): void {
     this._groups[groupIndex].lr = lr;
+    this._lrScalar(groupIndex).set(lr);
   }
 
   get numGroups(): number {
@@ -161,12 +211,21 @@ export class Lion {
 
   step(): Tensor[] {
     const runtime = this.api._runtime();
-    // Packed path (chain-packing P2): one flat chain per isomorphism class via
-    // packOptimizerProgram (the SAME LION_PROGRAM the per-param path interprets).
-    // Opt out with TORCHLETTE_PACK_OPTIM=0; a single param has no class to pack.
+    // Path selection (pinned by tools/parity-packed-vs-unpacked.ts):
+    //  - fused optStep kernel: the WebGPU default — Lion's LION_PROGRAM folded
+    //    into the generic program-roles realizer (opt-step-realizer.ts), one
+    //    DMA-packed in-place dispatch per size class (memory/speed of the fused
+    //    Adam path). Requires >1 param (nothing to pack otherwise).
+    //  - per-param: the reference definition AND the CPU / non-fused fallback AND
+    //    the TORCHLETTE_PACK_OPTIM=0 opt-out (the differential's unpacked arm).
+    // TORCHLETTE_PACK_OPTIM=0 forces the per-param reference on every backend.
     let updated: Tensor[];
-    if (ENV.TORCHLETTE_PACK_OPTIM !== "0" && this.params.length > 1) {
-      updated = this._stepPacked(runtime);
+    if (
+      ENV.TORCHLETTE_PACK_OPTIM !== "0" &&
+      this.params.length > 1 &&
+      this.hasFusedKernel()
+    ) {
+      updated = this._stepFused(runtime);
     } else {
       updated = this._stepPerParam(runtime);
     }
@@ -177,58 +236,91 @@ export class Lion {
   }
 
   /**
-   * Packed Lion step: group grad-bearing params by isomorphism class (param
-   * group → shared lr/wd), then emit ONE flat chain per class. Lion's param
-   * update reads the OLD momentum (paramReadsPostState=false); its stored EMA
-   * `m'` is written afterwards.
+   * Fused Lion step: one generic `optStep` node per grad-bearing param, folded
+   * from LION_PROGRAM by the program-roles realizer (design ruling O1). The node
+   * carries the de-named `OptStepConfig` (`spec:"lion"`, `stateSlots:["m"]`,
+   * `scalarInputs:["lr"]`); the executor batches same-size nodes into ONE packed
+   * DMA dispatch and the backend derives every in-place / ownership decision from
+   * the config's STRUCTURE. Lion's param term reads the OLD momentum
+   * (paramReadsPostState=false in the spec); the stored β2-EMA `m'` is the state
+   * output. wd is always decoupled (`decoupledWd:true`), lr rides as scalar-DATA.
    */
-  private _stepPacked(runtime: ReturnType<Torchlette["_runtime"]>): Tensor[] {
+  private _stepFused(runtime: ReturnType<Torchlette["_runtime"]>): Tensor[] {
     const updated: Tensor[] = [];
-    const groups = new Map<number, number[]>();
     for (let i = 0; i < this.params.length; i++) {
-      updated.push(this.params[i]);
-      const grad = this.params[i].grad?._unwrap() ?? null;
-      if (!grad) continue;
-      // Lazy persistent momentum (packed once). registerState adopts it into
-      // the step snapshot (the silent-UAF discipline).
-      if (!this.momentum[i])
-        this.momentum[i] = runtime.registerState(
-          runtime.zeros(this.params[i].shape, this.device),
-        );
+      const param = this.params[i];
+      const grad = param.grad?._unwrap() ?? null;
+      if (!grad) {
+        updated.push(param);
+        continue;
+      }
+
+      // Lazy persistent momentum. registerState adopts it into the step snapshot
+      // (the silent-UAF discipline — without it markStep demotes the mid-step-
+      // created tensor and pools its live buffer). This is THE UAF surface: the
+      // state slot must be copy_-in-place OR a properly registered replacement,
+      // never replace-and-hold. The optStep kernel writes `m` IN PLACE and the
+      // backend transfers its buffer ownership to the fresh output at execution.
+      let m = this.momentum[i];
+      if (!m) {
+        m = runtime.registerState(runtime.zeros(param.shape, this.device));
+        this.momentum[i] = m;
+      }
+
       const gi = this._groupIndex[i];
-      const list = groups.get(gi);
-      if (list) list.push(i);
-      else groups.set(gi, [i]);
-    }
-    for (const [gi, idxs] of groups) {
-      const group = this._groups[gi];
-      const st = packOptimizerClass(
-        runtime,
-        {
-          program: LION_PROGRAM,
-          items: idxs.map((i) => ({
-            id: i,
-            param: this.params[i]._unwrap(),
-            grad: this.params[i].grad!._unwrap(),
-            state: [this.momentum[i]!],
-          })),
-          sharedRoles: {
-            lr: group.lr,
-            wd: group.weightDecay,
-            beta1: this.beta1,
-            om_beta1: 1 - this.beta1,
-            beta2: this.beta2,
-            om_beta2: 1 - this.beta2,
-          },
-          // Full p' folds in the decoupled `lr·wd·p`; the no-wd path derives just
-          // the signed step (LION_STEP) and subtracts.
-          paramUpdate: group.weightDecay !== 0 ? LION_P_NEW : LION_P_NO_WD,
-          paramReadsPostState: false,
+      const wd = this._groups[gi].weightDecay;
+      const config: OptStepConfig = {
+        spec: "lion",
+        stateSlots: LION_STATE_SLOTS,
+        scalarInputs: LION_SCALAR_INPUTS,
+        hypers: {
+          beta1: this.beta1,
+          beta2: this.beta2,
+          weight_decay: wd,
         },
-        this._packState.get(gi),
+        decoupledWd: true,
+        // emitF16:false — do NOT dual-write the f16 param shadow (unlike Adam).
+        // The autocast forward recasts f32→f16 (exactly as Lion's graph-cat
+        // predecessor did), which is a per-step WASH here anyway: the packed
+        // dispatch hardcodes emitF16=false so only size-unique params would ever
+        // get the kernel shadow. Dual-writing is also INCOMPATIBLE with the
+        // cross-optimizer cache-reset the differential needs — the shadow is an
+        // arena buffer bound by the persistent model-forward compiled plan;
+        // deferredDestroy skips arena buffers (can't invalidate) and an immediate
+        // destroy poisons the plan's next replay ("used in submit while destroyed").
+        emitF16: false,
+      };
+
+      // 4-input optStep node [grad, param, m, lr]. lr flows as a persistent
+      // scalar-DATA tensor (stable buffer → TAG_WRITE, no repack).
+      const lrRt = this._lrTensor(gi);
+      const node = createLazyIRNode(
+        "optStep",
+        [
+          grad.lazyRef,
+          param._unwrap().lazyRef,
+          m.lazyRef,
+          lrRt.lazyRef,
+        ],
+        param.shape,
+        "f32",
+        this.device,
+        config,
       );
-      this._packState.set(gi, st);
+
+      // param (output 0) and m (output 1) point at the node's in-place results.
+      param._unwrap()._updateLazyRef(createPendingRef(node, 0));
+      m._updateLazyRef(createPendingRef(node, 1));
+
+      // Persist m (lazily materializes mid-step — same adoption rationale as the
+      // per-param path).
+      runtime.registerState(m);
+      updated.push(param);
     }
+
+    // Persist the live lr scalar buffers across the step boundary.
+    for (const s of this._lrLive)
+      if (s) runtime.registerState(s.tensor._unwrap());
     return updated;
   }
 
