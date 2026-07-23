@@ -88,6 +88,7 @@ import {
   OP_REGISTRY,
   UNARY_AUTOGRAD_OPS,
 } from "../ops/registry";
+import { SOFTPLUS_DEF } from "../ops/semantic/catalog";
 import { GELU_ERF_DEF, GELU_TANH_DEF } from "../ops/semantic/composite";
 import {
   type BackwardContext,
@@ -108,6 +109,9 @@ import { REDUCTION_DEF_BY_NAME } from "../ops/semantic/reduction";
 // `geluErfBackward` custom backwards (deleted). The VJP term is built ONCE.
 const GELU_TANH_GRAD = makeUnaryGrad(GELU_TANH_DEF);
 const GELU_ERF_GRAD = makeUnaryGrad(GELU_ERF_DEF);
+// softplus backward DERIVES from SOFTPLUS_DEF (COMPOSITE-CLOSURE F2 §4.4).
+const SOFTPLUS_GRAD = makeUnaryGrad(SOFTPLUS_DEF);
+
 // Import extracted modules
 import {
   applyAutocastImpl,
@@ -962,15 +966,22 @@ export class Torchlette {
 
   softplus(a: Tensor): Tensor {
     this._assertUsable(a);
-    // softplus(x) = log(1 + exp(x))
+    // softplus(x) = log(1 + exp(x)) — forward composition (softplus has no
+    // standalone backend kernel). Its MEANING is single-sourced in SOFTPLUS_DEF.
     const one = this.runtime.full(a.shape, 1, a.device);
     const expA = this.runtime.exp(a._unwrap());
     const inner = this.runtime.log(this.runtime.add(one, expA));
-    // d/dx softplus(x) = sigmoid(x)
-    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => {
-      const sigA = this.runtime.sigmoid(a._unwrap());
-      return [this.runtime.mul(grad, sigA)];
-    });
+    const tensorsToSave = a.requiresGrad ? [a] : [];
+    // Backward DERIVED from SOFTPLUS_DEF's adjoint (eˣ/(1+eˣ) = sigmoid(x)) —
+    // the hand `sigmoid(x)·g` closure is DELETED (COMPOSITE-CLOSURE F2 §4.4).
+    return this._wrapWithGrad(
+      inner,
+      [a],
+      (grad, getSaved) => [
+        SOFTPLUS_GRAD(this.runtime, grad, getSaved(0)._unwrap()),
+      ],
+      tensorsToSave,
+    );
   }
 
   fmod(a: Tensor, b: Tensor): Tensor {

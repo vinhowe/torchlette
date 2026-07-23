@@ -115,6 +115,22 @@ export const UNARY_DEFS: readonly ElementwiseDef[] = [
  * gradients derive here (registry ttGrad). Variable-exponent `pow` keeps its
  * hand grad.
  */
+/**
+ * softplus = log(1+eˣ) (COMPOSITE-CLOSURE F2 §4.4). A STANDALONE def (consumed
+ * via `makeUnaryGrad`, like the GELU defs) — NOT a member of `UNARY_DEFS`, so it
+ * does not perturb the registry / numeric / hand-table machinery. Its backward
+ * AUTO-DERIVES to eˣ/(1+eˣ) = sigmoid(x) through the existing P0 elementwise
+ * adjoint, deleting the last hand-authored elementwise fwd+bwd (`torchlette.ts`
+ * `softplus`). The forward stays a composition (softplus has no standalone
+ * backend kernel); only its MEANING is now single-sourced here.
+ */
+export const SOFTPLUS_DEF: ElementwiseDef = {
+  name: "softplus",
+  arity: 1,
+  expr: log(add(c(1), exp(x))),
+  gradPolicy: "derive",
+};
+
 export const BINARY_DEFS: readonly ElementwiseDef[] = [
   { name: "add", arity: 2, expr: add(x, y), gradPolicy: "derive" },
   // sub's tensor grad is handled STRUCTURALLY by the frontend (no registry
