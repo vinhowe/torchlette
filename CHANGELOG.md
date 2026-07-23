@@ -1,1 +1,86 @@
 # Changelog
+
+## [1.1.0](https://github.com/vinhowe/torchlette/compare/torchlette-v1.0.2...torchlette-v1.1.0) (2026-07-23)
+
+
+### Features
+
+* **#70 D1:** derived-ownership SHADOW model — owner SET + assert-agreement ([9a99195](https://github.com/vinhowe/torchlette/commit/9a991952e9a714f72864b16fda1b3965d1a3791e))
+* **#70 D3:** registered state — modules/optimizers DECLARE persistence; persist() → registerState() alias ([7404823](https://github.com/vinhowe/torchlette/commit/7404823e65adfa1a48063f098933a6ff252cd6e0))
+* **chain-packing/P1:** extract packOptimizerProgram; route Adam foreach through it ([ca37252](https://github.com/vinhowe/torchlette/commit/ca37252e70460dbd9d0be473e8320821096b5f87))
+* **chain-packing/P2:** wire Lion + SGD through packOptimizerProgram ([79762ca](https://github.com/vinhowe/torchlette/commit/79762ca5aded061e4c1ef8695b6216dd5771be87))
+* **composite-closure/A1:** the Expr→BlockExpr fold, dark + softplus catalog entry + parity probe ([cab1d7f](https://github.com/vinhowe/torchlette/commit/cab1d7fe7d1744659afba1193265e64d20d41c93))
+* **composite-closure/A2:** route the fused activation bodies through the Expr fold ([4e7c777](https://github.com/vinhowe/torchlette/commit/4e7c7775f978a631f1480218f1a22cc0301629f6))
+* **composite-closure/A3:** delete the hand activation DSL bodies; retire the flag ([7b79e5e](https://github.com/vinhowe/torchlette/commit/7b79e5efd577f462d7df555f52e72254e2cee400))
+* **composite-closure/C1:** the CompNode-adjoint pass, dark + oracle + cost probe ([428bbd8](https://github.com/vinhowe/torchlette/commit/428bbd8ab11efbac697a7efefad93f8ecb77a2ca))
+* **composite-closure/C2:** route the CPU rmsnorm/layernorm backwards through the derived VJP ([75da4a3](https://github.com/vinhowe/torchlette/commit/75da4a3a2e407f29d6c4f8abe0e15a981299a81c))
+* **composite-closure/C3:** assert the fused GPU backwards == derived; delete the hand CPU VJPs; retire the flag ([088901d](https://github.com/vinhowe/torchlette/commit/088901d71798b0afadb9e80ce9fc0122e9bd1cc1))
+* **composite-closure/T1:** the softmax backward becomes a DECLARED SIMPLIFICATION LEMMA ([926e025](https://github.com/vinhowe/torchlette/commit/926e025a397b01114faa6c87ea7bf15465e9a922))
+* **coverage/C1:** comparison-op serializer — packed optimizer plan reaches fullyCovered ([bc54bf5](https://github.com/vinhowe/torchlette/commit/bc54bf5411e4ee81b15c5e5587c7bc6aa1ea7757))
+* **coverage/C2:** derive cachedDonatableIds from IR liveness (single-source seam) ([3a2c5f3](https://github.com/vinhowe/torchlette/commit/3a2c5f398fa980ce3c2a3a965effccdd298537ef))
+* **coverage/C3:** packer class-splitting — ≤ binding-limit sub-classes ([6747854](https://github.com/vinhowe/torchlette/commit/67478542da86ac524ded06c7784b48311bf9a43f))
+* **derived-optimizer/fork-C:** host-computed [2] live-scalar bias correction, dark ([94a68db](https://github.com/vinhowe/torchlette/commit/94a68db761fbb9db678e9a9b457c3f6be330d1ff))
+* **derived-optimizer/R1:** OptTerm→tile-IR fold, dark ([53ed4b4](https://github.com/vinhowe/torchlette/commit/53ed4b44637550994567d3b1ac4705c118e546b6))
+* **derived-optimizer/R2:** derived Adam body behind TORCHLETTE_DERIVED_ADAM (fork B) ([39bef9f](https://github.com/vinhowe/torchlette/commit/39bef9fb75d67ef4d8063f9d2673fda1259a4e72))
+* **derived-optimizer/R3-FIX:** persistent [2] bc buffer; flip RE-CONFIRMED STOPPED (reclaim-boundary quantization) ([74d0456](https://github.com/vinhowe/torchlette/commit/74d0456afb66779624987d0d299057b4b8dad622))
+* **derived-optimizer/R3:** FLIP TORCHLETTE_DERIVED_ADAM default ON (fork C) ([fb5dabc](https://github.com/vinhowe/torchlette/commit/fb5dabccb037894642286782dc9dba74bb06eee4))
+* **derived-optimizer/R4:** delete the authored Adam body + the flag ([236a30c](https://github.com/vinhowe/torchlette/commit/236a30c2fcffed7a8be5a25da11fcfd919c502f1))
+* **derived-optimizer/R5a:** generalize adam-skeleton into a program-roles realizer ([0593e21](https://github.com/vinhowe/torchlette/commit/0593e214252d7ca2c728c1e95cf2517240cda4e5))
+* **opt-realizer/R5c:** LIVE fused Lion/SGD + delete the graph-cat pack path ([4f1a9e0](https://github.com/vinhowe/torchlette/commit/4f1a9e0199de6dd349bce08c87fba21596f1ff56))
+* **optim/chain-packing P3:** route Muon through the packer — typed refusal, per-param fallback ([60fcd6b](https://github.com/vinhowe/torchlette/commit/60fcd6be46e854be0160f6d861ebfd1c4f95e33f))
+* **optim:** Muon — an optimizer realized from MUON_PROGRAM alone ([764156c](https://github.com/vinhowe/torchlette/commit/764156c973eaf72b7e8ce07eebfadb99469edc0e))
+* **semantic-derivation/P0:** the definition stratum — meaning as data ([e899bf5](https://github.com/vinhowe/torchlette/commit/e899bf596b8f11a899db7bf959900a00f2d05f52))
+* **semantic-derivation/P2:** the erf primitive + composite definitions ([ce5284f](https://github.com/vinhowe/torchlette/commit/ce5284f61073ed80e40aff0fbcba6483acb461f5))
+* **semantic-derivation/P4:** cross_entropy completes as a composition ([e1cb7c8](https://github.com/vinhowe/torchlette/commit/e1cb7c836c1747eadb7e95414802e4be4e25ae61))
+* **semantic-derivation/P4:** the index-map schema + the transpose derivation ([ae6f259](https://github.com/vinhowe/torchlette/commit/ae6f259c7d6184a24332d9493bcaf014aa571a4d))
+* **semantic-derivation/P5:** Lion — the generality dividend ([bb98bbb](https://github.com/vinhowe/torchlette/commit/bb98bbba42c9d4e89ed3f9091ce9ba763c2442a2))
+* **semantic-derivation/P5:** the optimizer-program stratum ([84cc66c](https://github.com/vinhowe/torchlette/commit/84cc66cd5dad8583d3fc52fdc86c750068ed1a55))
+* **semantic-optimizer:** the mm contraction node + interpreter memoization + MUON_PROGRAM ([adad1c3](https://github.com/vinhowe/torchlette/commit/adad1c3c16faae10304f5b380773fbca1bc1e9af))
+* **semantic/§19:** derive matmul/linear adjoints — close the calculus ([f21f34f](https://github.com/vinhowe/torchlette/commit/f21f34f1b9165095d810805e97f12de663121ab8))
+* **semantic/P6:** the guard ruling + the cross-phase deletion sweep ([f6c7ace](https://github.com/vinhowe/torchlette/commit/f6c7ace943c25dc726264759ab813ecd1c500a61))
+* **step-boundary:** assertQuiesced — promote quiesce-before-demotion to a CPU throw ([f6bc46c](https://github.com/vinhowe/torchlette/commit/f6bc46cf10d89ab1d0c14040236c03aa9eaec103))
+* **step-fn-compiler/D3:** CE-from-IR contiguity coverage — the whole-step remat boundary plan compiles ([b4703bf](https://github.com/vinhowe/torchlette/commit/b4703bfadf5435245c38e9a3ebb0cb618862675e))
+* **step-fn-compiler/D3:** THE BYPASS DEATH — trainer runs checkpointed steps under whole-step remat ([329c11a](https://github.com/vinhowe/torchlette/commit/329c11ac1aba59511025246f69202a0f56b381dc))
+* **step-fn-compiler/D3:** typed SUNSET-BOUND refusal for the eager checkpoint compile hazard ([a78a500](https://github.com/vinhowe/torchlette/commit/a78a5006db4896271049681f2876e8fdc7ea830f))
+* **step-fn-compiler/P1:** whole-step trace acquisition behind TORCHLETTE_WHOLE_STEP ([4cb8f07](https://github.com/vinhowe/torchlette/commit/4cb8f07d403feded719d6a71226121aadbe78a9f))
+* **step-fn-compiler/P2:** compile the whole-step graph — park-live-registered-result ([d51aff8](https://github.com/vinhowe/torchlette/commit/d51aff81fa569c076143ff0fc13218775283cf0c))
+* **step-fn-compiler/P3:** remat as a pass — lift the checkpoint gate; D3 bypass-death STOPS on speed ([72d00fb](https://github.com/vinhowe/torchlette/commit/72d00fb5a2a92461ee1d53d6a38477b7ec9f3b26))
+* **step-fn-compiler/P4a:** GRADUATE whole-step to DEFAULT-for-training (opt-out =0) ([c7306eb](https://github.com/vinhowe/torchlette/commit/c7306ebfb83405416eb550b73b3d5334569b2a11))
+* **step-fn-compiler/P4a:** THE DECODE DISCRIMINATOR — VERDICT B (whole-step is a no-op for decode) ([3e09a1a](https://github.com/vinhowe/torchlette/commit/3e09a1a90936bb72dfe217a2f4e207c24280178d))
+* **step-tape/P4b-R R1:** demote the demo tape flag; prove the editor is tape-free ([4528bb0](https://github.com/vinhowe/torchlette/commit/4528bb0cf16f2345feed992f6b1e3e535e05e757))
+* **unrolled-k/P1:** decodeBlock — the static-KV unrolled-K greedy block behind TORCHLETTE_UNROLLED_K ([ad4c447](https://github.com/vinhowe/torchlette/commit/ad4c447c7bf1f0e9685d285d7f0e756cdd572e22))
+* **unrolled-k/P2:** build-from-IR generators for arg-reduce + max/min + RMSNorm ([d162d87](https://github.com/vinhowe/torchlette/commit/d162d879da3d9be3c5390ed31358cb137955e217))
+* **unrolled-k/P3':** fusedRoPE build-from-IR generator — offset-as-volatile-data ([b6f82b5](https://github.com/vinhowe/torchlette/commit/b6f82b5eeeb2e7d25ecfbd78b813ba48b3616a29))
+* **unrolled-k/P3':** on-device Gumbel-max sampling (seed-as-data) + parity gate ([7c33bff](https://github.com/vinhowe/torchlette/commit/7c33bff32787258b36e3788641c88270078970c4))
+* **unrolled-k/P4b:** Gumbel sampled block default-eligible — delete the unrolledKExplicit opt-in ([80eb25c](https://github.com/vinhowe/torchlette/commit/80eb25cd644c5bd662ba425113ed1959261d5c82))
+* **unrolled-k/P4:** THE DEMO CUTOVER — greedy block default-on, gemma2 port, gumbel opt-in ([51cf5f0](https://github.com/vinhowe/torchlette/commit/51cf5f0692238ea5d8c43f1e82582d248a404bbf))
+* **unrolled-k/sampler:** build-from-IR generators for deviceTopK + gather — the filtered block compiles ([8fea621](https://github.com/vinhowe/torchlette/commit/8fea621d7ef1db6586ec5dab858453afc84df569))
+* **unrolled-k/sampler:** on-device top-k/top-p/temperature — the demo sampler moves onto the block ([1d975aa](https://github.com/vinhowe/torchlette/commit/1d975aa07bef76cba12fde1e7bc84afd25bef0e5))
+
+
+### Bug Fixes
+
+* **#59:** read f16 gather input through array&lt;u32&gt; + unpack2x16float (Metal route-around) ([c088c85](https://github.com/vinhowe/torchlette/commit/c088c85660240222cd6e3cb0156d7a68b0ac29fb))
+* **#67:** DSL rules must not markDead a shared/external node — 'Input not ready: transpose' ([66a2b30](https://github.com/vinhowe/torchlette/commit/66a2b30a36d25562c9af964bf0c8f89c62e71dd7))
+* **#70 D4:** re-derive viewAliasesLiveBase from the tracker; fix row-8 (stale-snapshot second-engine bug, NOT gen-perturbation) ([fdbdd76](https://github.com/vinhowe/torchlette/commit/fdbdd76570bcc21b6c9150723423002c738a86f5))
+* **#90:** exonerate reclaimed harvest views aliasing a live base — the static-KV [lifetime] false positive ([1667792](https://github.com/vinhowe/torchlette/commit/1667792701282ff298bcc1b54567cc900dc79b24))
+* 84: reset storage tracker + pending registry at engine construction — kills the second-in-process oracle-path bimodality ([16e87c0](https://github.com/vinhowe/torchlette/commit/16e87c07d44a17c852a21ac59d28c09da82e8fe7))
+* **gemma2-browser:** f16 embedding load no longer allocates a 2.15GB block ([#59](https://github.com/vinhowe/torchlette/issues/59) regression) ([572aec0](https://github.com/vinhowe/torchlette/commit/572aec0105f26a8fe21b36f08c43fa59533505af))
+* **gemma2-sae-demo:** Golden Gate preset steers again — [#3124](https://github.com/vinhowe/torchlette/issues/3124) → [#12887](https://github.com/vinhowe/torchlette/issues/12887) ([ef5e8d6](https://github.com/vinhowe/torchlette/commit/ef5e8d6ed4a27e4b68e3bba8529a1c0afede0ab9))
+* **lifetime:** don't reap a storage a live durable wrapper still owns ([a5ae878](https://github.com/vinhowe/torchlette/commit/a5ae8783468c71b33e159485a54d9603ed1d1a28))
+* **pack-optimizer/P1:** dispose the unpack seg/narrow materializations — packed-path leak ([0570498](https://github.com/vinhowe/torchlette/commit/0570498fd38470997ae254c74b67b9420a54f8b5))
+* **step-boundary:** drop the spurious assertQuiesced in plain markStep ([2768713](https://github.com/vinhowe/torchlette/commit/27687133183a085e541d5626829fd227804a36dd))
+* **step-fn-compiler/D3:** decouple the step-object census from eager checkpointing (refusal collision) ([79e12ad](https://github.com/vinhowe/torchlette/commit/79e12adb4793c4a072224a06381e0ff536698f56))
+* **step-fn-compiler/P1:** gate whole-step deferral OFF for checkpointed backward ([41196a7](https://github.com/vinhowe/torchlette/commit/41196a71b92474c300d1b8ae7edda6bc6a9f76b8))
+* **step-fn-compiler/P4b:** Stage 0 — restore the browser training-trajectory spec ([508ca78](https://github.com/vinhowe/torchlette/commit/508ca78ef3551e9698a4197053b69aa8128c7dfa))
+* **unrolled-k/P4b:** park any plan-owned buffer a live storage aliases — the sampled external-destroy transient ([c0be756](https://github.com/vinhowe/torchlette/commit/c0be756b82fdd6cd50ac644b25b3f3d6c7370e80))
+* **unrolled-k/P4:** park registry-entry buffers for ANY live reader, not only registerState'd ([48cda47](https://github.com/vinhowe/torchlette/commit/48cda47b004a5a100bc9a34cf438d17731c946ff))
+* **webgpu:** arg-reduce over strided/offset views mis-indexes — force contiguous at seam ([24be1bc](https://github.com/vinhowe/torchlette/commit/24be1bc20f704e6285fee38e9adc6a3fc087da1e))
+
+
+### Performance Improvements
+
+* **executor:** memo the failed-generation tax for uncoverable recurring templates ([a84db43](https://github.com/vinhowe/torchlette/commit/a84db43ff708e7f79121b95a84f1653f7da12d4b))
+* **step-fn-compiler/P0:** linearize the compile-path passes for whole-step graphs ([8e33753](https://github.com/vinhowe/torchlette/commit/8e33753a14c5ae541a2c4a94e0bb9fedb5163acf))
+
+## Changelog
