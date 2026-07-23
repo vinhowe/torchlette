@@ -8,8 +8,19 @@
  * creating a unified kernel representation for future optimization passes.
  */
 
+import { ENV } from "../../core/env";
 import { sizeOf } from "../../core/shape";
+import { SOFTPLUS_DEF, UNARY_DEFS } from "../../ops/semantic/catalog";
+import { GELU_ERF_DEF, GELU_TANH_DEF } from "../../ops/semantic/composite";
+import {
+  ERF_A,
+  ERF_P,
+  GELU_SQRT_2_OVER_PI,
+  GELU_TANH_C,
+} from "../../ops/semantic/erf";
+import type { Expr } from "../../ops/semantic/expr";
 import type { DType } from "../types";
+import { lowerExprToTileIR } from "./expr-tile-fold";
 import {
   computeKernelMeta,
   type FusedKernelRecipe,
@@ -17,12 +28,6 @@ import {
   type KernelGenOptions,
   needsBroadcast,
 } from "./fusion-types";
-import {
-  ERF_A,
-  ERF_P,
-  GELU_SQRT_2_OVER_PI,
-  GELU_TANH_C,
-} from "../../ops/semantic/erf";
 import { compileTileKernel } from "./tile-compiler";
 import {
   type BindingSpec,
@@ -32,6 +37,35 @@ import {
   type KernelContext,
   type TileKernelSpec,
 } from "./tile-ir";
+
+/**
+ * COMPOSITE-CLOSURE F2 / A2 — the forward-activation WGSL body DERIVES from its
+ * `Expr` definition via `lowerExprToTileIR` (the fold), behind
+ * `TORCHLETTE_DERIVED_ACTIVATION` (born off; soak → default at A3 → the hand
+ * bodies + flag are removed). While the flag is off the hand switch body runs
+ * and is the differential oracle (tools/expr-fold-parity.ts); the fold is
+ * byte-identical for every activation except gelu_erf (1 f32 ULP, the L-EXPR
+ * lemma). Its single-source `Expr` per activation op-name:
+ */
+const ACTIVATION_EXPR: Readonly<Record<string, Expr>> = {
+  relu: unaryDefExpr("relu"),
+  sigmoid: unaryDefExpr("sigmoid"),
+  silu: unaryDefExpr("silu"),
+  softplus: SOFTPLUS_DEF.expr,
+  gelu: GELU_TANH_DEF.expr,
+  gelu_tanh: GELU_TANH_DEF.expr,
+  gelu_erf: GELU_ERF_DEF.expr,
+};
+
+function unaryDefExpr(name: string): Expr {
+  const d = UNARY_DEFS.find((u) => u.name === name);
+  if (!d) throw new Error(`fusion-tile-ir: no UNARY_DEF '${name}'`);
+  return d.expr;
+}
+
+function useDerivedActivation(): boolean {
+  return ENV.TORCHLETTE_DERIVED_ACTIVATION === "1";
+}
 
 // ============================================================================
 // Op mapping: OP_REGISTRY op name → tile-IR BlockExpr operations
@@ -46,6 +80,12 @@ export function applyFusedOp(
   inputs: BlockExpr[],
 ): BlockExpr {
   const a = inputs[0];
+
+  // A2: route the forward-activation body through the derived fold when enabled.
+  // The hand switch cases below stay as the flag-off differential oracle.
+  if (useDerivedActivation() && op in ACTIVATION_EXPR) {
+    return lowerExprToTileIR(ACTIVATION_EXPR[op], ctx, { x: a });
+  }
 
   switch (op) {
     // -- Direct unary (1:1 with tile-IR) --
