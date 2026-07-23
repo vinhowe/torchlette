@@ -321,6 +321,59 @@ class StorageTracker {
     };
   }
 
+  /**
+   * THE demotion predicate — is storage `s` demotable at the step boundary?
+   *
+   * INVARIANT: a storage is demotable (its one step-scoped wrapper claim gets
+   * released at markStep) IFF it is purely step-scoped — a live wrapper owns it
+   * AND nothing that survives the sweep keeps it. Formally: demotable :=
+   * rc>0 ∧ hasLiveOwner ∧ ¬keptHolder (this is exactly `_derived().stepScoped`).
+   *
+   * The three liveness layers, ONE model (do not re-collapse them into rc):
+   *   • rc  = EXISTENCE — is ANYTHING still holding the buffer (refcount.ts).
+   *   • owner SET W(s) = IDENTITY — WHICH wrappers hold it, and is any of them a
+   *     KEPT holder: persistent (SNAP∪REG), graph-retention clone, sidecar pin,
+   *     or a live view's base retain (the non-wrapper retain).
+   *   • generation stamp = TIME — was the wrapper born THIS step (part of W(s))
+   *     or the NEXT step (excluded from the SNAP-scoped owner set).
+   * rc alone is unsound as the demotion authority (one wrapper legitimately holds
+   * ctor+materialize rc=2), so demotion reads the owner SET, never rc-arithmetic;
+   * rc only decides "is anything still holding it" (the rc>0 term).
+   *
+   * `reason` is informational (a legible witness for the decision), never a
+   * control signal — the boolean is the whole contract.
+   *
+   * History: derived-ownership campaign task #70 D2 (owner SET replaces the
+   * steal-able owner slot); the persistence-UAF class it closes is #74 / #86 /
+   * the sequential-corruption ledger. See docs/architecture-debt.md.
+   */
+  isDemotableAtBoundary(
+    storageId: number,
+    maxGen: number | undefined,
+    liveViewBases: Set<number>,
+  ): { demotable: boolean; reason: string } {
+    const d = this._derived(storageId, maxGen, liveViewBases);
+    if (d.stepScoped) {
+      return { demotable: true, reason: "step-scoped: live owner, no kept holder" };
+    }
+    if (!d.hasLiveOwner) {
+      return {
+        demotable: false,
+        reason: "no live owner (GC scan / view-base retain handles it)",
+      };
+    }
+    // hasLiveOwner ∧ ¬stepScoped ⇒ a kept holder keeps it. Name which.
+    const kept: string[] = [];
+    if (d.persistent) kept.push("persistent(SNAP∪REG)");
+    if (d.graphHeld) kept.push("graph-retention");
+    if (d.sidecar) kept.push("sidecar-pin");
+    if (d.keptHolder && kept.length === 0) kept.push("view-base retain");
+    return {
+      demotable: false,
+      reason: kept.length ? `kept: ${kept.join("+")}` : "not step-scoped",
+    };
+  }
+
   /** Test-only: owner-SET stats. `sets` = number of storages with a set entry;
    *  `liveMembers` = total LIVE (deref'd) wrappers across all sets. Used by the
    *  GC-pressure gate to prove the owner set holds only WeakRefs (after GC + a
@@ -757,16 +810,13 @@ class StorageTracker {
   }
 
   /**
-   * Release tensor refs for step-scoped temporaries — driven by the DERIVED
-   * classification (task #70 D2 authoritative). For each tracked storage the
-   * `_derived` verdict decides survival: a storage is demoted (one wrapper claim
-   * released) iff it is `stepScoped` — a live owner exists and NO kept holder
-   * keeps it (persistent SNAP∪REG / graph-retention / sidecar-pin / view-base
-   * retain). Persistent tensors whose storage changed within the step (Adam m/v
-   * via _updateLazyRef) stay alive because a live SNAP/REG wrapper is still in
-   * W(s), even if the storage id is new. Reading the whole owner SET (not a
-   * single steal-able slot) is what makes the former reap-live / stale-disposed-
-   * slot class (§D1-log #1) unconstructible.
+   * The step-boundary demotion sweep: release the one step-scoped wrapper claim
+   * of every DEMOTABLE storage. Survival is decided per storage by THE demotion
+   * predicate `isDemotableAtBoundary` (see its INVARIANT). Persistent tensors
+   * whose storage changed within the step (Adam m/v via _updateLazyRef) survive
+   * because a live SNAP/REG wrapper is still in W(s), even with a new storage id.
+   *
+   * History: derived-ownership task #70 D2 (owner SET over the steal-able slot).
    */
   releaseStepTemps(maxGen?: number): number {
     if (!this._stepStartTensors) return 0;
@@ -776,11 +826,9 @@ class StorageTracker {
     // Iterate a snapshot of the owner-set keys — the loop mutates _ownerSet via
     // _liveOwners' lazy pruning, so we must not iterate the live map.
     for (const id of [...this._ownerSet.keys()]) {
-      const derived = this._derived(id, maxGen, liveViewBases);
-      // Demote only a genuinely step-scoped storage: a live owner exists and no
-      // kept holder keeps it. (`hasLiveOwner` false ⇒ nothing to release here —
-      // the GC scan / view-base retain handles those.)
-      if (!derived.stepScoped) continue;
+      if (!this.isDemotableAtBoundary(id, maxGen, liveViewBases).demotable) {
+        continue;
+      }
       if (rcGet(id) > 0) {
         rcRelease(id, "stepScoped");
         released++;
