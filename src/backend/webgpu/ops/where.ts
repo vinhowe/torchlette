@@ -53,7 +53,7 @@ export function where(
   const bytesPerElement = 4; // f32
   const limits = ctx.device.limits;
   const maxBindingSize =
-    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const outSizeBytes = outSize * bytesPerElement;
 
   // Use chunked dispatch when output exceeds binding limit and inputs are chunkable:

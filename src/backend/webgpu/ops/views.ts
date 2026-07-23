@@ -31,6 +31,7 @@ import {
   lcm,
   sizeOf,
   WORKGROUP_SIZE,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
 } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { createTensor, createTrackedBuffer } from "../tensor";
@@ -95,7 +96,7 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
   const dstBytesPerElement = dtypeBytes(dtype);
   const limits = ctx.device.limits;
   const maxBindingSize =
-    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const inputDataBytes = tensor.size * srcBytesPerElement;
   const outputDataBytes = tensor.size * dstBytesPerElement;
 
@@ -142,7 +143,7 @@ export function planCastDirect(
 ): ElementwiseDirectPlan | null {
   const ctx = requireContext();
   const maxBindingSize =
-    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    ctx.device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   if (
     tensor.size * dtypeBytes(tensor.dtype) > maxBindingSize ||
     tensor.size * dtypeBytes(dtype) > maxBindingSize
@@ -411,7 +412,7 @@ export function contiguous(a: BackendTensor): BackendTensor {
     const dataBytes = outSize * bpe;
     const maxBinding =
       requireContext().device.limits?.maxStorageBufferBindingSize ??
-      128 * 1024 * 1024;
+      DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
     if (
       tensor.isContiguous &&
       tensor.offset > 0 &&
@@ -454,7 +455,7 @@ export function contiguous(a: BackendTensor): BackendTensor {
   const ctx = requireContext();
   const limits = ctx.device.limits;
   const maxBindingSize =
-    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   // Get actual buffer size (the backing storage might be larger than the view)
@@ -500,7 +501,7 @@ export function planContiguousDirect(
 ): ElementwiseDirectPlan | null {
   const ctx = requireContext();
   const maxBindingSize =
-    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    ctx.device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   if (tensor.buffer.size > maxBindingSize) return null;
   return planContiguousDirectCore(tensor);
 }

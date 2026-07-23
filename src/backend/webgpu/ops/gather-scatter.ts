@@ -32,6 +32,7 @@ import {
   dtypeBytes,
   F32_BYTES,
   WORKGROUP_SIZE,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
 } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { createTensor, createTrackedBuffer } from "../tensor";
@@ -77,7 +78,7 @@ export function planGatherDirect(
   const elemBytes = dtypeBytes(dataDtype);
   const inputSizeBytes = sizeOf(inputShape) * elemBytes;
   const maxBindingSize =
-    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    ctx.device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   if (inputSizeBytes > maxBindingSize) return null; // chunked
   if (indexDtype !== "f32" && indexDtype !== "i32" && indexDtype !== "u32") {
     return null;
@@ -135,7 +136,7 @@ export function gather(
   const inputSizeBytes = tensorA.size * elemBytes;
   const deviceLimits = ctx.device.limits;
   const maxBindingSize =
-    deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    deviceLimits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const chunked = inputSizeBytes > maxBindingSize;
 
   // Shared setup
@@ -276,7 +277,7 @@ export function planScatterAddDirect(
   const outSize = sizeOf(inputShape);
   if (
     outSize * F32_BYTES >
-    (ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024)
+    (ctx.device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE)
   ) {
     return null; // chunked
   }
@@ -339,7 +340,7 @@ export function scatterAdd(
   const outputSizeBytes = tensorA.size * F32_BYTES;
   const deviceLimits = ctx.device.limits;
   const maxBindingSize =
-    deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    deviceLimits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const chunked = outputSizeBytes > maxBindingSize;
 
   // Shared setup

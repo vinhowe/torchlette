@@ -24,7 +24,7 @@ import { computeFlatChunkLayout } from "./chunked-dispatch";
 import { dispatchComputePass, getPipeline } from "./dispatch";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
-import { dtypeBytes } from "./shape-utils";
+import { DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE, dtypeBytes } from "./shape-utils";
 import type { AutotuneOptions } from "./tile-autotune";
 import { autotuneTileKernel, getDefaultConfig } from "./tile-autotune";
 import { compileTileKernel } from "./tile-compiler";
@@ -285,7 +285,7 @@ function computeChunkGeometry(
   limits: { maxStorageBufferBindingSize?: number } | undefined,
 ): ChunkGeometry {
   const maxBindingSize =
-    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const minAlignment =
     (limits as Record<string, number> | undefined)
       ?.minStorageBufferOffsetAlignment ?? 256;

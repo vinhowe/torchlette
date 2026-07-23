@@ -46,6 +46,7 @@ import {
   sizeOf,
   toIndexShape,
   WORKGROUP_SIZE,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
 } from "./shape-utils";
 import {
   autoFlushSharedEncoder,
@@ -194,7 +195,7 @@ export function planBinaryDirect(
   const bytesPerElement = dtypeBytes(dtype);
   const ctx = requireContext();
   const maxBindingSize =
-    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    ctx.device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   if (
     a.size * bytesPerElement > maxBindingSize ||
     b.size * bytesPerElement > maxBindingSize ||
@@ -266,7 +267,7 @@ export function dispatchBinary(
 
   const bytesPerElement = dtypeBytes(dtype);
   const maxBindingSize =
-    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    ctx.device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const aSizeBytes = a.size * bytesPerElement;
   const bSizeBytes = b.size * bytesPerElement;
   const outSizeBytes = outSize * bytesPerElement;
@@ -531,7 +532,7 @@ export function planUnaryDirect(
   const bytesPerElement = dtypeBytes(dtype);
   const ctx = requireContext();
   const maxBindingSize =
-    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    ctx.device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   if (a.size * bytesPerElement > maxBindingSize) return null;
   return planUnaryDirectCore(opKey, a, bytesPerElement);
 }
@@ -651,7 +652,7 @@ export function dispatchUnary(
   const outBytesPerElement =
     outDtype === dtype ? bytesPerElement : dtypeBytes(outDtype);
   const maxBindingSize =
-    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    ctx.device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
 
   // Chunked dispatch for large contiguous tensors (offset 0 required: the
   // chunked binding slices the buffer from element 0 — offset-view class,

@@ -5,6 +5,7 @@
 import { ENV } from "../../core/env";
 import { clearBindGroupCache } from "./bind-group-cache";
 import { bufferPool, destroyProfilingFenceBuffer } from "./buffer-pool";
+import { DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE } from "./shape-utils";
 import { advanceEpoch } from "./epoch";
 import type {
   GPUAdapter,
@@ -295,7 +296,7 @@ async function requestDeviceWithFallback(
   subgroupSupport: SubgroupSupport,
 ): Promise<{ device: GPUDevice; actualF16Supported: boolean } | null> {
   const adapterMaxStorage =
-    adapter.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    adapter.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const adapterMaxBuffer = adapter.limits?.maxBufferSize ?? 256 * 1024 * 1024;
   const adapterMaxStorageBuffers =
     adapter.limits?.maxStorageBuffersPerShaderStage ?? 8;
@@ -456,7 +457,7 @@ export function webgpuDeviceRequirements(adapter: GPUAdapter): {
     requiredFeatures,
     requiredLimits: {
       maxStorageBufferBindingSize:
-        adapter.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024,
+        adapter.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
       maxBufferSize: adapter.limits?.maxBufferSize ?? 256 * 1024 * 1024,
       maxStorageBuffersPerShaderStage:
         adapter.limits?.maxStorageBuffersPerShaderStage ?? 8,

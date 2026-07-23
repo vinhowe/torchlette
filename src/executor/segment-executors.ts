@@ -6,6 +6,7 @@ import type {
   DType,
 } from "../backend/types";
 import { isFusedBackend } from "../backend/types";
+import { DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE } from "../backend/webgpu/shape-utils";
 import {
   asGPUTensor,
   type GPUBuffer,
@@ -237,7 +238,7 @@ export async function executeFusedSegment(
 
   // Check if any input buffer exceeds maxStorageBufferBindingSize
   const maxBindingSize =
-    device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const hasOversizedBuffer = inputs.some(
     (inp) => inp.buffer.size > maxBindingSize,
   );

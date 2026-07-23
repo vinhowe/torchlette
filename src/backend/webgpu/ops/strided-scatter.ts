@@ -20,6 +20,7 @@ import {
   compute2DDispatch,
   sizeOf,
   WORKGROUP_SIZE,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
 } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { createTensor } from "../tensor";
@@ -129,7 +130,7 @@ function stridedScatterImpl(
 
   const ctx = requireContext();
   const maxBindingSize =
-    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    ctx.device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   // Byte math must follow the tensor dtype — with hardcoded f32 sizes an f16
   // full copy_ failed the fast-path size check below and fell into the
   // f32-typed kernel, silently corrupting the destination.

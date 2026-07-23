@@ -27,6 +27,7 @@ import {
   toIndexShape,
   WORKGROUP_SIZE,
   F32_BYTES,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
 } from "../shape-utils";
 import { realizeArgReduceWgsl as argReduceWGSL } from "../../../schedule/reduction-skeleton";
 import { createTensor, createTrackedBuffer } from "../tensor";
@@ -92,7 +93,7 @@ export function planComparisonDirect(
   if (outSize === 0) return null;
   const maxBinding =
     requireContext().device.limits?.maxStorageBufferBindingSize ??
-    128 * 1024 * 1024;
+    DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   if (
     a.size * F32_BYTES > maxBinding ||
     b.size * F32_BYTES > maxBinding ||

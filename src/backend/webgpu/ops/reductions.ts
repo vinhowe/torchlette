@@ -42,7 +42,7 @@ import {
   type PreambleChainKernelOp,
   type ReductionEpilogueOpDesc,
 } from "../reduction-tile-ir";
-import { alignBufferSize, contiguousStrides, dtypeBytes } from "../shape-utils";
+import { DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE, alignBufferSize, contiguousStrides, dtypeBytes } from "../shape-utils";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import { createTileKernelDispatcher } from "../tile-dispatch";
 
@@ -408,7 +408,7 @@ function fullReduction(
   if (op === "sum") {
     const bytesPerElement = dtypeBytes(tensor.dtype);
     const maxBindingSize =
-      ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+      ctx.device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
     if (
       tensor.buffer.size > maxBindingSize ||
       fullReductionNeedsChunking(tensor.size, bytesPerElement, ctx)
@@ -489,7 +489,7 @@ export function fullReductionNeedsChunking(
   ctx: WebGPUContext = requireContext(),
 ): boolean {
   const maxBindingSize =
-    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    ctx.device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   return totalElements * bytesPerElement > maxBindingSize;
 }
 
@@ -500,7 +500,7 @@ export function planChunkedFullReduction(
 ): ChunkedFullReductionPlan {
   const limits = ctx.device.limits;
   const maxBindingSize =
-    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
   const elementsPerAlignment = minAlignment / bytesPerElement;
   const maxElementsPerChunk = Math.floor(maxBindingSize / bytesPerElement);

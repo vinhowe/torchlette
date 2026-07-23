@@ -16,6 +16,7 @@ import {
   checkContiguousStrides,
   contiguousStrides,
   sizeOf,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
 } from "./shape-utils";
 import { arenaBufferSet, pinnedBufferSet, sharedEncoderActive } from "./webgpu-state";
 
@@ -269,7 +270,7 @@ export function createBufferWithData(
   const rawPoolSize = getSizeForClass(getSizeClass(alignedSize));
   const devLimits = device.limits;
   const maxBindingSizeForPool =
-    devLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    devLimits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const poolSize =
     rawPoolSize <= maxBindingSizeForPool ? rawPoolSize : alignedSize;
 

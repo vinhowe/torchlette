@@ -523,6 +523,18 @@ const structuralMissCounts = new Map<number, Set<number>>();
 const structuralWarned = new Set<number>();
 const PAYLOAD_THRASH_THRESHOLD = 4;
 
+/**
+ * Node interval between lowered-plan reclaim points (`flushSharedEncoder` +
+ * `flushBufferPool` = one submit) when liveness-release is on. This is the
+ * reclaim-boundary QUANTUM: a plan crossing a multiple of it pays +1 submit and
+ * a warmup pool-flush transient, so where a plan's node count falls relative to
+ * this value is load-bearing for warmup memory (docs/derived-optimizer-realizer-
+ * design.md §R3-FIX: Medium 586 nodes → 1 reclaim; +20-node prelude → 606 → 2
+ * reclaims → +800 MB warmup transient). Distinct from the `TORCHLETTE_RECLAIM_INTERVAL`
+ * env default — this is the liveness-release-on hardcode.
+ */
+const RECLAIM_INTERVAL_NODES = 300;
+
 function notePayloadThrash(
   fingerprint: { primary: number; structural: number },
   planNodes: LazyIRNode[],
@@ -3791,7 +3803,9 @@ export async function executePlanOptimized(
       // Insert reclaim points so released buffers get promoted to the available pool.
       // Matches the enableLivenessRelease default-on behavior.
       reclaimInterval:
-        ENV.TORCHLETTE_LIVENESS_RELEASE !== "0" ? 300 : undefined,
+        ENV.TORCHLETTE_LIVENESS_RELEASE !== "0"
+          ? RECLAIM_INTERVAL_NODES
+          : undefined,
     });
     template.loweredPlan = loweredPlan;
     // Create empty arena for WebGPU — populated during first execution,

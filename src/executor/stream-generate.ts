@@ -84,7 +84,7 @@ import {
   ropeVolatilePack,
 } from "../backend/webgpu/rope-kernel";
 import { planRowProgramDispatch } from "../backend/webgpu/row-program-dispatch";
-import { alignBufferSize, dtypeBytes } from "../backend/webgpu/shape-utils";
+import { DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE, alignBufferSize, dtypeBytes } from "../backend/webgpu/shape-utils";
 import { planDeviceTopK } from "../backend/webgpu/topk-kernel";
 import type { WebGPUTensor } from "../backend/webgpu/tensor";
 import type {
@@ -1214,7 +1214,7 @@ function generateSequential(
   const outSize = sizeOf(node.shape);
   const maxBinding =
     requireContext().device.limits?.maxStorageBufferBindingSize ??
-    128 * 1024 * 1024;
+    DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const outOversized = outSize * dtypeBytes(dtype) > maxBinding;
   // Transport windowing: decomposition is a WALKER transform, not a declaration
   // fact (Vin's P0 refinement). When the split axis is parallel (elementwise:
@@ -2070,7 +2070,7 @@ function serializeMeanReduction(
   let sumOutBytes: number;
   if (dims == null) {
     const inSize = sizeOf(inShape);
-    if (inSize * 4 > 128 * 1024 * 1024) return "chunked";
+    if (inSize * 4 > DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE) return "chunked";
     sumPlan = planFullReductionDispatch(decl.monoid, inSize);
     sumOutBytes = 4;
   } else {
@@ -4393,7 +4393,7 @@ function generateFused(
   // foreach optimizer's 320 MB packed-buffer decomposition. Detected the same
   // way the executor detects it — any external input buffer > maxBinding.
   const maxBindingSize =
-    device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const extInputOversized = extInputs.some((ref) => {
     if (!ref) return false;
     const oi = ref.kind === "materialized" ? 0 : (ref.outputIndex ?? 0);

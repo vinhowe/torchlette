@@ -85,7 +85,7 @@ export * from "../graph/engine-types";
 // Local imports from engine-types (used by Engine methods merged into RuntimeEngine)
 import {
   type AsyncScope,
-  type BaseState,
+  type MutationVersionState,
   type BaseStateInfo,
   type BaseId as EngineBaseId,
   type EngineMemoryStats,
@@ -419,7 +419,7 @@ export class RuntimeEngine {
   private dispatchModes: DispatchMode[] = [];
 
   // ── Engine fields (merged from Engine class) ──────────────────────────────
-  private readonly _baseState = new Map<EngineBaseId, BaseState>();
+  private readonly _baseState = new Map<EngineBaseId, MutationVersionState>();
   private readonly _execLock: ExecLock = { held: false, ownerId: 0, depth: 0 };
   private _nextOwnerId = 1;
   private _poisoned = false;
@@ -2804,12 +2804,12 @@ export class RuntimeEngine {
     }
   }
 
-  private _getOrCreateBaseState(baseId: EngineBaseId): BaseState {
+  private _getOrCreateBaseState(baseId: EngineBaseId): MutationVersionState {
     const existing = this._baseState.get(baseId);
     if (existing) {
       return existing;
     }
-    const initial: BaseState = {
+    const initial: MutationVersionState = {
       baseCommitVersion: 0,
       committed: new Set<number>(),
     };
@@ -2882,7 +2882,6 @@ export class RuntimeEngine {
         baseId,
         pinCount: count,
         binding: "ssa",
-        locId: null,
         hasValue: false,
         commitVersion: this._baseState.get(baseId)?.baseCommitVersion ?? 0,
       });

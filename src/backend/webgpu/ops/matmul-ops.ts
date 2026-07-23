@@ -28,6 +28,7 @@ import {
   gcd,
   sizeOf,
   WORKGROUP_SIZE,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
 } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { createTensor, createTrackedBuffer } from "../tensor";
@@ -59,7 +60,7 @@ export function matmul(
 
   const limits = ctx.device.limits;
   const maxBindingSize =
-    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
 
   // Check if B matrix exceeds max buffer binding size
   const bSizeBytes = b.size * dtypeBytes(b.dtype);
@@ -197,7 +198,7 @@ function sliceColumns(
 
   const limits = ctx.device.limits;
   const maxBindingSize =
-    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   // Check if input exceeds binding limit
@@ -302,7 +303,7 @@ function scatterColumnsToOutput(
 
   const limits = ctx.device.limits;
   const maxBindingSize =
-    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   // Check if output buffer exceeds limit

@@ -42,7 +42,10 @@ export interface SavedTensorRecord {
   baseCommitVersionAtSave: number;
 }
 
-export interface BaseState {
+/** Per-base mutation-version bookkeeping (saved-tensor version checking). Named
+ *  for what it is — it was `BaseState`, but it only ever held the commit version
+ *  + committed mutation-id set. */
+export interface MutationVersionState {
   baseCommitVersion: number;
   committed: Set<number>;
 }
@@ -115,8 +118,10 @@ export interface SavedTensorInfo {
 export interface BaseStateInfo {
   baseId: number;
   pinCount: number;
-  binding: "ssa" | "loc" | "pending_loc";
-  locId: number | null;
+  // Always "ssa": the "loc"/"pending_loc" union arms and the `locId` field were
+  // dead (never produced — the only writer, engine._debug_getBaseStatesInfo,
+  // hardcodes "ssa"/null, and no reader consumed locId). Collapsed to the truth.
+  binding: "ssa";
   hasValue: boolean;
   commitVersion: number;
 }
