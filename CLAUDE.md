@@ -142,6 +142,23 @@ TORCHLETTE_SEQ_LEN=512 NUM_STEPS=18 npx tsx tools/profile-training.ts` on dw-2-1
 node v18; the container node is too old). Read the LATE steps — the steady-state avg is
 warmup-inflated; pool reuse must settle (~step 10+).
 
+**124M DiLoCo regression tolerances are hardware-qualified (`tools/diloco-regression-check.ts`,
+measured 2026-07-23).** The run is deterministic in its inputs (seed 42 + fixed LCG
+sampler); all run-to-run variance is nondeterministic GPU reductions (parallel-reduction
+ordering + scatterAdd atomics), and that band is HARDWARE-dependent — one tolerance
+false-alarms. Measured run-to-run bands (max spread of round losses across repeats, so it's
+run-to-run, NOT device-to-device: a single V100 already spans the full band):
+- **A100 (dw-2-1, 8 runs × 2 GPUs):** band(r3/6/9) = **3.3e-4** → tol **5e-4** (band × 1.5);
+  baseline means {0: 9.807889, 3: 5.922661, 6: 5.150417, 9: 4.637923}.
+- **V100 (sivri, 12 runs × 3 GPUs):** band(r3/6/9) = **2.0e-3** → tol **3e-3** (band × 1.5);
+  baseline means {0: 9.808891, 3: 5.921947, 6: 5.153782, 9: 4.640370}.
+- **Round 0 is NOT bit-exact** — it drifts ~1.2e-6 run-to-run (tol 1e-5), and its VALUE
+  differs ~1e-3 across hardware (A100 9.80789 vs V100 9.80891); cross-hardware trajectory
+  means differ up to 3.4e-3 (r6), so the baselines are per-hardware. The check auto-selects
+  the profile from `nvidia-smi` (override `REG_HW=a100|v100`; unknown hw → wider V100 band)
+  and asserts a two-sided band `|actual − baseline| ≤ tol`. Non-canonical token blob still
+  exits 2. The coarse {0:9.81,…} figures above are the round-2-decimal summary of these means.
+
 ### HISTORICAL — NOT comparable to CURRENT
 **⚠ Memory is NOT comparable across hardware (V100-32GB vs A100-80GB) or arena eras.**
 The V100 lines below predate A100 + arena-reclaim. Trap to avoid: Medium 14.7 GB
