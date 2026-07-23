@@ -1,7 +1,12 @@
 # Chain Packing: the parallel-isomorphic-chain packer
 
-> **Status:** DESIGN (no `src/` change). This is the P0 design deliverable of the
-> "diamond hardening" campaign. It cashes the named blocker left by the
+> **Status:** PARTIALLY LANDED, then STOPPED. P3 shipped `src/` (the Muon
+> full-refusal seam — `muon.ts` `packVerdict()` + the packer's clause-4 gate; see
+> §4 P3 and §6 "Status — LANDED, full-refusal v1"); P4/P5 (the default flip + the
+> larger fused-kernel deletion) are STOPPED (see "P4/P5 STATUS (2026-07-21):
+> STOPPED" at the end and `coverage-campaign-design.md` §9). Began as the P0 design
+> deliverable of the "diamond hardening" campaign. It cashes the named blocker left
+> by the
 > semantic-derivation era: `docs/semantic-derivation-design.md` §16 / §16b
 > ("dissolution awaits a graph-altitude parallel-isomorphic-chain packer") and
 > `docs/architecture-debt.md` migration stage 3 ("delete the `adamStep` mega-op;

@@ -2,14 +2,17 @@
  * Semantic Derivation — the erf realization + GELU constants (Crystal Campaign
  * 3, Phase 2: COMPOSITES DERIVE).
  *
- * THE SINGLE SOURCE for two families of magic numbers that lived hand-copied
- * across FOUR surfaces (the "triplication" of design §1):
- *   - the Abramowitz–Stegun erf Horner polynomial (`ERF_A` / `ERF_P`), written
- *     character-for-character in `numeric.ts` `erf()`, `tile-ir.ts`
- *     `BlockExpr.erf()`, `fusion-tile-ir.ts` gelu_erf, and
- *     `custom-backward.ts` `geluErfBackward`;
- *   - the GELU-tanh constants (`GELU_SQRT_2_OVER_PI`, `GELU_TANH_C`), written in
- *     the CPU `gelu()`, the WGSL activation switch, and `geluTanhBackward`.
+ * THE SINGLE SOURCE for two families of magic numbers that USED to live hand-
+ * copied across several surfaces (the "triplication" of design §1) before this
+ * module and the semantic stratum consolidated them:
+ *   - the Abramowitz–Stegun erf Horner polynomial (`ERF_A` / `ERF_P`), once
+ *     written character-for-character in the CPU `erf()`, the tile-IR
+ *     `BlockExpr.erf()`, and the fused gelu_erf kernel (the old hand-written
+ *     `geluErfBackward` in the since-deleted `custom-backward.ts` derives now);
+ *   - the GELU-tanh constants (`GELU_SQRT_2_OVER_PI`, `GELU_TANH_C`), once written
+ *     in the CPU `gelu()`, the WGSL activation switch, the gelu-tanh backward, and
+ *     — until this sweep — the off-path Triton emitter (`triton-emit.ts`, which now
+ *     imports them from here).
  *
  * `erf` is admitted as an ALGEBRA PRIMITIVE (like `exp`/`tanh`): its *realization*
  * is an approximation (the A-S poly, `erfApprox` / the WGSL emit), single-sourced

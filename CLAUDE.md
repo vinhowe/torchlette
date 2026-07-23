@@ -46,10 +46,13 @@ BENCH_WARMUP=3 BENCH_ITERS=7 npx tsx bench/matmul-comparison.ts
   - `ops/` - Op implementations (elementwise, reductions, views, fused kernels, registry)
   - `matmul/` - Tiled matmul with shape-class tuning and K-split
   - `tile-*.ts` - Tile-IR compiler (IR, lowering, compiler, ops, dispatch)
-- `src/engine/` - Tensor engine core (lazy execution, graph compiler, fusion, plan building)
-- `src/frontend/` - User-facing API (table-driven ops, autograd, autocast, noGrad)
-  - `custom-backward.ts` - Extracted backward functions (matmul, linear, gelu) with BackwardContext
-- `src/runtime/` - RuntimeEngine (lazy IR node creation, dtype rules, table-driven ops)
+- `src/graph/` - Lazy IR core (`LazyIRNode`/`StorageHandle` types, node factory, storage tracker, refcount)
+- `src/runtime/` - RuntimeEngine (lazy IR node creation, dtype rules, table-driven ops, force/markStep)
+- `src/compiler/` - Graph analysis (fusion detection, graph-compiler, matmul-epilogue)
+- `src/executor/` - Plan building + execution (lowered plan, compiled plan, stream generation, memory planner, dispatch)
+- `src/schedule/` - Schedule-state + realizers (OptTerm fold, optimizer/GELU realizers)
+- `src/frontend/` - User-facing API (table-driven ops, autograd, autocast, noGrad); backward for matmul/linear/gelu are thin dispatch stubs here that call the derived semantic stratum
+- `src/ops/` - Op registry (elementwise grad specs) + `semantic/` derivation stratum (`contraction.ts` = the matmul/linear adjoint; `adjoint.ts`, `composite.ts`, `erf.ts`, `reduction.ts`)
 - `src/nn/` - Module system (auto parameters, linear, embedding, layernorm, init, grad clipping)
 - `src/optim/` - Optimizers (Adam/AdamW with fused GPU kernel, SGD, GradScaler, LR schedulers, parameter groups)
 - `test/` - test suite (cpu + webgpu projects run the same specs; see vitest.config.ts)
@@ -91,9 +94,9 @@ GPU memory is managed deterministically via two-tier reachability — no GC depe
 
 **Table-driven ops**: Simple unary ops (relu, exp, sqrt, etc.), binary ops (add, mul, pow), comparison ops (gt, lt, etc.), reduction ops (sum, max, min, mean), and arg-reduce ops (argmax, argmin) are all table-driven via interface augmentation + prototype loop at the bottom of their respective files. This preserves TypeScript autocomplete while eliminating boilerplate.
 
-**Custom backward extraction**: Complex backward functions (matmul, linear, gelu tanh, gelu erf) are extracted to `src/frontend/custom-backward.ts` with a `BackwardContext` interface. The frontend methods become thin dispatch stubs. Add new custom backward functions to this file following the same pattern.
+**Backward derivation (the semantic stratum)**: Complex backwards are no longer hand-written in a `custom-backward.ts` — that file was replaced by the derived semantic stratum in `src/ops/semantic/`. The matmul/linear adjoint is stated ONCE as the contraction fact in `src/ops/semantic/contraction.ts`; elementwise/composite backwards (gelu tanh, gelu erf, …) derive through `adjoint.ts` / `composite.ts` / `erf.ts`. The frontend methods in `src/frontend/torchlette.ts` are thin dispatch stubs (`BackwardContext` still lives there and in `contraction.ts`). Add new complex backwards by declaring the op's meaning in the semantic stratum, not by hand.
 
-**Gradient specs**: Simple ops (elementwise) define gradients in `src/ops/registry.ts` (UnaryGradFn, BinaryTTGradFn, BinaryTSGradFn). Complex ops define gradients in `custom-backward.ts`. Don't add complex backward logic to `torchlette.ts`.
+**Gradient specs**: Simple ops (elementwise) define gradients in `src/ops/registry.ts` (UnaryGradFn, BinaryTTGradFn, BinaryTSGradFn). Complex ops derive their gradients from the semantic stratum (`src/ops/semantic/`). Don't add complex backward logic to `torchlette.ts`.
 
 ## Framework Correctness Principles
 

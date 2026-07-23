@@ -1,7 +1,10 @@
 # Semantic Derivation: op meaning as the single source
 
-**Status:** v1 design + feasibility probes · 2026-07-20 (Crystal Campaign 3, ratified
-by Vin — "derive the reference"). **Design-only; no mechanism lands.** The probes in
+**Status:** LANDED (Phase 0 + Phase 1) · 2026-07-20 (Crystal Campaign 3, ratified
+by Vin — "derive the reference"). The stratum shipped to `src/ops/semantic/` — see
+"§12. Phase 0 — LANDED" (the definition schema; derived CPU body == hand body
+byte-exact, 24/24) and "§13. Phase 1 — LANDED" (the reduction schema) below. The
+probes in
 §3 are self-contained (`tools/semantic-derivation-probe.ts`, host; and
 `tools/semantic-derivation-gpu-probe.ts`, WebGPU) and their numbers are committed here.
 **Depends on / succeeds:** docs/schedule-state-design.md (the intra-kernel semantic

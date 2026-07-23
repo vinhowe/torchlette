@@ -38,6 +38,7 @@ import type {
   EpilogueConfig,
   TransposeMode,
 } from "../../backend/webgpu/matmul/types";
+import { GELU_SQRT_2_OVER_PI, GELU_TANH_C } from "../../ops/semantic/erf";
 import type { TiledMatmulDescriptor } from "../matmul-skeleton";
 import type { ProgramGridMap, ScheduleState, SemanticLoop } from "../types";
 
@@ -177,8 +178,10 @@ function emitUnary(op: string): string[] {
       return ["    acc = tl.maximum(acc, 0.0)"];
     case "gelu":
     case "gelu_tanh":
+      // GELU-tanh constants single-sourced from semantic/erf.ts (the canonical
+      // values every backend reads) — no hand-copied literal that can drift.
       return [
-        "    acc = 0.5 * acc * (1.0 + tl.math.tanh(0.7978845608028654 * (acc + 0.044715 * acc * acc * acc)))",
+        `    acc = 0.5 * acc * (1.0 + tl.math.tanh(${GELU_SQRT_2_OVER_PI} * (acc + ${GELU_TANH_C} * acc * acc * acc)))`,
       ];
     case "sigmoid":
       return ["    acc = tl.sigmoid(acc)"];

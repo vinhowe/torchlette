@@ -38,7 +38,6 @@ const GPU_TEST_FILES = [
   "test/scope-training.spec.ts",
   "test/second-run-determinism.spec.ts",
   "test/stale-external-rebind.spec.ts",
-  "test/static-kv-harvest-lifetime.spec.ts",
   "test/optim/fused-vs-elementwise.spec.ts",
   "test/optim/adam-multigroup.spec.ts",
   "test/oracle/gpt2-checkpoint-parity.spec.ts",
@@ -48,7 +47,6 @@ const GPU_TEST_FILES = [
   "test/topk-kernel.spec.ts",
   "test/true-segmentation-benchmark.spec.ts",
   "test/whole-step-checkpoint-refusal.spec.ts",
-  "test/witness-harvest.spec.ts",
 ];
 
 // Heavyweight training tests excluded from default `npm run test`.

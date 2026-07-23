@@ -1,6 +1,12 @@
 # The Derived Optimizer Realizer: the maximally platonic move
 
-> **Status:** DESIGN (no `src/` change). P0 deliverable answering Vin's question
+> **Status:** LANDED (R1, R2, R4, R5a). Began as the P0 design deliverable; the
+> mechanism shipped to `src/` — see "Implementation status (R1–R4) — updated
+> 2026-07-22" and "Fork C — LANDED, R3 FLIPPED, R4 DELETED" / "R5a — the
+> program-roles realizer, LANDED" below (R1 `src/schedule/optterm-fold.ts`; R2
+> landed derived Adam behind `TORCHLETTE_DERIVED_ADAM`, then R4 DELETED that flag
+> and mechanism — the flag no longer exists in `src/`). P0 deliverable answering
+> Vin's question
 > verbatim — *"figure out the maximally platonic move for the derived optimizer
 > program."* It is written **after** the chain-packing campaign STOPPED
 > (`docs/chain-packing-design.md` P4/P5, `docs/coverage-campaign-design.md` §9
