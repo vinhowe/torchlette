@@ -1247,11 +1247,16 @@ export async function awaitDeferredFence(): Promise<void> {
  * resolves. In CPU-only mode `issueDeferredFence` no-ops (no gpuContext) so the
  * flag stays false and this never fires.
  *
- * NOT for the runahead-ring settle path (`_deferBoundaryCommit`): that awaits an
- * ISOLATED fence and leaves the SHARED slot pointing at a NEWER step's un-awaited
- * fence by design, so `deferredPendingRelease` is legitimately true there. Only
- * call this at the shared-fence-quiesced sweep sites (markStep, the implied
- * boundary commit).
+ * Call this ONLY at a sweep site that issues+awaits the shared fence IMMEDIATELY
+ * before the demotion sweep — currently just `_commitStepBoundaryGen` (the implied
+ * step-boundary commit). NOT for:
+ *   - plain `markStep`: its quiesce is Step 0 awaiting the PRIOR step's fence plus
+ *     fence-gated deferredDestroy; Step 2's forceAllPending can leave a fresh fence
+ *     outstanding before the sweep (awaited at Step 4), so this flag is legitimately
+ *     true there;
+ *   - the runahead-ring settle (`_deferBoundaryCommit`): it awaits an ISOLATED
+ *     fence and leaves the SHARED slot pointing at a NEWER step's un-awaited fence
+ *     by design.
  */
 export function assertQuiesced(context: string): void {
   if (fenceState.deferredPendingRelease) {

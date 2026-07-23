@@ -2274,10 +2274,13 @@ export class Torchlette {
     this._drainBoundaryDeferred();
 
     // Step 3: Destroy all storages with rc <= 0.
-    // Quiesce-before-demotion is a deterministic throw here: Step 0 awaited any
-    // prior deferred fence and no new one is issued until Step 4, so the sweep
-    // runs with nothing un-fenced.
-    assertQuiesced("markStep");
+    // NOTE: no assertQuiesced here. markStep's quiesce-before-demotion is provided
+    // by Step 0 (awaiting the PRIOR step's fence) plus fence-gated deferredDestroy —
+    // NOT by an immediate issue+await before this sweep. Step 2's forceAllPending
+    // can legitimately leave a fresh fence outstanding (deferredPendingRelease=true)
+    // that Step 4 will await, so asserting it false here is the wrong invariant.
+    // Only _commitStepBoundaryGen (which issues+awaits a fence immediately before
+    // its sweep) is quiesced by construction and carries the assert.
     storageTracker.destroyUnreachable();
 
     // Step 3.5: Release refs for step-scoped temporaries, then destroy.
